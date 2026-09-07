@@ -9519,15 +9519,19 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private static bool HaveSameRows(EmbeddedTable left, EmbeddedTable right)
     {
-        // Cheap short-circuit: a matching row-storage lineage/revision (see
-        // EmbeddedTable.RowStorageIdentity) is a sound proof of content equality on its own —
-        // it can only hold when zero mutations of any kind have touched either side's row
-        // storage since they last shared the exact same physical RowStore lineage — so this
-        // never needs to force either table to load a still-pending row set from page storage
-        // just to prove what the revision counters already guarantee. Only when the identity
-        // check reports "possibly different" does this fall back to the O(row count) content
-        // comparison below, which does require both sides to be materialized.
-        if (ReferenceEquals(left, right) || left.RowStorageIdentity == right.RowStorageIdentity)
+        if (ReferenceEquals(left, right))
+            return true;
+
+        // See IsTableRowStorageUnchangedFromPrevious's remarks for why this fast, non-forcing
+        // check requires both sides to share the same resolution state before Revision is
+        // directly comparable: if BOTH are still pending, matching LineageId alone already
+        // proves neither could possibly have diverged; if BOTH are already resolved, Revision
+        // is directly comparable. When resolution state differs, this intentionally does NOT
+        // return a definitive answer from identity alone (that would risk the same false
+        // "changed" result the referenced remarks describe) — it simply skips the fast path and
+        // falls through to the row-by-row content comparison below, which is unconditionally
+        // correct regardless of either side's resolution state.
+        if (left.HasPendingRowLoad == right.HasPendingRowLoad && left.RowStorageIdentity == right.RowStorageIdentity)
             return true;
 
         if (left.Rows.Count != right.Rows.Count || left.RowIds.Count != right.RowIds.Count)
@@ -10140,13 +10144,35 @@ internal sealed class EmbeddedFileStore : IDisposable
             return false;
         }
 
-        // RowStorageIdentity reads the row storage's lineage/revision directly, without ever
-        // forcing either side to load a still-pending table's rows from page storage — unlike
-        // going through the Rows property (table.Rows.LineageId), which would defeat this
-        // exact optimization by decoding the whole table just to prove it need not be decoded.
-        // See EmbeddedTable.RowStorageIdentity's doc comment for why this is safe even while a
-        // concurrent reader might be mid-load on the same shared `previous` instance.
-        return ReferenceEquals(previous, table) || table.RowStorageIdentity == previous.RowStorageIdentity;
+        if (ReferenceEquals(previous, table))
+            return true;
+
+        // RowStorageIdentity's cheap, non-forcing comparison is only sound when BOTH sides are
+        // in the SAME resolution state relative to their shared lineage: Revision starts at 0
+        // for an unresolved (still-pending) table and only reaches its final, comparable value
+        // once the lazy loader's own row-population Add() calls run (see
+        // EmbeddedTable.AttachPendingRowLoader/EnsureRowsLoaded) — so comparing raw Revision
+        // across two same-lineage instances where exactly one side has resolved and the other
+        // has not produces a false "changed" result (e.g. pending=0 vs resolved=N) even though
+        // neither table was ever actually mutated. This is reachable in practice: a table with
+        // an unresolved custom-collation index defers hydration at Load() time (see
+        // ValidateStoredIndex's comparer.HasDeferredTerms early-out), so a mid-transaction
+        // catalog reload can independently resolve one side (e.g. because something else
+        // touched it) while the other stays pending, purely as a timing artifact unrelated to
+        // any real mutation.
+        // <para>
+        // When BOTH sides share the same resolution state, the cheap comparison is safe and
+        // never needs to force either side to load: if both are still pending, matching
+        // LineageId alone already proves neither could possibly have diverged (neither has even
+        // been decoded yet); if both are already resolved, Revision is directly comparable. Only
+        // when resolution state differs between the two sides does this fall back to forcing
+        // both to resolve via the Rows property — exactly the original, proven-correct
+        // comparison — scoped to just this one table's storage, never the whole catalog.
+        // </para>
+        if (table.HasPendingRowLoad == previous.HasPendingRowLoad)
+            return table.RowStorageIdentity == previous.RowStorageIdentity;
+
+        return table.Rows.LineageId == previous.Rows.LineageId && table.Rows.Revision == previous.Rows.Revision;
     }
 
     /// <summary>
