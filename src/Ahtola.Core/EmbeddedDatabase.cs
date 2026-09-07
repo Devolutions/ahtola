@@ -48294,6 +48294,22 @@ out bool hasReturning)
             // Remove actually retires rows — uses upstream's newest-wins representative.
             var slidingFrameIsGrowing = spec.Frame is null
                 || spec.Frame.Start.Kind == FrameBoundKind.UnboundedPreceding;
+            // A RANGE frame with BOTH bounds Preceding (e.g. "100 PRECEDING AND 2 PRECEDING")
+            // uses a structurally different cursor order upstream (window.rs's Pattern B /
+            // `same_kind_bounded`): the end cursor steps fully forward first (AGGSTEP, possibly
+            // spanning several rows in one advance), then the start cursor steps fully forward
+            // (AGGINVERSE) — both unclamped against each other, so a row can be transiently
+            // stepped in by the end cursor and then immediately inverted back out by the start
+            // cursor within the same outer-row transition. This differs from every other frame
+            // shape (e.g. an end bound of CURRENT ROW), whose end cursor only ever advances by
+            // exactly the current row's own peer group per iteration and whose start/end ranges
+            // never need to "pass through" a row neither range's final membership retains.
+            // Reproducing this transient membership matters because a numeric accumulator's
+            // overflow can occur only during that transient state (mirrors sumStep/sumInverse
+            // reporting a sticky flag regardless of whether the frame later narrows again).
+            var bothBoundsPreceding = spec.Frame is { Mode: Ahtola.Core.Parsing.WindowFrameMode.Range }
+                && spec.Frame.Start.Kind == FrameBoundKind.Preceding
+                && spec.Frame.End.Kind == FrameBoundKind.Preceding;
             var slidingAggregates = new Dictionary<FunctionExpression, SlidingWindowAggregate>();
             foreach (var (function, kind) in slidingEligible)
                 slidingAggregates[function] = new SlidingWindowAggregate(
@@ -48305,6 +48321,16 @@ out bool hasReturning)
                     preferNewestOnTie: !slidingFrameIsGrowing);
             var slidingStart = 0;
             var slidingEnd = -1;
+            // Independent high-water marks for the bothBoundsPreceding branch: the last position
+            // ever passed to Accumulate, and the last position ever passed to Remove. These must
+            // be tracked separately from slidingStart/slidingEnd (which represent the *logical*
+            // frame boundary for the defensive non-monotonic check and the other branch): a run
+            // of empty-frame transitions can walk slidingStart/slidingEnd forward without every
+            // intervening position actually having been added, so capping a later Remove range by
+            // "whatever was last logically at slidingEnd" is not safe — it must be capped by what
+            // was actually, physically added.
+            var addedThrough = -1;
+            var removedThrough = -1;
 
             IReadOnlyList<int>? sharedFramePositions = null;
             Dictionary<FunctionExpression, SqlValue>? sharedAggregateValues = null;
@@ -48334,6 +48360,40 @@ out bool hasReturning)
                             foreach (var (function, aggregate) in slidingAggregates)
                                 aggregate.Accumulate(inputs[function][sourceIndex]);
                         }
+
+                        addedThrough = newEnd;
+                        removedThrough = newStart - 1;
+                    }
+                    else if (bothBoundsPreceding)
+                    {
+                        // Pattern B: end cursor steps fully forward (unclamped against the start
+                        // cursor) before the start cursor steps fully forward — a row between the
+                        // old added-through mark and the new end gets transiently added, then
+                        // (possibly in the very same transition) immediately removed again. The
+                        // remove range is capped by addedThrough, not by the logical slidingEnd:
+                        // a run of empty-frame transitions can advance slidingEnd past positions
+                        // that were only ever *logically* skipped, never physically added, and
+                        // trying to Remove those would fail (or worse, remove an unrelated row).
+                        for (var candidate = addedThrough + 1; candidate <= newEnd; candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Accumulate(inputs[function][sourceIndex]);
+                        }
+
+                        addedThrough = Math.Max(addedThrough, newEnd);
+
+                        var removeThroughTarget = Math.Min(newStart - 1, addedThrough);
+                        for (var candidate = removedThrough + 1; candidate <= removeThroughTarget; candidate++)
+                        {
+                            context.CheckInterrupt();
+                            var sourceIndex = entries[candidate].SourceIndex;
+                            foreach (var (function, aggregate) in slidingAggregates)
+                                aggregate.Remove(inputs[function][sourceIndex]);
+                        }
+
+                        removedThrough = Math.Max(removedThrough, removeThroughTarget);
                     }
                     else
                     {

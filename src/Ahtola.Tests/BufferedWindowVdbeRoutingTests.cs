@@ -655,6 +655,55 @@ public sealed class BufferedWindowVdbeRoutingTests
     }
 
     [Test]
+    public void MovingSumOverIntegerExtremesRaisesTheSameTransientOverflowAsSqliteUnderDescendingBothPrecedingRange()
+    {
+        // A RANGE frame with BOTH bounds PRECEDING (unlike an end bound of CURRENT ROW) steps
+        // its end cursor fully forward before its start cursor steps fully forward, so a row can
+        // be transiently added by the end-cursor catch-up and then immediately inverted back out
+        // by the start-cursor catch-up within the very same row transition — even though that
+        // row never appears in either the old or the new frame's own final membership. Here the
+        // transient add of k=-5 followed by k=i64::MIN, then the transient removal of k=5,
+        // underflows i64 and sets the sticky overflow flag permanently (mirrors sumStep/
+        // sumInverse's ovrfl bookkeeping, window.rs's Pattern-B end-then-start cursor order).
+        string[] setup =
+        [
+            "CREATE TABLE t(k INT);",
+            "INSERT INTO t VALUES (-9223372036854775808),(-5),(0),(5),(9223372036854775807);",
+        ];
+        const string query =
+            "SELECT k, sum(k) OVER (ORDER BY k DESC RANGE BETWEEN 100 PRECEDING AND 2 PRECEDING) FROM t;";
+
+        using var connection = OpenManaged(setup);
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!
+            .Message.Should().Contain("integer overflow");
+        var sqlite = () => RunSqlite(setup, query);
+        sqlite.Should().Throw<MsData.SqliteException>();
+    }
+
+    [Test]
+    public void MovingMinMaxFrameMembershipAtIntegerExtremesStaysCorrectDespiteTheTransientSumOverflow()
+    {
+        // The same both-PRECEDING RANGE frame shape whose transient cursor catch-up overflows
+        // sum() must still report correct frame *membership* for order-insensitive aggregates
+        // that don't accumulate exact arithmetic the same way — count/group_concat/min are
+        // unaffected by the transient add-then-remove of a row that ultimately nets out.
+        string[] setup =
+        [
+            "CREATE TABLE t(k INT);",
+            "INSERT INTO t VALUES (-9223372036854775808),(-5),(0),(5),(9223372036854775807);",
+        ];
+        const string query =
+            """
+            SELECT k, count(*) OVER w, group_concat(k,',') OVER w, min(k) OVER w
+            FROM t WINDOW w AS (ORDER BY k DESC RANGE BETWEEN 100 PRECEDING AND 2 PRECEDING)
+            ORDER BY k DESC;
+            """;
+
+        AssertRoutesThroughWindowBuffer(setup, query);
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
     public void MovingGroupConcatEmptyPrefixNeverLeavesAStaleLeadingSeparator()
     {
         // Removing a head value whose own rendered text is empty must also strip the separator
