@@ -94,6 +94,35 @@ public class ManagedIntentionalMvccParityTests
         ReadValue(connection, "SELECT max(value) FROM t;").Should().Be(SqlValue.Integer(5));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ConcurrentSameValueSetvalDoesNotResurrectSupersededWatermarks(bool resetIsCalled)
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "PRAGMA journal_mode=mvcc; CREATE SEQUENCE s; BEGIN CONCURRENT;");
+        ReadValue(connection, "SELECT setval('s', 100);").Should().Be(SqlValue.Integer(100));
+        ReadValue(connection, resetIsCalled
+            ? "SELECT setval('s', 100, 0);"
+            : "SELECT setval('s', 100);").Should().Be(SqlValue.Integer(100));
+        Execute(connection, "COMMIT;");
+
+        using var next = database.Connect();
+        Execute(next, "BEGIN CONCURRENT;");
+        ReadValue(next, "SELECT nextval('s');")
+            .Should().Be(SqlValue.Integer(resetIsCalled ? 100 : 101));
+        // Moving off the repeated key must not expose an older, still-live version of it.
+        ReadValue(next, "SELECT setval('s', 102);").Should().Be(SqlValue.Integer(102));
+        ReadValue(next, "SELECT count(*) FROM \"__turso_internal_seq_s\";").AsInteger()
+            .Should().Be(1);
+        Execute(next, "COMMIT;");
+
+        using var observer = database.Connect();
+        ReadValue(observer, "SELECT count(*) FROM \"__turso_internal_seq_s\";").AsInteger()
+            .Should().Be(1);
+        ReadValue(observer, "SELECT nextval('s');").Should().Be(SqlValue.Integer(103));
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         foreach (var statement in connection.PrepareScript(sql))

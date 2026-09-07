@@ -44522,10 +44522,13 @@ out bool hasReturning)
         // sequence's own MINVALUE/MAXVALUE bounds.
         if (context.ConcurrentMvStore is { } insertStore && context.ConcurrentMvccTxId is { } insertTxId)
         {
-            insertStore.Insert(
-                insertTxId,
-                new MvccRowId(insertStore.GetOrCreateTableId(insertTxId, backingTableName), value),
-                backing.Rows[0]);
+            var rowId = new MvccRowId(insertStore.GetOrCreateTableId(insertTxId, backingTableName), value);
+            // End the previous version even when only is_called changes. Otherwise moving
+            // off this key later can reveal a superseded watermark that was never deleted.
+            if (previousRowId == value)
+                insertStore.UpdateIncludingBase(insertTxId, rowId, backing.Rows[0]);
+            else
+                insertStore.Insert(insertTxId, rowId, backing.Rows[0]);
         }
     }
 
