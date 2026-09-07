@@ -4087,6 +4087,38 @@ internal static class ManagedReplicaBootstrapper
             {
                 ExecuteNonQuery(database.Connect(), "PRAGMA wal_checkpoint(TRUNCATE)");
             }
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.IncrementalPendingLiveWalCheckpointed);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Republish the fingerprint to match the bytes the checkpoint above just made
+            // durable, mirroring ApplyLogicalUpdatesAsync's own checkpoint+refingerprint pairing
+            // (the MvccLogical apply path always keeps metadata.DatabaseSha256 in step with the
+            // file after any checkpoint that folds in a local write). Without this, metadata would
+            // still name the PRE-checkpoint fingerprint until this pull's own apply completes; if
+            // instead a later, unrelated pull attempt lands in the zero-pending branch above (e.g.
+            // after a subsequent push cycle drains every remaining pending change before the next
+            // pull), CheckFileDivergence's strict, protocol-independent comparison would then
+            // spuriously reject the very bytes this checkpoint already made durable.
+            var checkpointedFingerprint = ComputeDatabaseFingerprint(databasePath);
+            if (!string.Equals(checkpointedFingerprint, metadata.DatabaseSha256, StringComparison.Ordinal))
+            {
+                var metadataPath = databasePath + MetadataSuffix;
+                var metadataStagingPath = Path.Combine(
+                    Path.GetDirectoryName(Path.GetFullPath(databasePath))!,
+                    $".{Path.GetFileName(metadataPath)}.incremental-pending-checkpoint-{Guid.NewGuid():N}.tmp");
+                metadata = metadata with { DatabaseSha256 = checkpointedFingerprint };
+                try
+                {
+                    WriteMetadata(metadataStagingPath, metadataPath, metadata);
+                }
+                finally
+                {
+                    DeleteIfExists(metadataStagingPath);
+                }
+                ManagedReplicaFaultInjection.Hit(
+                    ManagedReplicaDurableBoundary.IncrementalPendingLiveWalCheckpointFingerprintPublished);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
             return metadata;
         }
         if (pendingLocalChanges.Count != 0)

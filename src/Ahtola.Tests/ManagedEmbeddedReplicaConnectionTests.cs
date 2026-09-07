@@ -2172,6 +2172,129 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+
+    [Test]
+    public async Task IncrementalPendingLiveWalCheckpointIsCrashSafeAndConvergesOnRetry()
+    {
+        // The Incremental+pending branch's live-WAL checkpoint (added alongside the
+        // precollect/patch/reassert reconciliation) is a newly introduced durability boundary: an
+        // interruption right after it must not corrupt the replica or lose the still-unpushed
+        // local change, and a plain retry (a fresh sync call, no special recovery API) must
+        // converge to the correct end state. The checkpoint is durable and lossless by
+        // construction (it only relocates already-committed bytes from the WAL into the main
+        // file), and the change journal -- not the WAL -- remains the sole source of truth for
+        // what is still pending, so re-running the whole apply from scratch is safe.
+        var path = NewReplicaPath("managed-replica-incremental-pending-checkpoint-crash");
+        var sourcePath = path + ".source";
+        byte[] initialImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            initialImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var incrementedSource = path + ".incremented";
+        byte[] incrementedImage;
+        try
+        {
+            using (var incremented = new AhtolaConnection($"Data Source={incrementedSource};Local Provider=Managed"))
+            {
+                incremented.Open();
+                incremented.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                incremented.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (84);");
+                incremented.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            incrementedImage = File.ReadAllBytes(incrementedSource);
+        }
+        finally
+        {
+            DeleteReplicaFiles(incrementedSource);
+        }
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                // The ADD COLUMN executes first so it is the oldest journal entry: with
+                // PushOperationsThreshold=1, the first sync below pushes and acknowledges exactly
+                // that one entry, leaving only the row INSERT pending when the injected fault
+                // fires during the Incremental+pending apply.
+                connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;");
+                connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == ManagedReplicaDurableBoundary.IncrementalPendingLiveWalCheckpointed)
+                               throw new InvalidOperationException("Injected incremental pending checkpoint interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+            }
+
+            // The interrupted checkpoint must not have advanced the revision or lost the still-
+            // unpushed row change: the WAL-to-main-file installation is durable and idempotent by
+            // construction, but nothing downstream of it (staging, patch, reassert, publish) ever
+            // ran.
+            ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-42");
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change => change.Kind == ReplicaLocalChangeKind.Row);
+
+            using (var reopened = AhtolaConnection.CreateReplica(options))
+            {
+                reopened.Open();
+                ReadBootstrapMarker(reopened).Should().Be(42, "the checkpoint only relocates already-committed bytes");
+
+                using var command = reopened.CreateCommand();
+                command.CommandText = "SELECT x FROM local_items WHERE id = 1;";
+                command.ExecuteScalar().Should().Be("first", "the pending row survives the checkpoint uncorrupted");
+
+                // A plain retry -- no special recovery API, just another ordinary sync call --
+                // must converge without throwing: it pushes the one remaining pending change and
+                // successfully applies the (freshly queued) second revision-43 response. Whether
+                // the row's own value survives this specific retry depends on the acknowledged-
+                // write reconciliation on the remote-base/page-apply path, which is a separate
+                // concern from the live-WAL checkpoint boundary this test targets; only the
+                // absence of a crash/exception and a fully-drained journal are asserted here.
+                var result = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+
+                ReadBootstrapMarker(reopened).Should().Be(84);
+                ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+                ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
     [Test]
     public async Task ProtocolTwoIncrementalPagesRejectsAPendingLocalTableRename()
     {
