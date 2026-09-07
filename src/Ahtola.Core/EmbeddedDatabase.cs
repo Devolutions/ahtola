@@ -4014,6 +4014,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             if (_mvStore is not null || _fileSystem is null || string.IsNullOrEmpty(_databasePath))
                 return;
+            EstablishHeapBaselineForMvccLocked();
             _mvStore = CreateOrGetSharedMvStore(
                 _fileSystem,
                 _databasePath,
@@ -4038,6 +4039,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (EmbeddedMvStoreRegistry.TryGet(_fileSystem, _databasePath, out var shared)
                 && shared is not null)
             {
+                EstablishHeapBaselineForMvccLocked();
                 _mvStore = shared;
                 return;
             }
@@ -4049,11 +4051,38 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (_fileStore.JournalMode != SqliteJournalMode.Mvcc)
                 return;
 
+            EstablishHeapBaselineForMvccLocked();
             _mvStore = CreateOrGetSharedMvStore(
                 _fileSystem,
                 _databasePath,
                 _fileCatalogVersion.SchemaCookie);
         }
+    }
+
+    /// <summary>
+    /// Forces every still-lazy table in the live catalog to load its committed rows before this
+    /// connection's MVCC store attaches (see <c>EnableMvccModeLocked</c>,
+    /// <c>AttachMvStoreFromDurableLog</c>, <c>EnsureMvccAttachedIfDurable</c>).
+    /// </summary>
+    /// <remarks>
+    /// MVCC's per-transaction view (<c>MergeConcurrentCatalogFromStoreLocked</c>) reconstructs
+    /// what a transaction should see by merging the heap catalog (<c>EmbeddedTable.Rows</c>)
+    /// with the store's version-chain overlay, on the assumption that the heap already reflects
+    /// a single, stable, already-known baseline that the overlay's rowIds are tracked relative
+    /// to. A page-backed table that is still lazily pending would otherwise materialize on first
+    /// touch from whatever happens to be currently committed at that later moment — which, for a
+    /// table an active BEGIN CONCURRENT reader has not yet touched, can be *after* a peer's
+    /// concurrent commit — silently promoting the reader's view past its own pinned snapshot.
+    /// Establishing the baseline once here, before any concurrent transaction can begin relying
+    /// on it, is far cheaper than making every page-backed table ineligible for lazy
+    /// materialization, and MVCC-mode connections are the only ones that need it: an ordinary
+    /// (non-MVCC) reader's isolation is a separate, already-tracked gap — see the "NOTE ON A
+    /// REJECTED DESIGN" comment in EmbeddedFileStore.
+    /// </remarks>
+    private void EstablishHeapBaselineForMvccLocked()
+    {
+        foreach (var table in _tables.Values)
+            _ = table.Rows;
     }
 
     private static MvStore CreateOrGetSharedMvStore(
@@ -4297,13 +4326,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         if (_fileStore is not null && _fileSystem is not null && !string.IsNullOrEmpty(_databasePath))
+        {
+            EstablishHeapBaselineForMvccLocked();
             _mvStore = CreateOrGetSharedMvStore(
                 _fileSystem,
                 _databasePath,
                 _fileCatalogVersion.SchemaCookie,
                 synchronousMode);
+        }
         else
+        {
             _mvStore = new MvStore();
+        }
 
         _version++;
         return SqliteJournalMode.Mvcc;
@@ -4388,6 +4422,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
                 EnsureFileCatalogVersionCurrent(busyTimeout);
                 using var writeRegistration = RegisterCatalogWrite(_databasePath);
+                // A full-catalog rewrite (Compact()/page-size migration) reassigns root pages,
+                // and AdoptCommittedTables below proves _tables unchanged by comparing row
+                // content against the freshly-reloaded, post-rewrite catalog. Force every
+                // still-lazy table in _tables to load its rows now, while its original root
+                // pages are still valid, so that comparison never has to resolve a pending row
+                // load against root pages the rewrite has already reassigned or reclaimed.
+                foreach (var table in _tables.Values)
+                    _ = table.Rows;
                 if (pageSize == _fileCatalogVersion.PageSize)
                     _fileStore.Compact();
                 else
@@ -5007,6 +5049,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private void PublishCatalog(SchemaCatalog catalog, FileCatalogVersion? fileCatalogVersion = null)
     {
+        // MVCC's per-transaction view (MergeConcurrentCatalogFromStoreLocked) reconstructs what
+        // a transaction should see by merging the heap catalog (EmbeddedTable.Rows) with the
+        // store's version-chain overlay, on the assumption that the heap already reflects a
+        // single, stable, already-known baseline the overlay's rowIds are tracked relative to.
+        // Every catalog this connection ever publishes flows through here — including a fresh
+        // reload (see TryReloadFileCatalogIfChanged), whose tables come straight out of
+        // EmbeddedFileStore.Load() and can be lazily pending again (see
+        // EmbeddedTable.HasPendingRowLoad) even though an earlier publish already hydrated the
+        // catalog being replaced. A page-backed table that is still lazily pending when this
+        // connection has MVCC active would otherwise materialize on first touch from whatever
+        // happens to be currently committed at that later moment — which, for a table an active
+        // BEGIN CONCURRENT reader has not yet touched, can be after a peer's concurrent commit —
+        // silently promoting the reader's view past its own pinned snapshot. Establishing the
+        // baseline here, on every publish, for as long as this connection has MVCC active, is
+        // the single chokepoint that catches every one of those reload paths; an ordinary
+        // (non-MVCC) reader's isolation remains a separate, already-tracked gap — see the "NOTE
+        // ON A REJECTED DESIGN" comment in EmbeddedFileStore.
+        if (_mvStore is not null)
+        {
+            foreach (var table in catalog.Tables.Values)
+                _ = table.Rows;
+        }
+
         var previousVirtualTables = _virtualTables;
         _tables = catalog.Tables;
         _views = catalog.Views;
@@ -62367,6 +62432,25 @@ public sealed class EmbeddedStatement : IDisposable
 // Row storage that funnels every mutation through a revision counter, so
 // statement-level caches (transient equality lookups) can detect staleness
 // without hunting down each individual mutation site.
+/// <summary>
+/// One <see cref="EmbeddedTable"/> instance's independent claim on a shared resource a pending
+/// row loader depends on (see <see cref="EmbeddedTable.AttachPendingRowLoader"/>) — concretely,
+/// <c>EmbeddedFileStore</c>'s pinned page-materialization transaction. Every distinct table
+/// instance that might invoke the same loader delegate (the original, plus every per-statement
+/// working-copy clone made before it was ever hydrated — see
+/// <see cref="EmbeddedTable.HasPendingRowLoad"/>) retains its own reference via
+/// <see cref="Retain"/> and releases it exactly once via <see cref="Release"/>, so one instance
+/// finishing first can never tear down a resource a sibling instance still needs.
+/// </summary>
+internal interface IPendingRowLoadResourceLease
+{
+    /// <summary>Retains an additional, independent reference for a new owning instance.</summary>
+    IPendingRowLoadResourceLease Retain();
+
+    /// <summary>Releases this instance's reference.</summary>
+    void Release();
+}
+
 internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
 {
     private static long _lineageSequence;
@@ -62378,11 +62462,14 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
     /// <summary>
     /// Identifies this specific RowStore instance's physical storage lineage, distinct from
     /// <see cref="Revision"/>. Assigned fresh, process-uniquely, whenever a RowStore is
-    /// constructed, and copied forward only by <see cref="ReplaceContentsPreservingRevision"/> —
-    /// i.e. only <see cref="EmbeddedTable.Clone"/>'s same-statement working copy carries the
-    /// same LineageId as its source; every other path that builds a replacement
-    /// <see cref="EmbeddedTable"/> (ALTER COLUMN, ADD/DROP COLUMN, or any other full rebuild that
-    /// re-adds every row into a brand-new RowStore) gets a distinct one.
+    /// constructed, and copied forward only by <see cref="ReplaceContentsPreservingRevision"/>
+    /// or <see cref="AdoptIdentity"/> — i.e. only <see cref="EmbeddedTable.Clone"/>'s
+    /// same-statement working copy carries the same LineageId as its source (whether that copy
+    /// happened eagerly, or was deferred because the source's own rows are still an unresolved
+    /// page-backed load — see <see cref="EmbeddedTable.HasPendingRowLoad"/>); every other path
+    /// that builds a replacement <see cref="EmbeddedTable"/> (ALTER COLUMN, ADD/DROP COLUMN, or
+    /// any other full rebuild that re-adds every row into a brand-new RowStore) gets a distinct
+    /// one.
     /// </summary>
     /// <remarks>
     /// Revision alone cannot distinguish "the same physical row store, unchanged since the
@@ -62480,6 +62567,29 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
             _rows.Add(row.ToArray());
         Revision = source.Revision;
         LineageId = source.LineageId;
+    }
+
+    /// <summary>
+    /// Adopts a source RowStore's Revision and LineageId onto this still-empty
+    /// RowStore without copying any row content. Used only when a table's base rows have
+    /// not yet been read from page storage (see <see cref="EmbeddedTable.HasPendingRowLoad"/>):
+    /// a per-statement working-copy clone of an untouched table must stay just as lazy as its
+    /// source, but <see cref="EmbeddedFileStore.IsTableRowStorageUnchangedFromPrevious"/> still
+    /// needs to prove "unchanged since the previous commit" by comparing Revision/LineageId
+    /// alone, without forcing either side to actually load its rows. Both sides independently
+    /// reload the identical committed page image later if anything ever touches them, so sharing
+    /// these two numbers ahead of time cannot make either one observe stale content.
+    /// </summary>
+    internal void AdoptIdentity(long lineageId, long revision)
+    {
+        if (_rows.Count != 0)
+        {
+            throw new InvalidOperationException(
+                "AdoptIdentity can only be used on a RowStore that has not been populated yet.");
+        }
+
+        LineageId = lineageId;
+        Revision = revision;
     }
 
     System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
@@ -63202,11 +63312,131 @@ internal sealed class EmbeddedTable
 
     public EmbeddedColumn[] ColumnDefinitions { get; private set; }
 
-    public RowStore Rows { get; } = new();
+    private readonly RowStore _rowsStore = new();
 
     // Parallel to <see cref="Rows"/> (index-aligned): the SQLite rowid backing each row.
     // Every row-mutating site keeps this list the same length and order as Rows.
-    public List<long> RowIds { get; } = [];
+    private readonly List<long> _rowIdsStore = [];
+
+    // Set by EmbeddedFileStore.Load() for a page-backed base table instead of eagerly
+    // walking its b-tree at physical-open time (see AttachPendingRowLoader). Null for
+    // every in-memory-only table and for any table whose rows have already been loaded.
+    private Action<EmbeddedTable>? _pendingRowLoader;
+
+    // A pending loader may depend on a shared resource (a pinned page-materialization
+    // transaction) that must survive at least as long as any EmbeddedTable instance that might
+    // still invoke it — see IPendingRowLoadResourceLease and EmbeddedFileStore's
+    // MaterializationTransactionLease. Released exactly once, whenever this specific instance's
+    // copy of the loader actually runs (see EnsureRowsLoaded).
+    private IPendingRowLoadResourceLease? _pendingRowLoadResourceLease;
+    private bool _rowsLoaded = true;
+
+    /// <summary>
+    /// The table's committed base rows, loaded from page storage on first access rather
+    /// than eagerly at physical-open time when <see cref="AttachPendingRowLoader"/> attached
+    /// a page-backed loader. Every other member below funnels through this getter (or
+    /// <see cref="RowIds"/>'s) so existing callers observe the same compatible, fully
+    /// in-memory, indexable row list they always have — only the timing of the underlying
+    /// page walk changes.
+    /// </summary>
+    public RowStore Rows
+    {
+        get
+        {
+            EnsureRowsLoaded();
+            return _rowsStore;
+        }
+    }
+
+    // Parallel to <see cref="Rows"/> (index-aligned): the SQLite rowid backing each row.
+    // Every row-mutating site keeps this list the same length and order as Rows.
+    public List<long> RowIds
+    {
+        get
+        {
+            EnsureRowsLoaded();
+            return _rowIdsStore;
+        }
+    }
+
+    /// <summary>
+    /// True while this table's committed base rows have not yet been read from page
+    /// storage. Observable so tests and diagnostics can prove a physical open, or a
+    /// statement that never touches this table, did not materialize it. Always false for
+    /// an in-memory-only table (nothing ever attaches a loader) and for any table whose
+    /// rows have already been loaded, whether lazily or eagerly.
+    /// </summary>
+    internal bool HasPendingRowLoad => !_rowsLoaded;
+
+    /// <summary>
+    /// Defers this table's initial row load to first access instead of populating it
+    /// immediately. Called by <c>EmbeddedFileStore.Load()</c> for a page-backed base table:
+    /// physical open only reconstructs the schema catalog, and <paramref name="loader"/> —
+    /// which reads this specific table's committed b-tree and populates
+    /// <see cref="Rows"/>/<see cref="RowIds"/> in lockstep, exactly as the eager path used
+    /// to — runs at most once, the first time anything actually observes this table's rows.
+    /// <paramref name="resourceLease"/>, if supplied, is released exactly once — when this
+    /// specific instance's copy of the loader actually runs (successfully or not) — and is
+    /// this instance's own claim on whatever shared resource the loader depends on; see
+    /// <see cref="TryCopyPendingRowLoadTo"/> for why a clone must retain its own reference
+    /// rather than share this one.
+    /// </summary>
+    internal void AttachPendingRowLoader(Action<EmbeddedTable> loader, IPendingRowLoadResourceLease? resourceLease = null)
+    {
+        ArgumentNullException.ThrowIfNull(loader);
+        _pendingRowLoader = loader;
+        _pendingRowLoadResourceLease = resourceLease;
+        _rowsLoaded = false;
+    }
+
+    private void EnsureRowsLoaded()
+    {
+        if (_rowsLoaded)
+            return;
+
+        // Flip the flag before invoking the loader: the loader populates this exact table
+        // through the very same Rows/RowIds properties (table.Rows.Add(...)), which would
+        // otherwise recurse back into EnsureRowsLoaded for every single row.
+        _rowsLoaded = true;
+        var loader = _pendingRowLoader;
+        var resourceLease = _pendingRowLoadResourceLease;
+        _pendingRowLoader = null;
+        _pendingRowLoadResourceLease = null;
+        try
+        {
+            loader?.Invoke(this);
+        }
+        finally
+        {
+            resourceLease?.Release();
+        }
+    }
+
+    /// <summary>
+    /// Propagates an unresolved lazy row load from this table onto <paramref name="clone"/>
+    /// without forcing either side to actually load anything, so a per-statement working-copy
+    /// clone of a table nobody has touched yet stays exactly as lazy as its source. Returns
+    /// false (having done nothing) when this table's rows are already loaded, or partially
+    /// loaded/in flight, so the caller falls back to its ordinary eager content copy.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="clone"/> retains its own reference to the shared resource lease (rather
+    /// than sharing this table's reference) because the two instances can now be hydrated
+    /// completely independently — for example, this table's committed copy and a per-statement
+    /// working-copy clone of it can both end up read during the same commit (see
+    /// EmbeddedFileStore.HaveSameRows / MergeConcurrentCatalogFromStoreLocked) — and one
+    /// instance finishing first must never tear down a resource the other still needs for its
+    /// own, independent invocation of the very same loader delegate.
+    /// </remarks>
+    private bool TryCopyPendingRowLoadTo(EmbeddedTable clone)
+    {
+        if (_rowsLoaded || _pendingRowLoader is null)
+            return false;
+
+        clone._rowsStore.AdoptIdentity(_rowsStore.LineageId, _rowsStore.Revision);
+        clone.AttachPendingRowLoader(_pendingRowLoader, _pendingRowLoadResourceLease?.Retain());
+        return true;
+    }
 
     // Index of the INTEGER PRIMARY KEY column that aliases the rowid, or -1 when the
     // table has a hidden rowid. A single column-level INTEGER PRIMARY KEY (declared type
@@ -63595,9 +63825,13 @@ internal sealed class EmbeddedTable
     internal void AdoptContentFrom(EmbeddedTable source)
     {
         ArgumentNullException.ThrowIfNull(source);
-        Rows.ReplaceContentsPreservingRevision(source.Rows);
-        RowIds.Clear();
-        RowIds.AddRange(source.RowIds);
+        if (!source.TryCopyPendingRowLoadTo(this))
+        {
+            Rows.ReplaceContentsPreservingRevision(source.Rows);
+            RowIds.Clear();
+            RowIds.AddRange(source.RowIds);
+        }
+
         Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         Indexes.AddRange(source.Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         source.CopyMethodAttachmentsTo(this);
@@ -64824,9 +65058,12 @@ internal sealed class EmbeddedTable
             Strict);
         clone.SchemaSqlCompact = SchemaSqlCompact;
         clone.Sql = Sql;
-        clone.Rows.ReplaceContentsPreservingRevision(Rows);
+        if (!TryCopyPendingRowLoadTo(clone))
+        {
+            clone.Rows.ReplaceContentsPreservingRevision(Rows);
+            clone.RowIds.AddRange(RowIds);
+        }
 
-        clone.RowIds.AddRange(RowIds);
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         CopyMethodAttachmentsTo(clone);

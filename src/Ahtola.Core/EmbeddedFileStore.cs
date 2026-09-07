@@ -313,6 +313,35 @@ internal sealed class EmbeddedFileStore : IDisposable
     private int _disposeRequested;
     private bool _disposed;
 
+    // NOTE ON A REJECTED DESIGN: an earlier revision of this file pinned a
+    // SqlitePagerReadTransaction at Load() time and had every pending row loader read through
+    // it, so a loader invoked long after Load() (after a later peer commit) would still observe
+    // the committed image Load() saw, matching MVCC/classic-transaction reader isolation
+    // expectations. That transaction, however, is a genuine reader lease in the pager's own
+    // lock manager: holding it open across statement boundaries made this store's own later
+    // writes (ordinary commits, REINDEX, VACUUM, MVCC checkpoint TRUNCATE) block on an
+    // exclusive-lock upgrade against a "reader" that was really just this store's own bookkeeping
+    // — a regression confirmed by broad test failures across ManagedMaintenanceStatementTests,
+    // MvccCheckpointStateMachineTests, and ManagedVacuumStorageTests. Every lazy row loader below
+    // therefore reads through the store's live pager (ReadPageForLoad et al. below), exactly like
+    // the eager path always has. This reopens a narrower, explicitly tracked gap instead: a
+    // transaction that begins before touching a still-pending table, and only touches it after a
+    // peer commits new data to that specific table, can observe the peer's write instead of its
+    // own pinned snapshot for that one table. Closing this correctly requires routing the lazy
+    // loader through the *active transaction's own* existing pinned snapshot
+    // (EmbeddedFileReadSnapshot / the transactionPinnedSnapshot plumbing already used by classic
+    // transactions and BEGIN CONCURRENT) instead of a new, separate, store-level pin — tracked as
+    // follow-up work, not resolved here.
+    private byte[] ReadPageForLoad(uint pageNumber, object? pinnedTransaction = null)
+        => _pager.ReadCommittedPage(pageNumber);
+
+    private uint GetCommittedPageCountForLoad(object? pinnedTransaction = null)
+        => _pager.CommittedPageCount;
+
+    private SqliteOverflowChainReader CreateOverflowReaderForLoad(object? pinnedTransaction = null)
+        => new(_pager, _header);
+
+
     private EmbeddedFileStore(IFileSystem fileSystem, string databasePath, string walPath, SqlitePager pager, SqliteDatabaseHeader header)
     {
         _fileSystem = fileSystem;
@@ -1407,7 +1436,51 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
 
             var table = ManagedSchemaRowParser.ParseTable(entry);
-            LoadTableRows(entry.Name, table, entry.RootPage, occupiedBtreePages);
+            // The lazy re-walk's seed must be captured BEFORE this table's own eager pass below
+            // mutates occupiedBtreePages with its own interior/leaf child pages — otherwise the
+            // seed would already contain this table's own pages, and the later, independent lazy
+            // walk of the very same tree would immediately "conflict" with itself the moment it
+            // re-adds them. Earlier tables' (and the schema root's) pages are still included, so
+            // genuine cross-tree overlap involving this table is still caught when this table is
+            // eventually touched.
+            var occupiedPagesSeed = new HashSet<uint>(occupiedBtreePages);
+
+            // Physical open still walks every table's b-tree once, synchronously, to prove its
+            // structure (rowid ordering, separator bounds, page-type/overlap validity) — the
+            // same guarantee EmbeddedDatabase.OpenFile has always given for a corrupt file, and
+            // still required immediately, not deferred (see the "ReopenRejects*" tests). What
+            // moves to first-touch is decoding each cell into managed SqlValue[] rows: this
+            // eager pass runs with materializeRows: false, so it validates and walks every page
+            // without appending anything to Rows/RowIds — no database-sized managed row list is
+            // ever built here. AttachPendingRowLoader below re-walks the same tree, decoding this
+            // time, the first time anything actually observes Rows/RowIds.
+            LoadTableRows(entry.Name, table, entry.RootPage, occupiedBtreePages, materializeRows: false);
+
+            // The lazy re-walk captures an immutable seed rather than the shared, still-mutating
+            // occupiedBtreePages set, and clones it fresh on every invocation (never mutating the
+            // seed itself): AttachPendingRowLoader's delegate is carried forward, unmodified, to
+            // every per-statement working-copy clone of a table nobody has touched yet (see
+            // EmbeddedTable.Clone/TryCopyPendingRowLoadTo), so the very same delegate instance can
+            // be invoked independently more than once (once per distinct EmbeddedTable instance
+            // that still shares it). A single shared, mutating HashSet would let the first such
+            // invocation's page claims collide with a second, logically-independent one for the
+            // same committed data.
+            //
+            // The loader reads through the store's live pager (see ReadPageForLoad), exactly
+            // like the eager pass just above and like the original eager-at-Load()-time design —
+            // see the NOTE ON A REJECTED DESIGN above _committedTables for why a Load()-pinned
+            // read transaction was tried and reverted, and for the narrower isolation gap that
+            // leaves open as tracked follow-up work.
+            var rootPageForLoad = entry.RootPage;
+            var entryNameForLoad = entry.Name;
+            table.AttachPendingRowLoader(
+                loadingTable =>
+                    LoadTableRows(
+                        entryNameForLoad,
+                        loadingTable,
+                        rootPageForLoad,
+                        new HashSet<uint>(occupiedPagesSeed),
+                        materializeRows: true));
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
         }
@@ -2442,29 +2515,31 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table,
         uint rootPage,
-        ISet<uint> occupiedBtreePages)
+        ISet<uint> occupiedBtreePages,
+        bool materializeRows = true,
+        object? pinnedTransaction = null)
     {
         if (rootPage < 2)
             throw new EmbeddedSqlException($"Managed file database references an invalid rootpage {rootPage}.");
 
         if (table.WithoutRowid)
         {
-            LoadWithoutRowidTableRows(tableName, table, rootPage, occupiedBtreePages);
+            LoadWithoutRowidTableRows(tableName, table, rootPage, occupiedBtreePages, materializeRows, pinnedTransaction);
             return;
         }
 
-        var page = _pager.ReadCommittedPage(rootPage);
+        var page = ReadPageForLoad(rootPage, pinnedTransaction);
         var header = SqliteBtreePageHeader.Parse(page);
         switch (header.PageType)
         {
             case SqliteBtreePageType.TableLeaf:
                 {
                     var view = SqliteTableLeafPageView.Parse(page, _usableSpace, isFirstPage: false);
-                    LoadTableLeafRows(table, view, previousRowId: null);
+                    LoadTableLeafRows(table, view, previousRowId: null, materializeRows, pinnedTransaction);
                     return;
                 }
             case SqliteBtreePageType.TableInterior:
-                LoadTableInteriorRows(table, rootPage, page, occupiedBtreePages);
+                LoadTableInteriorRows(table, rootPage, page, occupiedBtreePages, materializeRows, pinnedTransaction);
                 return;
             default:
                 throw new EmbeddedSqlException(
@@ -2476,7 +2551,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         EmbeddedTable table,
         uint rootPage,
         ReadOnlySpan<byte> rootPageImage,
-        ISet<uint> occupiedBtreePages)
+        ISet<uint> occupiedBtreePages,
+        bool materializeRows,
+        object? pinnedTransaction)
     {
         long? previousRowId = null;
         _ = LoadTableTreeNodeRows(
@@ -2486,7 +2563,9 @@ internal sealed class EmbeddedFileStore : IDisposable
             rootPageImage,
             occupiedBtreePages,
             ref previousRowId,
-            isRoot: true);
+            isRoot: true,
+            materializeRows,
+            pinnedTransaction);
     }
 
     private TableTreeReadResult LoadTableTreeNodeRows(
@@ -2496,7 +2575,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         ReadOnlySpan<byte> pageImage,
         ISet<uint> occupiedBtreePages,
         ref long? previousRowId,
-        bool isRoot)
+        bool isRoot,
+        bool materializeRows,
+        object? pinnedTransaction)
     {
         var header = SqliteBtreePageHeader.Parse(pageImage);
         switch (header.PageType)
@@ -2521,7 +2602,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                             $"Managed file database table rootpage {rootPage} has an empty leaf child page {pageNumber}.");
                     }
 
-                    var leafMaximumRowId = LoadTableLeafRows(table, leaf, previousRowId);
+                    var leafMaximumRowId = LoadTableLeafRows(table, leaf, previousRowId, materializeRows, pinnedTransaction);
                     if (leafMaximumRowId is null)
                     {
                         throw new EmbeddedSqlException(
@@ -2547,13 +2628,13 @@ internal sealed class EmbeddedFileStore : IDisposable
                      .Select(cell => cell.Cell.LeftChildPage)
                      .Append(interior.Header.RightMostChildPage))
         {
-            if (childPage < 2 || childPage > _pager.CommittedPageCount)
+            if (childPage < 2 || childPage > GetCommittedPageCountForLoad(pinnedTransaction))
             {
                 throw new EmbeddedSqlException(
                     $"Managed file database table rootpage {rootPage} interior page {pageNumber} references invalid child page {childPage}.");
             }
 
-            var currentChildType = SqliteBtreePageHeader.Parse(_pager.ReadCommittedPage(childPage)).PageType;
+            var currentChildType = SqliteBtreePageHeader.Parse(ReadPageForLoad(childPage, pinnedTransaction)).PageType;
             if (currentChildType is not (SqliteBtreePageType.TableLeaf or SqliteBtreePageType.TableInterior))
             {
                 throw new EmbeddedSqlException(
@@ -2577,7 +2658,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             var childPage = childIndex == interior.Cells.Count
                 ? interior.Header.RightMostChildPage
                 : interior.Cells[childIndex].Cell.LeftChildPage;
-            if (childPage < 2 || childPage > _pager.CommittedPageCount)
+            if (childPage < 2 || childPage > GetCommittedPageCountForLoad(pinnedTransaction))
             {
                 throw new EmbeddedSqlException(
                     $"Managed file database table rootpage {rootPage} interior page {pageNumber} references invalid child page {childPage}.");
@@ -2588,7 +2669,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"Managed file database table rootpage {rootPage} interior page {pageNumber} reuses b-tree page {childPage} as a child.");
             }
 
-            var childPageImage = _pager.ReadCommittedPage(childPage);
+            var childPageImage = ReadPageForLoad(childPage, pinnedTransaction);
             var currentChildType = SqliteBtreePageHeader.Parse(childPageImage).PageType;
             if (currentChildType is not (SqliteBtreePageType.TableLeaf or SqliteBtreePageType.TableInterior))
             {
@@ -2609,7 +2690,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                 childPageImage,
                 occupiedBtreePages,
                 ref previousRowId,
-                isRoot: false);
+                isRoot: false,
+                materializeRows,
+                pinnedTransaction);
             if (childHeight is { } expectedHeight && childResult.Height != expectedHeight)
             {
                 throw new EmbeddedSqlException(
@@ -2651,7 +2734,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     private long? LoadTableLeafRows(
         EmbeddedTable table,
         SqliteTableLeafPageView view,
-        long? previousRowId)
+        long? previousRowId,
+        bool materializeRows,
+        object? pinnedTransaction)
     {
         var aliasIndex = table.RowidAliasColumnIndex;
         foreach (var cell in view.Cells)
@@ -2662,16 +2747,20 @@ internal sealed class EmbeddedFileStore : IDisposable
                     "Managed file database table leaves are not globally ordered by rowid.");
             }
 
-            var values = RestoreRowidTableRecord(table, DecodeCellRecord(cell.Cell));
+            if (materializeRows)
+            {
+                var values = RestoreRowidTableRecord(table, DecodeCellRecord(cell.Cell, pinnedTransaction));
 
-            if (aliasIndex >= 0)
-                values[aliasIndex] = SqlValue.Integer(cell.Cell.RowId);
-            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, values);
+                if (aliasIndex >= 0)
+                    values[aliasIndex] = SqlValue.Integer(cell.Cell.RowId);
+                EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, values);
 
-            // Preserve the on-disk rowid so both alias and hidden-rowid tables keep their
-            // identity across reopen, exactly as SQLite does.
-            table.Rows.Add(values);
-            table.RowIds.Add(cell.Cell.RowId);
+                // Preserve the on-disk rowid so both alias and hidden-rowid tables keep their
+                // identity across reopen, exactly as SQLite does.
+                table.Rows.Add(values);
+                table.RowIds.Add(cell.Cell.RowId);
+            }
+
             previousRowId = cell.Cell.RowId;
         }
 
@@ -2682,13 +2771,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table,
         uint rootPage,
-        ISet<uint> occupiedBtreePages)
+        ISet<uint> occupiedBtreePages,
+        bool materializeRows = true,
+        object? pinnedTransaction = null)
     {
         var primaryKeySchema = ValidateWithoutRowidTableRepresentable(tableName, table);
         try
         {
-            var rootPageImage = _pager.ReadCommittedPage(rootPage);
-            var overflowReader = new SqliteOverflowChainReader(_pager, _header);
+            var rootPageImage = ReadPageForLoad(rootPage, pinnedTransaction);
+            var overflowReader = CreateOverflowReaderForLoad(pinnedTransaction);
             var rootHeader = SqliteBtreePageHeader.Parse(rootPageImage);
             var comparer = CreatePrimaryKeyComparer(primaryKeySchema);
             var records = rootHeader.PageType switch
@@ -2699,13 +2790,19 @@ internal sealed class EmbeddedFileStore : IDisposable
                     rootPageImage,
                     overflowReader,
                     occupiedBtreePages,
-                    comparer),
+                    comparer,
+                    pinnedTransaction),
                 _ => throw new InvalidDataException(
                     $"Stored WITHOUT ROWID table '{tableName}' root page has unsupported type {rootHeader.PageType}."),
             };
             SqlValue[]? previousKey = null;
             var syntheticRowId = 0L;
 
+            // Every record is still decoded and structurally validated (NULL primary-key,
+            // strictly-increasing key order) unconditionally, exactly as before — physical open
+            // must keep detecting a corrupt WITHOUT ROWID table immediately. Only whether the
+            // decoded row is *kept* (appended to Rows/RowIds, feeding ValidateRows' NOT
+            // NULL/UNIQUE cross-row checks below) is deferred to first actual access.
             foreach (var record in records)
             {
                 var storedValues = SqliteRecordCodec.Decode(record, _textEncoding);
@@ -2723,12 +2820,17 @@ internal sealed class EmbeddedFileStore : IDisposable
                         $"Stored WITHOUT ROWID table '{tableName}' primary keys are not strictly increasing in declared key order.");
                 }
 
-                table.Rows.Add(row);
-                table.RowIds.Add(checked(++syntheticRowId));
+                if (materializeRows)
+                {
+                    table.Rows.Add(row);
+                    table.RowIds.Add(checked(++syntheticRowId));
+                }
+
                 previousKey = key;
             }
 
-            table.ValidateRows(tableName, table.Rows);
+            if (materializeRows)
+                table.ValidateRows(tableName, table.Rows);
         }
         catch (EmbeddedSqlException)
         {
@@ -2744,11 +2846,11 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private SqlValue[] DecodeCellRecord(SqliteTableLeafCell cell)
+    private SqlValue[] DecodeCellRecord(SqliteTableLeafCell cell, object? pinnedTransaction = null)
     {
         var payload = cell.FirstOverflowPage is null
             ? cell.LocalPayload.ToArray()
-            : new SqliteOverflowChainReader(_pager, _header).ReadPayload(cell);
+            : CreateOverflowReaderForLoad(pinnedTransaction).ReadPayload(cell);
         return SqliteRecordCodec.Decode(payload, _textEncoding);
     }
 
@@ -12950,7 +13052,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         ReadOnlySpan<byte> rootPage,
         SqliteOverflowChainReader overflowReader,
         ISet<uint> occupiedBtreePages,
-        SqliteIndexRecordComparer? comparer = null)
+        SqliteIndexRecordComparer? comparer = null,
+        object? pinnedTransaction = null)
     {
         return ReadIndexInteriorNodeRecords(
             entry,
@@ -12958,7 +13061,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             rootPage,
             overflowReader,
             occupiedBtreePages,
-            comparer ?? new SqliteIndexRecordComparer(_textEncoding)).Records;
+            comparer ?? new SqliteIndexRecordComparer(_textEncoding),
+            pinnedTransaction).Records;
     }
 
     private IndexTreeReadResult ReadIndexInteriorNodeRecords(
@@ -12967,7 +13071,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         ReadOnlySpan<byte> pageImage,
         SqliteOverflowChainReader overflowReader,
         ISet<uint> occupiedBtreePages,
-        SqliteIndexRecordComparer comparer)
+        SqliteIndexRecordComparer comparer,
+        object? pinnedTransaction = null)
     {
         var interior = SqliteIndexInteriorPageView.Parse(
             pageImage,
@@ -12986,13 +13091,13 @@ internal sealed class EmbeddedFileStore : IDisposable
                      .Select(cell => cell.Cell.LeftChildPage)
                      .Append(interior.Header.RightMostChildPage))
         {
-            if (childPage < 2 || childPage > _pager.CommittedPageCount)
+            if (childPage < 2 || childPage > GetCommittedPageCountForLoad(pinnedTransaction))
             {
                 throw new InvalidDataException(
                     $"Stored index '{entry.Name}' interior page {pageNumber} references invalid child page {childPage}.");
             }
 
-            var currentChildType = SqliteBtreePageHeader.Parse(_pager.ReadCommittedPage(childPage)).PageType;
+            var currentChildType = SqliteBtreePageHeader.Parse(ReadPageForLoad(childPage, pinnedTransaction)).PageType;
             if (currentChildType is not (SqliteBtreePageType.IndexLeaf or SqliteBtreePageType.IndexInterior))
             {
                 throw new InvalidDataException(
@@ -13016,7 +13121,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             var childPage = childIndex == interior.Cells.Count
                 ? interior.Header.RightMostChildPage
                 : interior.Cells[childIndex].Cell.LeftChildPage;
-            if (childPage < 2 || childPage > _pager.CommittedPageCount)
+            if (childPage < 2 || childPage > GetCommittedPageCountForLoad(pinnedTransaction))
             {
                 throw new InvalidDataException(
                     $"Stored index '{entry.Name}' interior page {pageNumber} references invalid child page {childPage}.");
@@ -13027,7 +13132,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"Stored index '{entry.Name}' interior page {pageNumber} reuses b-tree page {childPage} as a child.");
             }
 
-            var childPageImage = _pager.ReadCommittedPage(childPage);
+            var childPageImage = ReadPageForLoad(childPage, pinnedTransaction);
             var childHeader = SqliteBtreePageHeader.Parse(childPageImage);
             if (childHeader.PageType is not (SqliteBtreePageType.IndexLeaf or SqliteBtreePageType.IndexInterior))
             {
@@ -13063,7 +13168,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                         childPageImage,
                         overflowReader,
                         occupiedBtreePages,
-                        comparer);
+                        comparer,
+                        pinnedTransaction);
                     break;
                 default:
                     throw new InvalidOperationException("SQLite index child type validation is incomplete.");
