@@ -295,6 +295,20 @@ public class ValuesAndRecursiveCteTests
     }
 
     [Test]
+    public void LargeRecursiveOffsetDoesNotConsumeTheRetainedRowBudget()
+    {
+        AssertMatchesSqlite([], """
+            WITH RECURSIVE c(x) AS (
+                SELECT 1
+                UNION ALL
+                SELECT x+1 FROM c WHERE x<1000002
+                LIMIT 2 OFFSET 1000000
+            )
+            SELECT x FROM c;
+            """);
+    }
+
+    [Test]
     public void HighFanoutRecursiveArmFailsPromptlyWithoutUnboundedQueueGrowth()
     {
         // A single recursive-arm invocation over one current row can itself fan out to more

@@ -32723,29 +32723,18 @@ out bool hasReturning)
             return false;
         }
 
-        // The total-admission guard: every row that survives DISTINCT dedup and is about to
-        // enter the pending queue -- whether an anchor row or one produced by a recursive
-        // arm invocation -- counts against RecursiveCteRowLimit at the moment it is admitted,
-        // not once it is later dequeued and emitted. A single recursive-arm invocation over
-        // one current row can itself produce an unbounded number of children (e.g. a CROSS
-        // JOIN fan-out), and because the pending queue has no separate capacity bound, an
-        // admission-time check is the only thing standing between one high-fanout arm and
-        // unbounded queue growth: without it, every child would be enqueued (and, on a
-        // priority-ordered queue, each of those would itself be dequeued and re-expanded,
-        // compounding across generations) long before the old post-dequeue-only check ever
-        // got a chance to run. Checking synchronously, per row, inside the very loop that
-        // walks one arm's materialized result mirrors the pre-per-row-queue evaluator, which
-        // bailed out of its own per-generation loop the moment its running total crossed the
-        // same limit rather than finishing the loop first.
-        var admittedRowCount = 0;
+        // Bound emitted and pending rows during admission, including the current row while
+        // it seeds recursion. OFFSET rows release their charge after expansion: they are no
+        // longer retained, but must be consumed in dequeue order, not priority-insertion order.
+        var retainedRowCount = 0;
 
         void AdmitRow(SqlValue[] values)
         {
             if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
                 return;
 
-            admittedRowCount++;
-            if (admittedRowCount > RecursiveCteRowLimit)
+            retainedRowCount++;
+            if (retainedRowCount > RecursiveCteRowLimit)
             {
                 throw new EmbeddedSqlException(
                     $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
@@ -32769,7 +32758,8 @@ out bool hasReturning)
         while (TryDequeueRow(out var currentValues))
         {
             var currentRow = new SourceRow(columns, currentValues);
-            if (emitOffset > 0)
+            var skippedByOffset = emitOffset > 0;
+            if (skippedByOffset)
             {
                 // An OFFSET row is dropped from the output but still feeds the
                 // recursive step, like SQLite's emit_offset jumping past the emit.
@@ -32808,6 +32798,9 @@ out bool hasReturning)
                 foreach (var producedRow in termResult.Rows)
                     AdmitRow(producedRow.ToArray());
             }
+
+            if (skippedByOffset)
+                retainedRowCount--;
         }
 
         return new SourceData(columns, result, collations, columnDefinitions);
