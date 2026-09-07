@@ -55,7 +55,12 @@ read them as an Ahtola trim regression. The gate records them under
   incomplete; `AhtolaBrowserRuntime.GetCapabilitiesAsync()` reports the gap and
   the data source refuses to initialize.
 - Large working sets: the mirror holds the whole database image in memory, so
-  size the database for the browser tab's heap.
+  size the database for the browser tab's heap. See "Bounded scan connections"
+  below for a narrower, opt-in, page-bounded alternative for a single-table
+  ascending scan.
+- Bounded scan connections themselves (`OpenBoundedScanConnectionAsync`): a
+  distinct, additive, still-narrow preview surface — see its own section for
+  the exact supported shape.
 
 ## Install
 
@@ -294,6 +299,50 @@ var diagnostic = await AhtolaBrowserStorageDiagnostics.RunSynchronousReadAsync(1
 // diagnostic.Succeeded, .WorkerOperationsUnchanged,
 // .ElapsedMilliseconds, .AverageMicrosecondsPerRead
 ```
+
+## Bounded scan connections (opt-in, preview)
+
+`AhtolaBrowserDataSource.OpenBoundedScanConnectionAsync()` opens a read-only,
+page-bounded asynchronous scan connection that never goes through
+`EmbeddedFileStore`/`EmbeddedDatabase` or the whole-image mirror described
+above at all: it opens its own `AsyncSqlitePager` directly over OPFS and
+streams rows page by page as a genuine `async` C# iterator (`await` ...
+`yield return`), so its resident memory is bounded by the scanned table's
+b-tree height, not by its row count — proportional to a handful of pages even
+for a table with a million rows, never one page per row. Because it never
+materializes a whole table (or a whole database image) in managed memory, it
+does not share any code path with the `WholeImage` mirror or with
+`AhtolaBrowserSynchronousMode.ReadOnlyMirror` above, and opening one while the
+other already holds the directory's OPFS Web Lock fails closed the same way
+opening two ordinary data sources over one directory already does.
+
+```csharp
+await using var dataSource = new AhtolaBrowserDataSource("inventory/main.db");
+await using var connection = await dataSource.OpenBoundedScanConnectionAsync(
+    new AhtolaBrowserBoundedScanOptions { PageBudget = 32 });
+
+await using var reader = await connection.ExecuteBoundedScanAsync(
+    "SELECT id, name FROM products");
+while (await reader.ReadAsync())
+    Console.WriteLine($"{reader.GetValue(0).AsInteger()} {reader.GetValue(1).AsText()}");
+```
+
+### Supported shape (v1)
+
+Only a narrow, explicitly classified shape is supported; everything else
+throws `AhtolaBrowserBoundedQueryException` **before any page is read** —
+this connection never silently falls back to a slower path. The caller
+decides whether to retry the same statement against an ordinary
+`OpenConnectionAsync`/`OpenSynchronousReadConnectionAsync` connection instead.
+
+| Statement / database shape | Behavior |
+| --- | --- |
+| `SELECT column-list \| * FROM one-ordinary-rowid-base-table [LIMIT n]` | Supported: ascending rowid scan, page-bounded, structural checks performed lazily per page on first visit rather than eagerly for the whole table at open |
+| `WHERE`, joins, subqueries, `ORDER BY`, `GROUP BY`/`HAVING`, `DISTINCT`, window definitions, `OFFSET`, expressions beyond a plain column reference, generated columns | `AhtolaBrowserBoundedQueryException`, naming the exact unsupported construct — natural follow-on slices |
+| `WITHOUT ROWID` tables, or any table with a registered index | `AhtolaBrowserBoundedQueryException` — these need the index-b-tree traversal shape, a distinct follow-on |
+| Any DDL, DML (`INSERT`/`UPDATE`/`DELETE`), `PRAGMA`, `ATTACH`, transactions | `AhtolaBrowserBoundedQueryException` — this connection is read-only by construction; there is no writer path, so there is no side-effect-duplication risk |
+| Encrypted (AHTLA page format) databases | `PlatformNotSupportedException` at `OpenBoundedScanConnectionAsync` — Web Crypto page decryption is asynchronous, and the pager's page-codec hook is currently synchronous-only; a `IAsyncPageCodec` hook is named future work |
+| A cursor whose actual required interior-page stack depth exceeds `PageBudget` | `AhtolaBrowserBoundedQueryException` at the exact `ReadAsync` call that would have exceeded it — the budget is an enforced ceiling, not an advisory default |
 
 ## EF Core
 

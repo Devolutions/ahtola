@@ -255,6 +255,51 @@ public sealed class AhtolaBrowserDataSource : DbDataSource, IManagedDatabaseFact
     }
 
     /// <summary>
+    /// Opens a read-only, page-bounded asynchronous scan connection over an unencrypted
+    /// plaintext database. Never goes through the whole-image mirror or the synchronous engine:
+    /// it opens its own OPFS Web Lock and layers <c>AsyncSqlitePager</c> directly on top, so it
+    /// cannot be open at the same time as a <c>WholeImage</c>/mirror connection over the same
+    /// directory. Only a narrow SQL shape is supported (see
+    /// <see cref="AhtolaBrowserBoundedConnection.ExecuteBoundedScanAsync"/>); everything else
+    /// throws <see cref="AhtolaBrowserBoundedQueryException"/>, and the caller decides whether to
+    /// retry it against an ordinary <see cref="OpenConnectionAsync"/> connection instead.
+    /// </summary>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The data source is <c>:memory:</c>, or configured with encryption — Web Crypto page
+    /// decryption is asynchronous and <c>AsyncSqlitePageStore</c>'s page-codec hook is currently
+    /// synchronous-only (see <c>docs/browser-encrypted-storage.md</c>).
+    /// </exception>
+    public async ValueTask<AhtolaBrowserBoundedConnection> OpenBoundedScanConnectionAsync(
+        AhtolaBrowserBoundedScanOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (_options.IsInMemory)
+        {
+            throw new PlatformNotSupportedException(
+                "A bounded scan connection requires OPFS-backed storage; it is not available for a "
+                + "':memory:' data source.");
+        }
+
+        if (EffectiveEncryption is not null)
+        {
+            throw new PlatformNotSupportedException(
+                "A bounded scan connection does not yet support encrypted browser storage: Web "
+                + "Crypto page decryption is asynchronous, and AsyncSqlitePageStore's page-codec "
+                + "hook is currently synchronous-only. Use an ordinary WholeImage/mirror connection "
+                + "for an encrypted database.");
+        }
+
+        var effectiveOptions = options ?? new AhtolaBrowserBoundedScanOptions();
+        return await AhtolaBrowserBoundedConnection.OpenAsync(
+            _options.OwnedDirectory,
+            _options.DatabasePath,
+            _options.SharedBufferSize,
+            effectiveOptions.PageBudget,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Performs the one required asynchronous initialization and open, then returns
     /// an <see cref="global::Ahtola.AhtolaConnection"/> intended for synchronous reads.
     /// </summary>
