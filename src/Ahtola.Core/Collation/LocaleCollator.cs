@@ -91,61 +91,52 @@ internal sealed class LocaleCollator
         return 0;
     }
 
-    /// <summary>
-    /// Writes a canonical, self-delimited byte key such that
-    /// <c>WriteSortKey(a)</c> orders the same as <c>WriteSortKey(b)</c> under
-    /// byte-wise comparison whenever <see cref="Compare"/> orders <c>a</c> and
-    /// <c>b</c> the same way, and two strings that compare equal always produce
-    /// an identical key (including a precomposed accented letter and its
-    /// canonically-decomposed spelling — see type remarks). Used both for
-    /// persisted index byte ordering and as a canonical equality key, mirroring
-    /// Turso's <c>LocaleCollationRegistry::sort_key</c> (which backs
-    /// <c>CollationSeq::hash_key</c> for the locale variant).
-    /// </summary>
-    public byte[] WriteSortKey(string text)
-    {
-        ArgumentNullException.ThrowIfNull(text);
-        var elements = BuildElements(text);
-
-        var buffer = new List<byte>(elements.Count * 4 + 8);
-        AppendLevel(buffer, elements, e => e.Primary.Group);
-        buffer.Add(0);
-        AppendLevel(buffer, elements, e => e.Primary.Major);
-        buffer.Add(0);
-        foreach (var element in elements)
-            AppendString(buffer, element.Primary.Minor);
-        buffer.Add(0);
-        AppendLevel(buffer, elements, e => e.Secondary);
-        buffer.Add(0);
-        AppendLevel(buffer, elements, e => EffectiveTertiary(e.Tertiary));
-        return buffer.ToArray();
-    }
-
-    private static void AppendLevel(List<byte> buffer, List<CollationElement> elements, Func<CollationElement, int> selector)
-    {
-        foreach (var element in elements)
-        {
-            var value = selector(element);
-            buffer.Add((byte)(value >> 24));
-            buffer.Add((byte)(value >> 16));
-            buffer.Add((byte)(value >> 8));
-            buffer.Add((byte)value);
-        }
-    }
-
-    private static void AppendString(List<byte> buffer, string? value)
-    {
-        if (string.IsNullOrEmpty(value))
-        {
-            buffer.Add(0);
-            return;
-        }
-
-        foreach (var ch in value)
-            buffer.Add((byte)ch);
-        buffer.Add(0xFF);
-    }
-
+    // REMOVED: WriteSortKey (byte-key encoding) — bug found by review
+    // (2026-09-07, commit ad4dbca chain).
+    //
+    // A prior version of this file exposed WriteSortKey, claiming it produced
+    // a canonical byte key whose byte-wise order always matched Compare's
+    // order, including when strings had a different element count. That
+    // claim was FALSE: the encoding wrote each collation level (all
+    // elements' Group values, then all elements' Major values, then all
+    // elements' Minor strings, then all Secondary values, then all Tertiary
+    // values) as flat fixed-width runs separated by a single 0x00 byte. When
+    // two strings produced a different NUMBER of elements, e.g.
+    // Compare("ab", "ab ") (2 elements vs. 3 — the trailing space is its own
+    // punctuation element), the flat per-level layout misaligned: "ab"'s
+    // single group-level separator byte landed at the exact same byte offset
+    // as the LAST BYTE of "ab "'s third group value (which can itself be 0),
+    // so byte-wise comparison continued past that point comparing "ab"'s
+    // Major level against "ab "'s still-unfinished Group level — an
+    // apples-to-oranges comparison with no fixed relationship to the
+    // intended order. Concretely, Compare("ab", "ab ") correctly returns
+    // "ab" < "ab " (shorter is a true prefix), but byte-wise comparing the
+    // two former WriteSortKey outputs returned the opposite result.
+    //
+    // A structurally correct fix requires a real self-delimiting,
+    // order-preserving encoding per collation element (e.g. escaping every
+    // raw 0x00 byte within an element's encoded fields and terminating each
+    // element with an unescaped 0x00 0x00 marker, so a shorter tied prefix's
+    // terminator is always guaranteed to sort before a longer string's
+    // continuing element bytes regardless of what secondary/tertiary content
+    // follows) — NOT a naive per-level length prefix, which would itself
+    // break ordinary lexicographic tie-breaking (e.g. a single-element "b"
+    // must still sort AFTER the two-element "aa" because 'b' > 'a' at the
+    // very first element, even though "b" has fewer elements than "aa";
+    // comparing element counts first would incorrectly reverse that).
+    //
+    // Nothing in this codebase calls WriteSortKey: index-writer/persisted-
+    // ordering paths use the Compare delegate directly (see
+    // LocaleCollationRegistry, Storage.SqliteKeyCollation), never a byte-key
+    // encoding. Given zero production callers, the safest and most honest
+    // fix is to remove the unused, demonstrably-incorrect API and its
+    // overclaiming doc comment entirely, rather than ship an intricate
+    // escaping scheme for code nothing exercises. If a byte-key encoding is
+    // ever actually needed (e.g. a future persisted-index format keyed by
+    // raw bytes instead of a comparison delegate), implement the
+    // escaped/self-delimiting scheme described above and add the exact
+    // "same-prefix, different-length" counterexample this note describes as
+    // a regression test before trusting it.
     private int EffectiveTertiary(int caseClass)
         => _tag.CaseFirst == LocaleCaseFirst.Upper ? 1 - caseClass : caseClass;
 

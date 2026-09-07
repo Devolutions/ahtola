@@ -280,11 +280,13 @@ public sealed class LocaleCollationTests
     }
 
     [Test]
-    public void SortKeyIsIdenticalForPrecomposedAndDecomposedSpellings()
+    public void PrecomposedAndDecomposedSpellingsCompareEqualViaTheSharedCompareDelegate()
     {
-        // WriteSortKey backs persisted index byte ordering and equality; it must
-        // produce byte-identical keys for canonically equivalent spellings, not just
-        // agree under Compare.
+        // WriteSortKey (a separate byte-key encoding) was removed after a review found
+        // it broke the lexical contract for same-prefix/different-length inputs (see
+        // LocaleCollator's removal note). Persisted index ordering and equality both
+        // go through this single Compare delegate instead -- verify it treats
+        // canonically equivalent spellings as equal directly, not through a sort key.
         LocaleCollationRegistry.TryResolve("fr-FR", out var compare).Should().BeTrue();
         compare.Should().NotBeNull();
         compare!("\u00e9", "e\u0301").Should().Be(0);
@@ -404,6 +406,150 @@ public sealed class LocaleCollationTests
 
         Action insert = () => Execute(connection, "INSERT INTO t VALUES (char(0x4E2D));");
         insert.Should().Throw<NotSupportedException>();
+    }
+
+    [Test]
+    public void SamePrefixDifferentLengthComparesShorterAsLess()
+    {
+        // Regression counterexample for the WriteSortKey defect a review found (see
+        // LocaleCollator's removal note): "ab" and "ab " tie on their shared 2-element
+        // prefix ('a','b') but differ in element count (a trailing space is its own
+        // punctuation element), so the shorter string -- being a true tied prefix --
+        // must sort first. This must hold through the single Compare delegate that
+        // now backs every comparison and persisted-index ordering path.
+        LocaleCollationRegistry.TryResolve("en", out var compare).Should().BeTrue();
+        compare.Should().NotBeNull();
+        compare!("ab", "ab ").Should().BeLessThan(0);
+        compare("ab ", "ab").Should().BeGreaterThan(0);
+        compare("ab", "ab").Should().Be(0);
+
+        // The same property must hold end to end through SQL comparisons and a
+        // persisted, locale-collated index ORDER BY -- not just the bare delegate.
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("locale-prefix-length-tiebreak.db", fileSystem);
+        using var connection = database.Connect();
+        Query(connection, "SELECT 'ab' < 'ab ' COLLATE 'en';")[0][0].AsInteger().Should().Be(1);
+
+        Execute(connection, "CREATE TABLE t(v TEXT);");
+        Execute(connection, "CREATE INDEX t_v ON t(v COLLATE 'en');");
+        Execute(connection, "INSERT INTO t VALUES ('ab '), ('ab'), ('ac');");
+        Query(connection, "SELECT v FROM t ORDER BY v COLLATE 'en';")
+            .Select(row => row[0].AsText())
+            .Should().Equal("ab", "ab ", "ac");
+    }
+
+    [Test]
+    public void RejectedArbitraryNamesAreNeverCached()
+    {
+        // A review found the registry cache had no bound: every distinct rejected
+        // name (structurally malformed, or syntactically valid but outside the
+        // accepted-profile allowlist) was cached forever, letting a stream of
+        // distinct garbage COLLATE names grow the process-wide dictionary without
+        // limit. Only successful (accepted-profile) resolutions may be cached now;
+        // verify a large batch of distinct rejected names leaves the cache
+        // completely unaffected.
+        var before = LocaleCollationRegistry.CachedEntryCount;
+        for (var i = 0; i < 500; i++)
+        {
+            LocaleCollationRegistry.TryResolve($"not-a-real-locale-{i}-garbage", out var compare)
+                .Should().BeFalse();
+            compare.Should().BeNull();
+        }
+
+        LocaleCollationRegistry.CachedEntryCount.Should().Be(
+            before,
+            "rejected names must never grow the cache, regardless of how many distinct ones are queried");
+
+        // A subsequent resolution of an ALREADY-rejected name is recomputed (not
+        // remembered as a permanent failure) rather than, say, throwing a stale
+        // cached exception -- confirm it still correctly fails every time.
+        LocaleCollationRegistry.TryResolve("not-a-real-locale-0-garbage", out var stillRejected).Should().BeFalse();
+        stillRejected.Should().BeNull();
+
+        // A genuinely accepted profile still gets cached normally (the allowlist
+        // itself is finite, so this is bounded growth, unlike arbitrary rejections).
+        // Uses a tag not exercised elsewhere in this test class, and checks
+        // idempotency (a second resolution of the same tag does not grow the
+        // cache further) rather than an absolute count relative to other tests,
+        // since LocaleCollationRegistry is a process-wide singleton shared with
+        // every other test in this run.
+        const string uniqueAcceptedTag = "es-u-co-trad-kf-upper-kn-true-ks-level4";
+        var beforeAccepted = LocaleCollationRegistry.CachedEntryCount;
+        LocaleCollationRegistry.TryResolve(uniqueAcceptedTag, out var accepted).Should().BeTrue();
+        accepted.Should().NotBeNull();
+        LocaleCollationRegistry.CachedEntryCount.Should().Be(beforeAccepted + 1);
+
+        LocaleCollationRegistry.TryResolve(uniqueAcceptedTag, out var acceptedAgain).Should().BeTrue();
+        acceptedAgain.Should().NotBeNull();
+        LocaleCollationRegistry.CachedEntryCount.Should().Be(
+            beforeAccepted + 1,
+            "resolving the same accepted tag again must not grow the cache further");
+    }
+
+    [Test]
+    [TestCase("level1")]
+    [TestCase("level2")]
+    [TestCase("level3")]
+    [TestCase("level4")]
+    [TestCase("identic")]
+    public void KsValueNeverSuppressesCaseOrAccentDistinctionsForAnyEnumeratedValue(string ksValue)
+    {
+        // Broader evidence matrix for the "ks is parsed but inert" claim (see
+        // LocaleCollationTag remarks): every enumerated ks value must still
+        // distinguish a primary difference, a secondary (accent) difference, AND a
+        // tertiary (case) difference -- not just the two values a prior version of
+        // this port's comments cited as examples.
+        var tag = $"en-u-ks-{ksValue}";
+        LocaleCollationRegistry.TryResolve(tag, out var compare).Should().BeTrue();
+        compare.Should().NotBeNull();
+        compare!("a", "b").Should().BeLessThan(0, $"primary difference under ks={ksValue}");
+        compare("a", "\u00e1").Should().BeLessThan(0, $"accent (secondary) difference under ks={ksValue}");
+        compare("a", "A").Should().BeLessThan(0, $"case (tertiary) difference under ks={ksValue}");
+
+        // Composed with kf=upper, case ordering must still correctly reverse under
+        // every ks value (not just verified in isolation).
+        LocaleCollationRegistry.TryResolve($"en-u-kf-upper-ks-{ksValue}", out var compareUpperFirst).Should().BeTrue();
+        compareUpperFirst.Should().NotBeNull();
+        compareUpperFirst!("a", "A").Should().BeGreaterThan(0, $"kf=upper composed with ks={ksValue}");
+    }
+
+    [Test]
+    [TestCase("9", "10")]
+    [TestCase("99", "100")]
+    [TestCase("a9b", "a10b")]
+    [TestCase("file9", "file10")]
+    [TestCase("v1.9", "v1.10")]
+    public void NumericFoldingOrdersConsistentlyAloneAndComposedWithKfAndKs(string smaller, string larger)
+    {
+        // Broader evidence matrix for kn=true numeric folding: each case is checked
+        // both in isolation and under the exact compound tag the pinned upstream
+        // sqltest corpus uses, so numeric folding is verified to compose correctly
+        // with case-first and the (inert) strength keyword, not just standalone.
+        LocaleCollationRegistry.TryResolve("en-u-kn-true", out var plain).Should().BeTrue();
+        plain.Should().NotBeNull();
+        plain!(smaller, larger).Should().BeLessThan(0);
+
+        LocaleCollationRegistry.TryResolve("en-u-kn-true-kf-upper-ks-level2", out var compound).Should().BeTrue();
+        compound.Should().NotBeNull();
+        compound!(smaller, larger).Should().BeLessThan(0);
+    }
+
+    [Test]
+    [TestCase("0", "00")]
+    [TestCase("007", "7")]
+    [TestCase("0001", "1")]
+    public void NumericFoldingTreatsLeadingZeroVariantsAsEqualAloneAndComposedWithKfAndKs(string left, string right)
+    {
+        // Leading zeros must fold to the SAME numeric magnitude (equal), both in
+        // isolation and under the exact compound tag the pinned upstream sqltest
+        // corpus uses.
+        LocaleCollationRegistry.TryResolve("en-u-kn-true", out var plain).Should().BeTrue();
+        plain.Should().NotBeNull();
+        plain!(left, right).Should().Be(0);
+
+        LocaleCollationRegistry.TryResolve("en-u-kn-true-kf-upper-ks-level2", out var compound).Should().BeTrue();
+        compound.Should().NotBeNull();
+        compound!(left, right).Should().Be(0);
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

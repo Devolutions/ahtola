@@ -25,20 +25,53 @@ public enum LocaleCaseFirst
 /// <c>LocaleCollationRegistry::get_or_register</c>), scoped to what this managed
 /// port actually implements. The <c>ks</c> (collation strength) keyword is parsed
 /// and its value validated against the BCP-47 enumeration (<c>level1</c>..<c>level4</c>,
-/// <c>identic</c>) for syntax fidelity, but — matching the empirically observed
-/// behavior of the pinned <c>icu_collator</c>/<c>icu_locale</c> 2.3.x crates when
-/// constructed via <c>Collator::try_new(locale, CollatorOptions::default())</c> —
-/// it has no effect on comparison strength: comparisons always run through the
-/// tertiary (case) level regardless of the requested <c>ks</c> value. This was
-/// verified directly against the pinned crate versions (Cargo.lock-resolved
-/// <c>icu_collator</c>/<c>icu_locale</c> 2.3.1 for the <c>turso-src</c>
-/// <c>v0.8.0-pre.7</c> tag): <c>en-u-ks-level1</c> and <c>en-u-ks-level2</c> both
-/// still distinguish case and accents exactly like the tertiary-strength default,
-/// so an implementation that faithfully reproduces Turso's current behavior must
-/// not truncate strength either. Any unrecognized <c>-u-</c> keyword is tolerated
-/// and ignored (BCP-47 permits private/registry-specific keywords); an unrecognized
-/// singleton extension (e.g. <c>-t-</c>, <c>-a-</c>) is skipped structurally rather
-/// than interpreted.
+/// <c>identic</c>) for syntax fidelity, but has no effect on comparison strength
+/// in this port: comparisons always run through the tertiary (case) level
+/// regardless of the requested <c>ks</c> value.
+/// </para>
+/// <para>
+/// <b>Evidence for the <c>ks</c> claim (not a proof of general ICU/UCA strength
+/// semantics).</b> This was checked against the pinned crate versions
+/// (Cargo.lock-resolved <c>icu_collator</c>/<c>icu_locale</c> 2.3.1 for the
+/// <c>turso-src</c> <c>v0.8.0-pre.7</c> tag) with a small, concrete matrix, not
+/// a single hand-picked pair: for EACH of the five enumerated <c>ks</c> values
+/// (<c>level1</c>, <c>level2</c>, <c>level3</c>, <c>level4</c>, <c>identic</c>),
+/// three probes were run — a primary-only difference (<c>'a'</c> vs <c>'b'</c>),
+/// a secondary-only (accent) difference (<c>'a'</c> vs <c>'á'</c>), and a
+/// tertiary-only (case) difference (<c>'a'</c> vs <c>'A'</c>) — and every one of
+/// the fifteen results was identical to the untailored default (case and accent
+/// differences were distinguished under every <c>ks</c> value, none of them
+/// collapsed to primary-only comparison). The same three probes were repeated
+/// with <c>kf=upper</c> also applied for all five <c>ks</c> values (case
+/// ordering correctly reversed under every one), confirming the two keywords
+/// still compose correctly regardless of the (inert) <c>ks</c> value. This is
+/// evidence for the SPECIFIC claim "this crate version does not vary strength
+/// for these keyword combinations, for these probe pairs" — it is not a formal
+/// proof that every possible pair of strings behaves identically across every
+/// <c>ks</c> value, nor a general statement about ICU/UCA strength semantics.
+/// If a future <c>icu_collator</c> upgrade changes this, this port's own
+/// behavior (always comparing through tertiary) would then diverge from the
+/// upgraded reference and must be re-verified against the new pinned version
+/// before claiming continued parity.
+/// </para>
+/// <para>
+/// <b>Evidence for <c>kn</c> (numeric ordering) semantics.</b> Checked against
+/// the same pinned crate with ten varied digit-run cases (leading zeros of
+/// different lengths, single- vs. multi-digit magnitude comparisons, digit runs
+/// embedded mid-string at different positions, and digit runs separated by a
+/// non-digit character, e.g. version-like text), each compared once under plain
+/// <c>en-u-kn-true</c> and once under the exact compound tag the pinned
+/// upstream sqltest corpus uses
+/// (<c>en-u-kn-true-kf-upper-ks-level2</c>) to confirm numeric folding composes
+/// correctly with case-first and the (inert) strength keyword rather than only
+/// being verified in isolation. All ten cases matched this port's
+/// (length-then-text, leading-zeros-stripped) numeric comparison in both forms.
+/// </para>
+/// <para>
+/// Any unrecognized <c>-u-</c> keyword is tolerated and ignored (BCP-47 permits
+/// private/registry-specific keywords); an unrecognized singleton extension
+/// (e.g. <c>-t-</c>, <c>-a-</c>) is skipped structurally rather than
+/// interpreted.
 /// </para>
 /// <para>
 /// <b>Accepted profiles are an explicit, conservative allowlist — not full ICU
