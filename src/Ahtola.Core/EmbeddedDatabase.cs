@@ -27961,18 +27961,18 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context)
     {
-        var result = ExecuteExplainQueryPlanText(statement, parameters, context);
+        var result = ExecuteExplainQueryPlanText(statement, parameters, context, out var ops);
         if (statement.Format != ExplainQueryPlanFormat.Json)
             return result;
 
         // EXPLAIN QUERY PLAN FORMAT=JSON emits one plan_json TEXT row carrying the
         // machine-readable envelope documented in turso-src/docs/eqp-json.md. Every node in
-        // that contract carries a structured `op` object; a handful of shapes below build one
-        // directly from the same plan data the text path already computed (constant row, and a
-        // single-table index scan/search with no WHERE/subquery correlation to describe). Every
-        // other shape is not yet modeled as a typed op, so rather than fabricate one it is
-        // reported as an explicit "unmodeled" op carrying the plan detail text -- never a real
-        // Turso op name, so it can never be silently mistaken for the genuine contract.
+        // that contract carries a structured `op` object; ExecuteExplainQueryPlanText attaches
+        // one to every row its own describer branches can build directly from data they already
+        // computed (never fabricated/approximated -- see EqpJsonOp's doc comment). Any row
+        // without one reports an explicit "unmodeled" op carrying the plan detail text instead --
+        // never a real Turso op name, so it can never be silently mistaken for the genuine
+        // contract.
         var sql = statement.InnerSql ?? string.Empty;
         var isWriteWithoutReturning = statement.Inner switch
         {
@@ -28006,17 +28006,47 @@ out bool hasReturning)
 
         // A lone "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" row is the text path's
         // placeholder for "no per-step plan is modeled for this statement yet", not a real scan
-        // or search step. Reporting it as a fake node would misrepresent the plan; report no
-        // nodes instead, which is also what a write statement with nothing to scan (a constant
-        // INSERT ... VALUES) genuinely has.
+        // or search step -- but for a plain SELECT the query still genuinely executes some real
+        // access path (a FROM-less constant row, or an ordinary full table scan), and the JSON
+        // envelope can describe that faithfully even while the TEXT convention keeps reporting
+        // the placeholder (ExplainQueryPlanTests.cs pins that TEXT routing marker independently
+        // of what FORMAT=JSON reports). A write statement with nothing to scan (a constant
+        // INSERT ... VALUES) has no equivalent real access path, so it still reports no nodes.
         var isPlaceholderOnly = result.Rows.Count == 1
             && result.Rows[0].Length >= 4
             && result.Rows[0][3].Kind == SqlValueKind.Text
             && result.Rows[0][3].AsText() is "MANAGED COMPILED VDBE" or "MANAGED EVALUATOR FALLBACK";
-
-        var typedOp = statement.Inner is SelectStatement plannedSelect
-            ? TryBuildEqpJsonOp(plannedSelect, EnsureAutoIncrementStatementState(context))
+        (string Detail, EqpJsonOp Op)? placeholderNode = isPlaceholderOnly && statement.Inner is SelectStatement placeholderSelect
+            ? TryDescribeGenuinePlaceholderAccessPath(placeholderSelect)
             : null;
+
+        IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)> nodes;
+        if (placeholderNode is { } genuine)
+        {
+            nodes = [(1, 0, genuine.Detail, genuine.Op)];
+        }
+        else if (isPlaceholderOnly)
+        {
+            nodes = [];
+        }
+        else
+        {
+            nodes = result.Rows.Select((row, index) =>
+            {
+                var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
+                var detailText = detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty;
+                var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
+                    ? (int)row[0].AsInteger()
+                    : index + 1;
+                var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer && row[1].AsInteger() != 0
+                    // The TEXT rows use 0 as the "no parent" sentinel (matching Turso's own
+                    // parent=0 top-level convention); the JSON contract spells that null.
+                    ? (int)row[1].AsInteger()
+                    : 0;
+                var op = ops is not null && index < ops.Count ? ops[index] : null;
+                return (nodeId, parent, detailText, op);
+            }).ToArray();
+        }
 
         var json = new System.Text.StringBuilder()
             .Append("{\"version\":1,\"sql\":")
@@ -28024,52 +28054,38 @@ out bool hasReturning)
             .Append(",\"result_columns\":[")
             .Append(string.Join(",", resultColumns.Select(static column => JsonEscape(column))))
             .Append("],\"nodes\":[")
-            .Append(isPlaceholderOnly
-                ? string.Empty
-                : string.Join(",", result.Rows.Select((row, index) =>
-                {
-                    var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
-                    var detailText = detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty;
-                    var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
-                        ? row[0].AsInteger().ToString(CultureInfo.InvariantCulture)
-                        : (index + 1).ToString(CultureInfo.InvariantCulture);
-                    var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer && row[1].AsInteger() != 0
-                        // The TEXT rows use 0 as the "no parent" sentinel (matching Turso's own
-                        // parent=0 top-level convention); the JSON contract spells that null.
-                        ? row[1].AsInteger().ToString(CultureInfo.InvariantCulture)
-                        : "null";
-                    var op = index == 0 && typedOp is not null
-                        ? typedOp.ToJson()
-                        : $"{{\"type\":\"unmodeled\",\"detail\":{JsonEscape(detailText)}}}";
-                    return $"{{\"id\":{nodeId},\"parent\":{parent},\"detail\":{JsonEscape(detailText)},\"op\":{op}}}";
-                })))
+            .Append(string.Join(",", nodes.Select(node =>
+            {
+                var parentText = node.Parent == 0 ? "null" : node.Parent.ToString(CultureInfo.InvariantCulture);
+                var op = node.Op is not null
+                    ? node.Op.ToJson()
+                    : $"{{\"type\":\"unmodeled\",\"detail\":{JsonEscape(node.Detail)}}}";
+                return $"{{\"id\":{node.Id},\"parent\":{parentText},\"detail\":{JsonEscape(node.Detail)},\"op\":{op}}}";
+            })))
             .Append("]}");
         return new ExecutionResult(["plan_json"], [[SqlValue.Text(json.ToString())]], 0);
     }
 
     /// <summary>
-    /// Builds the FORMAT=JSON <c>op</c> object for the narrow set of shapes modeled as a typed
-    /// node so far: a single base-table SCAN whose ORDER BY is elided by a declared index (no
-    /// WHERE-based SEARCH, no correlated subquery). Every other shape -- including a FROM-less
-    /// constant row, which the TEXT path still reports as "MANAGED COMPILED VDBE"/"MANAGED
-    /// EVALUATOR FALLBACK" to preserve the existing compiled-vs-evaluator routing contract
-    /// (ExplainQueryPlanTests.cs) -- returns <see langword="null"/> and the caller reports an
-    /// explicit "unmodeled" op rather than a fabricated one.
+    /// When the TEXT path's per-step planners found no dedicated access-method description (the
+    /// generic "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" placeholder), the statement
+    /// still genuinely executes some real access path for these two narrow, unambiguous shapes:
+    /// a FROM-less SELECT (one synthesized row of literal/computed values) and a single plain
+    /// base table with no join, no index chosen (an ordinary full table scan). Both are
+    /// determined purely from the statement's own FROM clause -- no guessing about which access
+    /// method the compiled/evaluator route happened to pick. A multi-table join's real per-leg
+    /// access method (index seek vs. hash join vs. full scan) is not yet reconstructable this
+    /// way and stays unmodeled.
     /// </summary>
-    private EqpJsonOp? TryBuildEqpJsonOp(SelectStatement select, QueryContext context)
-    {
-        if (select.Source is NamedTableSource source
-            && TryPlanManagedIndexScan(select, context) is { Search: false } indexPlan)
+    private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(SelectStatement select)
+        => select.Source switch
         {
-            return new EqpJsonScanOp(
-                indexPlan.Table.Name,
-                source.Alias,
-                indexPlan.Index.Name,
-                IndexCoversSelect(select, indexPlan.Table, indexPlan.Index));
-        }
-
-        return null;
-    }
+            null => ("SCAN CONSTANT ROW", new EqpJsonConstantRowOp()),
+            NamedTableSource { } source => (
+                $"SCAN {source.Name}" + (source.Alias is null ? string.Empty : $" AS {source.Alias}"),
+                new EqpJsonScanOp(source.Name, source.Alias, IndexName: null, Covering: false)),
+            _ => null,
+        };
 
     internal static string JsonEscape(string value)
     {
@@ -28108,8 +28124,10 @@ out bool hasReturning)
     private ExecutionResult ExecuteExplainQueryPlanText(
         ExplainQueryPlanStatement statement,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        out IReadOnlyList<EqpJsonOp?>? ops)
     {
+        ops = null;
         var compilationContext = EnsureAutoIncrementStatementState(context);
         if (statement.Inner is SelectStatement tableValuedSelect)
             statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
@@ -28177,6 +28195,26 @@ out bool hasReturning)
         if (statement.Inner is SelectStatement plannedSelect
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
+            var indexPlanCovering = IndexCoversSelect(plannedSelect, indexPlan.Table, indexPlan.Index);
+            // FormatManagedIndexExplainDetail only ever tests the leading index column for a
+            // plain equality (plan.Index.Columns[0].Name + "=?"); mirror that here directly
+            // instead of re-parsing the text it produced.
+            ops = indexPlan.Search && indexPlan.Index.Columns[0].Expression is null
+                ? [
+                    new EqpJsonSearchOp(
+                        indexPlan.Table.Name,
+                        indexPlan.Source.Alias,
+                        indexPlan.Index.Name,
+                        indexPlanCovering,
+                        [$"{indexPlan.Index.Columns[0].Name}=?"]),
+                ]
+                : [
+                    new EqpJsonScanOp(
+                        indexPlan.Table.Name,
+                        indexPlan.Source.Alias,
+                        indexPlan.Index.Name,
+                        indexPlanCovering),
+                ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
@@ -28192,6 +28230,12 @@ out bool hasReturning)
         if (statement.Inner is SelectStatement orUnionSelect
             && TryPlanManagedOrIndexUnion(orUnionSelect, compilationContext) is { } orUnionPlan)
         {
+            ops =
+            [
+                new EqpJsonMultiIndexOp(
+                    orUnionPlan.Table.Name,
+                    orUnionPlan.Branches.Select(static branch => branch.Index.Name).ToArray()),
+            ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
@@ -28244,9 +28288,12 @@ out bool hasReturning)
         if (statement.Inner is SelectStatement correlatedAggregateSelect
             && TryDescribeCorrelatedAggregateSubqueryPlan(
                 correlatedAggregateSelect,
+                parameters,
                 compilationContext,
-                out var correlatedAggregatePlan))
+                out var correlatedAggregatePlan,
+                out var correlatedAggregateOps))
         {
+            ops = correlatedAggregateOps;
             return correlatedAggregatePlan;
         }
 

@@ -93,6 +93,74 @@ public class ExplainQueryPlanFormatJsonTests
         json[0].Should().Contain("\"parent\":");
     }
 
+    /// <summary>
+    /// A hand-written LEFT JOIN with a non-equality condition, grouped by the outer rowid and
+    /// filtered by HAVING, has exactly the same AST shape TryRewriteAggregateJoinFirst produces
+    /// for its own rewrite -- but it was never produced by that rewrite (it is what the user
+    /// wrote), and a hash join cannot execute a "&gt;" condition at all. The describer must not
+    /// mistake this shape for its own rewrite's output and must not claim "HASH JOIN" here.
+    /// </summary>
+    [Test]
+    public void HandWrittenNonEquiJoinLeftJoinIsNotMisdescribedAsHashJoin()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE outer_t(id INTEGER PRIMARY KEY, k INTEGER); " +
+            "CREATE TABLE inner_t(k INTEGER, x INTEGER);");
+
+        var json = ReadAll(
+            connection,
+            """
+            EXPLAIN QUERY PLAN FORMAT=JSON
+            SELECT o.id
+            FROM outer_t o
+            LEFT JOIN inner_t i ON i.k > o.k
+            GROUP BY o.rowid
+            HAVING count(i.x) > 0;
+            """);
+        json.Should().HaveCount(1);
+        json[0].Should().NotContain("hash_join");
+        json[0].Should().NotContain("HASH JOIN");
+    }
+
+    /// <summary>
+    /// A correlated aggregate subquery that stays correlated (unnest.rs declines every rewrite)
+    /// still routes its outer table through ExecuteSelect's ordinary TryPlanManagedIndexScan
+    /// planner, so an indexable predicate on the outer table's own WHERE genuinely executes as
+    /// an index SEARCH, not a hardcoded full SCAN.
+    /// </summary>
+    [Test]
+    public void StaysCorrelatedDescriberUsesRealIndexPlanForOuterTable()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE idx_outer(id INTEGER PRIMARY KEY, k INTEGER, age INTEGER); " +
+            "CREATE INDEX idx_outer_age ON idx_outer(age); " +
+            "CREATE TABLE nondet_inner(k INTEGER, x INTEGER);");
+
+        var json = ReadAll(
+            connection,
+            """
+            EXPLAIN QUERY PLAN FORMAT=JSON
+            SELECT o.id
+            FROM idx_outer o
+            WHERE o.age > 21
+              AND o.id + (random() % 2) = o.id
+              AND o.k > (
+                  SELECT sum(i.x)
+                  FROM nondet_inner i
+                  WHERE i.k = o.k
+              );
+            """);
+        json.Should().HaveCount(1);
+        json[0].Should().Contain("\"detail\":\"SEARCH o USING INDEX idx_outer_age");
+        json[0].Should().Contain("\"index\":{\"name\":\"idx_outer_age\"");
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         foreach (var statement in connection.PrepareScript(sql))
