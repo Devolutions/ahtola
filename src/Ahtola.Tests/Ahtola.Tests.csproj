@@ -49,6 +49,14 @@
         <Content Include="..\..\conformance\sqlite-sqltests\**\*.sqltest"
                  LinkBase="Conformance"
                  CopyToOutputDirectory="PreserveNewest" />
+        <!-- Byte-identical static database fixtures referenced by `@database database/*.db
+             readonly` directives (e.g. where/small.sqltest, pragma/user_version_10.sqltest,
+             legacy-unquoted-view-columns.sqltest). Vendored unmodified from Turso's own
+             sqlite/conformance/database/ (see turso-src), which are themselves committed
+             binary fixtures, not build artifacts. -->
+        <Content Include="..\..\conformance\sqlite-sqltests\database\**\*.db"
+                 LinkBase="Conformance\database"
+                 CopyToOutputDirectory="PreserveNewest" />
         <Content Include="Conformance\managed-sqltest-expected-failures.txt"
                  CopyToOutputDirectory="PreserveNewest" />
         <Content Include="Conformance\managed-sqltest-harness-exclusions.txt"
