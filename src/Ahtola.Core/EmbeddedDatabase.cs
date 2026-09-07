@@ -64359,6 +64359,21 @@ internal sealed class EmbeddedTable
     }
 
     /// <summary>
+    /// The row storage's lineage/revision identity, read directly without forcing a still-
+    /// pending lazy load (contrast <see cref="Rows"/>/<see cref="RowIds"/>, which both force
+    /// one). Safe to call at any time and from any table state (pending, loaded, or
+    /// permanently failed): <see cref="RowStore.LineageId"/> is assigned once at construction
+    /// and only ever carried forward verbatim by <see cref="RowStore.AdoptIdentity"/> /
+    /// <see cref="RowStore.ReplaceContentsPreservingRevision"/> (both plain field copies, never
+    /// touched by <see cref="EnsureRowsLoaded"/> itself), and <see cref="RowStore.Revision"/>
+    /// only ever increases — so a caller that only needs to prove "this table's row storage is
+    /// provably the same physical lineage, unchanged since a previous snapshot" (see
+    /// <c>EmbeddedFileStore.IsTableRowStorageUnchangedFromPrevious</c>) never needs to pay for
+    /// decoding a whole table's pages just to answer that.
+    /// </summary>
+    internal (long LineageId, long Revision) RowStorageIdentity => (_rowsStore.LineageId, _rowsStore.Revision);
+
+    /// <summary>
     /// True while this table's committed base rows have not yet been read from page
     /// storage and no earlier attempt to do so has failed (see <see cref="HasFailedRowLoad"/>).
     /// Observable so tests and diagnostics can prove a physical open, or a statement that never

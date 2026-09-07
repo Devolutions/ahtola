@@ -1,4 +1,5 @@
 using Ahtola.Core;
+using Ahtola.Core.Parsing;
 using Ahtola.Core.Storage;
 using AwesomeAssertions;
 
@@ -150,15 +151,22 @@ public sealed class PageBackedLazyRowLoadTests
     }
 
     [Test]
-    public void CommittingAWriteEagerlyValidatesEveryOtherTableIncludingUntouchedSiblings()
+    public void CommittingAWriteNoLongerForceLoadsAnUntouchedIndexlessRowidAliasSibling()
     {
-        // Documents a second, separate, and known boundary of this slice: PersistCore's
-        // ValidateTableRepresentable pass still runs unconditionally over every table in the
-        // catalog on every committed write (pre-existing behavior, unchanged here), so a write
-        // to 'touched' still hydrates the untouched 'sibling' table once the statement commits.
-        // Making that pass skip a provably row-storage-unchanged table (the existing
-        // IsTableRowStorageUnchangedFromPrevious machinery) without forcing it to hydrate first
-        // is tracked as separate follow-up work, not silently claimed here.
+        // This test previously documented an open boundary of this slice
+        // ("CommittingAWriteEagerlyValidatesEveryOtherTableIncludingUntouchedSiblings"):
+        // PersistCore's ValidateTableRepresentable pass ran the rowid-alias INTEGER PRIMARY
+        // KEY uniqueness loop unconditionally over every table in the catalog on every
+        // committed write, forcing full hydration of every untouched sibling with that common
+        // table shape. That boundary is now closed: the loop is skipped whenever
+        // IsTableRowStorageUnchangedFromPrevious proves the sibling's row storage has not
+        // changed since the last successful commit — sound because a rowid-alias column's
+        // stored value always equals the row's own committed rowid, and
+        // EmbeddedFileStore.Load()'s structural pass already guarantees every table b-tree's
+        // rowids are strictly increasing/distinct, so an on-disk, never-mutated table's
+        // rowid-alias values cannot ever be duplicated; only an actual write (which always
+        // bumps RowStore.Revision) could introduce a duplicate, and that case is still fully
+        // checked (see CommittingADuplicateRowidAliasValueIsStillCaught below).
         var fileSystem = new InMemoryFileSystem();
         const string path = "lazy-mutation.db";
 
@@ -176,19 +184,64 @@ public sealed class PageBackedLazyRowLoadTests
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
-        var catalog = reopened.LiveCatalog;
         using var connection2 = reopened.Connect();
 
-        catalog.Tables["sibling"].HasPendingRowLoad.Should().BeTrue();
+        reopened.LiveCatalog.Tables["sibling"].HasPendingRowLoad.Should().BeTrue();
         Execute(connection2, "INSERT INTO touched VALUES (2, 'b');");
-        catalog.Tables["sibling"].HasPendingRowLoad.Should().BeFalse(
-            "a committed write still validates (and thus hydrates) every table today");
+        // Every commit republishes EmbeddedDatabase's whole table dictionary from a fresh
+        // SchemaCatalog.Clone() (see PublishCatalog), so LiveCatalog must be re-fetched after
+        // each write to observe the current generation: even an untouched table's entry
+        // becomes a distinct EmbeddedTable instance on every commit (sharing lazy state with
+        // its predecessor via TryCopyPendingRowLoadTo, never the same reference).
+        reopened.LiveCatalog.Tables["sibling"].HasPendingRowLoad.Should().BeTrue(
+            "a committed write to an unrelated table must no longer force-load an untouched " +
+            "indexless rowid-alias sibling");
 
         ReadRows(connection2, "SELECT id, value FROM touched ORDER BY id;")
             .Select(row => (row[0].AsInteger(), row[1].AsText()))
             .Should()
             .Equal((1L, "a"), (2L, "b"));
         ReadText(connection2, "SELECT value FROM sibling WHERE id = 1;").Should().Be("z");
+        reopened.LiveCatalog.Tables["sibling"].HasPendingRowLoad.Should().BeFalse(
+            "actually reading 'sibling' still hydrates it, same as always");
+    }
+
+    [Test]
+    public void CommittingAnActualDuplicateRowidAliasValueIsStillCaught()
+    {
+        // Correctness companion to the boundary-closing test above: skipping the rowid-alias
+        // uniqueness loop for an UNCHANGED table must never let a genuine, freshly-introduced
+        // duplicate slip through undetected on the table that actually mutated.
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "duplicate-rowid-alias.db";
+
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);");
+        Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
+
+        // sqlite_autoindex/rowid-alias enforcement normally rejects this at the VDBE layer
+        // before it ever reaches PersistCore's validation; this proves the *storage-layer*
+        // uniqueness check (the one this change gates) independently, the same way the
+        // pre-existing unconditional loop was exercised, by going through EmbeddedFileStore
+        // directly with a row set the VDBE layer never got a chance to validate.
+        var fileStore = database.FileStore!;
+        var table = database.LiveCatalog.Tables["t"];
+        var duplicated = table.Clone();
+        duplicated.Rows[1] = [SqlValue.Integer(1), SqlValue.Text("duplicate")];
+
+        var tables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["t"] = duplicated,
+        };
+        var views = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
+        var triggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
+        var virtualTables = new Dictionary<string, EmbeddedDatabase.VirtualTableDefinition>(
+            StringComparer.OrdinalIgnoreCase);
+
+        Action persistDuplicate = () => fileStore.Persist(tables, views, triggers, virtualTables);
+        persistDuplicate.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*INTEGER PRIMARY KEY*contains duplicate values*");
     }
 
     [Test]

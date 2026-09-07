@@ -9519,6 +9519,17 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private static bool HaveSameRows(EmbeddedTable left, EmbeddedTable right)
     {
+        // Cheap short-circuit: a matching row-storage lineage/revision (see
+        // EmbeddedTable.RowStorageIdentity) is a sound proof of content equality on its own —
+        // it can only hold when zero mutations of any kind have touched either side's row
+        // storage since they last shared the exact same physical RowStore lineage — so this
+        // never needs to force either table to load a still-pending row set from page storage
+        // just to prove what the revision counters already guarantee. Only when the identity
+        // check reports "possibly different" does this fall back to the O(row count) content
+        // comparison below, which does require both sides to be materialized.
+        if (ReferenceEquals(left, right) || left.RowStorageIdentity == right.RowStorageIdentity)
+            return true;
+
         if (left.Rows.Count != right.Rows.Count || left.RowIds.Count != right.RowIds.Count)
             return false;
 
@@ -10129,9 +10140,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             return false;
         }
 
-        return ReferenceEquals(previous, table)
-            || (table.Rows.LineageId == previous.Rows.LineageId
-                && table.Rows.Revision == previous.Rows.Revision);
+        // RowStorageIdentity reads the row storage's lineage/revision directly, without ever
+        // forcing either side to load a still-pending table's rows from page storage — unlike
+        // going through the Rows property (table.Rows.LineageId), which would defeat this
+        // exact optimization by decoding the whole table just to prove it need not be decoded.
+        // See EmbeddedTable.RowStorageIdentity's doc comment for why this is safe even while a
+        // concurrent reader might be mid-load on the same shared `previous` instance.
+        return ReferenceEquals(previous, table) || table.RowStorageIdentity == previous.RowStorageIdentity;
     }
 
     /// <summary>
@@ -10209,7 +10224,27 @@ internal sealed class EmbeddedFileStore : IDisposable
         // catalog already materializes in table.Indexes; the generic index validation
         // below covers it. Only a rowid-alias INTEGER PRIMARY KEY, which has no backing
         // index, needs its values checked directly here.
-        if (primaryKeyCount == 1 && table.RowidAliasColumnIndex >= 0)
+        //
+        // Skipped entirely when this table's row storage is provably unchanged since the
+        // previous successful commit (see IsTableRowStorageUnchangedFromPrevious): a rowid-alias
+        // column's stored value is always exactly the row's own committed rowid
+        // (RestoreRowidTableRecord sets values[aliasIndex] = SqlValue.Integer(cell.Cell.RowId)),
+        // and EmbeddedFileStore.Load()'s structural pass already proves every table b-tree's
+        // rowids are strictly increasing (LoadTableLeafRows/LoadTableTreeNodeRows) — so distinct,
+        // valid rowid-alias values are a structural guarantee of the b-tree format itself for any
+        // row that came from disk unmodified. The only way a duplicate or non-integer rowid-alias
+        // value can appear is a genuine in-memory mutation (INSERT/UPDATE) during this or an
+        // earlier transaction, and any such mutation necessarily bumps RowStore.Revision — so
+        // "row storage unchanged since it was last proven valid here" is exactly the right, safe
+        // gate: it is never satisfied by an actual write this check still needs to catch, only by
+        // a table nothing wrote to, whose on-disk rowids were already distinct by construction.
+        // This is the single largest remaining eager-hydration boundary for the common
+        // `INTEGER PRIMARY KEY` table shape: without this gate, every write anywhere in the
+        // database forces every such sibling table to decode its entire row set from page
+        // storage, even though nothing about it changed.
+        if (primaryKeyCount == 1
+            && table.RowidAliasColumnIndex >= 0
+            && !IsTableRowStorageUnchangedFromPrevious(name, table, previousTables, out _))
         {
             var seen = new HashSet<long>();
             foreach (var row in table.Rows)
