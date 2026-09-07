@@ -14,8 +14,8 @@
       "commit_at_analysis": "7b62a3f"
     },
     "conformance_ground_truth": "src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt (606 failure lines at analysis time)",
-    "current_conformance_expected_failures": 145,
-    "current_conformance_expected_failures_note": "Integrated work removes all 13 original SQL-binding, all 27 window/numeric, all 24 recursive-CTE, 24 newly exposed SQL-extension, and 14 generated-column/reserved-name entries. The original 18 planner entries remain. FK schema-rewrite corruption remains assigned, not classified as formatting. The expanded corpus also tracks physical-fixture open-time differences and intentional feature/representation differences. These are not 145 independent bugs. Fixture cases execute rather than being harness-excluded. The remaining-gap plan tracks current work; the 217 closed records below are historical dispositions.",
+    "current_conformance_expected_failures": 142,
+    "current_conformance_expected_failures_note": "Integrated work removes all 13 original SQL-binding, all 27 window/numeric, all 24 recursive-CTE, 24 newly exposed SQL-extension, 14 generated-column/reserved-name, and three legacy-view entries. The FK schema-rewrite prerequisite is integrated; remaining schema-text differences require policy classification. The original 18 planner entries and expanded assigned gaps remain alongside intentional feature/representation and eager-corruption-rejection differences. These are not 142 independent bugs. Fixture cases execute rather than being harness-excluded. The remaining-gap plan tracks current work; the 217 closed records below are historical dispositions.",
     "current_execution_plan": "docs/turso-remaining-gap-plan.md",
     "last_reconciled": "2026-09-06",
     "entry_count": 217,

@@ -126,9 +126,6 @@ integrity_check/parity_non_unique_index.sqltest::integrity-check-non-unique-inde
 integrity_check/parity_non_unique_index.sqltest::quick-check-non-unique-index-entry | database variant 1/1 (database/integrity_non_unique_index_entry.db): database failed to open: Stored unique index 'idx_u' on table 't' contains duplicate non-NULL keys.
 integrity_check/parity_overflow_list_length_mismatch.sqltest::integrity-check-overflow-list-length-mismatch | database variant 1/1 (database/integrity_overflow_list_length_mismatch.db): database failed to open: SQLite overflow chain ends before its logical payload length.
 integrity_check/parity_overflow_list_length_mismatch.sqltest::quick-check-overflow-list-length-mismatch | database variant 1/1 (database/integrity_overflow_list_length_mismatch.db): database failed to open: SQLite overflow chain ends before its logical payload length.
-turso/legacy-unquoted-view-columns.sqltest::legacy-broken-view-table-still-readable | database variant 1/1 (database/testing_legacy_unquoted_view_columns.db): database failed to open: Expected RightParen. At SQL offset 19.
-turso/legacy-unquoted-view-columns.sqltest::legacy-broken-view-is-unavailable | database variant 1/1 (database/testing_legacy_unquoted_view_columns.db): database failed to open: Expected RightParen. At SQL offset 19.
-turso/legacy-unquoted-view-columns.sqltest::legacy-broken-view-row-still-listed-in-schema | database variant 1/1 (database/testing_legacy_unquoted_view_columns.db): database failed to open: Expected RightParen. At SQL offset 19.
 
 # COVER workstream (2026-09-06): 116 cases exposed by adopting 25 more turso-sqltests files
 # (turso/alter_column.sqltest, turso/attach/*, turso/gencol-index-order.sqltest,

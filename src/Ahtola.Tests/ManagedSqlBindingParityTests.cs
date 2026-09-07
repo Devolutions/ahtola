@@ -6,6 +6,28 @@ namespace Ahtola.Tests;
 
 public class ManagedSqlBindingParityTests
 {
+    [Test]
+    public void ForeignKeyRenamePreservesChildColumnNamesAfterSchemaReplay()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, """
+            CREATE TABLE p(id INTEGER PRIMARY KEY);
+            CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER,
+                FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+            ALTER TABLE p RENAME COLUMN id TO parent_id;
+            """, default);
+        ReadRows(connection, "SELECT name FROM pragma_table_info('c') ORDER BY cid;", default)
+            .Select(row => row[0].AsText()).Should().Equal("id", "pid");
+
+        var sql = ReadRows(connection, "SELECT sql FROM sqlite_schema WHERE name='c';", default)[0][0].AsText();
+        using var reopened = new EmbeddedDatabase();
+        using var replay = reopened.Connect();
+        Execute(replay, sql, default);
+        ReadRows(replay, "SELECT name FROM pragma_table_info('c') ORDER BY cid;", default)
+            .Select(row => row[0].AsText()).Should().Equal("id", "pid");
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void TriggerJournalModeUsesTheFiringConnection(bool temporary)
