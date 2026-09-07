@@ -326,6 +326,45 @@ public sealed class PageBackedLazyRowLoadTests
             "once the reader's own transaction ends, a fresh read observes the committed insert");
     }
 
+    [Test]
+    public void DisposingAConnectionWithStillPendingTablesDoesNotThrowOrLeak()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "lazy-dispose.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(
+                connection,
+                """
+                CREATE TABLE untouched_one(id INTEGER PRIMARY KEY, value TEXT);
+                CREATE TABLE untouched_two(id INTEGER PRIMARY KEY, value TEXT);
+                """);
+            Execute(connection, "INSERT INTO untouched_one VALUES (1, 'a');");
+            Execute(connection, "INSERT INTO untouched_two VALUES (1, 'b');");
+        }
+
+        // Open, touch nothing, and dispose repeatedly: every table stays lazy for the whole
+        // connection lifetime, and disposal must neither throw nor leave the file store unable
+        // to be reopened cleanly afterward (no dangling pager state from an abandoned load).
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+            var catalog = database.LiveCatalog;
+            catalog.Tables["untouched_one"].HasPendingRowLoad.Should().BeTrue();
+            catalog.Tables["untouched_two"].HasPendingRowLoad.Should().BeTrue();
+            var connection = database.Connect();
+            connection.Dispose();
+            database.Dispose();
+        }
+
+        using var verifier = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var verifierConnection = verifier.Connect();
+        ReadText(verifierConnection, "SELECT value FROM untouched_one WHERE id = 1;").Should().Be("a");
+        ReadText(verifierConnection, "SELECT value FROM untouched_two WHERE id = 1;").Should().Be("b");
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         foreach (var statement in connection.PrepareScript(sql))
