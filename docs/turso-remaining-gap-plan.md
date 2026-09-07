@@ -5,7 +5,7 @@
 Prepared 2026-09-06 against Ahtola `83bb892` and the read-only Turso
 `v0.8.0-pre.7` pin, `277ddd050`.
 
-The live expected-failures file contains 100 entries: 82 engine, planner, or
+At the baseline, the expected-failures file contained 100 entries: 82 engine, planner, or
 diagnostic parity candidates; 17 deliberate extensions (8 DML LIMIT, 2 STORED
 generated columns, 7 WITHOUT ROWID); and 1 Turso CLI error-prefix difference.
 These are coverage entries, not independent defects. The historical inventory's
@@ -219,3 +219,44 @@ The initial 82-marker goal would leave 18 documented differences (17 intentional
 extensions and one CLI prefix), but that is not an upper bound on the eventual
 backlog exposed by COVER. A workstream is complete only after its accepted
 behavior is integrated and evidenced; starting a worker is not closure.
+
+## Integration checkpoint: `73af390` (2026-09-07)
+
+This is an in-progress checkpoint, not a claim of complete Turso parity. The
+expanded corpus currently records 112 differences. Coverage growth and explicit
+intentional differences make that count incomparable with the original 100
+without considering which files and capabilities are now exercised.
+
+The 64 original SQL/WIN/CTE correctness entries are closed. CREATE INDEX and
+table-constraint NULL ordering, generated-column conversions, dependent-FK
+renames, malformed stored-view isolation, safe cross-schema routing, and
+committed sequence watermarks are integrated. Physical fixture construction
+and engine-open outcomes now run through the normal conformance comparison;
+the harness-exclusion list remains empty.
+
+The remaining 19 ALTER entries describe schema rendering or diagnostic
+decoration, not the previously fixed value-loss and dependent-column-rename
+bugs. Managed token-spliced schema SQL preserves SQLite-style whitespace,
+inline REFERENCES clauses, and replacement-name quoting. Replay/reopen and
+generated-column value-preservation controls guard semantics independently.
+Ten MVCC entries retain explicit managed policies: conflict-free concurrent
+DDL, rollback-restored allocations, and in-memory journal-mode behavior.
+Nine corruption-fixture files retain 18 observed eager-open rejection
+differences; none are hidden as harness skips.
+
+Architecture work remains open. The integrated page accessor now serves live
+MVCC base-row scans, but this alone does not eliminate every whole-catalog
+hydration boundary. Sync staging/rebase and checkpoint hash reuse are delivered,
+not a complete sparse revert-history format. Hash scheduling corrections remain
+under review for predicate replay and honest live-memory accounting. Window
+output spilling alone is not the required bound on evaluator partitions.
+Planner/JSON completeness and the constrained locale implementation remain
+separate pending work.
+
+The browser workstream is implementing a narrower additive profile: an
+explicitly opt-in, read-only asynchronous scan surface over the existing async
+pager. Unsupported statement/database shapes fail explicitly rather than
+falling back or replaying SQL. It must bound live pages, decoded records, schema
+and WAL metadata, and in-flight buffers, with real cancellation/disposal
+boundaries. The current WholeImage and ReadOnlyMirror profiles remain unchanged.
+This slice is not general asynchronous SQL execution or encrypted-page support.
