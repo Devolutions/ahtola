@@ -203,6 +203,47 @@ public class ManagedPercentileAggregateRuntimeSliceTests
             "Inconsistent percentile values across rows");
     }
 
+    /// <summary>
+    /// Linear interpolation between two ordered-set values must stay finite for every input
+    /// pair a double can represent, not just the small-magnitude samples the pinned corpus
+    /// happens to exercise. Verifies both the WITHIN GROUP form and the legacy two-argument
+    /// form (which share the same interpolation helper) alongside the plain MEDIAN()
+    /// even-count average, which has the identical overflow hazard in its own averaging step.
+    /// </summary>
+    [Test]
+    public void PercentileInterpolationStaysFiniteForOppositeAndSameSignExtremes()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        // The pinned turso-sqltests/within-group.sqltest corpus value: percentile_cont must
+        // still reproduce PostgreSQL's exact rounding for ordinary same-sign inputs (the
+        // overflow-safety fix below must not regress this back to 2.4000000000000004).
+        Execute(connection, "CREATE TABLE fl(x DOUBLE PRECISION);");
+        Execute(connection, "INSERT INTO fl VALUES (1.5),(2.5),(3.5),(10.0);");
+        ReadRows(connection, "SELECT CAST(percentile_cont(0.3) WITHIN GROUP (ORDER BY x) AS TEXT) FROM fl;")[0]
+            .Should().Equal(SqlValue.Text("2.4"));
+
+        // Opposite-sign extremes whose difference overflows double: interpolating between
+        // them at the midpoint (or averaging them for MEDIAN) must yield the finite true
+        // result (0), never +Infinity.
+        Execute(connection, "CREATE TABLE ext(x DOUBLE PRECISION);");
+        Execute(connection, "INSERT INTO ext VALUES (-1.7e308),(1.7e308);");
+        ReadRows(connection, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM ext;")[0]
+            .Should().Equal(SqlValue.Real(0d));
+        ReadRows(connection, "SELECT median(x) FROM ext;")[0]
+            .Should().Equal(SqlValue.Real(0d));
+        ReadRows(connection, "SELECT percentile_cont(x, 0.5) FROM ext;")[0]
+            .Should().Equal(SqlValue.Real(0d));
+
+        // Same-sign extremes near DBL_MAX: a naive (a + b) average would also overflow even
+        // though the true average is one of the finite inputs themselves.
+        Execute(connection, "CREATE TABLE big(x DOUBLE PRECISION);");
+        Execute(connection, "INSERT INTO big VALUES (1.7e308),(1.7e308);");
+        ReadRows(connection, "SELECT median(x) FROM big;")[0]
+            .Should().Equal(SqlValue.Real(1.7e308));
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);

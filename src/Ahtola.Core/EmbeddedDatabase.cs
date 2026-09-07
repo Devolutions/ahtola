@@ -28852,6 +28852,16 @@ out bool hasReturning)
             case null or LiteralExpression or HexNegationOverflowExpression or CurrentTimeExpression or ParameterExpression or RaiseExpression
                 or ColumnExpression or StarExpression or QualifiedStarExpression:
                 return;
+            // A bare DEFAULT is only meaningful inside an INSERT statement's VALUES row list
+            // (BuildInsertRow resolves it there without ever reaching this validator, which
+            // only walks SELECT-shaped expression trees — projections, WHERE, HAVING, GROUP
+            // BY, ORDER BY, LIMIT/OFFSET, join conditions, and INSERT ... SELECT sources).
+            // Reaching it here means DEFAULT was used somewhere else (`SELECT DEFAULT`,
+            // `WHERE a = DEFAULT`, …), which SQLite/Turso reject at prepare time — mirrors
+            // Turso's translator.rs/condition.rs: `bail_parse_error!("DEFAULT is only valid
+            // in INSERT VALUES")`.
+            case DefaultValueExpression:
+                throw new EmbeddedSqlException("DEFAULT is only valid in INSERT VALUES");
             case RowValueExpression row:
                 foreach (var value in row.Values)
                     ValidateExpressionIndexDirectives(value, context);
@@ -39107,10 +39117,12 @@ out bool hasReturning)
             ParameterExpression parameter => ReadParameter(parameters, parameter.Index),
             RowValueExpression => throw new EmbeddedSqlException("row value misused"),
             // Only meaningful in an INSERT statement's VALUES row list, where BuildInsertRow
-            // intercepts it before evaluation. Reaching Evaluate means it appeared somewhere
-            // else (SELECT list, WHERE, a non-INSERT VALUES term, …), which SQLite/Turso reject.
+            // intercepts it before evaluation. ValidateExpressionIndexDirectives already
+            // rejects a SELECT-shaped DEFAULT at prepare time; this is a defense-in-depth
+            // backstop for any statement family that reaches evaluation without going through
+            // that validator. Mirrors Turso's translator.rs/condition.rs diagnostic text.
             DefaultValueExpression => throw new EmbeddedSqlException(
-                "near \"DEFAULT\": syntax error"),
+                "DEFAULT is only valid in INSERT VALUES"),
             ColumnExpression column => EvaluateColumn(column, row, context),
             RaiseExpression raise => EvaluateRaise(raise, parameters, row, context),
             FunctionExpression function => EvaluateFunctionRespectingOuterAggregateScope(function, parameters, row, context),
@@ -43614,7 +43626,7 @@ out bool hasReturning)
         {
             var middle = values.Count / 2;
             return SqlValue.Real(values.Count % 2 == 0
-                ? (values[middle - 1] + values[middle]) / 2d
+                ? SafeLerp(values[middle - 1], values[middle], 0.5d)
                 : values[middle]);
         }
 
@@ -43628,11 +43640,7 @@ out bool hasReturning)
                 return SqlValue.Real(values[lower]);
 
             var weight = rank - lower;
-            // lower + (upper - lower) * weight, not lower * (1 - weight) + upper * weight:
-            // the two are mathematically equivalent but not bit-identical in floating point,
-            // and only this ordering matches PostgreSQL's percentile_cont (and the pinned
-            // corpus's exact expected text, e.g. 2.4 rather than 2.4000000000000004).
-            return SqlValue.Real(values[lower] + ((values[upper] - values[lower]) * weight));
+            return SqlValue.Real(SafeLerp(values[lower], values[upper], weight));
         }
 
         return SqlValue.Real(values[(int)Math.Floor(rank)]);
@@ -43702,9 +43710,7 @@ out bool hasReturning)
                 return SqlValue.Real(values[lower]);
 
             var weight = rank - lower;
-            // See the matching comment on the legacy two-argument form above: this exact
-            // operand order is required for bit-identical output with the pinned corpus.
-            return SqlValue.Real(values[lower] + ((values[upper] - values[lower]) * weight));
+            return SqlValue.Real(SafeLerp(values[lower], values[upper], weight));
         }
 
         var discreteValues = new List<SqlValue>();
@@ -43806,6 +43812,45 @@ out bool hasReturning)
                 numeric = default;
                 return false;
         }
+    }
+
+    /// <summary>
+    /// Numerically robust linear interpolation between two doubles for a weight in
+    /// <c>[0, 1]</c>, mirroring the reference algorithm behind C++20's <c>std::lerp</c>
+    /// (WG21 P0811) and matching PostgreSQL's own <c>percentile_cont</c> support function
+    /// (<c>orderedsetaggs.c</c>'s <c>float8_lerp</c>: <c>loval + (pct * (hival - loval))</c>).
+    /// <para>
+    /// For same-signed (or zero-adjacent) operands, the direct form <c>a + weight * (b - a)</c>
+    /// is used — this is what PostgreSQL computes, and it is both overflow-safe (<c>b - a</c>
+    /// cannot exceed the larger operand's own magnitude when the operands share a sign) and
+    /// the only form that reproduces PostgreSQL's exact rounding (e.g. the pinned corpus's
+    /// <c>2.4</c> rather than the algebraically-equivalent weighted form's
+    /// <c>2.4000000000000004</c>).
+    /// </para>
+    /// <para>
+    /// For operands that bracket zero (opposite signs, e.g. <c>-1.7e308</c> and
+    /// <c>1.7e308</c>), <c>b - a</c> can itself overflow to +/-Infinity even though both
+    /// inputs and the true interpolated result are finite, so the weighted convex-combination
+    /// form <c>weight * b + (1 - weight) * a</c> is used instead: each term is individually
+    /// bounded by one operand's own magnitude, so their sum cannot overflow.
+    /// </para>
+    /// </summary>
+    private static double SafeLerp(double a, double b, double weight)
+    {
+        if ((a <= 0d && b >= 0d) || (a >= 0d && b <= 0d))
+            return (weight * b) + ((1d - weight) * a);
+
+        if (weight == 1d)
+            return b;
+
+        var x = a + (weight * (b - a));
+        // Percentile interpolation only ever calls this with weight in [0, 1] (rank's
+        // fractional part), so extrapolation never happens in practice, but the guard is
+        // kept to match std::lerp's reference algorithm exactly rather than silently relying
+        // on a narrower, call-site-specific assumption.
+        return (weight > 1d) == (b > a)
+            ? (b < x ? x : b)
+            : (x < b ? x : b);
     }
 
     private static int ComparePercentileValues(double left, double right)

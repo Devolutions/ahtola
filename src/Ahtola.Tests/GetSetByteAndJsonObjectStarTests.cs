@@ -95,6 +95,36 @@ public class GetSetByteAndJsonObjectStarTests
             "json_object(*) requires a FROM clause");
     }
 
+    /// <summary>
+    /// json_object(*) must expand correctly wherever it appears in an expression tree — not
+    /// only when it is a projection's entire top-level expression — because the star can be
+    /// nested inside another call or used as a WHERE predicate operand, and because a
+    /// table-valued function's hidden columns must stay excluded even when the star is not
+    /// evaluated through the runtime's raw-row fallback.
+    /// </summary>
+    [Test]
+    public void JsonObjectStarExpandsWhenNestedOrUsedAsAPredicate()
+    {
+        using var connection = Open();
+        ExecuteScript(connection, """
+            CREATE TABLE js_products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+            INSERT INTO js_products VALUES (1, 'Widget', 9.99);
+            """);
+
+        // Nested inside another function call: the star must still expand, not survive as a
+        // CountStar call the runtime evaluator would otherwise read straight off the row.
+        ReadScalar(connection, "SELECT upper(json_object(*)) FROM js_products WHERE id = 1;")
+            .Should().Be("""{"ID":1,"NAME":"WIDGET","PRICE":9.99}""");
+
+        // Used as a WHERE predicate operand over a table-valued function: generate_series's
+        // hidden start/stop/step columns must stay excluded from the comparison, exactly as
+        // they are excluded from a SELECT projection.
+        ReadRows(
+            connection,
+            "SELECT value FROM generate_series(1,3) WHERE json_object(*) = json('{\"value\":1}');")
+            .Should().Equal("1");
+    }
+
     private static EmbeddedConnection Open()
     {
         var embedded = new EmbeddedDatabase();
