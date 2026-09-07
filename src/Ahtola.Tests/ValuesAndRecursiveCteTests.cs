@@ -294,6 +294,37 @@ public class ValuesAndRecursiveCteTests
             .Should().Contain("exceeded the maximum");
     }
 
+    [Test]
+    public void HighFanoutRecursiveArmFailsPromptlyWithoutUnboundedQueueGrowth()
+    {
+        // A single recursive-arm invocation over one current row can itself fan out to more
+        // rows than the total row cap in one call (here, a CROSS JOIN against
+        // generate_series produces 1,050,000 children from the CTE's single seed row -- a
+        // modest 5% overshoot, kept small so the unavoidable cost of materializing that one
+        // arm's own result stays a small, fixed cost). The pending work queue has no
+        // capacity bound of its own, so the guard against a runaway recursion must trip the
+        // moment admission crosses RecursiveCteRowLimit -- while walking that one arm's
+        // materialized result -- rather than only after each admitted row is later dequeued
+        // and fed back through the recursive term again. If admission were unbounded (the
+        // regression this guards against), the engine would enqueue all 1,050,000 rows up
+        // front and then have to dequeue and re-invoke the recursive SELECT (a far more
+        // expensive operation than an array append) at least 50,000 more times before its
+        // own row-count check ever got a chance to run, which costs far more than the
+        // generous budget below allows.
+        var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        var error = CaptureError(
+            [],
+            "WITH RECURSIVE c(x) AS ("
+                + "VALUES(0) "
+                + "UNION ALL "
+                + "SELECT y.value FROM c, generate_series(1, 1050000) AS y WHERE c.x < 1"
+                + ") SELECT count(*) FROM c;");
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(start);
+
+        error.Should().Contain("exceeded the maximum of 1000000 rows");
+        elapsed.Should().BeLessThan(TimeSpan.FromSeconds(30));
+    }
+
     private static void AssertMatchesSqlite(
         IReadOnlyList<string> setup,
         string query,

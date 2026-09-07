@@ -32671,14 +32671,39 @@ out bool hasReturning)
             return false;
         }
 
-        foreach (var row in anchor.Rows)
+        // The total-admission guard: every row that survives DISTINCT dedup and is about to
+        // enter the pending queue -- whether an anchor row or one produced by a recursive
+        // arm invocation -- counts against RecursiveCteRowLimit at the moment it is admitted,
+        // not once it is later dequeued and emitted. A single recursive-arm invocation over
+        // one current row can itself produce an unbounded number of children (e.g. a CROSS
+        // JOIN fan-out), and because the pending queue has no separate capacity bound, an
+        // admission-time check is the only thing standing between one high-fanout arm and
+        // unbounded queue growth: without it, every child would be enqueued (and, on a
+        // priority-ordered queue, each of those would itself be dequeued and re-expanded,
+        // compounding across generations) long before the old post-dequeue-only check ever
+        // got a chance to run. Checking synchronously, per row, inside the very loop that
+        // walks one arm's materialized result mirrors the pre-per-row-queue evaluator, which
+        // bailed out of its own per-generation loop the moment its running total crossed the
+        // same limit rather than finishing the loop first.
+        var admittedRowCount = 0;
+
+        void AdmitRow(SqlValue[] values)
         {
-            var values = row.ToArray();
             if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
-                continue;
+                return;
+
+            admittedRowCount++;
+            if (admittedRowCount > RecursiveCteRowLimit)
+            {
+                throw new EmbeddedSqlException(
+                    $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
+            }
 
             EnqueueRow(values);
         }
+
+        foreach (var row in anchor.Rows)
+            AdmitRow(row.ToArray());
 
         var recursiveOperatorDisplay = recursiveOperator == CompoundOperator.UnionAll ? "UNION ALL" : "UNION";
 
@@ -32706,11 +32731,6 @@ out bool hasReturning)
                 // DecrJumpZero jumping past the recursive step once the limit hits zero.
                 if (budget is int budgetValue && result.Count >= budgetValue)
                     return new SourceData(columns, result, collations, columnDefinitions);
-                if (result.Count > RecursiveCteRowLimit)
-                {
-                    throw new EmbeddedSqlException(
-                        $"recursive query for {name} exceeded the maximum of {RecursiveCteRowLimit} rows");
-                }
             }
 
             var iterationContext = cteContext with
@@ -32734,13 +32754,7 @@ out bool hasReturning)
                 }
 
                 foreach (var producedRow in termResult.Rows)
-                {
-                    var values = producedRow.ToArray();
-                    if (seen is not null && !TryAddRecursiveDistinctRow(seen, values, collations))
-                        continue;
-
-                    EnqueueRow(values);
-                }
+                    AdmitRow(producedRow.ToArray());
             }
         }
 
