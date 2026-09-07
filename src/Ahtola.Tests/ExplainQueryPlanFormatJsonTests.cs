@@ -163,6 +163,41 @@ public class ExplainQueryPlanFormatJsonTests
         json[0].Should().Contain("\"index\":{\"name\":\"idx_outer_age\"");
     }
 
+    /// <summary>
+    /// EXISTS/NOT EXISTS unnested into an internal semi/anti join always executes on the
+    /// evaluator's GetSemiOrAntiJoinRows, which probes an in-memory hash bucket
+    /// (TryGetTransientLookupRows) rather than seeking any real declared index -- even when one
+    /// exists on the correlation column. The describer must report that honestly ("USING
+    /// AUTOMATIC COVERING INDEX") instead of naming the real index this access path never
+    /// actually reads.
+    /// </summary>
+    [Test]
+    public void ExistsSemiJoinDescribesAutomaticIndexNotTheRealOne()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE semi_users (id INTEGER PRIMARY KEY, name TEXT); " +
+            "CREATE TABLE semi_orders (id INTEGER PRIMARY KEY, user_id INTEGER); " +
+            "CREATE INDEX idx_semi_orders_user ON semi_orders(user_id);");
+
+        var json = ReadAll(
+            connection,
+            """
+            EXPLAIN QUERY PLAN FORMAT=JSON
+            SELECT *
+            FROM semi_users u
+            WHERE EXISTS (SELECT 1 FROM semi_orders o WHERE o.user_id = u.id);
+            """);
+        json.Should().HaveCount(1);
+        json[0].Should().Contain("\"detail\":\"SCAN semi_users AS u\"");
+        json[0].Should().Contain(
+            "\"detail\":\"SEARCH o USING AUTOMATIC COVERING INDEX (user_id=?)\",\"op\":{\"type\":\"search\",\"table\":\"semi_orders\",\"alias\":\"o\",\"join\":\"semi\"");
+        json[0].Should().NotContain("idx_semi_orders_user");
+        json[0].Should().NotContain("\"integer_primary_key\"");
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         foreach (var statement in connection.PrepareScript(sql))

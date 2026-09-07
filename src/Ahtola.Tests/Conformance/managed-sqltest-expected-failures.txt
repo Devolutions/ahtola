@@ -74,8 +74,6 @@ turso/analyze.sqltest::analyze-table-without-rowid-fails | policy candidate: int
 # its statement terminator; some operations/topology remain incomplete. Native-layout IDs
 # are not a reason to fabricate operations or hide a missing materialization relationship.
 turso/explain-query-plan-json.sqltest::search-nodes-name-the-index-the-constraints-and-the-join | JSON SQL echo omits the trailing semicolon; join search/sorter operation metadata and node identifiers differ
-turso/explain-query-plan-json.sqltest::exists-is-reported-as-a-semi-join | JSON SQL echo and EXISTS semi-join topology differ from the pinned contract
-turso/explain-query-plan-json.sqltest::not-exists-is-reported-as-an-anti-join | JSON SQL echo and NOT EXISTS anti-join topology differ from the pinned contract
 turso/explain-query-plan-json.sqltest::both-readers-of-a-shared-cte-point-at-one-materialization | JSON SQL echo, shared CTE materialization metadata and reader relationships are incomplete
 turso/explain-query-plan-json.sqltest::a-from-clause-subquery-nests-its-body-under-its-own-scan | JSON SQL echo and nested FROM-subquery parent/child topology differ
 turso/explain-query-plan-json.sqltest::a-compound-select-lists-its-arms | JSON SQL echo and compound/compound-arm operation topology differ

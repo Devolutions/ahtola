@@ -108,6 +108,52 @@ public sealed partial class EmbeddedDatabase
             return true;
         }
 
+        // EXISTS/NOT EXISTS unnested into an internal semi/anti join (unnest.rs's
+        // try_rewrite_exists): the inner table's columns are never visible past a semi/anti join
+        // (JoinKind.ProducesLeftShapeOnly), so it is used only for the correlation test itself.
+        // TryBuildCompiledJoinSource declines Semi/Anti unconditionally (no bytecode lowering
+        // exists for it), so this always runs on the evaluator's GetSemiOrAntiJoinRows, which
+        // always probes an in-memory hash bucket built by TryGetTransientLookupRows -- it never
+        // seeks a real declared index, even when one exists on the correlation column. Describe
+        // that honestly ("USING AUTOMATIC COVERING INDEX", matching the same wording the
+        // compiled route's own genuinely-automatic hash join already uses elsewhere) rather than
+        // naming a real index this access path never actually reads.
+        if (rewritten.Source is JoinTableSource
+            {
+                Kind: JoinKind.Semi or JoinKind.Anti,
+            } semiAntiSource
+            && semiAntiSource is
+            {
+                Left: NamedTableSource semiOuter,
+                Right: NamedTableSource semiInner,
+                Condition: BinaryExpression { Operator: BinaryOperator.Equal } semiCondition,
+            }
+            && TryDescribeSemiOrAntiCorrelationColumn(semiCondition, semiInner, context, out var innerColumn))
+        {
+            var outerAlias = semiOuter.Alias ?? semiOuter.Name;
+            var innerAlias = semiInner.Alias ?? semiInner.Name;
+            result = new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    PlanRow(1, 0, $"SCAN {semiOuter.Name} AS {outerAlias}"),
+                    PlanRow(2, 0, $"SEARCH {innerAlias} USING AUTOMATIC COVERING INDEX ({innerColumn}=?)"),
+                ],
+                0);
+            ops =
+            [
+                new EqpJsonScanOp(semiOuter.Name, semiOuter.Alias, IndexName: null, Covering: false),
+                new EqpJsonSearchOp(
+                    semiInner.Name,
+                    semiInner.Alias,
+                    IndexName: null,
+                    Covering: true,
+                    [$"{innerColumn}=?"],
+                    Join: semiAntiSource.Kind == JoinKind.Semi ? "semi" : "anti",
+                    Ephemeral: true),
+            ];
+            return true;
+        }
+
         // Nothing became a join: describe the outer table's actual access method plus one tag
         // per correlated scalar subquery this select's own scope still holds (unnest.rs declined
         // every rewrite, or the subquery was never an aggregate candidate to begin with, e.g. a
@@ -177,6 +223,38 @@ public sealed partial class EmbeddedDatabase
 
     private static SqlValue[] PlanRow(int id, int parent, string detail) =>
         [SqlValue.Integer(id), SqlValue.Integer(parent), SqlValue.Integer(0), SqlValue.Text(detail)];
+
+    /// <summary>
+    /// Extracts the inner table's correlation column name from a semi/anti join's equality
+    /// condition (<c>inner.col = outer.expr</c> or <c>outer.expr = inner.col</c>), so the
+    /// describer can print it into the AUTOMATIC COVERING INDEX constraint text. Declines
+    /// (returns <see langword="false"/>) for anything other than one plain column reference
+    /// qualified by the inner table's own alias/name on exactly one side -- a composite or
+    /// expression key is not attempted here.
+    /// </summary>
+    private static bool TryDescribeSemiOrAntiCorrelationColumn(
+        BinaryExpression condition,
+        NamedTableSource inner,
+        QueryContext context,
+        out string columnName)
+    {
+        columnName = string.Empty;
+        var innerQualifier = inner.Alias ?? inner.Name;
+        var leftIsInner = IsColumnQualifiedBy(condition.Left, innerQualifier);
+        var rightIsInner = IsColumnQualifiedBy(condition.Right, innerQualifier);
+        if (leftIsInner == rightIsInner)
+            return false;
+
+        var innerColumn = (ColumnExpression)(leftIsInner ? condition.Left : condition.Right);
+        columnName = innerColumn.UnqualifiedName ?? innerColumn.Name;
+        return context.Tables.TryGetValue(inner.Name, out var table)
+            && table.TryGetColumnIndex(columnName, out _);
+    }
+
+    private static bool IsColumnQualifiedBy(Expression expression, string qualifier)
+        => expression is ColumnExpression { BooleanKeyword: null } column
+            && column.Qualifier is not null
+            && string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>
@@ -270,7 +348,8 @@ internal sealed record EqpJsonSearchOp(
     IReadOnlyList<string> Constraints,
     string? Join = null,
     bool Ephemeral = false,
-    string SearchKind = "seek") : EqpJsonOp
+    string SearchKind = "seek",
+    bool IsIntegerPrimaryKey = false) : EqpJsonOp
 {
     public override string ToJson()
     {
@@ -278,7 +357,11 @@ internal sealed record EqpJsonSearchOp(
         AppendTableFields(json, Table, Alias, Join);
         json.Append(",\"search_kind\":").Append(EmbeddedDatabase.JsonEscape(SearchKind));
         AppendIndexField(json, IndexName, Covering, Ephemeral);
-        if (IndexName is null)
+        // Turso's own contract only sets this when the search has *no* index at all because it
+        // seeks the table's declared INTEGER PRIMARY KEY (rowid) directly -- distinct from
+        // IndexName being null because the access path is an ephemeral/automatic structure with
+        // no real persisted name to report (see the semi/anti-join describer).
+        if (IndexName is null && IsIntegerPrimaryKey)
             json.Append(",\"integer_primary_key\":true");
         json.Append(",\"constraints\":[")
             .Append(string.Join(",", Constraints.Select(static c => EmbeddedDatabase.JsonEscape(c))))
