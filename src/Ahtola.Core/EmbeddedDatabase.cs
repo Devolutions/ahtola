@@ -29666,6 +29666,19 @@ out bool hasReturning)
         if (index.Columns.Any(term => term.IsExpression))
             return false;
 
+        // An index over a VIRTUAL generated column has no physical row bytes of its own to
+        // index directly: the entry SQLite/Turso build is really an expression index over the
+        // column's defining expression, and neither engine treats an expression index as
+        // COVERING even when the expression's value is the only thing the query needs. Mirror
+        // that: a VIRTUAL generated column anywhere in the index keeps it a plain SCAN/SEARCH.
+        if (index.Columns.Any(term =>
+                term.ColumnIndex >= 0
+                && term.ColumnIndex < table.ColumnDefinitions.Length
+                && table.ColumnDefinitions[term.ColumnIndex] is { GenerationExpression: not null, GeneratedStored: false }))
+        {
+            return false;
+        }
+
         var covered = new HashSet<int>();
         foreach (var term in index.Columns)
         {
