@@ -9530,9 +9530,19 @@ internal sealed class EmbeddedFileStore : IDisposable
         // return a definitive answer from identity alone (that would risk the same false
         // "changed" result the referenced remarks describe) — it simply skips the fast path and
         // falls through to the row-by-row content comparison below, which is unconditionally
-        // correct regardless of either side's resolution state.
-        if (left.HasPendingRowLoad == right.HasPendingRowLoad && left.RowStorageIdentity == right.RowStorageIdentity)
+        // correct regardless of either side's resolution state. The same remarks also explain
+        // why a poisoned (permanently failed) table must never be treated as "resolved" here
+        // either — HasPendingRowLoad reads false for both a poisoned and a genuinely successful
+        // table, and a failed load's Clear() still advances Revision by one, so this excludes
+        // either side being poisoned from the fast path too: only a table that is neither still
+        // pending nor poisoned nor the other side counts as genuinely "resolved" for this check.
+        if (!left.HasFailedRowLoad
+            && !right.HasFailedRowLoad
+            && left.HasPendingRowLoad == right.HasPendingRowLoad
+            && left.RowStorageIdentity == right.RowStorageIdentity)
+        {
             return true;
+        }
 
         if (left.Rows.Count != right.Rows.Count || left.RowIds.Count != right.RowIds.Count)
             return false;
@@ -10169,8 +10179,27 @@ internal sealed class EmbeddedFileStore : IDisposable
         // both to resolve via the Rows property — exactly the original, proven-correct
         // comparison — scoped to just this one table's storage, never the whole catalog.
         // </para>
-        if (table.HasPendingRowLoad == previous.HasPendingRowLoad)
+        // <para>
+        // "Resolved" above must never include a table whose load permanently failed:
+        // <see cref="EmbeddedTable.HasPendingRowLoad"/> reports false for BOTH a genuinely
+        // successful load and a poisoned one (see <see cref="EmbeddedTable.HasFailedRowLoad"/>),
+        // and a failed load's cleanup (<c>RowStore.Clear()</c>, called after a loader throws
+        // partway through) still increments <see cref="RowStore.Revision"/> by exactly one — so
+        // a poisoned, same-lineage table's (LineageId, Revision) pair can coincidentally match a
+        // genuinely healthy instance's. Trusting RowStorageIdentity in that case would let this
+        // fast path silently declare "unchanged" instead of surfacing the failure, which a
+        // caller like <see cref="ValidateTableRepresentable"/> could then skip re-validating
+        // entirely. Whenever either side is poisoned this instead always falls through to
+        // forcing <see cref="EmbeddedTable.Rows"/> below, which rethrows the captured failure
+        // exactly like any other access to that table would — the comparison can never bypass a
+        // poisoned table's failure into a false "unchanged" result.
+        // </para>
+        if (!table.HasFailedRowLoad
+            && !previous.HasFailedRowLoad
+            && table.HasPendingRowLoad == previous.HasPendingRowLoad)
+        {
             return table.RowStorageIdentity == previous.RowStorageIdentity;
+        }
 
         return table.Rows.LineageId == previous.Rows.LineageId && table.Rows.Revision == previous.Rows.Revision;
     }

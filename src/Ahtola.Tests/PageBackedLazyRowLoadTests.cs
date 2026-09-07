@@ -476,6 +476,81 @@ public sealed class PageBackedLazyRowLoadTests
     }
 
     [Test]
+    public void APoisonedTableNeverPassesAsUnchangedJustBecauseItsRevisionCoincidentallyMatchesAHealthyClone()
+    {
+        // Regression coverage for a subtle hole a reviewer found in the fix committed as fd51b6d
+        // (IsTableRowStorageUnchangedFromPrevious / HaveSameRows's HasPendingRowLoad-gated fast
+        // path): EmbeddedTable.HasPendingRowLoad reports false for BOTH a genuinely successful
+        // load AND a permanently failed (poisoned) one -- see HasFailedRowLoad -- and a failed
+        // load's cleanup (RowStore.Clear(), run unconditionally in EnsureRowsLoaded's catch
+        // block) still advances RowStore.Revision by exactly one, exactly like a single
+        // successful Add() would. So a poisoned clone and a healthy, same-lineage sibling can
+        // reach the identical (LineageId, Revision) pair purely by construction, not by any real
+        // absence of mutation -- and the fd51b6d fast path, which only checked
+        // "both sides report the same HasPendingRowLoad", would have silently treated that as
+        // proof of "unchanged", masking the failure entirely instead of surfacing it.
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "poisoned-vs-healthy-clone.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);");
+            // Exactly one row: the healthy side's real load ends at Revision == 1 (one Add()).
+            Execute(connection, "INSERT INTO t VALUES (1, 10);");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        var healthy = reopened.LiveCatalog.Tables["t"];
+        healthy.HasPendingRowLoad.Should().BeTrue(
+            "a reopened, indexless rowid-alias table must still be lazy immediately after physical open");
+
+        // Clone while still pending, so the clone independently carries forward the SAME
+        // lineage and the SAME (unresolved) pending-load delegate as the shared instance --
+        // see EmbeddedTable.TryCopyPendingRowLoadTo -- before either side ever resolves.
+        var poisoned = healthy.Clone();
+        poisoned.HasPendingRowLoad.Should().BeTrue();
+
+        // Replace the clone's loader with one that fails before adding anything: the failure
+        // cleanup's Clear() call still advances Revision from 0 to 1, exactly matching what the
+        // healthy sibling's own single real Add() below will also produce.
+        poisoned.AttachPendingRowLoader(_ => throw new InvalidDataException("simulated mid-load corruption"));
+
+        Action poisonedAccess = () => _ = poisoned.Rows.Count;
+        poisonedAccess.Should().Throw<InvalidDataException>();
+        poisoned.HasFailedRowLoad.Should().BeTrue();
+
+        // Resolve the healthy sibling naturally, decoding the one real row from disk.
+        healthy.Rows.Count.Should().Be(1);
+        healthy.HasFailedRowLoad.Should().BeFalse();
+
+        // Sanity: both sides really do reach the coincidentally-identical identity the bug
+        // exploited -- same lineage (Clone/AttachPendingRowLoader never rebuild the RowStore),
+        // same Revision (1, from unrelated causes on each side).
+        poisoned.RowStorageIdentity.Should().Be(healthy.RowStorageIdentity);
+        poisoned.HasPendingRowLoad.Should().Be(healthy.HasPendingRowLoad);
+
+        // EmbeddedFileStore.AdoptCommittedTables calls the exact same HaveSameRows this test
+        // targets, to decide whether a caller's dictionary may be trusted as this store's new
+        // committed-tables baseline. Presenting it the poisoned clone in place of the healthy
+        // table must fail closed -- surfacing the captured load failure -- rather than silently
+        // adopting a reference whose rows can never be trusted again. poisoned.Rows was already
+        // forced once above (poisonedAccess), so this second access re-raises through
+        // EnsureRowsLoaded's "already failed" branch (InvalidOperationException wrapping the
+        // original InvalidDataException) rather than the raw exception a first access throws --
+        // either way, the important thing this test proves is that it throws at all instead of
+        // silently returning "unchanged".
+        var fileStore = reopened.FileStore;
+        fileStore.Should().NotBeNull();
+        Action adopt = () => fileStore!.AdoptCommittedTables(
+            new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase) { ["t"] = poisoned });
+        adopt.Should().Throw<InvalidOperationException>()
+            .WithMessage("*rows can no longer be trusted*")
+            .WithInnerException<InvalidDataException>()
+            .WithMessage("simulated mid-load corruption");
+    }
+
+    [Test]
     public void VacuumFailsClosedInsteadOfPersistingATableWhoseLazyLoadFailed()
     {
         var fileSystem = new InMemoryFileSystem();
