@@ -92,16 +92,30 @@ internal readonly record struct FileCatalogVersion(
     int PageSize,
     SqliteTextEncoding TextEncoding)
 {
-    public static FileCatalogVersion FromHeader(SqliteDatabaseHeader header)
-        => new(
+    /// <summary>
+    /// Builds a <see cref="FileCatalogVersion"/> from a parsed header, substituting
+    /// <paramref name="trustedPageCount"/> (the pager's actual committed page count) for
+    /// <see cref="SqliteDatabaseHeader.DatabaseSizeInPages"/> whenever the header's own count is
+    /// untrusted: zero, or reported when <see cref="SqliteDatabaseHeader.VersionValidFor"/>
+    /// does not match <see cref="SqliteDatabaseHeader.ChangeCounter"/> (file format spec 1.3.7
+    /// "Database Size"). Returning the raw untrusted value here would leak a stale or absent
+    /// page count into every caller of <c>CommittedCatalogVersion</c> (PRAGMA page_count and
+    /// friends), even though the pager itself already computed the real count from the file.
+    /// </summary>
+    public static FileCatalogVersion FromHeader(SqliteDatabaseHeader header, uint trustedPageCount)
+    {
+        var headerSizeIsAuthoritative = header.DatabaseSizeInPages != 0
+            && header.VersionValidFor == header.ChangeCounter;
+        return new FileCatalogVersion(
             header.ChangeCounter,
             header.SchemaCookie,
-            header.DatabaseSizeInPages,
+            headerSizeIsAuthoritative ? header.DatabaseSizeInPages : trustedPageCount,
             header.FreelistPageCount,
             header.UserVersion,
             header.ApplicationId,
             header.PageSize,
             header.TextEncoding);
+    }
 }
 
 internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
@@ -5181,13 +5195,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             readOnly: true,
             foreignReadOnly: foreignReadOnly);
         var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
-        // The in-header database size is only authoritative when the change counter exactly
-        // matches the version-valid-for number (file format spec 1.3.7 "Database Size"); when
-        // they differ the header's declared size is merely untrusted, not evidence of
-        // corruption (see the matching comment on SqlitePager.InitializeCleanWalView), so the
-        // size check only applies once that precondition holds.
-        if (header.VersionValidFor == header.ChangeCounter
-            && header.DatabaseSizeInPages != pager.CommittedPageCount)
+        // The in-header database size is only authoritative when it is non-zero AND the change
+        // counter exactly matches the version-valid-for number (file format spec 1.3.7
+        // "Database Size"); a zero size is untrusted even when the counters agree (the spec's
+        // "non-zero" clause), and any other mismatch means the header's declared size is merely
+        // untrusted, not evidence of corruption (see the matching comment on
+        // SqlitePager.InitializeCleanWalView). Either way the untrusted size must never be
+        // reported as this file's page count -- pager.CommittedPageCount (computed from the
+        // actual file) is the only trustworthy value to hand back in that case.
+        var headerSizeIsAuthoritative = header.DatabaseSizeInPages != 0
+            && header.VersionValidFor == header.ChangeCounter;
+        if (headerSizeIsAuthoritative && header.DatabaseSizeInPages != pager.CommittedPageCount)
         {
             throw new InvalidDataException(
                 "The managed file catalog does not have an authoritative committed SQLite header.");
@@ -5196,7 +5214,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new FileCatalogVersion(
             header.ChangeCounter,
             header.SchemaCookie,
-            header.DatabaseSizeInPages,
+            headerSizeIsAuthoritative ? header.DatabaseSizeInPages : pager.CommittedPageCount,
             header.FreelistPageCount,
             header.UserVersion,
             header.ApplicationId,
@@ -37046,19 +37064,34 @@ out bool hasReturning)
             // Query this class never actually parsed. DROP VIEW bypasses this helper (it reads
             // catalog.Views directly in DdlStatementCompiler.CompileDropView), so the row can
             // still be removed.
-            if (found.BrokenReason is { } reason)
-            {
-                throw new EmbeddedSqlException(
-                    $"view '{name}' could not be loaded: its SQL in sqlite_schema does not parse ({reason}). "
-                        + "Use DROP VIEW to remove it, then recreate it.");
-            }
-
+            ThrowIfBroken(found, name);
             view = found;
             return true;
         }
 
         view = null!;
         return false;
+    }
+
+    /// <summary>
+    /// Fails closed the moment a broken view (see <see cref="ViewDefinition.BrokenReason"/>) is
+    /// about to be resolved as an actual query source, wherever that resolution happens to
+    /// enter -- <see cref="TryGetView"/>'s SELECT-side lookup, and the INSTEAD OF trigger DML
+    /// paths (PerformInsteadOfInsert/Update/Delete in EmbeddedDatabase.Triggers.cs) that look up
+    /// <c>context.Views</c> directly rather than through <see cref="TryGetView"/>. Centralized
+    /// here (rather than duplicated at every call site) and in <see cref="ResolveViewColumns"/>
+    /// and <see cref="GetViewRows"/>, the two primitives every one of those paths ultimately
+    /// calls, so a caller cannot accidentally reintroduce the gap by adding a new direct
+    /// <c>context.Views.TryGetValue</c> lookup that forgets the check.
+    /// </summary>
+    private static void ThrowIfBroken(ViewDefinition view, string name)
+    {
+        if (view.BrokenReason is { } reason)
+        {
+            throw new EmbeddedSqlException(
+                $"view '{name}' could not be loaded: its SQL in sqlite_schema does not parse ({reason}). "
+                    + "Use DROP VIEW to remove it, then recreate it.");
+        }
     }
 
     // Enters a view's resolution scope, guarding against direct or mutual recursion and
@@ -37087,9 +37120,12 @@ out bool hasReturning)
     }
 
     private static string[] ResolveViewColumns(ViewDefinition view, QueryContext viewContext)
-        => viewContext.SchemaValidation && view.Columns is not null
+    {
+        ThrowIfBroken(view, view.Name);
+        return viewContext.SchemaValidation && view.Columns is not null
             ? view.Columns.ToArray()
             : ApplyViewColumnNames(view, DescribeQuery(view.Query, viewContext));
+    }
 
     private static string[] ApplyViewColumnNames(ViewDefinition view, string[] queryColumns)
     {

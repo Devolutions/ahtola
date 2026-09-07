@@ -3906,15 +3906,19 @@ public sealed class SqlitePager : IDisposable
                 "A rollback-journal SQLite database requires legacy read and write format versions.");
         }
 
-        // The in-header database size is only authoritative when the change counter exactly
-        // matches the version-valid-for number (file format spec 1.3.7 "Database Size"). When
-        // they differ, the header's declared size is not trustworthy and the spec says to fall
-        // back to the size derived from the actual file -- not to refuse to open. Turso in
-        // particular writes a fixed version-valid-for constant that only a VACUUM updates
-        // (core/storage/sqlite3_ondisk.rs), so an otherwise-valid Turso-authored database that
-        // was never vacuumed routinely fails this equality without being corrupt.
-        if (header.VersionValidFor == header.ChangeCounter
-            && header.DatabaseSizeInPages != _pageStore.PageCount)
+        // The in-header database size is only authoritative when it is non-zero AND the change
+        // counter exactly matches the version-valid-for number (file format spec 1.3.7
+        // "Database Size"). A zero size is untrusted even when the counters agree (the spec's
+        // own "non-zero" clause); any other mismatch means the header's declared size is merely
+        // untrusted, not evidence of corruption. Turso in particular writes a fixed
+        // version-valid-for constant that only a VACUUM updates (core/storage/sqlite3_ondisk.rs),
+        // so an otherwise-valid Turso-authored database that was never vacuumed routinely fails
+        // this equality without being corrupt. Either way the spec says to fall back to the size
+        // derived from the actual file -- not to refuse to open -- which _pageStore.PageCount
+        // already reflects below regardless of this check's outcome.
+        var headerSizeIsAuthoritative = header.DatabaseSizeInPages != 0
+            && header.VersionValidFor == header.ChangeCounter;
+        if (headerSizeIsAuthoritative && header.DatabaseSizeInPages != _pageStore.PageCount)
         {
             throw new InvalidDataException(
                 "A rollback-journal SQLite database must have an authoritative main-database header.");
@@ -3937,12 +3941,13 @@ public sealed class SqlitePager : IDisposable
             throw new InvalidDataException("A clean SQLite WAL view requires WAL/MVCC read and write format versions.");
         }
 
-        // See the matching comment in InitializeRollbackJournalView: a version-valid-for/
-        // change-counter mismatch means the header's declared page count is merely untrusted,
-        // not that the database is corrupt, so this falls back to the real page count instead
-        // of throwing.
-        if (header.VersionValidFor == header.ChangeCounter
-            && header.DatabaseSizeInPages != _pageStore.PageCount)
+        // See the matching comment in InitializeRollbackJournalView: a zero size, or a
+        // version-valid-for/change-counter mismatch, means the header's declared page count is
+        // merely untrusted, not that the database is corrupt, so this falls back to the real
+        // page count instead of throwing.
+        var headerSizeIsAuthoritative = header.DatabaseSizeInPages != 0
+            && header.VersionValidFor == header.ChangeCounter;
+        if (headerSizeIsAuthoritative && header.DatabaseSizeInPages != _pageStore.PageCount)
         {
             throw new InvalidDataException(
                 "A SQLite WAL database without a WAL file must have an authoritative main-database header.");

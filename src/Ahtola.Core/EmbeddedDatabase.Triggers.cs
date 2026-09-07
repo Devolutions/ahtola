@@ -2548,7 +2548,7 @@ public sealed partial class EmbeddedDatabase
     {
         if (statement.Upsert is not null)
             throw new EmbeddedSqlException("cannot UPSERT a view");
-        if (context.Views is null || !context.Views.TryGetValue(statement.TableName, out var view))
+        if (!TryGetView(context, statement.TableName, out var view))
             throw new EmbeddedSqlException($"no such view: {statement.TableName}");
 
         var triggers = GetRowTriggers(
@@ -2644,7 +2644,7 @@ public sealed partial class EmbeddedDatabase
             throw new EmbeddedSqlException(
                 "Managed INSTEAD OF UPDATE triggers do not support limited DML or RETURNING.");
         }
-        if (context.Views is null || !context.Views.TryGetValue(statement.TableName, out var view))
+        if (!TryGetView(context, statement.TableName, out var view))
             throw new EmbeddedSqlException($"no such view: {statement.TableName}");
 
         var triggers = GetRowTriggers(
@@ -2708,7 +2708,7 @@ public sealed partial class EmbeddedDatabase
             throw new EmbeddedSqlException(
                 "Managed INSTEAD OF DELETE triggers do not support limited DML or RETURNING.");
         }
-        if (context.Views is null || !context.Views.TryGetValue(statement.TableName, out var view))
+        if (!TryGetView(context, statement.TableName, out var view))
             throw new EmbeddedSqlException($"no such view: {statement.TableName}");
 
         var triggers = GetRowTriggers(

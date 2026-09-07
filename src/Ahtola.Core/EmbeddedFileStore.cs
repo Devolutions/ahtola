@@ -3063,7 +3063,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             checkpointAfterCommit: false,
             vacuumSourceHeader: vacuumSourceHeader);
 
-    internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
+    internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header, _pager.CommittedPageCount);
 
     /// <summary>
     /// Rebuilds the current managed catalog into the smallest complete page image
