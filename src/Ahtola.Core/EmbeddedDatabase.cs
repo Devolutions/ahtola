@@ -58783,9 +58783,11 @@ Func<string, ParsedStatement> rewrite)
         var resolvedSchemas = schemas
             .Select(ResolveCollectedSchema)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return TryRouteAttachedUpdateReadingMain(statement, resolvedSchemas, out var routed)
-            ? routed
-            : RouteForSchemas(statement, schemas);
+        if (TryRouteAttachedUpdateReadingMain(statement, resolvedSchemas, out var routed))
+            return routed;
+        if (TryRouteSingleWriteMultiSchemaStatement(statement, resolvedSchemas, out routed))
+            return routed;
+        return RouteForSchemas(statement, schemas);
     }
 
     // Turso acquires the independent read and write databases needed by a temp trigger subprogram
@@ -58903,6 +58905,112 @@ Func<string, ParsedStatement> rewrite)
             static entry => entry.Value.Clone(),
             StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Generalizes <see cref="TryRouteAttachedUpdateReadingMain"/> beyond "attached UPDATE reading
+    /// main only": any INSERT/UPDATE/DELETE that touches more than one schema routes here as long
+    /// as exactly one of those schemas is the statement's actual write target (any of main, temp,
+    /// or an attachment - not just main). The target keeps its own catalog; every other schema the
+    /// source/predicate reads is merged in as a read-only external table, aliased on a name
+    /// collision, mirroring how <see cref="RouteMultiSchemaReadQuery"/> merges every referenced
+    /// schema for pure reads. Turso plans the write and every read with independent database IDs; this is the
+    /// managed equivalent for the narrow "one write, several reads" shape the corpus exercises
+    /// (INSERT ... SELECT across databases, DELETE ... WHERE x IN (SELECT ... FROM other db)).
+    /// </summary>
+    private bool TryRouteSingleWriteMultiSchemaStatement(
+        ParsedStatement statement,
+        IReadOnlySet<string> resolvedSchemas,
+        out RoutedStatement routed)
+    {
+        routed = default;
+        if (resolvedSchemas.Count < 2)
+            return false;
+
+        string targetName;
+        switch (statement)
+        {
+            case InsertStatement { Upsert: null } insert:
+                targetName = insert.TableName;
+                break;
+            case UpdateStatement { From: null, IndexDirective: null } update:
+                targetName = update.TableName;
+                break;
+            case DeleteStatement delete:
+                targetName = delete.TableName;
+                break;
+            default:
+                return false;
+        }
+
+        var targetSchema = ManagedSchemaName.TrySplit(targetName, out var qualifiedSchema, out var targetLocalName)
+            ? qualifiedSchema
+            : ResolveCollectedSchema(UnqualifiedSchemaMarker + targetName);
+        if (!ManagedSchemaName.TrySplit(targetName, out _, out targetLocalName))
+            targetLocalName = targetName;
+
+        if (!resolvedSchemas.Contains(targetSchema)
+            || FindSchemaDatabase(targetSchema) is not { } targetDatabase)
+        {
+            return false;
+        }
+
+        var readSchemas = resolvedSchemas
+            .Where(schema => !schema.Equals(targetSchema, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (readSchemas.Length == 0)
+            return false;
+
+        var targetCatalog = GetTransactionState(targetDatabase)?.Catalog ?? targetDatabase.LiveCatalog;
+        var usedNames = new HashSet<string>(targetCatalog.Tables.Keys, StringComparer.OrdinalIgnoreCase);
+        var externalTables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
+        var sourceNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var schema in readSchemas)
+        {
+            if (FindSchemaDatabase(schema) is not { } database)
+                return false;
+
+            var catalog = GetTransactionState(database)?.Catalog ?? database.LiveCatalog;
+            foreach (var pair in catalog.Tables)
+            {
+                var sourceName = usedNames.Contains(pair.Key) ? "\u0001" + schema + ":" + pair.Key : pair.Key;
+                usedNames.Add(sourceName);
+                externalTables[sourceName] = pair.Value.Clone();
+                sourceNames[MainTempSourceKey(schema, pair.Key)] = sourceName;
+            }
+        }
+
+        var noCtes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rewritten = statement switch
+        {
+            InsertStatement insert => insert with
+            {
+                TableName = targetLocalName,
+                Source = insert.Source is null
+                    ? null
+                    : RewriteMainTempReadQuery(insert.Source, sourceNames, noCtes),
+                Rows = insert.Rows.Select(row => row.Select(expression =>
+                    RewriteMainTempReadExpression(expression, sourceNames, noCtes)!).ToArray()).ToArray(),
+            },
+            UpdateStatement update => update with
+            {
+                TableName = targetLocalName,
+                Where = RewriteMainTempReadExpression(update.Where, sourceNames, noCtes),
+            },
+            DeleteStatement delete => delete with
+            {
+                TableName = targetLocalName,
+                Where = RewriteMainTempReadExpression(delete.Where, sourceNames, noCtes),
+            },
+            _ => statement,
+        };
+
+        routed = new RoutedStatement(
+            targetDatabase,
+            rewritten,
+            IsAttached: !ReferenceEquals(targetDatabase, _database) && !ReferenceEquals(targetDatabase, _tempDatabase),
+            ExternalTables: externalTables);
+        return true;
+    }
+
     private RoutedStatement RouteForSchemas(ParsedStatement statement, HashSet<string> schemas)
     {
         var resolvedSchemas = schemas
@@ -58913,11 +59021,9 @@ Func<string, ParsedStatement> rewrite)
         if (statement is QueryStatement query
             && !StatementMayMutate(_database, statement)
             && !StatementMayMutate(_tempDatabase, statement)
-            && resolvedSchemas.Count == 2
-            && resolvedSchemas.Contains("main")
-            && resolvedSchemas.Contains("temp"))
+            && resolvedSchemas.Count >= 2)
         {
-            return RouteMainTempReadQuery(query);
+            return RouteMultiSchemaReadQuery(query, resolvedSchemas);
         }
         if (resolvedSchemas.Count != 1)
         {
@@ -59027,18 +59133,32 @@ Func<string, ParsedStatement> rewrite)
     }
 
     // Temp is connection-private, so a read-only catalog can safely combine its current snapshot with main.
-    // Attached databases deliberately remain outside this route because they have independent lock lifecycles.
-    private RoutedStatement RouteMainTempReadQuery(QueryStatement query)
+    // Attached databases have independent lock lifecycles, but a pure SELECT never needs a write lock on
+    // them, so the same synthetic-catalog technique generalizes to any set of schemas: merge every
+    // referenced schema's tables into one read-only catalog (aliasing a name that exists in more than one
+    // schema so both stay reachable), rewrite every table/column reference to the merged name, and execute
+    // against main's engine (which already shares the function/collation registry every attachment was
+    // seeded with at ATTACH time).
+    private RoutedStatement RouteMultiSchemaReadQuery(QueryStatement query, IEnumerable<string> resolvedSchemas)
     {
-        var mainCatalog = GetTransactionState(_database)?.Catalog ?? _database.LiveCatalog;
-        var tempCatalog = GetTransactionState(_tempDatabase)?.Catalog ?? _tempDatabase.LiveCatalog;
-        var mainTableNames = new HashSet<string>(mainCatalog.Tables.Keys, StringComparer.OrdinalIgnoreCase);
-        var tempTableNames = new HashSet<string>(tempCatalog.Tables.Keys, StringComparer.OrdinalIgnoreCase);
         var tables = new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
         var sourceNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        AddTables("main", mainCatalog, tempTableNames);
-        AddTables("temp", tempCatalog, mainTableNames);
+        foreach (var schema in resolvedSchemas)
+        {
+            if (FindSchemaDatabase(schema) is not { } database)
+                throw new EmbeddedSqlException($"no such database: {schema}");
+
+            var catalog = GetTransactionState(database)?.Catalog ?? database.LiveCatalog;
+            foreach (var pair in catalog.Tables)
+            {
+                var sourceName = usedNames.Contains(pair.Key) ? "\u0001" + schema + ":" + pair.Key : pair.Key;
+                usedNames.Add(sourceName);
+                tables[sourceName] = pair.Value;
+                sourceNames[MainTempSourceKey(schema, pair.Key)] = sourceName;
+            }
+        }
 
         // A view's own identity/routing stays wherever CREATE [TEMP] VIEW stored it (its name
         // is never renamed the way a colliding table's is), but its body must resolve through
@@ -59060,21 +59180,6 @@ Func<string, ParsedStatement> rewrite)
                 tables,
                 views,
                 new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase)));
-
-        void AddTables(
-            string schema,
-            EmbeddedDatabase.SchemaCatalog catalog,
-            HashSet<string> otherTableNames)
-        {
-            foreach (var pair in catalog.Tables)
-            {
-                var sourceName = otherTableNames.Contains(pair.Key)
-                    ? "\u0001" + schema + ":" + pair.Key
-                    : pair.Key;
-                tables.Add(sourceName, pair.Value);
-                sourceNames.Add(MainTempSourceKey(schema, pair.Key), sourceName);
-            }
-        }
     }
 
     private QueryStatement RewriteMainTempReadQuery(
