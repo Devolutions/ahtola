@@ -262,6 +262,43 @@ public sealed class AsyncBoundedRowidScanTests
     }
 
     [Test]
+    public async Task SchemaWalkerPinsItsOwnLeafSoAnOverflowingCreateTableTextEnforcesTheBudgetToo()
+    {
+        // The exact same class of bug as the row cursor's leaf-pinning fix, but for
+        // AsyncSchemaCatalogLoader's own traversal of sqlite_schema: a single, very wide
+        // CREATE TABLE forces its own stored SQL text into sqlite_schema's "sql" column to
+        // overflow beyond page 1's local payload threshold, so loading the schema itself must
+        // fetch at least one overflow page while page 1 (the schema's only leaf, since one
+        // table's schema row easily fits in a single page otherwise) is still logically needed.
+        var fileSystem = new InMemoryFileSystem();
+        var manyColumns = string.Join(", ", Enumerable.Range(0, 200).Select(i => $"column_{i}_with_a_long_name INTEGER"));
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+            Execute(connection, $"CREATE TABLE wide(id INTEGER PRIMARY KEY, {manyColumns});");
+
+        await using var pager = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            DatabasePath,
+            WalPath,
+            readOnly: true);
+        await using var readTransaction = await pager.BeginReadAsync();
+        // Budget of 1: page 1 is the schema's own leaf holding the "wide" row, whose SQL text
+        // overflows -- exactly the scenario where an unpinned leaf could be silently evicted to
+        // make room for the overflow page.
+        var pageCache = new BoundedAsyncPageCache(readTransaction, pager.UsableSpace, capacity: 1);
+
+        var act = async () => await AsyncSchemaCatalogLoader.LoadAsync(pageCache, SqliteTextEncoding.Utf8);
+
+        await act.Should().ThrowAsync<SqliteBoundedPageBudgetExceededException>();
+
+        // Recovery after the fault: the read transaction (and therefore the connection) must
+        // still be a valid, disposable object -- a budget fault during schema loading is
+        // terminal for that one LoadAsync call, not for the whole connection.
+        var disposeAct = async () => await readTransaction.DisposeAsync();
+        await disposeAct.Should().NotThrowAsync();
+    }
+
+    [Test]
     public async Task RejectsUnsupportedShapesBeforeAnyPageIsRead()
     {
         var fileSystem = new InMemoryFileSystem();
