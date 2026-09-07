@@ -263,7 +263,7 @@ This slice is not general asynchronous SQL execution or encrypted-page support.
 
 ### Later checkpoint: `b383ae6`
 
-The live inventory now contains 113 recorded differences. Eleven planner
+The live inventory now contains 104 recorded differences. Eleven planner
 markers closed (eight correlated-query descriptions and three generated-column
 index descriptions); adoption of the 15-case JSON EQP file exposed 12 remaining
 contract differences. The compiled LEFT JOIN suffix change does not close the
@@ -285,15 +285,28 @@ with retained output, and released batch entries drop their actual references.
 Working sets larger than cache capacity can still reload indexes; this is not
 a claim of full partition-reordered grace execution.
 
-Mixed-database atomic publication and foreign CDC remain blocked. Reordering
-physical and memory commits, or accurately labeling a partial commit, is not
-an atomicity guarantee. Foreign CDC also needs durable handling of partial
-ON CONFLICT FAIL writes. The locale implementation and bounded browser profile
-remain withheld pending their respective cache-bound and corrupt-schema
-recovery corrections. A dedicated follow-up owns reusable sync prefix history;
-the accepted staging/rebase/hash-reuse slice is not that history implementation.
+Safe ATTACH transaction scope and foreign CDC are delivered: multiple
+connection-private memory databases can commit together, while any physical
+database write must be the transaction's sole database mutation. This
+conservative guard avoids claiming physical-plus-memory atomicity. Partial
+ON CONFLICT FAIL writes publish their matching CDC records after the statement
+outcome is known. The constrained locale and bounded browser profiles are
+delivered with their explicit supported-shape limits.
 
-The broader conformance run exposed timeout failures in groupby/default.sqltest
-and subquery/default.sqltest. A focused worker is checking the current engine
-against the same fixtures and per-case time budget; neither the timeout nor
-the fixture size is being relaxed.
+Reusable sync-prefix history remains deferred. Its frozen delta-capture
+checkpoint was withheld because a v5-only decoder would reject durable,
+in-flight v4 recovery state after upgrade. The accepted staging/rebase/hash-
+reuse slice is not a reusable multi-generation history implementation.
+
+The broader conformance run initially exposed timeout failures in
+groupby/default.sqltest and subquery/default.sqltest. On the integrated parent,
+the two complete files now pass under the unchanged 30-second per-case cap
+(2/2 NUnit file tests, 10m59s total). A spill-record batching prototype was
+therefore not needed and was withheld because its whole-record pooled buffers
+were outside the finite execution-memory ledger. Neither the timeout nor the
+fixture size was relaxed.
+
+The frozen window-bounding checkpoint was also withheld after final review
+found allocate-before-reserve and exception-path accounting leaks. Existing
+window semantics remain integrated; a strict overall out-of-core evaluator
+bound is not claimed.

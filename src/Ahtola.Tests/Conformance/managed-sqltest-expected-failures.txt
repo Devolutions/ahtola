@@ -143,9 +143,10 @@ integrity_check/parity_overflow_list_length_mismatch.sqltest::quick-check-overfl
 # sequence watermarks have since been fixed. Remaining ALTER entries preserve SQLite-style
 # token-spliced schema text or differ in CLI error decoration. FK replay/reopen and generated
 # column value-preservation tests guard the semantic fixes independently of text formatting.
-# Cross-database atomic publication (reversible multi-database transactions with at most one
-# physical file) and attached-database CDC routing (connection-wide capture routed to whichever
-# attached database owns turso_cdc) have since been fixed, leaving only one intentional
+# Cross-database atomic publication is supported for multiple connection-private memory databases;
+# a transaction that writes a physical database must touch no other database and fails before
+# mutation otherwise. Attached-database CDC routing (connection-wide capture routed to whichever
+# attached database owns turso_cdc) has also been fixed, leaving only one intentional
 # SQL-source canonicalization difference in turso/attach/writes.sqltest. The final MVCC entries
 # retain intentional DDL/allocation/storage-mode contracts, pinned by
 # ManagedIntentionalMvccParityTests, not unsupported-harness exclusions.
@@ -169,7 +170,6 @@ turso/alter_column.sqltest::rename-parent-3-composite | schema rendering: replac
 turso/alter_column.sqltest::rename-self-1 | schema rendering: valid REFERENCES "s1_new" does not match the fixture's sql LIKE '%REFERENCES s1_new%' check for an unquoted table name
 turso/alter_column.sqltest::rename-self-2-composite | schema rendering: replacement table-name quoting and retained source whitespace differ from Turso's canonical form
 turso/attach/writes.sqltest::attach-write-schema-with-index-sql-canonical | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE INDEX idx1 ON t1 (name)' but was 'CREATE INDEX idx1 ON t1(name)'
-turso/gencol-index-order.sqltest::eqp-eq-prefix-order-by-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SEARCH t USING INDEX tav (a=?)' but was '1|0|0|SEARCH t USING COVERING INDEX tav (a=?)'
 turso/gencol-index-order.sqltest::eqp-group-by-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED COMPILED VDBE'
 turso/gencol-index-order.sqltest::eqp-max-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED COMPILED VDBE'
 turso/gencol-index-order.sqltest::eqp-order-by-desc-virtual-column-uses-index | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1|0|0|SCAN t USING INDEX tv' but was '0|0|0|MANAGED EVALUATOR FALLBACK'
