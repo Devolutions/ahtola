@@ -54903,6 +54903,9 @@ public sealed partial class EmbeddedConnection : IDisposable
     [field: ThreadStatic]
     internal static Action? AfterMvccBeginBeforeCatalogSnapshotForTesting { get; set; }
 
+    [field: ThreadStatic]
+    internal static Action<EmbeddedDatabase>? BeforeCommittingPersistentChangeForTesting { get; set; }
+
     private readonly EmbeddedDatabase _database;
     private EmbeddedDatabase _tempDatabase;
     private readonly Dictionary<string, AttachedDatabase> _attachedDatabases = new(StringComparer.OrdinalIgnoreCase);
@@ -58051,25 +58054,25 @@ public sealed partial class EmbeddedConnection : IDisposable
         // EnsureTransactionMayMutate's own check only sees an ALREADY-established HasChanges on
         // some OTHER tracked database - it cannot see the routed database's own pending write,
         // since that flag is only set after Execute() succeeds, strictly later than this routing
-        // step. A single EXPLICIT-TRANSACTION statement whose routed target and CDC owner are
-        // two DIFFERENT physical databases is therefore just as much an immediate two-physical-
-        // database violation as if the routed write had already completed and set HasChanges -
-        // StatementMayMutate already confirmed this statement mutates routed.Database above, so
-        // that write is unconditional (barring failure) regardless of whether its own HasChanges
-        // flag exists yet. Scoped to _transactionDatabases is not null for the same reason
-        // EnsureTransactionMayMutate's own multi-physical check is: an autocommit statement's
-        // routed-database write and its separate foreign-CDC-owner publish are each their own
-        // independent single-file commit, with no combined-COMMIT atomicity ever claimed between
-        // them, so two different physical databases across (or even within) autocommit
+        // step. A single EXPLICIT-TRANSACTION statement whose routed target and CDC owner are two
+        // DIFFERENT databases, where at least one of them is physical, is therefore just as much
+        // an immediate violation of the "a physical write must be the only database this
+        // transaction touches" rule as if the routed write had already completed and set
+        // HasChanges - StatementMayMutate already confirmed this statement mutates
+        // routed.Database above, so that write is unconditional (barring failure) regardless of
+        // whether its own HasChanges flag exists yet. Scoped to _transactionDatabases is not
+        // null for the same reason EnsureTransactionMayMutate's own check is: an autocommit
+        // statement's routed-database write and its separate foreign-CDC-owner publish are each
+        // their own independent single-file commit, with no combined-COMMIT atomicity ever
+        // claimed between them, so two different databases across (or even within) autocommit
         // statements over time is not the same hazard this guard exists to prevent.
         if (_transactionDatabases is not null
-            && foreignCdcDatabase.IsFileBacked
-            && routed.Database.IsFileBacked
-            && !ReferenceEquals(routed.Database, foreignCdcDatabase))
+            && !ReferenceEquals(routed.Database, foreignCdcDatabase)
+            && (foreignCdcDatabase.IsFileBacked || routed.Database.IsFileBacked))
         {
             throw new EmbeddedSqlException(
-                "Managed ATTACH transactions cannot modify more than one physical (disk-backed) "
-                + "database because independent WAL files cannot be committed atomically.");
+                "Managed ATTACH transactions cannot modify more than one database because "
+                + "independent WAL files cannot be committed atomically.");
         }
 
         EnsureTransactionMayMutate(foreignCdcDatabase, routed.Statement);
@@ -61570,11 +61573,25 @@ Func<string, ParsedStatement> rewrite)
         // the middle of a COMMIT where two or more database files are updated, some of those
         // files might get the changes where others might not" (sqlite.org/lang_attach.html). A
         // ':memory:' attachment has no file and no crash-recovery contract at all - a crash
-        // loses its state regardless of commit ordering - so any number of memory databases may
-        // be written in one transaction alongside at most one physical database without
-        // weakening that guarantee. Two or more physical databases stays rejected: Ahtola has no
-        // coordinated multi-file recovery (a master/super-journal or equivalent), so it cannot
-        // claim the atomicity SQLite itself declines to guarantee there.
+        // loses its state regardless of commit ordering, and each ':memory:' attachment is
+        // private to this connection (see ExecuteAttach), so there is never a concurrent writer
+        // that could invalidate a healthy commit either - so any number of memory databases may
+        // be written together in one transaction.
+        //
+        // A physical database's write, however, must still be the ONLY database this transaction
+        // touches - not just "at most one OTHER physical database", but no other database at
+        // all, including ':memory:' ones. Committing a physical database first and then applying
+        // already-computed ':memory:' publishes second is not, on its own, enough to claim
+        // combined atomicity: if a later ':memory:' database's own commit then fails (a real,
+        // if rare, possibility - a concurrent MVCC merge conflict, for instance), the physical
+        // effect is retained while the memory effect is lost, which is an honestly-classified
+        // PARTIAL commit, not the atomic transaction a single COMMIT implies. Proving the
+        // ':memory:' publish step can never fail once the physical commit has already returned
+        // requires preflighting/reserving every fallible piece of that publish (schema merge,
+        // version-conflict detection) while holding each database's commit lock continuously
+        // from before the physical commit through the memory apply - a real, currently
+        // unimplemented staged-commit design - so mixing a physical write with any other
+        // database's write in the same transaction stays rejected until that design exists.
         //
         // This is computed live from _transactionDatabases's own HasChanges bookkeeping (the
         // same source CommitTransaction's persistentChanges reads) rather than a separately
@@ -61583,13 +61600,16 @@ Func<string, ParsedStatement> rewrite)
         // then failed (see RecursiveNoOpDepthErrorDoesNotReserveATransactionWriteDatabase) never
         // sets HasChanges, and rolling back to a savepoint already restores it, so neither can
         // wrongly "reserve" a database this guard would otherwise have to un-reserve itself.
-        if (database.IsFileBacked
-            && _transactionDatabases.Any(pair =>
-                pair.Value.HasChanges && pair.Key.IsFileBacked && !ReferenceEquals(pair.Key, database)))
+        var otherChangedDatabases = _transactionDatabases
+            .Where(pair => pair.Value.HasChanges && !ReferenceEquals(pair.Key, database));
+        var conflictsWithAnotherDatabase = database.IsFileBacked
+            ? otherChangedDatabases.Any()
+            : otherChangedDatabases.Any(pair => pair.Key.IsFileBacked);
+        if (conflictsWithAnotherDatabase)
         {
             throw new EmbeddedSqlException(
-                "Managed ATTACH transactions cannot modify more than one physical (disk-backed) "
-                + "database because independent WAL files cannot be committed atomically.");
+                "Managed ATTACH transactions cannot modify more than one database because "
+                + "independent WAL files cannot be committed atomically.");
         }
     }
 
@@ -61939,13 +61959,16 @@ Func<string, ParsedStatement> rewrite)
         var persistentChanges = changed
             .Where(pair => !ReferenceEquals(pair.Key, _tempDatabase))
             .ToArray();
-        // Mirrors the EnsureTransactionMayMutate relaxation: at most one physical (disk-backed)
-        // database may be committed here. Any number of ':memory:' databases may accompany it,
-        // since none of them carries a crash-recovery contract this commit could break.
-        if (persistentChanges.Count(pair => pair.Key.IsFileBacked) > 1)
+        // Mirrors the EnsureTransactionMayMutate rule: a physical (disk-backed) database's write
+        // must be the ONLY database committed here - not just "at most one other physical
+        // database". Any number of ':memory:' databases may be committed together (none of them
+        // carries a crash-recovery contract this commit could break), but never alongside a
+        // physical one, until a provably non-failing staged-memory-publish design exists (see
+        // EnsureTransactionMayMutate's doc comment).
+        if (persistentChanges.Length > 1 && persistentChanges.Any(pair => pair.Key.IsFileBacked))
         {
             throw new InvalidOperationException(
-                "A managed ATTACH transaction reached an unsafe multi-physical-database write state.");
+                "A managed ATTACH transaction reached an unsafe multi-database write state.");
         }
 
         var tempChange = changed
@@ -61966,38 +61989,43 @@ Func<string, ParsedStatement> rewrite)
         ExceptionDispatchInfo? deferredMaintenanceFailure = null;
         var schemaCatalogWasPublished = false;
         // Every ':memory:' database this loop has already durably published, paired with the
-        // catalog it held immediately before that publish, so a later database's failure (memory
-        // or the one physical database) can revert it: PublishCatalog is an irreversible
-        // reference swap, so once the try/catch below completes a memory database's commit
-        // successfully, ResetTransactionState() alone can no longer undo it. A file-backed
-        // database is never in this list - its commit is durable the instant PersistFileCatalog
-        // returns and must not be reverted, which is exactly why it is committed first below.
+        // catalog it held immediately before that publish, so a later database's failure can
+        // revert it: PublishCatalog is an irreversible reference swap, so once the try/catch
+        // below completes a memory database's commit successfully, ResetTransactionState() alone
+        // can no longer undo it. persistentChanges is EITHER a single physical database (the
+        // guard above forbids mixing) or N ':memory:' databases - so this list is only ever
+        // populated in the all-memory case; a physical commit is durable the instant
+        // PersistFileCatalog returns and is never reverted.
         var publishedMemoryDatabases = new List<(EmbeddedDatabase Database, EmbeddedDatabase.SchemaCatalog PreviousCatalog)>();
-        // True once the (at most one) physical database in this transaction has durably
-        // committed, even with no schema change. Unlike a ':memory:' database's publish (which
-        // is reverted by RevertPublishedMemoryDatabases if a later database's own commit fails),
-        // a physical commit is never reverted, so schemaCatalogWasPublished alone under-reports
-        // durability for a multi-database transaction: a pure data write (no schema change) to
-        // the physical database, followed by a later ':memory:' database's commit failing, must
-        // still be treated as a partially-durable commit, not the "nothing happened yet, safe to
-        // leave the transaction open for retry" case the original single-database bare rethrow
-        // below was written for.
+        // True once the sole physical database in this transaction (if any) has durably
+        // committed, even with no schema change. schemaCatalogWasPublished alone under-reports
+        // durability here: a pure data write (no schema change) to the physical database still
+        // means real, irreversible I/O happened, which the outer catch below must not mistake for
+        // "nothing happened yet, safe to leave the transaction open for retry".
         var anyPersistentChangeWasPublished = false;
         try
         {
-            // Commit the at-most-one physical database first: if it fails, nothing else in this
-            // transaction has published yet, so the failure propagates exactly like the original
-            // single-database path always did. Every ':memory:' database follows - each is a bare
-            // catalog-reference publish with no I/O and no crash-recovery contract of its own -
-            // and if one of them fails, every ':memory:' database that already published earlier
-            // in this same loop is reverted via publishedMemoryDatabases before the failure
-            // propagates, so a subsequent ROLLBACK (or the exception itself) never leaves a
-            // partially-committed transaction that looks committed from a fresh read.
+            // persistentChanges holds either the sole physical database or N ':memory:'
+            // databases (the guard above forbids mixing), so this ordering is a no-op in
+            // practice - kept only so a later database's failure in the all-memory case still
+            // reverts every ':memory:' database that already published earlier in this same
+            // loop via publishedMemoryDatabases before the failure propagates, so a subsequent
+            // ROLLBACK (or the exception itself) never leaves a partially-committed transaction
+            // that looks committed from a fresh read.
             foreach (var (database, state) in persistentChanges.OrderByDescending(pair => pair.Key.IsFileBacked))
             {
                 var previousCatalogForRevert = database.LiveCatalog;
                 try
                 {
+                    // Test-only hook (mirrors BeforePinningTransactionSnapshotForTesting/
+                    // AfterMvccBeginBeforeCatalogSnapshotForTesting): lets a test inject a
+                    // genuine failure at a controlled point inside this real commit loop - not a
+                    // hand-rolled simulation of it - so a multi-':memory:'-database commit's
+                    // revert-on-later-failure behavior can be verified end-to-end, exercising
+                    // CommitTransaction() itself rather than only the isolated
+                    // RevertPublishedMemoryCatalog primitive. Placed inside the try so a thrown
+                    // fault is caught by the exact same handler as a real commit failure below.
+                    BeforeCommittingPersistentChangeForTesting?.Invoke(database);
                     database.CommitTransaction(
                         state.Catalog,
                         state.Version,

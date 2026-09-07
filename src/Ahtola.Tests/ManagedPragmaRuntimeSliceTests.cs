@@ -493,7 +493,7 @@ public sealed class ManagedPragmaRuntimeSliceTests
             Execute(connection, "BEGIN;");
             Execute(connection, "PRAGMA main.user_version = 999;");
             Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "PRAGMA aux.user_version = 999;"))!
-                .Message.Should().Contain("cannot modify more than one physical (disk-backed) database");
+                .Message.Should().Contain("cannot modify more than one database");
             Execute(connection, "ROLLBACK;");
             ReadValue(connection, "PRAGMA main.user_version;").Should().Be(SqlValue.Integer(456));
             ReadValue(connection, "PRAGMA aux.user_version;").Should().Be(SqlValue.Integer(12));

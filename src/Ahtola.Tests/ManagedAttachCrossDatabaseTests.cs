@@ -98,29 +98,32 @@ public sealed class ManagedAttachCrossDatabaseTests
     }
 
     [Test]
-    public void PhysicalMainPlusInMemoryAttachmentsCommitTogether()
+    public void PhysicalMainPlusInMemoryAttachmentsStillRejectMixedWritesInOneTransaction()
     {
         var fileSystem = new InMemoryFileSystem();
         using var main = EmbeddedDatabase.OpenFile("xdb-mixed-main.db", fileSystem);
         using var connection = main.Connect();
         Execute(connection, "ATTACH DATABASE ':memory:' AS aux1;");
-        Execute(connection, "ATTACH DATABASE ':memory:' AS aux2;");
         Execute(connection, "CREATE TABLE main.m(value TEXT);");
         Execute(connection, "CREATE TABLE aux1.a1(value TEXT);");
-        Execute(connection, "CREATE TABLE aux2.a2(value TEXT);");
 
-        // One physical database (main) plus any number of ':memory:' attachments is a safe
-        // combination: only main's write needs true crash-recoverable atomicity, and the memory
-        // attachments have no file/crash contract to break (sqlite.org/lang_attach.html).
+        // A physical database's write must still be the ONLY database this transaction touches -
+        // not just "at most one OTHER physical database". Reversible/staged ':memory:'
+        // publication proven safe alongside a *simultaneous* physical commit (preflighting every
+        // fallible piece of the memory publish while holding locks through the physical commit)
+        // is not implemented, so mixing a physical write with a ':memory:' one in the same
+        // transaction stays rejected until that design exists (see EnsureTransactionMayMutate's
+        // doc comment) - unlike multiple ':memory:' databases together, which is provably safe
+        // and supported (see MultipleInMemoryAttachmentsCommitTogetherInOneTransaction).
         Execute(connection, "BEGIN;");
         Execute(connection, "INSERT INTO main.m VALUES ('main-write');");
-        Execute(connection, "INSERT INTO aux1.a1 VALUES ('aux1-write');");
-        Execute(connection, "INSERT INTO aux2.a2 VALUES ('aux2-write');");
-        Execute(connection, "COMMIT;");
+        var mixedWrite = () => Execute(connection, "INSERT INTO aux1.a1 VALUES ('aux1-write');");
+        mixedWrite.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*cannot modify more than one database*atomically*");
+        Execute(connection, "ROLLBACK;");
 
-        ReadRows(connection, "SELECT value FROM main.m;").Should().ContainSingle().Which.Should().Equal(SqlValue.Text("main-write"));
-        ReadRows(connection, "SELECT value FROM aux1.a1;").Should().ContainSingle().Which.Should().Equal(SqlValue.Text("aux1-write"));
-        ReadRows(connection, "SELECT value FROM aux2.a2;").Should().ContainSingle().Which.Should().Equal(SqlValue.Text("aux2-write"));
+        ReadRows(connection, "SELECT count(*) FROM main.m;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+        ReadRows(connection, "SELECT count(*) FROM aux1.a1;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
     }
 
     [Test]
@@ -224,45 +227,56 @@ public sealed class ManagedAttachCrossDatabaseTests
         Execute(connection, "INSERT INTO aux1.t1 VALUES ('one');");
         var secondPhysicalWrite = () => Execute(connection, "INSERT INTO aux2.t2 VALUES ('two');");
         secondPhysicalWrite.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*cannot modify more than one physical (disk-backed) database*");
+            .WithMessage("*cannot modify more than one database*");
         Execute(connection, "ROLLBACK;");
     }
 
     [Test]
-    public void PhysicalDatabaseCommitFailureLeavesInMemoryAttachmentUncommitted()
+    public void MultipleMemoryDatabaseCommitFaultRevertsTheEarlierPublishedDatabaseEndToEnd()
     {
-        const string path = "xdb-fault-main.db";
-        var inner = new InMemoryFileSystem();
-        var fileSystem = new FlushFailingFileSystem(inner, path);
-        using var main = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var main = new EmbeddedDatabase();
         using var connection = main.Connect();
-        ReadRows(connection, "PRAGMA journal_mode = DELETE;");
-        Execute(connection, "ATTACH DATABASE ':memory:' AS aux;");
-        Execute(connection, "CREATE TABLE main.m(value TEXT);");
-        Execute(connection, "CREATE TABLE aux.a(value TEXT);");
-        Execute(connection, "INSERT INTO main.m VALUES ('existing');");
+        Execute(connection, "ATTACH DATABASE ':memory:' AS aux1;");
+        Execute(connection, "ATTACH DATABASE ':memory:' AS aux2;");
+        Execute(connection, "CREATE TABLE aux1.a1(value TEXT);");
+        Execute(connection, "CREATE TABLE aux2.a2(value TEXT);");
 
         Execute(connection, "BEGIN;");
-        Execute(connection, "INSERT INTO aux.a VALUES ('should-not-persist');");
-        Execute(connection, "INSERT INTO main.m VALUES ('pending');");
+        Execute(connection, "INSERT INTO aux1.a1 VALUES ('aux1-write');");
+        Execute(connection, "INSERT INTO aux2.a2 VALUES ('aux2-write');");
 
-        // The at-most-one physical database in a mixed transaction commits first precisely so a
-        // later failure (here, simulated) never reaches the point of publishing a ':memory:'
-        // attachment's catalog; before that ordering fix, a memory-first commit order could leave
-        // aux durably visible even though the surrounding transaction never actually committed.
-        fileSystem.ArmFlushFailure();
-        var failingCommit = () => Execute(connection, "COMMIT;");
-        failingCommit.Should().Throw<IOException>();
-        fileSystem.Disarm();
+        // BeginTransaction snapshots main, temp, then attached databases sorted by path
+        // identity, so aux1 is committed (published) before aux2 in CommitTransaction()'s
+        // persistentChanges loop. Force the SECOND database's commit to fail via the test-only
+        // hook - exercising the real CommitTransaction() code path end-to-end, not a hand-rolled
+        // simulation of it - and verify the FIRST database's already-published catalog is
+        // correctly reverted to its pre-commit state rather than silently staying visible even
+        // though the surrounding COMMIT never actually completed. This is the stronger,
+        // end-to-end counterpart to RevertPublishedMemoryCatalogRestoresThePreRevertCatalogState
+        // (which only exercises the isolated revert primitive directly).
+        var invocationCount = 0;
+        EmbeddedConnection.BeforeCommittingPersistentChangeForTesting = _ =>
+        {
+            if (++invocationCount == 2)
+                throw new IOException("Injected second-database commit failure.");
+        };
+        try
+        {
+            var failingCommit = () => Execute(connection, "COMMIT;");
+            failingCommit.Should().Throw<IOException>();
+        }
+        finally
+        {
+            EmbeddedConnection.BeforeCommittingPersistentChangeForTesting = null;
+        }
 
         Execute(connection, "ROLLBACK;");
-        ReadRows(connection, "SELECT value FROM main.m;")
-            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("existing"));
-        ReadRows(connection, "SELECT count(*) FROM aux.a;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+        ReadRows(connection, "SELECT count(*) FROM aux1.a1;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+        ReadRows(connection, "SELECT count(*) FROM aux2.a2;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
 
         // The connection must recover cleanly for further use, not be left in some half-open state.
-        Execute(connection, "INSERT INTO main.m VALUES ('after-recovery');");
-        ReadRows(connection, "SELECT count(*) FROM main.m;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2));
+        Execute(connection, "INSERT INTO aux1.a1 VALUES ('after-recovery');");
+        ReadRows(connection, "SELECT count(*) FROM aux1.a1;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
     }
 
     [Test]
@@ -449,58 +463,12 @@ public sealed class ManagedAttachCrossDatabaseTests
         // physical databases' HasChanges finally surface together at COMMIT.
         var cdcThroughSecondPhysical = () => Execute(connection, "INSERT INTO auxphys.p VALUES ('should-not-run');");
         cdcThroughSecondPhysical.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*cannot modify more than one physical (disk-backed) database*");
+            .WithMessage("*cannot modify more than one database*");
 
         // The rejected statement must not have partially mutated anything - not auxphys (its own
         // write target) and not the CDC owner's backing table.
         ReadRows(connection, "SELECT count(*) FROM auxphys.p;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
         Execute(connection, "ROLLBACK;");
-    }
-
-    private sealed class FlushFailingFileSystem(IFileSystem inner, string targetPath) : IFileSystem
-    {
-        private int _armed;
-
-        public bool FileExists(string path) => inner.FileExists(path);
-
-        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
-            => new FailureFile(this, inner.OpenFile(path, mode, readOnly), path == targetPath);
-
-        public void DeleteFile(string path) => inner.DeleteFile(path);
-
-        public void ArmFlushFailure() => Volatile.Write(ref _armed, 1);
-
-        public void Disarm() => Volatile.Write(ref _armed, 0);
-
-        private void FailIfArmed(bool isTarget)
-        {
-            if (isTarget && Interlocked.Exchange(ref _armed, 0) == 1)
-                throw new IOException("Injected physical commit flush failure.");
-        }
-
-        private sealed class FailureFile(
-            FlushFailingFileSystem owner,
-            IFile innerFile,
-            bool isTarget) : IFile
-        {
-            public long Length => innerFile.Length;
-
-            public bool IsReadOnly => innerFile.IsReadOnly;
-
-            public int Read(long position, Span<byte> destination) => innerFile.Read(position, destination);
-
-            public void Write(long position, ReadOnlySpan<byte> source) => innerFile.Write(position, source);
-
-            public void SetLength(long length) => innerFile.SetLength(length);
-
-            public void FlushToDisk()
-            {
-                owner.FailIfArmed(isTarget);
-                innerFile.FlushToDisk();
-            }
-
-            public void Dispose() => innerFile.Dispose();
-        }
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)
