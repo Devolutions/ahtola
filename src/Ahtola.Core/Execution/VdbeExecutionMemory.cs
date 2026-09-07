@@ -64,6 +64,10 @@ public sealed class VdbeExecutionMetrics
     /// <summary>Times a probe was answered via a resident lightweight partition index instead of a full scan.</summary>
     public long HashPartitionIndexSeeks { get; private set; }
 
+    /// <summary>Times a group of buffered probe rows was processed together (partition-major scheduling);
+    /// see VdbeHashJoinRuntime.FlushProbeBatch. Includes single-probe fallback calls (batch of size 1).</summary>
+    public long HashProbeBatchesFlushed { get; private set; }
+
     public long KeyedRowSetsSpilled { get; private set; }
 
     public long WindowBuffersSpilled { get; private set; }
@@ -132,6 +136,9 @@ public sealed class VdbeExecutionMetrics
 
     internal void HashPartitionIndexSeek() =>
         HashPartitionIndexSeeks = checked(HashPartitionIndexSeeks + 1);
+
+    internal void HashProbeBatchFlushed() =>
+        HashProbeBatchesFlushed = checked(HashProbeBatchesFlushed + 1);
 
     internal void KeyedRowSetSpilled() =>
         KeyedRowSetsSpilled = checked(KeyedRowSetsSpilled + 1);

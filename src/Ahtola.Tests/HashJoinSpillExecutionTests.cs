@@ -692,6 +692,58 @@ public class HashJoinSpillExecutionTests
         metrics.CurrentRetainedBytes.Should().Be(0);
     }
 
+    [Test]
+    public void BatchedProbeSchedulingBoundsReloadsByDistinctPartitionsNotProbeCount()
+    {
+        // The actual probe-side scheduling closure (not just a cheaper fallback tier):
+        // FlushProbeBatch groups every buffered probe by the exact partition it targets and
+        // answers the whole group with one resolution, so - as long as the batch (bounded by
+        // MaxProbeBatchRows, not by memory) can hold the whole cyclic run - the number of
+        // times a partition is loaded/index-built no longer scales with how many probes
+        // cycle through it. This is the same 8-distinct-partition working set as
+        // CyclicProbesExceedingResidentCapacityStillAvoidRawRescans, but with a large build
+        // payload (forcing a spill regardless of budget) and a budget generous enough that,
+        // once spilled, all 8 partitions' lightweight indexes (which never retain the large
+        // payload, only offsets/keys) plus the whole in-flight probe batch fit
+        // simultaneously - isolating the batching effect from residency-cache capacity
+        // pressure, which the other test deliberately keeps tight.
+        const long budget = 200_000;
+        var metrics = new VdbeExecutionMetrics();
+        var payload = new string('y', 2000);
+        var right = Enumerable.Range(0, 80)
+            .Select(value => Row(value, $"r{value}-{payload}"))
+            .ToArray();
+        var representative = new[] { 3, 20, 1, 8, 7, 24, 5, 26 };
+        const int cycles = 20;
+        var left = Enumerable.Range(0, cycles)
+            .SelectMany(_ => representative.Select(key => Row(key, $"p{key}")))
+            .ToArray();
+        var program = JoinProgram(left, right, VdbeJoinKind.Inner);
+        var options = Options(new InMemoryFileSystem(), metrics, budget);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = Drain(statement);
+
+        var expected = Enumerable.Range(0, cycles)
+            .SelectMany(_ => representative.Select(key =>
+                ((string?)$"p{key}", (string?)$"r{key}-{payload}")));
+        rows.Select(Labels).Should().Equal(expected);
+
+        metrics.HashPartitionsCreated.Should().Be(16);
+        // 160 probes (20 cycles x 8 keys) touching only 8 distinct partitions: unbatched,
+        // per-probe resolution would reload/rebuild a partition every time the probe order
+        // moves to a different one (at least 160 total, since the same partition is never
+        // adjacent to itself). Batched, every probe fits in a single flushed batch (160 is
+        // comfortably under MaxProbeBatchRows=256), so each distinct partition is resolved
+        // at most once total - bounded by distinct-partition count, not by how many probes
+        // cycle through it.
+        (metrics.HashPartitionLoads + metrics.HashPartitionIndexBuilds)
+            .Should().BeLessThanOrEqualTo(representative.Length);
+        metrics.HashProbeBatchesFlushed.Should().Be(1);
+        metrics.HashPartitionFallbackScans.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
     private static VdbeExecutionOptions Options(
         IFileSystem fileSystem,
         VdbeExecutionMetrics metrics,

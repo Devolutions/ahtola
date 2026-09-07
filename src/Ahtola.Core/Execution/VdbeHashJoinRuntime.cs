@@ -82,6 +82,21 @@ internal static class VdbeHashJoinRuntime
     // Turso uses because it always partitions a hash table from scratch.
     private const int MinSplitPartitionCount = 2;
 
+    // Upper bound on how many probe rows are grouped into one partition-major processing
+    // pass (see FlushProbeBatch). This is a genuine probe-side scheduling mechanism, not
+    // just a cache-tier decision: every probe in a batch that targets the same spill
+    // partition is answered by loading/building/scanning that partition exactly once for
+    // the whole group, regardless of how the probe order interleaves between partitions -
+    // mirroring the intent (not the async chunked-IO mechanics) of turso-src/core/vdbe/
+    // hash_table.rs's probe-side buffering (ProbeSpillState/buffer_probe_row/grace_begin),
+    // scoped here to an in-memory batch with strict output-order preservation rather than a
+    // full two-phase grace pass that would reorder emission to partition order. A larger
+    // value amortizes reload/rescan cost over more probes per partition touch (the actual
+    // fix for cyclic/interleaved thrashing); memory for the batch itself is still bounded by
+    // the shared execution budget (see the TryRetain/flush-and-retry logic in EnumerateCore),
+    // so this cap only limits per-partition-group bookkeeping overhead, not correctness.
+    private const int MaxProbeBatchRows = 256;
+
     private const ulong HashOffsetBasis = 14695981039346656037UL;
     private const ulong HashPrime = 1099511628211UL;
 
@@ -94,6 +109,16 @@ internal static class VdbeHashJoinRuntime
     {
         public static PartitionKey Top(int topIndex) => new(topIndex, -1);
     }
+
+    /// <summary>
+    /// One probe row buffered for grouped, partition-major processing (see
+    /// <see cref="MaxProbeBatchRows"/> and <c>FlushProbeBatch</c>). <see cref="RetainedBytes"/>
+    /// is 0 for a probe processed via a singleton batch that bypassed real buffering because
+    /// even an empty batch could not afford it (see the fallback path in EnumerateCore); a
+    /// zero value signals the cleanup path to skip releasing memory that was never retained.
+    /// </summary>
+    private readonly record struct ProbeBatchEntry(VdbeJoinRow Probe, string? Key, long RetainedBytes);
+
 
     public static IEnumerable<VdbeJoinRow> Enumerate(
         VdbeJoinOperatorPlan plan,
@@ -268,118 +293,149 @@ internal static class VdbeHashJoinRuntime
             bool[]? matched = trackUnmatchedBuild && spill is null
                 ? buffered?.CreateMatchedMap() ?? []
                 : null;
+
+            // Buffered, partition-major probe scheduling for the spilled path only (the
+            // small in-memory HashBuildBuffer path below never thrashes, since its
+            // dictionary is never evicted). Probe rows are consumed from the single-pass
+            // probeNode enumerator exactly once, in order, and accumulated into a bounded
+            // batch (see ProbeBatchEntry) rather than answered immediately one at a time.
+            // Once a batch is flushed, every probe in it that targets the same spill
+            // partition is answered together - loading/building/scanning that partition
+            // exactly once for the whole group, not once per probe - which is the actual
+            // structural fix for repeated reload/rescan under a cyclic or interleaved probe
+            // order, not merely a cheaper fallback tier (see FlushProbeBatch remarks).
+            // Batching never changes emission order: FlushProbeBatch always replays its
+            // batch's results in original within-batch probe order, and batches themselves
+            // are flushed and yielded strictly in probe-arrival order, so the final sequence
+            // is identical to fully streaming per-probe processing.
+            List<ProbeBatchEntry>? pendingBatch = null;
+
+            IEnumerable<VdbeJoinRow> DrainPendingBatch()
+            {
+                if (pendingBatch is not { Count: > 0 } batch)
+                    yield break;
+
+                // Release the batch's buffering-cap accounting up front, before any actual
+                // partition resolution/scanning: it exists only to bound how much can
+                // accumulate while WAITING to be processed, not to persist through
+                // processing itself. Holding it through the flush would compete with the
+                // scan/load tiers' own transient per-entry retention for the exact same
+                // shared budget - memory the original, unbatched per-probe design never had
+                // to share, since a single in-flight probe was never itself charged against
+                // the budget while its match was being resolved. Releasing here restores
+                // that same headroom for FlushProbeBatch's actual work.
+                foreach (var entry in batch)
+                {
+                    if (entry.RetainedBytes > 0)
+                        context.Memory.Release(entry.RetainedBytes);
+                }
+                pendingBatch = null;
+
+                foreach (var row in FlushProbeBatch(
+                    batch, spill!, residency, plan, buildNode, buildIsRight, trackUnmatchedBuild, context))
+                    yield return row;
+            }
+
             foreach (var probe in probeNode.Enumerate(maximumRows: null, context))
             {
                 context.ThrowIfCancellationRequested();
-                var matchedProbe = false;
-                var key = probeKey(probe);
 
-                if (key is not null)
+                if (spill is null)
                 {
-                    if (spill is null)
+                    var matchedProbe = false;
+                    var key = probeKey(probe);
+                    if (key is not null && buffered?.TryGetCandidates(key, out var candidateIndices) == true)
                     {
-                        if (buffered?.TryGetCandidates(key, out var candidateIndices) == true)
+                        foreach (var buildIndex in candidateIndices)
                         {
-                            foreach (var buildIndex in candidateIndices)
-                            {
-                                context.ThrowIfCancellationRequested();
-                                var build = buffered[buildIndex];
-                                var combined = Combine(build.Row, probe, buildIsRight);
-                                if (!Matches(plan, build.Row, probe, combined, buildIsRight))
-                                    continue;
+                            context.ThrowIfCancellationRequested();
+                            var build = buffered[buildIndex];
+                            var combined = Combine(build.Row, probe, buildIsRight);
+                            if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                                continue;
 
-                                matchedProbe = true;
-                                if (matched is not null)
-                                    matched[buildIndex] = true;
-                                yield return combined;
-                                if (maximumRows is { } maximum && ++emitted >= maximum)
-                                    yield break;
-                            }
+                            matchedProbe = true;
+                            if (matched is not null)
+                                matched[buildIndex] = true;
+                            yield return combined;
+                            if (maximumRows is { } maximum && ++emitted >= maximum)
+                                yield break;
                         }
                     }
-                    else
+
+                    if (!matchedProbe && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
                     {
-                        var resolution = residency.Resolve(spill, key, context);
-                        if (resolution.Loaded is not null)
-                        {
-                            foreach (var build in resolution.Loaded.Find(key))
-                            {
-                                context.ThrowIfCancellationRequested();
-                                var combined = Combine(build.Row, probe, buildIsRight);
-                                if (!Matches(plan, build.Row, probe, combined, buildIsRight))
-                                    continue;
+                        yield return Combine(probe, NullRow(buildNode));
+                        if (maximumRows is { } maximum && ++emitted >= maximum)
+                            yield break;
+                    }
+                    continue;
+                }
 
-                                matchedProbe = true;
-                                if (trackUnmatchedBuild)
-                                    spill.MarkMatched(build.Ordinal, context);
-                                yield return combined;
-                                if (maximumRows is { } maximum && ++emitted >= maximum)
-                                    yield break;
-                            }
-                        }
-                        else if (resolution.Index is not null)
-                        {
-                            foreach (var lease in spill.ReadPartitionIndexMatches(
-                                resolution.Id,
-                                resolution.Index,
-                                key,
-                                context,
-                                residency))
-                            {
-                                VdbeJoinRow? combinedResult = null;
-                                using (lease)
-                                {
-                                    context.ThrowIfCancellationRequested();
-                                    var build = lease.Entry;
-                                    var combined = Combine(build.Row, probe, buildIsRight);
-                                    if (!Matches(plan, build.Row, probe, combined, buildIsRight))
-                                        continue;
+                var probeKeyValue = probeKey(probe);
+                var entryBytes = VdbeManagedFootprint.EstimateHashBuildEntry(
+                    probe.Values,
+                    probeKeyValue,
+                    probe.RowIds.Length);
 
-                                    matchedProbe = true;
-                                    if (trackUnmatchedBuild)
-                                        spill.MarkMatched(build.Ordinal, context);
-                                    combinedResult = combined;
-                                }
-
-                                yield return combinedResult;
-                                if (maximumRows is { } maximum && ++emitted >= maximum)
-                                    yield break;
-                            }
-                        }
-                        else
-                        {
-                            context.Options.Metrics.HashPartitionFallbackScan();
-                            foreach (var lease in spill.ReadPartitionByKey(resolution.Id, context))
-                            {
-                                VdbeJoinRow? combinedResult = null;
-                                using (lease)
-                                {
-                                    context.ThrowIfCancellationRequested();
-                                    var build = lease.Entry;
-                                    if (!string.Equals(build.Key, key, StringComparison.Ordinal))
-                                        continue;
-
-                                    var combined = Combine(build.Row, probe, buildIsRight);
-                                    if (!Matches(plan, build.Row, probe, combined, buildIsRight))
-                                        continue;
-
-                                    matchedProbe = true;
-                                    if (trackUnmatchedBuild)
-                                        spill.MarkMatched(build.Ordinal, context);
-                                    combinedResult = combined;
-                                }
-
-                                yield return combinedResult;
-                                if (maximumRows is { } maximum && ++emitted >= maximum)
-                                    yield break;
-                            }
-                        }
+                if (pendingBatch is { Count: >= MaxProbeBatchRows })
+                {
+                    foreach (var row in DrainPendingBatch())
+                    {
+                        yield return row;
+                        if (maximumRows is { } maximum && ++emitted >= maximum)
+                            yield break;
                     }
                 }
 
-                if (!matchedProbe && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                if (context.Memory.TryRetain(entryBytes))
                 {
-                    yield return Combine(probe, NullRow(buildNode));
+                    (pendingBatch ??= []).Add(new ProbeBatchEntry(probe, probeKeyValue, entryBytes));
+                    continue;
+                }
+
+                // Not enough headroom for another buffered probe: flush what is pending
+                // (freeing its retained bytes) and retry once before falling back further.
+                foreach (var row in DrainPendingBatch())
+                {
+                    yield return row;
+                    if (maximumRows is { } maximum && ++emitted >= maximum)
+                        yield break;
+                }
+
+                if (context.Memory.TryRetain(entryBytes))
+                {
+                    (pendingBatch ??= []).Add(new ProbeBatchEntry(probe, probeKeyValue, entryBytes));
+                    continue;
+                }
+
+                // Even a fully empty batch cannot afford to buffer this one probe: process
+                // it immediately, completely unbatched (RetainedBytes: 0 means
+                // DrainPendingBatch's cleanup never attempts to release anything for it), so
+                // a pathologically tight budget never regresses versus plain per-probe
+                // streaming - this reuses the exact same grouped resolution/match logic via
+                // a singleton batch, it just never benefits from cross-probe grouping.
+                foreach (var row in FlushProbeBatch(
+                    [new ProbeBatchEntry(probe, probeKeyValue, RetainedBytes: 0)],
+                    spill,
+                    residency,
+                    plan,
+                    buildNode,
+                    buildIsRight,
+                    trackUnmatchedBuild,
+                    context))
+                {
+                    yield return row;
+                    if (maximumRows is { } maximum && ++emitted >= maximum)
+                        yield break;
+                }
+            }
+
+            if (spill is not null)
+            {
+                foreach (var row in DrainPendingBatch())
+                {
+                    yield return row;
                     if (maximumRows is { } maximum && ++emitted >= maximum)
                         yield break;
                 }
@@ -450,6 +506,196 @@ internal static class VdbeHashJoinRuntime
                 context.RecordCleanupFailure(exception, spill);
             }
             spillInfrastructureReservation?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Answers every buffered probe in <paramref name="batch"/> that targets the spilled
+    /// build side, grouped so each distinct partition it touches is resolved
+    /// (loaded/index-built/scanned) exactly once for the whole group - the actual
+    /// probe-side scheduling fix for repeated reload/rescan under an interleaved or cyclic
+    /// probe order, not merely a cheaper fallback tier. Also serves the unbatched
+    /// (<see cref="ProbeBatchEntry.RetainedBytes"/> == 0) singleton fallback path in
+    /// EnumerateCore, so both share one correctness-checked implementation.
+    /// </summary>
+    /// <remarks>
+    /// Grouping happens in two passes because splitting a top-level partition (see
+    /// <c>HashSpill.TrySplitPartition</c>) can only be decided the first time any probe in
+    /// this batch (or an earlier one) touches it, and a split reroutes different keys within
+    /// the same top-level partition to different sub-partitions. Pass 1 groups by the stable
+    /// top-level index (a pure hash computation, never affected by splitting) and resolves
+    /// one representative key per top-level group purely to let any pending split decision
+    /// finalize as a side effect (the resolution result itself is discarded). Pass 2 then
+    /// re-derives each probe's final (possibly post-split) <see cref="PartitionKey"/> and
+    /// groups by that, so every probe is matched against the exact partition it actually
+    /// belongs to, regardless of when the split happened. Output order is preserved by
+    /// buffering every result per batch-local index during grouped processing and only
+    /// replaying them, strictly in original batch order, in the final loop.
+    /// </remarks>
+    private static IEnumerable<VdbeJoinRow> FlushProbeBatch(
+        IReadOnlyList<ProbeBatchEntry> batch,
+        HashSpill spill,
+        PartitionResidencyCache residency,
+        VdbeJoinOperatorPlan plan,
+        VdbeJoinPlanNode buildNode,
+        bool buildIsRight,
+        bool trackUnmatchedBuild,
+        VdbeJoinExecutionContext context)
+    {
+        context.Options.Metrics.HashProbeBatchFlushed();
+
+        var matchesByLocalIndex = new List<VdbeJoinRow>?[batch.Count];
+
+        var topLevelGroups = new Dictionary<int, List<int>>();
+        var orderedTopLevelIndices = new List<int>();
+        for (var localIndex = 0; localIndex < batch.Count; localIndex++)
+        {
+            var key = batch[localIndex].Key;
+            if (key is null)
+                continue; // NULL join keys never match; only eligible for outer null-extension below.
+
+            var topIndex = GetPartition(key);
+            if (!topLevelGroups.TryGetValue(topIndex, out var indices))
+            {
+                indices = [];
+                topLevelGroups.Add(topIndex, indices);
+                orderedTopLevelIndices.Add(topIndex);
+            }
+            indices.Add(localIndex);
+        }
+
+        foreach (var topIndex in orderedTopLevelIndices)
+        {
+            context.ThrowIfCancellationRequested();
+            var topLevelLocalIndices = topLevelGroups[topIndex];
+
+            // Trigger any pending split decision for this top-level partition exactly once
+            // (HashSpill.TrySplitPartition itself only ever attempts a split the first time
+            // any caller touches a given top-level index); the resolution this call returns
+            // is discarded; it only serves to finalize routing before the real regroup below.
+            _ = residency.Resolve(spill, batch[topLevelLocalIndices[0]].Key!, context);
+
+            var finalGroups = new Dictionary<PartitionKey, List<int>>();
+            var orderedFinalIds = new List<PartitionKey>();
+            foreach (var localIndex in topLevelLocalIndices)
+            {
+                var id = spill.GetPartitionKey(batch[localIndex].Key!);
+                if (!finalGroups.TryGetValue(id, out var indices))
+                {
+                    indices = [];
+                    finalGroups.Add(id, indices);
+                    orderedFinalIds.Add(id);
+                }
+                indices.Add(localIndex);
+            }
+
+            foreach (var id in orderedFinalIds)
+            {
+                context.ThrowIfCancellationRequested();
+                var localIndices = finalGroups[id];
+                var resolution = residency.Resolve(spill, batch[localIndices[0]].Key!, context);
+
+                if (resolution.Loaded is not null)
+                {
+                    foreach (var localIndex in localIndices)
+                    {
+                        var key = batch[localIndex].Key!;
+                        var probe = batch[localIndex].Probe;
+                        foreach (var build in resolution.Loaded.Find(key))
+                        {
+                            context.ThrowIfCancellationRequested();
+                            var combined = Combine(build.Row, probe, buildIsRight);
+                            if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                                continue;
+
+                            if (trackUnmatchedBuild)
+                                spill.MarkMatched(build.Ordinal, context);
+                            (matchesByLocalIndex[localIndex] ??= []).Add(combined);
+                        }
+                    }
+                }
+                else if (resolution.Index is not null)
+                {
+                    foreach (var localIndex in localIndices)
+                    {
+                        var key = batch[localIndex].Key!;
+                        var probe = batch[localIndex].Probe;
+                        foreach (var lease in spill.ReadPartitionIndexMatches(
+                            resolution.Id, resolution.Index, key, context, residency))
+                        {
+                            using (lease)
+                            {
+                                context.ThrowIfCancellationRequested();
+                                var build = lease.Entry;
+                                var combined = Combine(build.Row, probe, buildIsRight);
+                                if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                                    continue;
+
+                                if (trackUnmatchedBuild)
+                                    spill.MarkMatched(build.Ordinal, context);
+                                (matchesByLocalIndex[localIndex] ??= []).Add(combined);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Neither tier fit this partition: answer every probe in this group with
+                    // ONE sequential scan instead of one scan per probe - the actual,
+                    // measurable I/O reduction for a partition too large for even the
+                    // lightweight index, and the direct fix for "oversized partitions
+                    // rescan per probe" when several such probes share a batch.
+                    context.Options.Metrics.HashPartitionFallbackScan();
+                    var byKey = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+                    foreach (var localIndex in localIndices)
+                    {
+                        var key = batch[localIndex].Key!;
+                        if (!byKey.TryGetValue(key, out var indicesForKey))
+                        {
+                            indicesForKey = [];
+                            byKey.Add(key, indicesForKey);
+                        }
+                        indicesForKey.Add(localIndex);
+                    }
+
+                    foreach (var lease in spill.ReadPartitionByKey(resolution.Id, context))
+                    {
+                        using (lease)
+                        {
+                            context.ThrowIfCancellationRequested();
+                            var build = lease.Entry;
+                            if (build.Key is null || !byKey.TryGetValue(build.Key, out var indicesForKey))
+                                continue;
+
+                            foreach (var localIndex in indicesForKey)
+                            {
+                                var probe = batch[localIndex].Probe;
+                                var combined = Combine(build.Row, probe, buildIsRight);
+                                if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                                    continue;
+
+                                if (trackUnmatchedBuild)
+                                    spill.MarkMatched(build.Ordinal, context);
+                                (matchesByLocalIndex[localIndex] ??= []).Add(combined);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (var localIndex = 0; localIndex < batch.Count; localIndex++)
+        {
+            var matches = matchesByLocalIndex[localIndex];
+            if (matches is not null)
+            {
+                foreach (var row in matches)
+                    yield return row;
+            }
+            else if (buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+            {
+                yield return Combine(batch[localIndex].Probe, NullRow(buildNode));
+            }
         }
     }
 
@@ -746,13 +992,15 @@ internal static class VdbeHashJoinRuntime
     }
 
     /// <summary>
-    /// A lightweight key-&gt;record-offset index over one spill partition, built from a single
-    /// header-only pass (record boundaries and keys, never the row payload or rowids). Its
-    /// per-partition memory footprint is a small fraction of a fully materialized
-    /// <see cref="LoadedPartition"/>, so a memory budget that cannot hold every partition a
-    /// cyclic probe order touches as full rows can still hold this cheaper index for many
-    /// more of them at once, mitigating the residual thrashing a bounded full-row LRU alone
-    /// cannot avoid when the working set exceeds its capacity (see
+    /// A lightweight key-&gt;record-offset index over one spill partition, built from a
+    /// single sequential pass that reads every record's length/key bytes but never decodes
+    /// row values or rowids (see <c>HashSpill.TryBuildKeyIndexCore</c> remarks for why this
+    /// still reads the whole partition's bytes - it reduces retained MEMORY, not I/O volume,
+    /// per rebuild). Its per-partition memory footprint is a small fraction of a fully
+    /// materialized <see cref="LoadedPartition"/>, so a memory budget that cannot hold every
+    /// partition a cyclic probe order touches as full rows can still hold this cheaper index
+    /// for many more of them at once, mitigating the residual thrashing a bounded full-row
+    /// LRU alone cannot avoid when the working set exceeds its capacity (see
     /// <see cref="PartitionResidencyCache"/>). Once built it is an exact, complete index of
     /// every key in the partition, so a lookup miss is a definitive no-match, not a hint.
     /// </summary>
@@ -1323,11 +1571,26 @@ internal static class VdbeHashJoinRuntime
 
         /// <summary>
         /// Builds a lightweight key-&gt;record-offset index for the given partition: a single
-        /// header-only pass over its file that records where each key's record(s) begin,
-        /// without decoding row values or rowids. Much cheaper per entry than
-        /// <see cref="TryLoadPartitionCore"/>, so it can serve as a fallback tier when a
-        /// partition's full rows do not fit but a bare index of its keys still does.
+        /// pass over its file that records where each key's record(s) begin, decoding only
+        /// record-length prefixes and key bytes and never decoding row values or rowids.
         /// </summary>
+        /// <remarks>
+        /// This still performs a full sequential read of the whole partition file end to
+        /// end - its I/O volume is the same order as a raw fallback scan of that partition,
+        /// not "header-only" in the sense of touching only a fixed-size prefix. What it
+        /// actually reduces is retained MEMORY (no row-value/rowid arrays are ever
+        /// materialized), which is what lets a shared memory budget hold many more resident
+        /// partitions of this cheaper shape than of the fully materialized
+        /// <see cref="TryLoadPartitionCore"/> shape, raising effective cache capacity for a
+        /// probe order that revisits partitions. On its own, rebuilding this index on every
+        /// cache miss for a genuinely over-capacity cyclic working set still re-reads that
+        /// partition's full bytes each time (see
+        /// HashJoinSpillExecutionTests.CyclicProbesExceedingResidentCapacityStillAvoidRawRescans,
+        /// which documents this as a real, not eliminated, limitation). The batched,
+        /// partition-major probe scheduling in FlushProbeBatch is what actually amortizes
+        /// this I/O across every probe in a batch that shares the same partition, rather than
+        /// re-paying it once per probe.
+        /// </remarks>
         public PartitionKeyIndex? TryBuildKeyIndexByKey(PartitionKey id, VdbeJoinExecutionContext context) =>
             TryBuildKeyIndexCore(GetPartitionFile(id), context);
 
