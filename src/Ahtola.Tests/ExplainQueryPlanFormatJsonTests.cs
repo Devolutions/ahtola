@@ -19,13 +19,19 @@ public class ExplainQueryPlanFormatJsonTests
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
-        connection.PrepareScript("CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER);").ToList();
+        Execute(
+            connection,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER); " +
+            "CREATE INDEX idx_users_age ON users(age);");
 
         var rows = ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM users WHERE age > 21;");
         rows.Should().HaveCount(1);
         var json = rows[0];
         json.Should().StartWith("{\"version\":1,");
-        json.Should().Contain("\"sql\":\"EXPLAIN QUERY PLAN SELECT id FROM users WHERE age > 21\"");
+        // The envelope echoes the statement exactly as written, FORMAT=JSON clause included
+        // (turso-src/docs/eqp-json.md; core/translate/eqp.rs's `sql` field is the verbatim
+        // input), so the echo names the format the caller asked for.
+        json.Should().Contain("\"sql\":\"EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM users WHERE age > 21\"");
         json.Should().Contain("\"result_columns\":[");
         json.Should().Contain("\"nodes\":[");
         json.Should().Contain("\"detail\":\"");
@@ -71,15 +77,33 @@ public class ExplainQueryPlanFormatJsonTests
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
-        connection.PrepareScript("CREATE TABLE t(a INTEGER PRIMARY KEY);").ToList();
+        Execute(
+            connection,
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER); " +
+            "CREATE INDEX idx_t_b ON t(b);");
 
-        var json = ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t;");
+        var json = ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT a FROM t WHERE b = 1;");
         json.Should().HaveCount(1);
-        // Every node entry carries a non-empty detail drawn from the engine's plan text
-        // (a SCAN/SEARCH detail or the evaluator-fallback marker).
+        // A modeled node (here, an index SEARCH) carries a non-empty detail drawn from the
+        // engine's plan text. A statement with no per-step plan modeled yet reports an empty
+        // nodes array instead of a fabricated node (see ExecuteExplainQueryPlan's
+        // isPlaceholderOnly handling) rather than a fake "detail".
         json[0].Should().MatchRegex("\"detail\":\"[^\"]+\"");
         json[0].Should().Contain("\"id\":");
         json[0].Should().Contain("\"parent\":");
+    }
+
+    private static void Execute(EmbeddedConnection connection, string sql)
+    {
+        foreach (var statement in connection.PrepareScript(sql))
+        {
+            using (statement)
+            {
+                while (statement.Step(default) == StatementStepResult.Row)
+                {
+                }
+            }
+        }
     }
 
     private static List<string> ReadAll(EmbeddedConnection connection, string sql)
