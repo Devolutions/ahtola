@@ -3153,8 +3153,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     internal bool IsTransactionSnapshotGateHeldForTesting => Monitor.IsEntered(_gate);
 
-    /// <summary>Exposes the file-backed store for direct storage-layer test coverage.</summary>
-    internal EmbeddedFileStore? FileStoreForTesting => _fileStore;
+    /// <summary>
+    /// The file-backed store, or null for an in-memory-only database. Used both by production
+    /// code that needs to open a durable page-native accessor (see
+    /// <see cref="GetNamedTableRows"/>'s concurrent-MVCC base-row scan) and directly by
+    /// storage-layer tests.
+    /// </summary>
+    internal EmbeddedFileStore? FileStore => _fileStore;
 
     /// <summary>
     /// Fires inside <see cref="CreateTransactionSnapshotWithPin"/> and
@@ -36846,6 +36851,79 @@ out bool hasReturning)
 
             IEnumerable<MvccDualCursor.Row> EnumerateBaseRows()
             {
+                // Prefer the transaction's own pinned durable b-tree snapshot: an unconditional
+                // ascending scan of the committed base table (see
+                // EmbeddedFileStore.ScanCommittedRowidTableAscending for a rowid table, or its
+                // WITHOUT ROWID primary-key-index counterpart) whose physical key order already
+                // matches keyComparer (both derive from the same declared rowid/collation
+                // semantics), so no in-memory sort/materialization of the whole table is needed.
+                // requireCommittedTableIdentity: false matches the identical, already-shipped
+                // precedent in GetConcurrentMvccIndexRows.EnumerateBaseRows: a concurrent
+                // transaction's QueryContext.Tables entry is a working-copy Clone(), never
+                // reference-equal to the truly committed table even when nothing changed, and
+                // MVCC's own version-chain overlay (not this table object) is what carries this
+                // transaction's own uncommitted row mutations — the base scan only ever needs to
+                // reflect the last *committed* state, which the pinned snapshot already pins.
+                // Only when the file store is unavailable, the pinned snapshot could not be
+                // opened, or the table/index is otherwise ineligible (e.g. an in-memory table)
+                // does this fall back to the classic table.GetScanOrderIndices() full-heap
+                // materialization.
+                EmbeddedFileIndexFullScanAccessor? scanAccessor = null;
+                var opened = false;
+                if (context.Database?.FileStore is { } fileStore
+                    && context.TransactionPinnedSnapshot is { } pinnedSnapshot)
+                {
+                    opened = table.HasRowid
+                        ? fileStore.TryOpenBaseTableFullScanAccessor(
+                            table,
+                            pinnedSnapshot,
+                            out scanAccessor,
+                            requireCommittedTableIdentity: false)
+                        : fileStore.TryOpenIndexFullScanAccessor(
+                            table,
+                            index: null,
+                            covering: false,
+                            pinnedSnapshot,
+                            out scanAccessor,
+                            requireCommittedTableIdentity: false);
+                }
+
+                if (opened && scanAccessor is not null)
+                {
+                    // Same test-observable evidence GetConcurrentMvccIndexRows already records
+                    // for indexed durable cursors (see VdbeJoinIndexSeekMetrics /
+                    // MvccDirectIndexAccessTests): a caller can assert DurableCursorPlans
+                    // increased and IndexPagesRead/TableRowsFetched moved, proving this path
+                    // actually opened a bounded page-native cursor instead of silently falling
+                    // back to the full-heap materialization below.
+                    var metrics = context.Database?._joinIndexSeekMetrics;
+                    metrics?.DurableCursorPlanCreated();
+                    Action? pageRead = metrics is null ? null : metrics.IndexPageRead;
+                    Action? rowFetched = metrics is null ? null : metrics.TableRowFetched;
+                    scanAccessor.Open();
+                    try
+                    {
+                        foreach (var row in scanAccessor.Scan(pageRead, rowFetched))
+                        {
+                            context.CheckInterrupt();
+                            var rowId = row.RowId ?? 0L;
+                            var key = table.HasRowid
+                                ? MvccKey.FromInteger(rowId)
+                                : MvccKey.FromPrimaryKey(
+                                    table.PrimaryKeySchema!,
+                                    row.Values,
+                                    context.MvccTextEncoding);
+                            yield return new MvccDualCursor.Row(key, row.Values);
+                        }
+                    }
+                    finally
+                    {
+                        scanAccessor.Dispose();
+                    }
+
+                    yield break;
+                }
+
                 foreach (var index in table.GetScanOrderIndices())
                 {
                     var rowId = index < table.RowIds.Count ? table.RowIds[index] : index + 1;

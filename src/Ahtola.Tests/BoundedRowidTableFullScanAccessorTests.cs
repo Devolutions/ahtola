@@ -10,7 +10,7 @@ namespace Ahtola.Tests;
 /// an ordinary rowid table's own committed b-tree that decodes rows one at a time instead of
 /// materializing the whole table first. This is additive infrastructure only in this commit — it
 /// has no live caller yet — so these tests exercise it directly against
-/// <c>EmbeddedDatabase.FileStoreForTesting</c> rather than through the query engine.
+/// <c>EmbeddedDatabase.FileStore</c> rather than through the query engine.
 /// </summary>
 [NonParallelizable]
 public sealed class BoundedRowidTableFullScanAccessorTests
@@ -30,7 +30,7 @@ public sealed class BoundedRowidTableFullScanAccessorTests
         }
 
         var table = database.LiveCatalog.Tables["t"];
-        var fileStore = database.FileStoreForTesting!;
+        var fileStore = database.FileStore!;
 
         fileStore.TryOpenBaseTableFullScanAccessor(table, sharedSnapshot: null, out var accessor)
             .Should().BeTrue();
@@ -66,7 +66,7 @@ public sealed class BoundedRowidTableFullScanAccessorTests
         }
 
         var table = database.LiveCatalog.Tables["t"];
-        var fileStore = database.FileStoreForTesting!;
+        var fileStore = database.FileStore!;
 
         fileStore.TryOpenBaseTableFullScanAccessor(table, sharedSnapshot: null, out var accessor)
             .Should().BeTrue();
@@ -105,7 +105,7 @@ public sealed class BoundedRowidTableFullScanAccessorTests
         table.HasPendingRowLoad.Should().BeTrue(
             "physical open must not have materialized this indexless table yet");
 
-        var fileStore = reopened.FileStoreForTesting!;
+        var fileStore = reopened.FileStore!;
         fileStore.TryOpenBaseTableFullScanAccessor(table, sharedSnapshot: null, out var accessor)
             .Should().BeTrue();
         using (accessor)
@@ -135,7 +135,7 @@ public sealed class BoundedRowidTableFullScanAccessorTests
         }
 
         var table = database.LiveCatalog.Tables["t"];
-        var fileStore = database.FileStoreForTesting!;
+        var fileStore = database.FileStore!;
 
         fileStore.TryOpenBaseTableFullScanAccessor(table, sharedSnapshot: null, out var accessor)
             .Should().BeTrue();
@@ -164,7 +164,7 @@ public sealed class BoundedRowidTableFullScanAccessorTests
         }
 
         var table = database.LiveCatalog.Tables["t"];
-        var fileStore = database.FileStoreForTesting!;
+        var fileStore = database.FileStore!;
 
         fileStore.TryOpenBaseTableFullScanAccessor(table, sharedSnapshot: null, out var accessor)
             .Should().BeTrue();
@@ -191,7 +191,7 @@ public sealed class BoundedRowidTableFullScanAccessorTests
         }
 
         var table = database.LiveCatalog.Tables["t"];
-        var fileStore = database.FileStoreForTesting!;
+        var fileStore = database.FileStore!;
 
         fileStore.TryOpenBaseTableFullScanAccessor(table, sharedSnapshot: null, out _)
             .Should().BeFalse(
