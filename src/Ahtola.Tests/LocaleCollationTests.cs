@@ -48,7 +48,7 @@ public sealed class LocaleCollationTests
                      // with the generic Latin table for some inputs -- that is not the same as a
                      // proven profile, so it stays out of the accepted allowlist.
     [TestCase("fr-CA")] // French Canadian: a real, distinct BCP-47 region this port has not verified;
-                       // only fr-FR is an accepted profile.
+                        // only fr-FR is an accepted profile.
     [TestCase("fr-BE")]
     [TestCase("fr")] // Bare French (no region) is also rejected: only the exact fr-FR profile
                      // used by the pinned upstream test was verified.
