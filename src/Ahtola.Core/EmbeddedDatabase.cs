@@ -3139,6 +3139,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     internal bool IsTransactionSnapshotGateHeldForTesting => Monitor.IsEntered(_gate);
 
+    /// <summary>Exposes the file-backed store for direct storage-layer test coverage.</summary>
+    internal EmbeddedFileStore? FileStoreForTesting => _fileStore;
+
     /// <summary>
     /// Fires inside <see cref="CreateTransactionSnapshotWithPin"/> and
     /// <see cref="BeginConcurrentTransactionSnapshotLocked"/> after the catalog clone but
@@ -63557,6 +63560,24 @@ internal sealed class EmbeddedTable
     private IPendingRowLoadResourceLease? _pendingRowLoadResourceLease;
     private bool _rowsLoaded = true;
 
+    // True only while EnsureRowsLoaded's own loader invocation is on the call stack. The loader
+    // populates this exact table through the very same Rows/RowIds properties
+    // (table.Rows.Add(...)); without this guard, that reentrant access would call
+    // EnsureRowsLoaded again for every single row appended. _rowsLoaded itself cannot be set to
+    // true before the loader runs to serve this purpose (as an earlier revision did): if the
+    // loader throws partway through, that would have already marked an incompletely-populated
+    // table as successfully, permanently loaded, so every later reader would silently observe a
+    // truncated row set forever — including a subsequent VACUUM/persist pass, which would then
+    // durably rewrite the database with the missing rows gone. See EnsureRowsLoaded.
+    private bool _rowLoadInProgress;
+
+    // Set when a previous load attempt threw partway through. A partially populated RowStore can
+    // never be trusted (see the reentrancy comment above), so a failed load's rows are discarded
+    // and every subsequent access fails closed by rethrowing this captured failure, rather than
+    // silently retrying (which could mask a real, persistent corruption or I/O fault) or silently
+    // returning the incomplete rows a prior attempt happened to append before failing.
+    private ExceptionDispatchInfo? _rowLoadFailure;
+
     /// <summary>
     /// The table's committed base rows, loaded from page storage on first access rather
     /// than eagerly at physical-open time when <see cref="AttachPendingRowLoader"/> attached
@@ -63587,12 +63608,21 @@ internal sealed class EmbeddedTable
 
     /// <summary>
     /// True while this table's committed base rows have not yet been read from page
-    /// storage. Observable so tests and diagnostics can prove a physical open, or a
-    /// statement that never touches this table, did not materialize it. Always false for
-    /// an in-memory-only table (nothing ever attaches a loader) and for any table whose
-    /// rows have already been loaded, whether lazily or eagerly.
+    /// storage and no earlier attempt to do so has failed (see <see cref="HasFailedRowLoad"/>).
+    /// Observable so tests and diagnostics can prove a physical open, or a statement that never
+    /// touches this table, did not materialize it. Always false for an in-memory-only table
+    /// (nothing ever attaches a loader) and for any table whose rows have already been loaded,
+    /// whether lazily or eagerly.
     /// </summary>
-    internal bool HasPendingRowLoad => !_rowsLoaded;
+    internal bool HasPendingRowLoad => !_rowsLoaded && _rowLoadFailure is null;
+
+    /// <summary>
+    /// True once a previous attempt to load this table's committed rows has thrown partway
+    /// through. Every access to <see cref="Rows"/>/<see cref="RowIds"/> keeps rethrowing that
+    /// same failure from this point on — the table's row set can never be trusted again once a
+    /// load has failed partway (see <see cref="EnsureRowsLoaded"/>).
+    /// </summary>
+    internal bool HasFailedRowLoad => _rowLoadFailure is not null;
 
     /// <summary>
     /// Defers this table's initial row load to first access instead of populating it
@@ -63613,27 +63643,55 @@ internal sealed class EmbeddedTable
         _pendingRowLoader = loader;
         _pendingRowLoadResourceLease = resourceLease;
         _rowsLoaded = false;
+        _rowLoadFailure = null;
     }
 
     private void EnsureRowsLoaded()
     {
-        if (_rowsLoaded)
+        if (_rowsLoaded || _rowLoadInProgress)
             return;
 
-        // Flip the flag before invoking the loader: the loader populates this exact table
-        // through the very same Rows/RowIds properties (table.Rows.Add(...)), which would
-        // otherwise recurse back into EnsureRowsLoaded for every single row.
-        _rowsLoaded = true;
+        if (_rowLoadFailure is { } failure)
+        {
+            // A previous attempt already left this table's rows untrustworthy (see the class
+            // field comments on _rowLoadInProgress/_rowLoadFailure). Fail closed permanently:
+            // never silently retry a page-decode failure (it usually means real corruption or an
+            // I/O fault, and non-deterministic retry could mask that — the same "do not retry,
+            // require a fresh open" philosophy EmbeddedPostCommitMaintenanceException already
+            // uses elsewhere in this store) and never allow a caller to observe the partial rows
+            // the failed attempt happened to append before throwing.
+            throw new InvalidOperationException(
+                $"A previous attempt to load table '{Name}' rows failed; its rows can no longer "
+                + "be trusted. Reopen the database to retry.",
+                failure.SourceException);
+        }
+
         var loader = _pendingRowLoader;
         var resourceLease = _pendingRowLoadResourceLease;
-        _pendingRowLoader = null;
-        _pendingRowLoadResourceLease = null;
+        _rowLoadInProgress = true;
         try
         {
             loader?.Invoke(this);
+            // Only a fully successful run may retire the pending loader/lease and declare the
+            // table loaded: flipping _rowsLoaded before this point (as an earlier revision did)
+            // would let a mid-load throw permanently strand a truncated row set that every later
+            // reader — including a subsequent VACUUM/persist pass — would then treat as complete.
+            _rowsLoaded = true;
+            _pendingRowLoader = null;
+            _pendingRowLoadResourceLease = null;
+        }
+        catch (Exception exception)
+        {
+            _rowsStore.Clear();
+            _rowIdsStore.Clear();
+            _pendingRowLoader = null;
+            _pendingRowLoadResourceLease = null;
+            _rowLoadFailure = ExceptionDispatchInfo.Capture(exception);
+            throw;
         }
         finally
         {
+            _rowLoadInProgress = false;
             resourceLease?.Release();
         }
     }

@@ -365,6 +365,105 @@ public sealed class PageBackedLazyRowLoadTests
         ReadText(verifierConnection, "SELECT value FROM untouched_two WHERE id = 1;").Should().Be("b");
     }
 
+    [Test]
+    public void ALoaderThatFailsPartwayNeverStrandsATruncatedRowSet()
+    {
+        // Regression coverage for a critical bug found in review: EnsureRowsLoaded used to flip
+        // _rowsLoaded to true (and discard the pending loader/lease) BEFORE invoking the loader,
+        // so that a loader which appended some rows and then threw left the table permanently
+        // and silently marked "successfully loaded" with only its partial rows. Every later
+        // reader -- including a subsequent VACUUM/persist pass -- would then treat that
+        // truncated row set as complete and correct, an actual data-loss bug.
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "failed-lazy-load.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);");
+            Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        var table = reopened.LiveCatalog.Tables["t"];
+        table.HasPendingRowLoad.Should().BeTrue();
+
+        // Replace the store's real committed-page loader with a synthetic one that reproduces
+        // the reported repro exactly: it appends one row, then throws, simulating a page decode
+        // failure partway through a real load.
+        table.AttachPendingRowLoader(loadingTable =>
+        {
+            loadingTable.Rows.Add([SqlValue.Integer(1), SqlValue.Text("a")]);
+            loadingTable.RowIds.Add(1);
+            throw new InvalidDataException("simulated mid-load page corruption");
+        });
+
+        Action firstAccess = () => _ = table.Rows.Count;
+        firstAccess.Should().Throw<InvalidDataException>().WithMessage("simulated mid-load page corruption");
+
+        table.HasFailedRowLoad.Should().BeTrue();
+        table.HasPendingRowLoad.Should().BeFalse(
+            "a permanently failed load is neither successfully loaded nor still pending a retry");
+
+        // The critical regression: a second access must keep failing closed, never silently
+        // return the one partial row the failed attempt appended before throwing.
+        Action secondAccess = () => _ = table.Rows.Count;
+        secondAccess.Should().Throw<InvalidOperationException>()
+            .WithMessage("*rows can no longer be trusted*");
+        Action thirdAccessViaRowIds = () => _ = table.RowIds.Count;
+        thirdAccessViaRowIds.Should().Throw<InvalidOperationException>()
+            .WithMessage("*rows can no longer be trusted*");
+
+        // Cloning is the per-statement working-copy path every statement takes (see
+        // EmbeddedTable.Clone/AdoptContentFrom); it must propagate the same failure rather than
+        // silently succeeding with an empty or partially populated clone.
+        Action cloneAttempt = () => table.Clone();
+        cloneAttempt.Should().Throw<InvalidOperationException>()
+            .WithMessage("*rows can no longer be trusted*");
+    }
+
+    [Test]
+    public void VacuumFailsClosedInsteadOfPersistingATableWhoseLazyLoadFailed()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "failed-lazy-load-vacuum.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(
+                connection,
+                """
+                CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);
+                CREATE TABLE sibling(id INTEGER PRIMARY KEY, value TEXT);
+                """);
+            Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+            Execute(connection, "INSERT INTO sibling VALUES (1, 'z');");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        var table = reopened.LiveCatalog.Tables["t"];
+        table.AttachPendingRowLoader(loadingTable =>
+        {
+            loadingTable.Rows.Add([SqlValue.Integer(1), SqlValue.Text("a")]);
+            loadingTable.RowIds.Add(1);
+            throw new InvalidDataException("simulated mid-load page corruption");
+        });
+
+        using var connection2 = reopened.Connect();
+
+        // VACUUM (EmbeddedDatabase.MigratePageSize) forces every still-lazy table in the live
+        // catalog to hydrate before rewriting the file, specifically so a still-pending table
+        // never gets compared against reassigned root pages -- see 812a106. That same forced
+        // hydration must now surface this table's permanent load failure instead of silently
+        // vacuuming the database down to only the rows that happened to load before the fault.
+        Action vacuum = () => Execute(connection2, "VACUUM;");
+        vacuum.Should().Throw<Exception>(
+            "VACUUM must fail closed rather than persist a truncated table to disk");
+
+        table.HasFailedRowLoad.Should().BeTrue();
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         foreach (var statement in connection.PrepareScript(sql))
