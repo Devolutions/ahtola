@@ -2040,7 +2040,8 @@ internal static class ManagedReplicaBootstrapper
                 protectedMetadata,
                 originalPath,
                 committedPath,
-                cancellationToken);
+                cancellationToken,
+                knownCommittedFingerprint: protectedMetadata.DatabaseSha256);
             CompleteRemoteBaseSnapshotPublication(options.Path);
         }
         finally
@@ -2558,7 +2559,9 @@ internal static class ManagedReplicaBootstrapper
                     protectedMetadata,
                     stagingPath,
                     protectedStagingPath,
-                    cancellationToken);
+                    cancellationToken,
+                    knownOriginalFingerprint: publishedRemoteBase,
+                    knownCommittedFingerprint: protectedMetadata.DatabaseSha256);
                 CompleteRemoteBaseSnapshotPublication(options.Path);
                 return;
             }
@@ -2659,7 +2662,9 @@ internal static class ManagedReplicaBootstrapper
                     protectedMetadata,
                     protectedStagingPath,
                     stagingPath,
-                    cancellationToken);
+                    cancellationToken,
+                    knownOriginalFingerprint: publishedIncrementalRemoteBase,
+                    knownCommittedFingerprint: protectedMetadata.DatabaseSha256);
                 CompleteRemoteBaseSnapshotPublication(options.Path);
                 return;
             }

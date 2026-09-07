@@ -2296,6 +2296,53 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
     }
 
     [Test]
+    public void PublishProtectedSnapshotsStillDetectsAMismatchedKnownFingerprintHint()
+    {
+        // StageFileCapture's caller-supplied fingerprint parameters are a pure I/O-saving hint
+        // (skip a redundant standalone pre-hash when the caller already knows the value from
+        // having just computed it over the same unmodified bytes) -- they must never let a
+        // genuinely wrong value slip through unverified. The page-by-page capture loop
+        // independently recomputes and cross-checks a fingerprint against whichever value is in
+        // force, so passing a deliberately incorrect hint here must still fail closed exactly as
+        // it would with no hint at all.
+        var path = NewReplicaPath("managed-replica-protected-snapshot-mismatched-hint");
+        var originalPath = path + ".original";
+        var committedPath = path + ".committed";
+        try
+        {
+            var originalImage = CreateDatabaseImageWithMarker(originalPath, 42);
+            var committedImage = CreateDatabaseImageWithMarker(committedPath, 84);
+            File.WriteAllBytes(originalPath, originalImage);
+            File.WriteAllBytes(committedPath, committedImage);
+
+            var handler = new ReplicaPushHandler(
+                [CreatePullResponse("revision-42", originalImage, protocol: 2), CreateLogicalPullResponse("revision-42", body: [])],
+                _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+            var options = CreateOptions(path, handler);
+            using (var connection = AhtolaConnection.CreateReplica(options))
+                connection.Open();
+
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            var wrongFingerprint = new string('0', 64);
+
+            Assert.Throws<InvalidDataException>(() =>
+                ManagedReplicaRevertWal.PublishProtectedSnapshots(
+                    path,
+                    metadata,
+                    originalPath,
+                    committedPath,
+                    CancellationToken.None,
+                    knownOriginalFingerprint: wrongFingerprint));
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+            DeleteReplicaFiles(originalPath);
+            DeleteReplicaFiles(committedPath);
+        }
+    }
+
+    [Test]
     public async Task ProtocolTwoIncrementalPagesRejectsAPendingLocalTableRename()
     {
         // Unlike CREATE/ADD COLUMN, a RENAME cannot be idempotently reasserted after an
