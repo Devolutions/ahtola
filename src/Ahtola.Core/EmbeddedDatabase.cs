@@ -44176,14 +44176,23 @@ out bool hasReturning)
     /// <summary>
     /// Replaces the backing table's rows with the single watermark row an allocation or setval leaves
     /// behind (upstream compacts to one row at commit; the managed catalog is statement-atomic, so the
-    /// replacement is exact here).
+    /// replacement is exact here). Reports the swap to <paramref name="context"/> as a delete of the
+    /// prior watermark row (its rowid is the previous value, since <c>value</c> is the rowid-aliased
+    /// primary key) followed by an insert of the new one, so a concurrent (<c>BEGIN CONCURRENT</c>)
+    /// transaction's MVCC store sees the allocation the same way it sees any other row write. Without
+    /// this, nextval/setval's mutation was only ever a "classic" in-memory edit invisible to the MVCC
+    /// commit path, so the watermark reverted to its pre-transaction value once the surrounding
+    /// concurrent transaction committed.
     /// </summary>
     private static void WriteSequenceWatermark(
+        EmbeddedDatabase.QueryContext context,
+        string backingTableName,
         EmbeddedTable backing,
         long value,
         long isCalled,
         ManagedSequence sequence)
     {
+        var previousRowId = backing.RowIds.Count > 0 ? backing.RowIds[0] : (long?)null;
         backing.Rows.Clear();
         backing.RowIds.Clear();
         backing.Rows.Add(
@@ -44197,6 +44206,31 @@ out bool hasReturning)
             SqlValue.Integer(sequence.Cycle ? 1 : 0),
         ]);
         backing.RowIds.Add(value);
+
+        if (previousRowId is { } oldRowId
+            && oldRowId != value
+            && context.ConcurrentMvStore is { } deleteStore
+            && context.ConcurrentMvccTxId is { } deleteTxId)
+        {
+            deleteStore.DeleteOrTombstoneBase(
+                deleteTxId,
+                new MvccRowId(deleteStore.GetOrCreateTableId(deleteTxId, backingTableName), oldRowId));
+        }
+
+        // A direct MvStore.Insert (mirroring ChangeDataCaptureSession.Append), not
+        // QueryContext.ReportRowChange's generic INSERT path: that path promotes a rowid that
+        // collides with one the store has already seen to a fresh store-global id (correct for
+        // an ordinary AUTOINCREMENT insert racing a peer connection), but a sequence's watermark
+        // legitimately reuses a rowid a CYCLE sequence already emitted earlier in the same
+        // transaction - promoting it would silently move the stored value outside the
+        // sequence's own MINVALUE/MAXVALUE bounds.
+        if (context.ConcurrentMvStore is { } insertStore && context.ConcurrentMvccTxId is { } insertTxId)
+        {
+            insertStore.Insert(
+                insertTxId,
+                new MvccRowId(insertStore.GetOrCreateTableId(insertTxId, backingTableName), value),
+                backing.Rows[0]);
+        }
     }
 
     /// <summary>
@@ -44240,7 +44274,7 @@ out bool hasReturning)
         var descriptor = ReadSequenceDescriptor(sequenceName, backing);
         var (current, isCalled, wasEmpty, _) = ReadSequenceWatermark(backing, descriptor.Ascending);
         var next = descriptor.ComputeNext(current, isCalled, wasEmpty);
-        WriteSequenceWatermark(backing, next, 1, descriptor);
+        WriteSequenceWatermark(context, GetSequenceBackingTableName(sequenceName), backing, next, 1, descriptor);
         context.SequenceSession?.SetCurrval(rawName, next);
         // The watermark rewrite is a real catalog mutation even though this SELECT returns rows: flag it
         // so the statement's commit path publishes the clone (the writable-CTE state doubles as the
@@ -44295,7 +44329,7 @@ out bool hasReturning)
         }
 
         var isCalled = arguments.Count == 3 ? arguments[2].AsInteger() : 1;
-        WriteSequenceWatermark(backing, value, isCalled, descriptor);
+        WriteSequenceWatermark(context, GetSequenceBackingTableName(sequenceName), backing, value, isCalled, descriptor);
         context.SequenceSession?.SetCurrval(rawName, value);
         context.CteMutationState?.MarkChanged();
         return SqlValue.Integer(value);
