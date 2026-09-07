@@ -18173,7 +18173,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 && TryGetVirtualTable(context, named, out _);
         return context.ConcurrentMvStore is null
             && (isVirtualTableScan || !context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
-            && (isVirtualTableScan || !CanStreamProjectionRows(select, context, outerRow));
+            && (isVirtualTableScan || !CanStreamProjectionRows(select, context, outerRow, IsAggregateSelect(select)));
     }
 
     // True when any node of the FROM tree is one of the internal semi/anti joins introduced by
@@ -30408,7 +30408,7 @@ out bool hasReturning)
         var orUnionPlan = intersectionPlan is null && indexPlan is null
             ? TryPlanManagedOrIndexUnion(statement, context)
             : null;
-        var streamProjectionRows = CanStreamProjectionRows(statement, context, outerRow)
+        var streamProjectionRows = CanStreamProjectionRows(statement, context, outerRow, hasAggregate)
             && !(context.ConcurrentMvStore is not null
                 && indexPlan is not null
                 && limit is >= 0);
@@ -30823,7 +30823,8 @@ out bool hasReturning)
     private bool CanStreamProjectionRows(
         SelectStatement statement,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        bool hasAggregate)
     {
         if (outerRow is not null
             || statement.Source is not NamedTableSource named
@@ -30833,14 +30834,20 @@ out bool hasReturning)
             return false;
         }
 
+        // hasAggregate already covers ContainsAggregate(projection) plus the cases that check
+        // does not see on its own: an aggregate nested in a scalar/EXISTS/IN subquery whose
+        // columns belong to THIS query's own FROM (ContainsOuterOwnedAggregate). Streaming
+        // per-row output for such a query would bypass the aggregate collapse below and hand
+        // the aggregate branch an unfiltered row set (aggregate-of-outer-column.sqltest::
+        // outer-where-filters-before-the-outer-aggregate), since streaming also skips the
+        // ordinary WHERE-filter loop in favor of adding every scanned row unconditionally.
         return (statement.Where is null || IsScanPredicate(statement.Where))
             && statement.GroupBy.Count == 0
             && statement.Having is null
             && statement.OrderBy.Count == 0
             && !statement.Distinct
-            && !statement.Projections.Any(projection =>
-                ContainsAggregate(projection.Expression)
-                || ContainsWindowFunction(projection.Expression));
+            && !hasAggregate
+            && !statement.Projections.Any(projection => ContainsWindowFunction(projection.Expression));
     }
 
     private SqlValue[] EvaluateGroupedProjectionRow(
@@ -37603,20 +37610,12 @@ out bool hasReturning)
 
     // Builds the static CTE affinity map consumed by DescribeQueryAffinities from the
     // runtime-materialized CTEs carried on a QueryContext, recovering each column's
-    // affinity from the threaded column definitions (BLOB when unavailable).
-    //
-    // KNOWN RESIDUAL GAP: BuildSourceColumnDefinitionsFromAffinities already collapses a
-    // genuinely-declared-BLOB column with no custom collation to "no definition" (the same
-    // shape a no-affinity column produces), so a missing definition here cannot be told
-    // apart from a truly affinity-less one - both fall to the ColumnAffinity.Blob branch
-    // below with the QueryAffinityColumn.HasAffinity default (true). That default happens to
-    // be correct whenever the missing definition came from a genuinely-declared BLOB source
-    // (the case every current corpus test exercises), but would incorrectly report
-    // HasAffinity for a CTE column that is truly affinity-less (e.g. `WITH u(x) AS (SELECT 5)
-    // ...`). Fixing that fully requires carrying HasAffinity through EmbeddedColumn itself,
-    // which is out of scope here; the direct (non-CTE-materialized) affinity pipeline above
-    // (GetExpressionAffinity/CompoundColumnAffinity/QueryAffinityColumn) already tracks it
-    // precisely.
+    // affinity - and now its HasAffinity bit - from the threaded column definitions.
+    // BuildSourceColumnDefinitionsFromAffinities only omits a definition for a genuinely
+    // affinity-less column (HasAffinity false and no custom collation), so "has a
+    // definition" is exactly HasAffinity here; a missing definition reports Blob/false
+    // (no affinity), matching a bare literal (ManagedSqlBindingParityTests.
+    // DeclaredBlobAndAbsentAffinityRemainDistinct).
     private static Dictionary<string, IReadOnlyList<QueryAffinityColumn>> BuildAffinityMapFromRuntimeCtes(
         IReadOnlyDictionary<string, SourceData> runtimeCtes)
     {
@@ -37625,19 +37624,18 @@ out bool hasReturning)
         {
             var definitions = entry.Value.ColumnDefinitions;
             map[entry.Key] = entry.Value.Columns
-                .Select((column, index) => new QueryAffinityColumn(
-                    null,
-                    column,
-                    definitions is not null
-                        && index < definitions.Count
-                        && definitions[index] is { } definition
-                        ? EmbeddedTable.GetAffinity(definition.DeclaredType)
-                        : ColumnAffinity.Blob,
-                    definitions is not null
-                        && index < definitions.Count
-                        && definitions[index] is { } declaredDefinition
-                        ? declaredDefinition.DeclaredType
-                        : null))
+                .Select((column, index) =>
+                {
+                    var definition = definitions is not null && index < definitions.Count
+                        ? definitions[index]
+                        : null;
+                    return new QueryAffinityColumn(
+                        null,
+                        column,
+                        definition is not null ? EmbeddedTable.GetAffinity(definition.DeclaredType) : ColumnAffinity.Blob,
+                        definition?.DeclaredType,
+                        HasAffinity: definition is not null);
+                })
                 .ToArray();
         }
 
@@ -37646,9 +37644,15 @@ out bool hasReturning)
 
     // Materializes per-column definitions for a derived/CTE row source from a query's
     // described affinities so comparisons against its columns apply SQLite's affinity
-    // rules. BLOB-affinity columns carry no definition (no affinity), matching SQLite,
-    // unless the query output column carries a declared collation — then the definition
-    // exists only to expose that collation to comparisons.
+    // rules. A column with no declared affinity at all carries no definition (matching
+    // SQLite: a literal/computed-expression column has no affinity), unless the query
+    // output column carries a declared collation - then the definition exists only to
+    // expose that collation to comparisons. A genuinely declared BLOB column (a real
+    // column, CAST, or something derived from one - see QueryAffinityColumn.HasAffinity)
+    // still gets a real definition even though its DeclaredType is null: GetAffinity(null)
+    // resolves back to BLOB, keeping it distinct from "no affinity" for the datatype3 4.2
+    // rule 2 TEXT-coercion comparisons apply (ManagedSqlBindingParityTests.
+    // DeclaredBlobAndAbsentAffinityRemainDistinct).
     private static IReadOnlyList<EmbeddedColumn?> BuildSourceColumnDefinitionsFromAffinities(
         IReadOnlyList<QueryAffinityColumn> affinities,
         string[] outputColumns,
@@ -37662,7 +37666,7 @@ out bool hasReturning)
             var collation = collations is not null && index < collations.Count
                 ? NormalizeDeclaredCollation(collations[index])
                 : null;
-            if (affinity == ColumnAffinity.Blob
+            if (!affinities[index].HasAffinity
                 && (collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase)))
             {
                 definitions[index] = null;
@@ -54130,7 +54134,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfDisposed();
         ThrowIfInsideHookCallback();
         var parameterMap = SqlParameterMap.Parse(sql);
-        var statement = SqlParser.Parse(sql, parameterMap);
+        var statement = SqlParser.Parse(sql, parameterMap, IsKnownTableOrViewName);
         if (_hooks.Authorizer is not null)
             statement = Authorize(statement);
 
@@ -54296,11 +54300,49 @@ public sealed partial class EmbeddedConnection : IDisposable
         => throw new EmbeddedSqlException(
             "Managed connections do not support reentrant use of the connection from a hook callback.");
 
+    // Names declared by an earlier CREATE TABLE/CREATE VIEW statement within the SAME
+    // PrepareScript call, before any statement in that script has actually been executed.
+    // A multi-statement script prepares every statement upfront (PrepareScript's own
+    // Select(Prepare).ToArray()), so without this, a later statement's "is not a function"
+    // diagnostic (IsKnownTableOrViewName) would only see the connection's already-committed
+    // catalog - which does not yet include a table/view an earlier statement in the SAME
+    // script is about to create (cte.sqltest::table-referenced-with-call-arguments-rejected).
+    private HashSet<string>? _pendingScriptObjectNames;
+
     public IReadOnlyList<EmbeddedStatement> PrepareScript(string sql)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
-        return SqlScript.Split(sql).Select(Prepare).ToArray();
+        var previousPending = _pendingScriptObjectNames;
+        var pending = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _pendingScriptObjectNames = pending;
+        try
+        {
+            var results = new List<EmbeddedStatement>();
+            foreach (var statementSql in SqlScript.Split(sql))
+            {
+                var statement = Prepare(statementSql);
+                results.Add(statement);
+                var declaredName = statement.Statement switch
+                {
+                    CreateTableStatement createTable => createTable.Name,
+                    CreateViewStatement createView => createView.Name,
+                    _ => null,
+                };
+                if (declaredName is not null)
+                {
+                    pending.Add(ManagedSchemaName.TrySplit(declaredName, out _, out var localName)
+                        ? localName
+                        : declaredName);
+                }
+            }
+
+            return results;
+        }
+        finally
+        {
+            _pendingScriptObjectNames = previousPending;
+        }
     }
 
     public void ResetForPooling()
@@ -56605,22 +56647,26 @@ Func<string, ParsedStatement> rewrite)
             throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
         }
 
-        // A temp view's body may reference only temp-schema objects: the managed
-        // engine evaluates a view inside the database that owns it, so a body
-        // touching main-schema tables cannot be evaluated from temp. Upstream
-        // SQLite stores the view in temp but resolves names at query time; this
-        // cross-schema evaluation is a documented divergence (see
-        // managed-sqltest-expected-failures.txt).
+        // A temp view's body may freely reference main-schema objects, exactly like a temp
+        // table can - EnterView (the runtime scope entered when the view executes) does not
+        // restrict which schema's tables its body can see, it only isolates the view's own
+        // CTE namespace, so a plain unqualified `t` inside a TEMP VIEW body already resolves
+        // to a main table the same way it would for any other statement (temp-view.sqltest,
+        // views.sqltest::drop-view-finds-temp-view-with-unqualified-name). Only an explicit
+        // reference into an attached database stays unsupported, matching the restriction
+        // every other non-main-schema view already has (Turso view.rs:316-383/planner.rs
+        // resolves a view body against the connection's full schema search path, not just
+        // the schema that owns the view).
         if (statement.Temporary)
         {
             var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             CollectQuerySchemas(statement.Query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
             foreach (var schema in schemas.Select(ResolveCollectedSchema))
             {
-                if (!schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+                if (!schema.Equals("temp", StringComparison.OrdinalIgnoreCase)
+                    && !schema.Equals("main", StringComparison.OrdinalIgnoreCase))
                 {
-                    throw new EmbeddedSqlException(
-                        "Managed temporary views can only reference objects in the temp schema.");
+                    throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
                 }
             }
         }
@@ -56725,7 +56771,114 @@ Func<string, ParsedStatement> rewrite)
     {
         var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         CollectQuerySchemas(query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        ExpandViewSchemas(
+            query,
+            schemas,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
         return RouteForSchemas(query, schemas);
+    }
+
+    // A view reference resolves (for routing purposes) to whichever schema stores the view,
+    // but the view's OWN body may touch other schemas the outer statement's text never
+    // mentions at all - a TEMP VIEW commonly wraps a query against MAIN tables. Schema-based
+    // statement routing only sees the outer statement's own text, so without this expansion a
+    // query that only appears to touch the view's owning schema gets routed there alone, and
+    // the view later fails to resolve its own body against that single-schema catalog
+    // (temp-view.sqltest, views.sqltest::drop-view-finds-temp-view-with-unqualified-name).
+    // Walks the statement's FROM sources (recursively through CTEs/compounds/derived tables),
+    // and for every reference that resolves to a view, merges in every schema that view's body
+    // touches - recursively, for a view whose body itself references another view - guarding
+    // against a cycle with `visitedViews`.
+    private void ExpandViewSchemas(
+        QueryStatement query,
+        HashSet<string> schemas,
+        HashSet<string> commonTableExpressions,
+        HashSet<string> visitedViews)
+    {
+        switch (query)
+        {
+            case SelectStatement select:
+                ExpandSourceViewSchemas(select.Source, schemas, commonTableExpressions, visitedViews);
+                break;
+            case CompoundSelectStatement compound:
+                foreach (var term in compound.Terms)
+                    ExpandViewSchemas(term, schemas, commonTableExpressions, visitedViews);
+                break;
+            case WithSelectStatement with:
+                var names = new HashSet<string>(commonTableExpressions, StringComparer.OrdinalIgnoreCase);
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                {
+                    names.Add(commonTableExpression.Name);
+                    ExpandViewSchemas(commonTableExpression.Query, schemas, names, visitedViews);
+                }
+                ExpandViewSchemas(with.Query, schemas, names, visitedViews);
+                break;
+        }
+    }
+
+    private void ExpandSourceViewSchemas(
+        TableSource? source,
+        HashSet<string> schemas,
+        HashSet<string> commonTableExpressions,
+        HashSet<string> visitedViews)
+    {
+        switch (source)
+        {
+            case NamedTableSource named:
+                ExpandNamedSourceView(named, schemas, commonTableExpressions, visitedViews);
+                break;
+            case DerivedTableSource derived:
+                ExpandViewSchemas(derived.Query, schemas, commonTableExpressions, visitedViews);
+                break;
+            case JoinTableSource join:
+                ExpandSourceViewSchemas(join.Left, schemas, commonTableExpressions, visitedViews);
+                ExpandSourceViewSchemas(join.Right, schemas, commonTableExpressions, visitedViews);
+                break;
+        }
+    }
+
+    private void ExpandNamedSourceView(
+        NamedTableSource named,
+        HashSet<string> schemas,
+        HashSet<string> commonTableExpressions,
+        HashSet<string> visitedViews)
+    {
+        var hasExplicitSchema = ManagedSchemaName.TrySplit(named.Name, out var explicitSchema, out var objectName);
+        if (!hasExplicitSchema)
+        {
+            if (commonTableExpressions.Contains(named.Name))
+                return;
+            objectName = named.Name;
+        }
+
+        var owningSchema = hasExplicitSchema
+            ? explicitSchema
+            : ResolveCollectedSchema(UnqualifiedSchemaMarker + objectName);
+        if (!TryFindViewDefinition(owningSchema, objectName, out var view))
+            return;
+
+        var viewKey = owningSchema + "\u0001" + objectName;
+        if (!visitedViews.Add(viewKey))
+            return;
+
+        CollectQuerySchemas(view.Query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        ExpandViewSchemas(
+            view.Query,
+            schemas,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            visitedViews);
+    }
+
+    private bool TryFindViewDefinition(string schema, string objectName, out ViewDefinition view)
+    {
+        view = null!;
+        var database = FindSchemaDatabase(schema);
+        if (database is null)
+            return false;
+
+        var catalog = GetTransactionState(database)?.Catalog ?? database.LiveCatalog;
+        return catalog.Views.TryGetValue(objectName, out view!);
     }
 
     private RoutedStatement RouteDataStatement(ParsedStatement statement)
@@ -56992,13 +57145,25 @@ Func<string, ParsedStatement> rewrite)
         AddTables("main", mainCatalog, tempTableNames);
         AddTables("temp", tempCatalog, mainTableNames);
 
+        // A view's own identity/routing stays wherever CREATE [TEMP] VIEW stored it (its name
+        // is never renamed the way a colliding table's is), but its body must resolve through
+        // this same merged catalog once the outer statement reaches here - real SQLite never
+        // restricts a view's body to the schema that owns it (temp-view.sqltest,
+        // views.sqltest::drop-view-finds-temp-view-with-unqualified-name). Temp shadows main on
+        // a name collision, matching ordinary unqualified-name precedence.
+        var views = new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in mainCatalog.Views)
+            views[pair.Key] = pair.Value;
+        foreach (var pair in tempCatalog.Views)
+            views[pair.Key] = pair.Value;
+
         return new RoutedStatement(
             _database,
             RewriteMainTempReadQuery(query, sourceNames, new HashSet<string>(StringComparer.OrdinalIgnoreCase)),
             IsAttached: false,
             new EmbeddedDatabase.SchemaCatalog(
                 tables,
-                new Dictionary<string, ViewDefinition>(StringComparer.OrdinalIgnoreCase),
+                views,
                 new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase)));
 
         void AddTables(
@@ -57134,9 +57299,15 @@ Func<string, ParsedStatement> rewrite)
         if (!ManagedSchemaName.TrySplit(sourceName, out _, out localName))
             localName = sourceName;
 
-        return sourceNames.TryGetValue(MainTempSourceKey(schema, localName), out var rewritten)
-            ? source with { Name = rewritten, IsSchemaQualified = false }
-            : source;
+        if (sourceNames.TryGetValue(MainTempSourceKey(schema, localName), out var rewritten))
+            return source with { Name = rewritten, IsSchemaQualified = false };
+
+        // No cross-schema name collision (the common case, and the only shape a view name
+        // takes here - a view is never entered into sourceNames, only tables are): the merged
+        // catalog stores this source under its bare name regardless of which schema owns it,
+        // so an explicit qualifier that survived unrenamed would otherwise fail to resolve
+        // against it (RouteMainTempReadQuery merges main+temp tables and views by bare name).
+        return source.IsSchemaQualified ? source with { Name = localName, IsSchemaQualified = false } : source;
     }
 
     private IReadOnlyList<OrderByTerm> RewriteMainTempReadOrderBy(
@@ -57312,6 +57483,11 @@ Func<string, ParsedStatement> rewrite)
             return schema;
 
         var objectName = schema[1..];
+        return IsKnownTableOrViewName(objectName) ? ResolveCollectedSchemaCore(objectName) : "main";
+    }
+
+    private string ResolveCollectedSchemaCore(string objectName)
+    {
         if (IsTemporarySchemaTable(objectName))
             return "temp";
         if (GetTransactionState(_tempDatabase) is { } tempState
@@ -57339,6 +57515,46 @@ Func<string, ParsedStatement> rewrite)
         }
 
         return "main";
+    }
+
+    // True when `name` names a real table or view somewhere on this connection's schema
+    // search path (temp, main, or an attached database) - or was declared by an earlier
+    // CREATE TABLE/CREATE VIEW statement still pending within the same PrepareScript call
+    // (_pendingScriptObjectNames). Handed to SqlParser as a lookup so a bare `name(args)`
+    // call that resolves to one of these - not a registered table-valued function, not a
+    // CTE - gets the same "'name' is not a function" diagnostic a CTE called with arguments
+    // already gets, instead of the generic "is not supported" message
+    // (cte.sqltest::table-referenced-with-call-arguments-rejected).
+    private bool IsKnownTableOrViewName(string name)
+    {
+        if (_pendingScriptObjectNames?.Contains(name) == true)
+            return true;
+        if (IsTemporarySchemaTable(name))
+            return true;
+        if (GetTransactionState(_tempDatabase) is { } tempState
+            ? tempState.Catalog.Tables.ContainsKey(name) || tempState.Catalog.Views.ContainsKey(name)
+            : _tempDatabase.ContainsTableOrView(name))
+        {
+            return true;
+        }
+        if (GetTransactionState(_database) is { } mainState
+            ? mainState.Catalog.Tables.ContainsKey(name) || mainState.Catalog.Views.ContainsKey(name)
+            : _database.ContainsTableOrView(name))
+        {
+            return true;
+        }
+
+        foreach (var attachment in _attachedDatabases.Values)
+        {
+            if (GetTransactionState(attachment.Database) is { } state
+                ? state.Catalog.Tables.ContainsKey(name) || state.Catalog.Views.ContainsKey(name)
+                : attachment.Database.ContainsTableOrView(name))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsTemporarySchemaTable(string name)
@@ -60419,6 +60635,11 @@ public sealed class EmbeddedStatement : IDisposable
         _sql = sql;
         _boundValues = new SqlValue[parameters.Count + 1];
     }
+
+    // Exposes the parsed statement for same-assembly callers that need to inspect its
+    // shape without re-parsing (PrepareScript's incremental "does an earlier statement in
+    // this same script declare this name" tracking).
+    internal ParsedStatement Statement => _statement;
 
     public int ParameterCount => _parameters.Count;
 

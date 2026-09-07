@@ -41,8 +41,6 @@
 # expects rejection (see the two gencol markers below).
 
 agg_sum_overflow.sqltest::sum-overflow-forgiven-by-later-float | database variant 1/1 (:memory:): expected success but got error: integer overflow
-aggregate-of-outer-column.sqltest::outer-where-filters-before-the-outer-aggregate | database variant 1/1 (:memory:): expected 1 row(s), got 2 row(s); row 0 expected '2' but was '1'
-cte.sqltest::table-referenced-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'not_a_function' is not supported: no module registration, planner, or execution contract is available. At SQL offset 28.' does not 
 delete-update-limit-rejected.sqltest::delete-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-limit-offset-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 delete-update-limit-rejected.sqltest::delete-where-limit-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
@@ -80,9 +78,6 @@ recursive-cte.sqltest::recursive-cte-used-nested-cte-self-ref-rejected | databas
 recursive-cte.sqltest::recursive-cte-visited-set-via-nested-cte-rejected | database variant 1/1 (:memory:): error 'circular reference: reach' does not match pattern 'multiple recursive references: reach'
 recursive-cte.sqltest::recursive-cte-window-clause-self-ref-rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
 recursive-cte.sqltest::recursive-cte-self-ref-with-call-arguments-rejected | database variant 1/1 (:memory:): error 'Managed table-valued source 'cte1' is not supported: no module registration, planner, or execution contract is available. At SQL offset 129.' does not match pat
-temp-view.sqltest::create-temp-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
-temp-view.sqltest::create-temporary-view-lives-in-temp-schema-not-main | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
-views.sqltest::drop-view-finds-temp-view-with-unqualified-name | database variant 1/1 (:memory:): expected success but got error: Managed temporary views can only reference objects in the temp schema.
 window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][none] | database variant 1/1 (:memory:): managed and SQLite rows differ
 window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-no-others] | database variant 1/1 (:memory:): managed and SQLite rows differ
 window/frame_matrix.sqltest::frame-asc[range][unbounded-preceding][2-preceding][exclude-current-row] | database variant 1/1 (:memory:): managed and SQLite rows differ

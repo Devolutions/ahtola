@@ -16,12 +16,23 @@ internal sealed class SqlParser
     private IReadOnlyList<SqlToken>? _pendingUpdateOfTokens;
     /// <summary>CTE names in scope for the statement body being parsed (WITH clause).</summary>
     private HashSet<string>? _activeCteNames;
+    // The parser has no schema access of its own; a caller that does (EmbeddedConnection.Prepare)
+    // may supply this so a bare `name(args)` call that matches a real table or view - not a
+    // registered table-valued function, not a CTE - gets the same "'name' is not a function"
+    // diagnostic SQLite/Turso give a CTE called with arguments, instead of the generic
+    // "is not supported" message (cte.sqltest::table-referenced-with-call-arguments-rejected).
+    private readonly Func<string, bool>? _isKnownNonFunctionName;
 
-    private SqlParser(string sql, SqlParameterMap parameterMap, SqlSourceSpans? spans = null)
+    private SqlParser(
+        string sql,
+        SqlParameterMap parameterMap,
+        SqlSourceSpans? spans = null,
+        Func<string, bool>? isKnownNonFunctionName = null)
     {
         _lexer = new SqlLexer(sql);
         _sql = sql;
         _spans = spans;
+        _isKnownNonFunctionName = isKnownNonFunctionName;
         for (var index = 1; index <= parameterMap.Count; index++)
         {
             var name = parameterMap.GetName(index);
@@ -30,9 +41,12 @@ internal sealed class SqlParser
         }
     }
 
-    public static ParsedStatement Parse(string sql, SqlParameterMap parameterMap)
+    public static ParsedStatement Parse(
+        string sql,
+        SqlParameterMap parameterMap,
+        Func<string, bool>? isKnownNonFunctionName = null)
     {
-        var parser = new SqlParser(sql, parameterMap);
+        var parser = new SqlParser(sql, parameterMap, isKnownNonFunctionName: isKnownNonFunctionName);
         var statement = parser.ParseStatement();
         parser.Consume(TokenKind.Semicolon);
         parser.Expect(TokenKind.End);
@@ -3136,6 +3150,11 @@ internal sealed class SqlParser
             // A CTE referenced with call arguments is a known non-function (upstream
             // planner.rs: "'cte1' is not a function").
             if (_activeCteNames is not null && _activeCteNames.Contains(functionName))
+                throw Error($"'{functionName}' is not a function");
+            // Same diagnostic for a real table or view: the parser has no schema access of
+            // its own, so the connection preparing the statement hands in a lookup for the
+            // one case this matters (cte.sqltest::table-referenced-with-call-arguments-rejected).
+            if (_isKnownNonFunctionName?.Invoke(functionName) == true)
                 throw Error($"'{functionName}' is not a function");
             throw Error(TableValuedFunctionRegistry.UnsupportedMessage(ManagedSchemaName.Display(name)));
         }
