@@ -57604,7 +57604,8 @@ public sealed partial class EmbeddedConnection : IDisposable
             DropTableStatement drop => RouteExistingNamedStatement(
                 drop.Name,
                 ManagedSchemaObjectKind.Table,
-                name => drop with { Name = name }),
+                name => drop with { Name = name },
+                ifExists: drop.IfExists),
             CreateIndexStatement createIndex => RouteCreateIndex(createIndex),
             DropIndexStatement dropIndex => RouteExistingNamedStatement(
                 dropIndex.Name,
@@ -58053,13 +58054,17 @@ Func<string, ParsedStatement> rewrite)
     private RoutedStatement RouteExistingNamedStatement(
         string objectName,
         ManagedSchemaObjectKind kind,
-        Func<string, ParsedStatement> rewrite)
+        Func<string, ParsedStatement> rewrite,
+        bool ifExists = false)
     {
         if (ManagedSchemaName.TrySplit(objectName, out var schema, out var localName))
         {
             // SQLite reports a missing qualified object at resolve time with the
-            // qualifier kept, so validate before the routing rewrite strips it.
+            // qualifier kept, so validate before the routing rewrite strips it. A
+            // DROP ... IF EXISTS defers that check to the routed database's own
+            // executor, which already treats a missing target as a no-op.
             if (kind == ManagedSchemaObjectKind.Table
+                && !ifExists
                 && !SchemaExists(schema, localName))
                 throw NoSuchTableError(objectName);
             return RouteSchema(schema, localName, rewrite);
@@ -58359,18 +58364,16 @@ Func<string, ParsedStatement> rewrite)
             : hasViewSchema
                 ? viewSchema
                 : "main";
+        // A view may only reference objects in its own schema: Turso's translate_create_view
+        // walks the body for table references and rejects the first one that resolves to a
+        // different database (view cannot reference table in attached database: schema.table),
+        // in either direction - a main-homed view reaching into an attachment, or an
+        // attached-homed view reaching back into main/another attachment.
         if (!statement.Temporary
-            && homeSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
-            && ContainsSchemaQualification(statement))
+            && FindFirstForeignViewTableReference(statement.Query, homeSchema) is { } foreignReference)
         {
             throw new EmbeddedSqlException(
-                "A view in the main schema cannot reference objects in an attached database.");
-        }
-        if (!statement.Temporary
-            && !homeSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
-            && ContainsSchemaQualification(statement.Query))
-        {
-            throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
+                $"view cannot reference table in attached database: {foreignReference}");
         }
 
         // A temp view's body may freely reference main-schema objects, exactly like a temp
@@ -58403,11 +58406,177 @@ Func<string, ParsedStatement> rewrite)
             local => statement with
             {
                 Name = local,
+                // Every qualifier left in the body now provably names this same home schema (the
+                // check above rejected anything else), so it is safe to strip down to local names:
+                // the view is evaluated inside the database that owns it, which has no notion of
+                // its own ATTACH alias.
+                Query = RewriteQuerySchema(
+                    statement.Query,
+                    homeSchema,
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase)),
                 // The parser already strips the view's own-name schema qualifier from
                 // statement.Sql; no further removal is needed here (and counting it again could
                 // over-consume a body identifier spelled like the schema name).
                 Sql = statement.Sql,
             });
+    }
+
+    /// <summary>
+    /// Finds the first table reference in a view body that is explicitly schema-qualified to
+    /// something other than <paramref name="homeSchema"/>, returning its "schema.table" spelling
+    /// for the diagnostic. Traversal order mirrors <see cref="CollectQuerySchemas"/> so the
+    /// reported table is the first one a left-to-right/top-to-bottom read of the SQL would reach,
+    /// matching upstream's diagnostic. Unqualified references are never flagged here: a view is
+    /// always allowed to reference its own schema without writing the qualifier.
+    /// </summary>
+    private static string? FindFirstForeignViewTableReference(QueryStatement query, string homeSchema)
+    {
+        switch (query)
+        {
+            case SelectStatement select:
+                return FindFirstForeignInSource(select.Source, homeSchema)
+                    ?? FindFirstForeignInProjections(select.Projections, homeSchema)
+                    ?? FindFirstForeignInExpression(select.Where, homeSchema)
+                    ?? select.GroupBy.Select(expression => FindFirstForeignInExpression(expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(select.Having, homeSchema)
+                    ?? select.NamedWindows.Select(window => FindFirstForeignInWindow(window.Specification, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? select.OrderBy.Select(term => FindFirstForeignInExpression(term.Expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(select.Limit, homeSchema)
+                    ?? FindFirstForeignInExpression(select.Offset, homeSchema);
+            case ValuesClause values:
+                return values.Rows.SelectMany(row => row)
+                    .Select(expression => FindFirstForeignInExpression(expression, homeSchema))
+                    .FirstOrDefault(found => found is not null);
+            case CompoundSelectStatement compound:
+                return compound.Terms
+                        .Select(term => FindFirstForeignViewTableReference(term, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? compound.OrderBy.Select(term => FindFirstForeignInExpression(term.Expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(compound.Limit, homeSchema)
+                    ?? FindFirstForeignInExpression(compound.Offset, homeSchema);
+            case WithSelectStatement with:
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                {
+                    if (FindFirstForeignViewTableReference(commonTableExpression.Query, homeSchema) is { } found)
+                        return found;
+                }
+                return FindFirstForeignViewTableReference(with.Query, homeSchema);
+            default:
+                throw new InvalidOperationException($"Cannot inspect query {query.GetType().Name}.");
+        }
+    }
+
+    private static string? FindFirstForeignInSource(TableSource? source, string homeSchema)
+    {
+        switch (source)
+        {
+            case null:
+                return null;
+            case NamedTableSource named:
+                if (!ManagedSchemaName.TrySplit(named.Name, out var schema, out var localName)
+                    || schema.Equals(homeSchema, StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+
+                return schema + "." + localName;
+            case DerivedTableSource derived:
+                return FindFirstForeignViewTableReference(derived.Query, homeSchema);
+            case JoinTableSource join:
+                return FindFirstForeignInSource(join.Left, homeSchema)
+                    ?? FindFirstForeignInSource(join.Right, homeSchema)
+                    ?? FindFirstForeignInExpression(join.Condition, homeSchema);
+            case TableValuedFunctionSource function:
+                return function.Schema is { } explicitSchema
+                    && !explicitSchema.Equals(homeSchema, StringComparison.OrdinalIgnoreCase)
+                        ? explicitSchema + "." + function.Name
+                        : function.Arguments
+                            .Select(argument => FindFirstForeignInExpression(argument, homeSchema))
+                            .FirstOrDefault(found => found is not null);
+            default:
+                return null;
+        }
+    }
+
+    private static string? FindFirstForeignInProjections(IReadOnlyList<Projection> projections, string homeSchema)
+        => projections.Select(projection => FindFirstForeignInExpression(projection.Expression, homeSchema))
+            .FirstOrDefault(found => found is not null);
+
+    private static string? FindFirstForeignInWindow(WindowSpecification? window, string homeSchema)
+    {
+        if (window is null)
+            return null;
+
+        return window.PartitionBy.Select(expression => FindFirstForeignInExpression(expression, homeSchema))
+                .FirstOrDefault(found => found is not null)
+            ?? window.OrderBy.Select(term => FindFirstForeignInExpression(term.Expression, homeSchema))
+                .FirstOrDefault(found => found is not null)
+            ?? FindFirstForeignInExpression(window.Frame?.Start.Offset, homeSchema)
+            ?? FindFirstForeignInExpression(window.Frame?.End.Offset, homeSchema);
+    }
+
+    private static string? FindFirstForeignInExpression(Expression? expression, string homeSchema)
+    {
+        switch (expression)
+        {
+            case null:
+                return null;
+            case ScalarSubqueryExpression scalarSubquery:
+                return FindFirstForeignViewTableReference(scalarSubquery.Query, homeSchema);
+            case ExistsExpression exists:
+                return FindFirstForeignViewTableReference(exists.Query, homeSchema);
+            case InSubqueryExpression inSubquery:
+                return FindFirstForeignInExpression(inSubquery.Value, homeSchema)
+                    ?? FindFirstForeignViewTableReference(inSubquery.Query, homeSchema);
+            case RowValueExpression rowValue:
+                return rowValue.Values.Select(value => FindFirstForeignInExpression(value, homeSchema))
+                    .FirstOrDefault(found => found is not null);
+            case FunctionExpression function:
+                return function.Arguments.Select(argument => FindFirstForeignInExpression(argument, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(function.Filter, homeSchema)
+                    ?? (function.AggregateOrderBy ?? [])
+                        .Select(orderBy => FindFirstForeignInExpression(orderBy.Expression, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInWindow(function.Window, homeSchema);
+            case CollationExpression collation:
+                return FindFirstForeignInExpression(collation.Expression, homeSchema);
+            case CastExpression cast:
+                return FindFirstForeignInExpression(cast.Expression, homeSchema);
+            case CaseExpression @case:
+                return FindFirstForeignInExpression(@case.Operand, homeSchema)
+                    ?? @case.Clauses.Select(clause =>
+                            FindFirstForeignInExpression(clause.When, homeSchema)
+                            ?? FindFirstForeignInExpression(clause.Then, homeSchema))
+                        .FirstOrDefault(found => found is not null)
+                    ?? FindFirstForeignInExpression(@case.Else, homeSchema);
+            case LikeExpression like:
+                return FindFirstForeignInExpression(like.Value, homeSchema)
+                    ?? FindFirstForeignInExpression(like.Pattern, homeSchema)
+                    ?? FindFirstForeignInExpression(like.Escape, homeSchema);
+            case GlobExpression glob:
+                return FindFirstForeignInExpression(glob.Value, homeSchema)
+                    ?? FindFirstForeignInExpression(glob.Pattern, homeSchema);
+            case InExpression @in:
+                return FindFirstForeignInExpression(@in.Value, homeSchema)
+                    ?? @in.Values.Select(value => FindFirstForeignInExpression(value, homeSchema))
+                        .FirstOrDefault(found => found is not null);
+            case BetweenExpression between:
+                return FindFirstForeignInExpression(between.Value, homeSchema)
+                    ?? FindFirstForeignInExpression(between.Lower, homeSchema)
+                    ?? FindFirstForeignInExpression(between.Upper, homeSchema);
+            case UnaryExpression unary:
+                return FindFirstForeignInExpression(unary.Operand, homeSchema);
+            case BinaryExpression binary:
+                return FindFirstForeignInExpression(binary.Left, homeSchema)
+                    ?? FindFirstForeignInExpression(binary.Right, homeSchema);
+            default:
+                return null;
+        }
     }
 
     private static int CopyQuotedToken(
