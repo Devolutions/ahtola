@@ -168,7 +168,7 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
             var rows = AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
                 pageCache,
                 plan.RootPage,
-                plan.RowidAliasColumnIndex,
+                plan.Table,
                 _textEncoding,
                 plan.Limit,
                 cancellationToken);

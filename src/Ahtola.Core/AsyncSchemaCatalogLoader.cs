@@ -18,6 +18,18 @@ internal static class AsyncSchemaCatalogLoader
 {
     private const uint SchemaRootPage = 1;
 
+    /// <summary>
+    /// The same depth ceiling <see cref="Storage.AsyncBoundedRowidTableScanCursor"/> and the
+    /// synchronous <see cref="Storage.SqliteTableBtreeCursor"/> already enforce. A self- or
+    /// long-cyclic <c>sqlite_schema</c> b-tree is caught here because revisiting any page always
+    /// requires one more descend step (this walk pushes a frame and moves to a child, never to
+    /// an already-popped ancestor), so a cycle strictly increases stack depth every time it
+    /// repeats rather than looping at constant depth — the same reasoning that makes depth
+    /// capping alone sufficient for those two traversals, with no separate visited-page set
+    /// needed.
+    /// </summary>
+    private const int MaximumDepth = 64;
+
     /// <summary>Walks the schema b-tree and reconstructs every recognizable base table.</summary>
     public static async ValueTask<AsyncSchemaCatalog> LoadAsync(
         IAsyncSqliteBtreePageIo pageIo,
@@ -27,7 +39,7 @@ internal static class AsyncSchemaCatalogLoader
         ArgumentNullException.ThrowIfNull(pageIo);
 
         var rows = new List<ManagedSchemaRow>();
-        await WalkAsync(pageIo, SchemaRootPage, isFirstPage: true, rows, textEncoding, cancellationToken)
+        await WalkAsync(pageIo, SchemaRootPage, rows, textEncoding, cancellationToken)
             .ConfigureAwait(false);
 
         var indexedTableNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -70,61 +82,96 @@ internal static class AsyncSchemaCatalogLoader
 
     private static async ValueTask WalkAsync(
         IAsyncSqliteBtreePageIo pageIo,
-        uint pageNumber,
-        bool isFirstPage,
+        uint rootPage,
         List<ManagedSchemaRow> rows,
         SqliteTextEncoding textEncoding,
         CancellationToken cancellationToken)
     {
-        var image = await pageIo.ReadPageAsync(pageNumber, cancellationToken).ConfigureAwait(false);
-        var header = SqliteBtreePageHeader.Parse(image, isFirstPage, pageIo.UsableSpace);
-        switch (header.PageType)
+        var overflowReader = new AsyncSqliteOverflowChainReader(pageIo);
+        // Each frame is one still-open ancestor interior page: its parsed view and the index of
+        // the next child to descend into once the currently active subtree is exhausted. This
+        // mirrors AsyncBoundedRowidTableScanCursor.ScanAscendingAsync's iterative traversal
+        // exactly, replacing the previous unbounded recursive WalkAsync (self-call per child,
+        // per rightmost child) that a corrupt/adversarial sqlite_schema b-tree containing a
+        // self-referencing or long interior-page cycle could drive into unbounded recursion —
+        // a StackOverflowException, which .NET cannot catch, ahead of ever reaching the
+        // classifier or any caller's try/catch.
+        var stack = new List<(SqliteTableInteriorPageView View, int NextChildIndex)>();
+        var currentPage = rootPage;
+
+        while (true)
         {
-            case SqliteBtreePageType.TableLeaf:
-                {
-                    var leaf = SqliteTableLeafPageView.Parse(image, pageIo.UsableSpace, isFirstPage);
-                    var overflowReader = new AsyncSqliteOverflowChainReader(pageIo);
-                    foreach (var pageCell in leaf.Cells)
-                    {
-                        var record = await overflowReader
-                            .ReadPayloadAsync(pageCell.Cell, cancellationToken)
-                            .ConfigureAwait(false);
-                        var values = SqliteRecordCodec.Decode(record, textEncoding);
-                        rows.Add(ToSchemaRow(pageCell.Cell.RowId, values));
-                    }
+            cancellationToken.ThrowIfCancellationRequested();
+            // Computed fresh from the actual page number, exactly like the synchronous
+            // SqliteTableBtreeCursor.TrySeekLeaf does on every iteration -- never hardcoded false
+            // for every page after the root. Only physical page 1 carries the 100-byte database
+            // header prefix; a corrupt tree that routes back to page 1 as if it were an ordinary
+            // child must still be parsed at the right offset, not misread as a bogus page type
+            // from byte 0 of the SQLite header ('S' of "SQLite format 3").
+            var isFirstPage = currentPage == 1;
+            var image = await pageIo.ReadPageAsync(currentPage, cancellationToken).ConfigureAwait(false);
+            var header = SqliteBtreePageHeader.Parse(image, isFirstPage, pageIo.UsableSpace);
 
-                    break;
+            if (header.PageType == SqliteBtreePageType.TableInterior)
+            {
+                if (stack.Count >= MaximumDepth)
+                {
+                    throw new InvalidDataException(
+                        $"SQLite sqlite_schema b-tree rooted at page {rootPage} is deeper than "
+                        + $"{MaximumDepth} levels, or contains a cycle.");
                 }
 
-            case SqliteBtreePageType.TableInterior:
-                {
-                    var interior = SqliteTableInteriorPageView.Parse(image, pageIo.UsableSpace, isFirstPage);
-                    foreach (var cell in interior.Cells)
-                    {
-                        await WalkAsync(
-                            pageIo,
-                            cell.Cell.LeftChildPage,
-                            isFirstPage: false,
-                            rows,
-                            textEncoding,
-                            cancellationToken).ConfigureAwait(false);
-                    }
+                var interior = SqliteTableInteriorPageView.Parse(image, pageIo.UsableSpace, isFirstPage);
+                stack.Add((interior, 0));
+                currentPage = ChildAt(interior, 0);
+                continue;
+            }
 
-                    await WalkAsync(
-                        pageIo,
-                        interior.Header.RightMostChildPage,
-                        isFirstPage: false,
-                        rows,
-                        textEncoding,
-                        cancellationToken).ConfigureAwait(false);
-                    break;
-                }
-
-            default:
+            if (header.PageType != SqliteBtreePageType.TableLeaf)
+            {
                 throw new InvalidDataException(
-                    $"SQLite page {pageNumber} is not part of the sqlite_schema b-tree.");
+                    $"SQLite page {currentPage} is not part of the sqlite_schema b-tree.");
+            }
+
+            var leaf = SqliteTableLeafPageView.Parse(image, pageIo.UsableSpace, isFirstPage);
+            foreach (var pageCell in leaf.Cells)
+            {
+                var record = await overflowReader
+                    .ReadPayloadAsync(pageCell.Cell, cancellationToken)
+                    .ConfigureAwait(false);
+                var values = SqliteRecordCodec.Decode(record, textEncoding);
+                rows.Add(ToSchemaRow(pageCell.Cell.RowId, values));
+            }
+
+            // Ascend until a frame has an unvisited next child, descending into it; an empty
+            // stack after popping everything means the whole tree is exhausted.
+            uint? nextPage = null;
+            while (stack.Count > 0)
+            {
+                var frameIndex = stack.Count - 1;
+                var frame = stack[frameIndex];
+                var nextChildIndex = frame.NextChildIndex + 1;
+                if (nextChildIndex <= frame.View.Cells.Count)
+                {
+                    stack[frameIndex] = frame with { NextChildIndex = nextChildIndex };
+                    nextPage = ChildAt(frame.View, nextChildIndex);
+                    break;
+                }
+
+                stack.RemoveAt(frameIndex);
+            }
+
+            if (nextPage is not { } resolvedNextPage)
+                return;
+
+            currentPage = resolvedNextPage;
         }
     }
+
+    private static uint ChildAt(SqliteTableInteriorPageView view, int childIndex)
+        => childIndex < view.Cells.Count
+            ? view.Cells[childIndex].Cell.LeftChildPage
+            : view.Header.RightMostChildPage;
 
     private static ManagedSchemaRow ToSchemaRow(long rowId, SqlValue[] values)
     {

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using Ahtola.Core;
 
 namespace Ahtola.Core.Storage;
 
@@ -43,12 +44,13 @@ internal static class AsyncBoundedRowidTableScanCursor
     public static async IAsyncEnumerable<SqlValue[]> ScanAscendingAsync(
         BoundedAsyncPageCache pageCache,
         uint rootPage,
-        int rowidAliasColumnIndex,
+        EmbeddedTable table,
         SqliteTextEncoding textEncoding,
         long? limit,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
+        ArgumentNullException.ThrowIfNull(table);
 
         var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
         // Each frame is one still-open ancestor interior page: the page number (for
@@ -56,7 +58,6 @@ internal static class AsyncBoundedRowidTableScanCursor
         // once the currently active subtree is exhausted.
         var stack = new List<(uint PageNumber, SqliteTableInteriorPageView View, int NextChildIndex)>();
         var currentPage = rootPage;
-        var isFirstPage = rootPage == 1;
         var yielded = 0L;
 
         try
@@ -67,6 +68,13 @@ internal static class AsyncBoundedRowidTableScanCursor
                     yield break;
 
                 cancellationToken.ThrowIfCancellationRequested();
+                // Computed fresh from the actual page number being visited, exactly like the
+                // synchronous SqliteTableBtreeCursor.TrySeekLeaf does on every iteration — not
+                // hardcoded false for every page after the root. Only physical page 1 carries
+                // the 100-byte database header prefix; a corrupt tree that routes back to page 1
+                // as if it were an ordinary child must still be parsed at the right offset, not
+                // misread as a bogus page type from byte 0 of the SQLite header.
+                var isFirstPage = currentPage == 1;
                 var image = await pageCache.ReadPageAsync(currentPage, cancellationToken).ConfigureAwait(false);
                 var header = SqliteBtreePageHeader.Parse(image, isFirstPage, pageCache.UsableSpace);
 
@@ -82,7 +90,6 @@ internal static class AsyncBoundedRowidTableScanCursor
                     pageCache.Pin(currentPage);
                     stack.Add((currentPage, interior, 0));
                     currentPage = ChildAt(interior, 0);
-                    isFirstPage = false;
                     continue;
                 }
 
@@ -93,20 +100,41 @@ internal static class AsyncBoundedRowidTableScanCursor
                 }
 
                 var leaf = SqliteTableLeafPageView.Parse(image, pageCache.UsableSpace, isFirstPage);
-                foreach (var cell in leaf.Cells)
+                var leafPage = currentPage;
+                // The leaf must stay pinned for as long as any of its cells might still need an
+                // overflow-chain fetch through the same capacity-capped cache: without this, an
+                // overflow read could evict the leaf's own cache entry to make room, understating
+                // real resident memory (the leaf's bytes are still alive via this parsed `leaf`
+                // view and its cells) instead of the cache's accounting failing loud with
+                // SqliteBoundedPageBudgetExceededException when the budget is genuinely too
+                // small to hold both at once.
+                pageCache.Pin(leafPage);
+                try
                 {
-                    if (limit is { } cellMax && yielded >= cellMax)
-                        yield break;
+                    foreach (var cell in leaf.Cells)
+                    {
+                        if (limit is { } cellMax && yielded >= cellMax)
+                            yield break;
 
-                    var record = await overflowReader
-                        .ReadPayloadAsync(cell.Cell, cancellationToken)
-                        .ConfigureAwait(false);
-                    var values = SqliteRecordCodec.Decode(record, textEncoding);
-                    if (rowidAliasColumnIndex >= 0 && rowidAliasColumnIndex < values.Length)
-                        values[rowidAliasColumnIndex] = SqlValue.Integer(cell.Cell.RowId);
+                        var record = await overflowReader
+                            .ReadPayloadAsync(cell.Cell, cancellationToken)
+                            .ConfigureAwait(false);
+                        var rawValues = SqliteRecordCodec.Decode(record, textEncoding);
+                        // A row written before a later ALTER TABLE ADD COLUMN decodes with fewer
+                        // values than the table's current column count; reuse the exact same
+                        // default/NULL padding EmbeddedFileStore's own eager load path uses so
+                        // the two can never disagree about a short record's missing columns.
+                        var values = EmbeddedFileStore.RestoreRowidTableRecord(table, rawValues);
+                        if (table.RowidAliasColumnIndex >= 0)
+                            values[table.RowidAliasColumnIndex] = SqlValue.Integer(cell.Cell.RowId);
 
-                    yield return values;
-                    yielded++;
+                        yield return values;
+                        yielded++;
+                    }
+                }
+                finally
+                {
+                    pageCache.Unpin(leafPage);
                 }
 
                 // Ascend until a frame has an unvisited next child, descending into it; an
@@ -132,7 +160,6 @@ internal static class AsyncBoundedRowidTableScanCursor
                     yield break;
 
                 currentPage = resolvedNextPage;
-                isFirstPage = false;
             }
         }
         finally

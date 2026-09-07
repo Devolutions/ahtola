@@ -50,7 +50,7 @@ public sealed class AsyncBoundedRowidScanTests
         await foreach (var row in AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
             pageCache,
             plan!.RootPage,
-            plan.RowidAliasColumnIndex,
+            plan.Table,
             textEncoding,
             plan.Limit))
         {
@@ -103,7 +103,7 @@ public sealed class AsyncBoundedRowidScanTests
         await foreach (var row in AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
             pageCache,
             plan.RootPage,
-            plan.RowidAliasColumnIndex,
+            plan.Table,
             textEncoding,
             plan.Limit))
         {
@@ -148,7 +148,7 @@ public sealed class AsyncBoundedRowidScanTests
             await foreach (var _ in AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
                 pageCache,
                 plan!.RootPage,
-                plan.RowidAliasColumnIndex,
+                plan.Table,
                 textEncoding,
                 plan.Limit))
             {
@@ -156,6 +156,109 @@ public sealed class AsyncBoundedRowidScanTests
         };
 
         await act.Should().ThrowAsync<SqliteBoundedPageBudgetExceededException>();
+    }
+
+    [Test]
+    public async Task PadsRowsWrittenBeforeAlterTableAddColumnWithDefaultsInsteadOfIndexingOutOfRange()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT);");
+            // This physical row is stored with only 2 columns' worth of record content.
+            Execute(connection, "INSERT INTO items VALUES (1, 'old-row');");
+            Execute(connection, "ALTER TABLE items ADD COLUMN note TEXT DEFAULT 'unset';");
+            // This row is stored after the ALTER, so its own record already has 3 values.
+            Execute(connection, "INSERT INTO items VALUES (2, 'new-row', 'explicit');");
+        }
+
+        await using var pager = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            DatabasePath,
+            WalPath,
+            readOnly: true);
+        await using var readTransaction = await pager.BeginReadAsync();
+        var pageCache = new BoundedAsyncPageCache(readTransaction, pager.UsableSpace, capacity: 32);
+        var textEncoding = await ReadTextEncodingAsync(pageCache);
+        var catalog = await AsyncSchemaCatalogLoader.LoadAsync(pageCache, textEncoding);
+
+        var plan = BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM items", catalog, out var rejectionReason);
+        plan.Should().NotBeNull(rejectionReason);
+        plan!.ProjectedColumnIndexes.Should().HaveCount(3);
+
+        var rows = new List<SqlValue[]>();
+        await foreach (var row in AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
+            pageCache,
+            plan.RootPage,
+            plan.Table,
+            textEncoding,
+            plan.Limit))
+        {
+            rows.Add(row);
+        }
+
+        rows.Should().HaveCount(2);
+        // The pre-ALTER row's short record must be padded with the column's declared default
+        // (matching EmbeddedFileStore.RestoreRowidTableRecord's own behavior) rather than
+        // leaving the projected values array too short to index into.
+        rows[0][0].AsInteger().Should().Be(1L);
+        rows[0][1].AsText().Should().Be("old-row");
+        rows[0][2].AsText().Should().Be("unset");
+        rows[1][0].AsInteger().Should().Be(2L);
+        rows[1][1].AsText().Should().Be("new-row");
+        rows[1][2].AsText().Should().Be("explicit");
+    }
+
+    [Test]
+    public async Task PinsTheCurrentLeafSoAnOverflowFetchCannotSilentlyEvictItsCacheEntry()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, blob TEXT);");
+            // Large enough to force at least one overflow page beyond the leaf's local payload.
+            Execute(connection, $"INSERT INTO items VALUES (1, '{new string('x', 8000)}');");
+        }
+
+        await using var pager = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            DatabasePath,
+            WalPath,
+            readOnly: true);
+        await using var readTransaction = await pager.BeginReadAsync();
+        // A single-page table (root is itself the leaf) needs exactly one resident page for the
+        // leaf and at least one more for its overflow chain. A capacity of 1 can therefore only
+        // ever succeed if the leaf's own cache entry is allowed to be silently evicted to make
+        // room for the overflow page -- which would understate real resident memory (the leaf's
+        // bytes are still alive via the parsed view and its cells) instead of failing loud.
+        var pageCache = new BoundedAsyncPageCache(readTransaction, pager.UsableSpace, capacity: 1);
+        var textEncoding = await ReadTextEncodingAsync(pageCache);
+        var catalog = await AsyncSchemaCatalogLoader.LoadAsync(pageCache, textEncoding);
+
+        var plan = BoundedRowidScanShapeClassifier.TryClassify("SELECT blob FROM items", catalog, out var rejectionReason);
+        plan.Should().NotBeNull(rejectionReason);
+
+        var act = async () =>
+        {
+            await foreach (var _ in AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
+                pageCache,
+                plan!.RootPage,
+                plan.Table,
+                textEncoding,
+                plan.Limit))
+            {
+            }
+        };
+
+        await act.Should().ThrowAsync<SqliteBoundedPageBudgetExceededException>();
+
+        // The budget fault must leave the connection's own resources (the read transaction, the
+        // pager) in a state that still disposes cleanly -- a fault here must be terminal for the
+        // scan, not for the whole connection.
+        var disposeAct = async () => await readTransaction.DisposeAsync();
+        await disposeAct.Should().NotThrowAsync();
     }
 
     [Test]

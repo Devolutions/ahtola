@@ -9,8 +9,7 @@ namespace Ahtola.Core.Parsing;
 internal sealed record BoundedRowidScanPlan(
     string TableName,
     uint RootPage,
-    int TotalColumnCount,
-    int RowidAliasColumnIndex,
+    EmbeddedTable Table,
     IReadOnlyList<int> ProjectedColumnIndexes,
     IReadOnlyList<string> ColumnNames,
     long? Limit);
@@ -203,8 +202,7 @@ internal static class BoundedRowidScanShapeClassifier
         return new BoundedRowidScanPlan(
             tableSource.Name,
             entry.RootPage,
-            entry.Table.Columns.Length,
-            entry.Table.RowidAliasColumnIndex,
+            entry.Table,
             columnIndexes,
             columnNames,
             limit);
