@@ -109,6 +109,7 @@ rejection parity, not a promise of general recursive FULL JOIN support.
 | PLAN | Remaining 18 EQP/EXPLAIN entries | SQL, CTE | EQP describes actual rewrites; cost original versus decorrelated plans; reuse identical aggregate subqueries; lower eligible semi/anti/grouped shapes for real EXPLAIN |
 | EQP | Complete FORMAT=JSON | PLAN | Structured op variants, CTE materializations, null root parents, original SQL, correct result columns; adopt the 15 pinned upstream cases |
 | NULLIDX | Explicit index NULLS FIRST/LAST | Integrated Wave 1 parser/schema | Metadata, persisted ordering, forward/reverse seeks, bounds, ORDER BY satisfaction, uniqueness/UPSERT, reopen and corruption checks; adopt 83 upstream cases |
+| LOCALE | Newly discovered ICU-locale collation parity | Coordinate NULLIDX comparator integration | Generalized locale/tag options, consistent equality/order, and durable index ordering through pure-managed, trim/AOT-safe facilities; adopt 7 upstream cases without replacing the canonical SQLite collation corpus |
 | COVER | Expand upstream coverage | Harness work parallel with Wave 1; engine-dependent adoption after integration | Classify all remaining Turso-specific files, run eligible backend-tagged SQL, and provide equivalents for path fixtures without rewriting expected SQL |
 
 Do not implement plan parity by fabricating upstream display strings. A runtime
@@ -122,12 +123,23 @@ Document nonstandard index SQL/file interoperability and fail closed when a
 consumer cannot honor the physical ordering.
 
 COVER starts from all 319 pinned SQLite-suite files already present, plus 5 of
-61 Turso-specific files adopted. The 14 excluded path-fixture files comprise
+67 Turso-specific files adopted. The initial top-level count of 61 omitted six
+files under the upstream attach directory; 62 files therefore need disposition.
+New Turso-suite files stay under `conformance/sqlite-sqltests/turso`, preserving
+their upstream relative paths, rather than overwriting same-named SQLite files.
+The 14 excluded path-fixture files comprise
 12 integrity/corruption fixtures and 2 other database fixtures. Review the 12
 rust-backend annotations individually instead of indiscriminately removing
 backend filtering. Preserve genuine CLI-only and unadopted-capability exclusions.
 Newly exposed failures become explicit owned follow-up work; do not silently
 expand the expected-failures file to declare coverage green.
+
+LOCALE was exposed by the broader audit: `fr-FR`, traditional Spanish tailoring,
+upper-first ordering, numeric collation, and strength/case distinctions have
+seven positive upstream cases. A host-dependent approximate comparator or
+hardcoded sample outputs do not establish parity. If deterministic portable
+ordering cannot be supplied under the managed/AOT constraint, record the actual
+design blocker instead of silently accepting incompatible persisted indexes.
 
 ## Wave 3: architectural depth
 
@@ -164,6 +176,11 @@ Use existing diagnostics and benchmark infrastructure to establish benefit.
    SQLite shares the contract, use the existing differential infrastructure.
 3. Run the existing managed wrapper with an explicit nonzero execution floor:
    `pwsh .\scripts\Invoke-ManagedTestSuite.ps1 -Framework net10.0 -Filter "<affected selectors>" -MinimumExecutedTests 1`.
+   Corpus selectors use `Name~relative/file.sqltest`; combine them with `|` and
+   `FullyQualifiedName~RegressionClass` as needed. Each corpus file is one NUnit
+   test, not one test per internal SQL case. Set the execution floor accordingly.
+   `FullyQualifiedName~Sqltest` selects the whole corpus/harness, and
+   `--list-tests` does not prove that an execution filter narrowed the run.
 4. Exercise affected complete sqltest files and both evaluator/compiled routes
    when routing differs. Remove only entries that demonstrably pass.
 5. After integration, run the affected broader conformance lane and net8/net9/net10
