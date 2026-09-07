@@ -154,8 +154,8 @@ public class CompiledCompoundRecursiveDifferentialTests
     [Test]
     public void DistinctRecursiveTermMatchesSqliteAndTruthfullyReportsFallback()
     {
-        // A DISTINCT recursive projection must be evaluated once per current row: a
-        // single-row DISTINCT never removes anything, preserving duplicates the
+        // A DISTINCT recursive projection deduplicates each current row's expansion
+        // independently, preserving duplicates across expansions that the
         // whole-generation worktable transform would otherwise incorrectly collapse
         // (see IsRoutableRecursiveTerm / recursive-cte-distinct-in-recursive-step). So this
         // shape stays on the evaluator's own per-row priority queue instead of routing
@@ -182,7 +182,8 @@ public class CompiledCompoundRecursiveDifferentialTests
         foreach (var sql in setup)
             Execute(connection, sql);
         QueryPlanDetail(connection, joined).Should().Be("MANAGED EVALUATOR FALLBACK");
-        Assert.Throws<EmbeddedSqlException>(() => ExplainOpcodes(connection, joined));
+        Assert.Throws<EmbeddedSqlException>(() => ExplainOpcodes(connection, joined))!
+            .Message.Should().Contain("only supported for statements lowered to the bytecode compiler");
     }
 
     [Test]
