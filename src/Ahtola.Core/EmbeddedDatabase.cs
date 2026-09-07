@@ -27966,47 +27966,112 @@ out bool hasReturning)
             return result;
 
         // EXPLAIN QUERY PLAN FORMAT=JSON emits one plan_json TEXT row carrying the
-        // machine-readable envelope documented in turso-src/docs/eqp-json.md. The
-        // managed engine's plan rows become node entries; the structured `op` objects
-        // of the upstream format are not yet modeled, so each node carries the plan
-        // detail text with the node id/parent linkage from the text rows.
+        // machine-readable envelope documented in turso-src/docs/eqp-json.md. Every node in
+        // that contract carries a structured `op` object; a handful of shapes below build one
+        // directly from the same plan data the text path already computed (constant row, and a
+        // single-table index scan/search with no WHERE/subquery correlation to describe). Every
+        // other shape is not yet modeled as a typed op, so rather than fabricate one it is
+        // reported as an explicit "unmodeled" op carrying the plan detail text -- never a real
+        // Turso op name, so it can never be silently mistaken for the genuine contract.
         var sql = statement.InnerSql ?? string.Empty;
+        var isWriteWithoutReturning = statement.Inner switch
+        {
+            InsertStatement { Returning: null } => true,
+            UpdateStatement { Returning: null } => true,
+            DeleteStatement { Returning: null } => true,
+            _ => false,
+        };
         // The query's result columns come from the same auto-increment statement state the
         // text path binds; when the inner statement is not a plain query, fall back to
-        // the plan row columns.
+        // the plan row columns. INSERT/UPDATE/DELETE without RETURNING produce no output rows
+        // at all, so their result_columns is always empty rather than the internal EQP columns.
         string[] resultColumns;
-        try
+        if (isWriteWithoutReturning)
         {
-            resultColumns = statement.Inner is QueryStatement innerQuery
-                ? DescribeQuery(innerQuery, EnsureAutoIncrementStatementState(context))
-                : result.Columns;
+            resultColumns = [];
         }
-        catch (EmbeddedSqlException)
+        else
         {
-            resultColumns = result.Columns;
+            try
+            {
+                resultColumns = statement.Inner is QueryStatement innerQuery
+                    ? DescribeQuery(innerQuery, EnsureAutoIncrementStatementState(context))
+                    : result.Columns;
+            }
+            catch (EmbeddedSqlException)
+            {
+                resultColumns = result.Columns;
+            }
         }
+
+        // A lone "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" row is the text path's
+        // placeholder for "no per-step plan is modeled for this statement yet", not a real scan
+        // or search step. Reporting it as a fake node would misrepresent the plan; report no
+        // nodes instead, which is also what a write statement with nothing to scan (a constant
+        // INSERT ... VALUES) genuinely has.
+        var isPlaceholderOnly = result.Rows.Count == 1
+            && result.Rows[0].Length >= 4
+            && result.Rows[0][3].Kind == SqlValueKind.Text
+            && result.Rows[0][3].AsText() is "MANAGED COMPILED VDBE" or "MANAGED EVALUATOR FALLBACK";
+
+        var typedOp = statement.Inner is SelectStatement plannedSelect
+            ? TryBuildEqpJsonOp(plannedSelect, EnsureAutoIncrementStatementState(context))
+            : null;
+
         var json = new System.Text.StringBuilder()
             .Append("{\"version\":1,\"sql\":")
             .Append(JsonEscape("EXPLAIN QUERY PLAN " + sql))
             .Append(",\"result_columns\":[")
             .Append(string.Join(",", resultColumns.Select(static column => JsonEscape(column))))
             .Append("],\"nodes\":[")
-            .Append(string.Join(",", result.Rows.Select((row, index) =>
-            {
-                var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
-                var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
-                    ? row[0].AsInteger().ToString(CultureInfo.InvariantCulture)
-                    : (index + 1).ToString(CultureInfo.InvariantCulture);
-                var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer
-                    ? row[1].AsInteger().ToString(CultureInfo.InvariantCulture)
-                    : "null";
-                return $"{{\"id\":{nodeId},\"parent\":{parent},\"detail\":{JsonEscape(detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty)}}}";
-            })))
+            .Append(isPlaceholderOnly
+                ? string.Empty
+                : string.Join(",", result.Rows.Select((row, index) =>
+                {
+                    var detail = row.Length >= 4 ? row[3] : SqlValue.Null;
+                    var detailText = detail.Kind == SqlValueKind.Text ? detail.AsText() : string.Empty;
+                    var nodeId = row.Length >= 1 && row[0].Kind == SqlValueKind.Integer
+                        ? row[0].AsInteger().ToString(CultureInfo.InvariantCulture)
+                        : (index + 1).ToString(CultureInfo.InvariantCulture);
+                    var parent = row.Length >= 2 && row[1].Kind == SqlValueKind.Integer && row[1].AsInteger() != 0
+                        // The TEXT rows use 0 as the "no parent" sentinel (matching Turso's own
+                        // parent=0 top-level convention); the JSON contract spells that null.
+                        ? row[1].AsInteger().ToString(CultureInfo.InvariantCulture)
+                        : "null";
+                    var op = index == 0 && typedOp is not null
+                        ? typedOp.ToJson()
+                        : $"{{\"type\":\"unmodeled\",\"detail\":{JsonEscape(detailText)}}}";
+                    return $"{{\"id\":{nodeId},\"parent\":{parent},\"detail\":{JsonEscape(detailText)},\"op\":{op}}}";
+                })))
             .Append("]}");
         return new ExecutionResult(["plan_json"], [[SqlValue.Text(json.ToString())]], 0);
     }
 
-    private static string JsonEscape(string value)
+    /// <summary>
+    /// Builds the FORMAT=JSON <c>op</c> object for the narrow set of shapes modeled as a typed
+    /// node so far: a single base-table SCAN whose ORDER BY is elided by a declared index (no
+    /// WHERE-based SEARCH, no correlated subquery). Every other shape -- including a FROM-less
+    /// constant row, which the TEXT path still reports as "MANAGED COMPILED VDBE"/"MANAGED
+    /// EVALUATOR FALLBACK" to preserve the existing compiled-vs-evaluator routing contract
+    /// (ExplainQueryPlanTests.cs) -- returns <see langword="null"/> and the caller reports an
+    /// explicit "unmodeled" op rather than a fabricated one.
+    /// </summary>
+    private EqpJsonOp? TryBuildEqpJsonOp(SelectStatement select, QueryContext context)
+    {
+        if (select.Source is NamedTableSource source
+            && TryPlanManagedIndexScan(select, context) is { Search: false } indexPlan)
+        {
+            return new EqpJsonScanOp(
+                indexPlan.Table.Name,
+                source.Alias,
+                indexPlan.Index.Name,
+                IndexCoversSelect(select, indexPlan.Table, indexPlan.Index));
+        }
+
+        return null;
+    }
+
+    internal static string JsonEscape(string value)
     {
         var escaped = new System.Text.StringBuilder(value.Length + 2);
         foreach (var character in value)

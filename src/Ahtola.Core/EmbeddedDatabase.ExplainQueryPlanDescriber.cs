@@ -99,3 +99,36 @@ public sealed partial class EmbeddedDatabase
     private static SqlValue[] PlanRow(int id, int parent, string detail) =>
         [SqlValue.Integer(id), SqlValue.Integer(parent), SqlValue.Integer(0), SqlValue.Text(detail)];
 }
+
+/// <summary>
+/// A structured <c>EXPLAIN QUERY PLAN FORMAT=JSON</c> node <c>op</c>, matching the small subset
+/// of the typed contract in <c>turso-src/docs/eqp-json.md</c> / <c>core/translate/eqp.rs</c> that
+/// <see cref="EmbeddedDatabase.TryBuildEqpJsonOp"/> currently models. Every JSON field is written
+/// directly rather than reflected/serialized generically, keeping this trim/AOT-safe.
+/// </summary>
+internal abstract record EqpJsonOp
+{
+    public abstract string ToJson();
+}
+
+internal sealed record EqpJsonScanOp(string Table, string? Alias, string? IndexName, bool Covering) : EqpJsonOp
+{
+    public override string ToJson()
+    {
+        var json = new System.Text.StringBuilder("{\"type\":\"scan\",\"table\":")
+            .Append(EmbeddedDatabase.JsonEscape(Table));
+        if (Alias is not null)
+            json.Append(",\"alias\":").Append(EmbeddedDatabase.JsonEscape(Alias));
+        json.Append(",\"source\":\"table\"");
+        if (IndexName is not null)
+        {
+            json.Append(",\"index\":{\"name\":")
+                .Append(EmbeddedDatabase.JsonEscape(IndexName))
+                .Append(",\"covering\":")
+                .Append(Covering ? "true" : "false")
+                .Append(",\"ephemeral\":false}");
+        }
+
+        return json.Append('}').ToString();
+    }
+}

@@ -125,10 +125,10 @@ internal sealed class SqlParser
             if (ConsumeKeyword("QUERY"))
             {
                 ExpectKeyword("PLAN");
-                var format = ParseExplainQueryPlanFormat();
                 var innerStart = _lexer.Current.Offset;
+                var format = ParseExplainQueryPlanFormat();
                 var inner = ParseStatement();
-                var innerSql = _sql[innerStart..].Trim();
+                var innerSql = _sql[innerStart..].TrimEnd();
                 return new ExplainQueryPlanStatement(inner, format, InnerSql: innerSql);
             }
 

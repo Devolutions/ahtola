@@ -70,6 +70,23 @@ turso/create-index-nulls-first-last.sqltest::eqp-upper-range-seek-on-nulls-last-
 turso/create-index-nulls-first-last.sqltest::eqp-min-fast-path-on-nulls-last-index | separately owned gap: the VDBE compiler's MIN()-via-covering-index fast path does not yet recognize a NULLS-FIRST/LAST-carrying index as eligible, falling back to MANAGED COMPILED VDBE (a full aggregate scan); the returned value is still correct (see min-max-with-nulls-last-index, which passes), only the EXPLAIN QUERY PLAN fast-path optimization is unapplied
 turso/create-index-nulls-first-last.sqltest::eqp-max-fast-path-on-desc-nulls-first-index | same separately owned MAX()-via-covering-index fast-path gap as eqp-min-fast-path-on-nulls-last-index, for a DESC NULLS FIRST index
 turso/analyze.sqltest::analyze-table-without-rowid-fails | policy candidate: intentional extension — Ahtola supports ANALYZE on WITHOUT ROWID tables (consistent with the without_rowid.sqltest extensions above) where the pinned Turso corpus expects "Parse error: ANALYZE on tables without rowid is not supported"
+# JSON EQP adoption: retain actual contract differences. Original SQL echo currently loses
+# its statement terminator; some operations/topology remain incomplete. Native-layout IDs
+# are not a reason to fabricate operations or hide a missing materialization relationship.
+turso/explain-query-plan-json.sqltest::search-nodes-name-the-index-the-constraints-and-the-join | JSON SQL echo omits the trailing semicolon; join search/sorter operation metadata and node identifiers differ
+turso/explain-query-plan-json.sqltest::exists-is-reported-as-a-semi-join | JSON SQL echo and EXISTS semi-join topology differ from the pinned contract
+turso/explain-query-plan-json.sqltest::not-exists-is-reported-as-an-anti-join | JSON SQL echo and NOT EXISTS anti-join topology differ from the pinned contract
+turso/explain-query-plan-json.sqltest::both-readers-of-a-shared-cte-point-at-one-materialization | JSON SQL echo, shared CTE materialization metadata and reader relationships are incomplete
+turso/explain-query-plan-json.sqltest::a-from-clause-subquery-nests-its-body-under-its-own-scan | JSON SQL echo and nested FROM-subquery parent/child topology differ
+turso/explain-query-plan-json.sqltest::a-compound-select-lists-its-arms | JSON SQL echo and compound/compound-arm operation topology differ
+turso/explain-query-plan-json.sqltest::list-and-scalar-subqueries-report-whether-they-are-correlated | JSON SQL echo and list/scalar subquery correlation metadata differ
+turso/explain-query-plan-json.sqltest::an-or-over-two-indexes-lists-both-branches | JSON SQL echo, multi-index branch metadata and rowid PRIMARY KEY naming differ
+turso/explain-query-plan-json.sqltest::a-recursive-cte-reports-its-setup-and-step-phases | JSON SQL echo and recursive setup/step topology differ
+turso/explain-query-plan-json.sqltest::the-json-tree-matches-the-text-rows | List-subquery/sorter text and JSON topology differ from the pinned snapshot
+turso/explain-query-plan-json.sqltest::leaving-out-the-format-clause-means-text | Compiled LEFT JOIN access descriptions omit the LEFT-JOIN suffix
+turso/explain-query-plan-json.sqltest::quotes-in-the-statement-are-escaped-in-the-echo | Original SQL echo loses its terminator; index access text uses the alias instead of table AS alias
+turso/explain-query-plan-json.sqltest::the-format-clause-is-case-insensitive | Original SQL echo loses its terminator; constant-row representation differs
+turso/explain-query-plan-json.sqltest::planning-a-write-does-not-run-it | Original SQL echo loses its trailing semicolon; the non-executing write plan otherwise matches
 turso/vector.sqltest::vector-insert-no-quotes | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is otherwise identical)
 turso/without_rowid.sqltest::without-rowid-secondary-unique-rejected | intentional extension: Ahtola supports secondary UNIQUE constraints on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-create-index-rejected | intentional extension: Ahtola supports secondary CREATE INDEX on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
