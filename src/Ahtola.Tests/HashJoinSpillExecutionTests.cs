@@ -67,7 +67,13 @@ public class HashJoinSpillExecutionTests
             (null, "rn"));
         metrics.HashPartitionsCreated.Should().Be(16);
         metrics.HashPartitionLoads.Should().BeGreaterThan(0);
-        metrics.HashPartitionFallbackScans.Should().BeGreaterThan(0);
+        // At least one partition could not be fully loaded under this tight budget and had
+        // to be answered by a fallback tier - either the lightweight key index (preferred,
+        // cheaper) or, failing that, a raw scan. Which one engages is an implementation
+        // detail of the adaptive partition/probe handling; that some fallback tier engaged
+        // at all is the invariant this scenario is exercising.
+        (metrics.HashPartitionIndexBuilds + metrics.HashPartitionFallbackScans)
+            .Should().BeGreaterThan(0);
         metrics.CurrentRetainedBytes.Should().Be(0);
         metrics.ActiveSpillFiles.Should().Be(0);
     }
@@ -529,6 +535,161 @@ public class HashJoinSpillExecutionTests
         metrics.ActiveSpillFiles.Should().Be(0);
         metrics.CurrentRetainedBytes.Should().Be(0);
         fileSystem.Created.Should().OnlyContain(path => !backing.FileExists(path));
+    }
+
+    [Test]
+    public void SmallInMemoryJoinNeverEngagesAdaptivePartitioningCounters()
+    {
+        // Documents the unchanged path: a join small enough to stay entirely in the
+        // in-memory HashBuildBuffer never spills, so none of the new spill-partition
+        // residency/split/index machinery is touched at all.
+        var metrics = new VdbeExecutionMetrics();
+        var program = JoinProgram(
+            [Row(1, "l1"), Row(2, "l2")],
+            [Row(1, "r1"), Row(2, "r2")],
+            VdbeJoinKind.Inner);
+        var options = Options(new InMemoryFileSystem(), metrics, memoryLimitBytes: 1024 * 1024);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+
+        Drain(statement).Should().HaveCount(2);
+
+        metrics.HashPartitionsCreated.Should().Be(0);
+        metrics.HashPartitionLoads.Should().Be(0);
+        metrics.HashPartitionFallbackScans.Should().Be(0);
+        metrics.HashPartitionResidencyReuses.Should().Be(0);
+        metrics.HashPartitionEvictions.Should().Be(0);
+        metrics.HashPartitionSplits.Should().Be(0);
+        metrics.HashPartitionIndexBuilds.Should().Be(0);
+        metrics.HashPartitionIndexSeeks.Should().Be(0);
+    }
+
+    [Test]
+    public void OversizedPartitionSplitsWithoutBreakingCorrectness()
+    {
+        // 2000 large-payload build rows spread over the fixed 16 top-level partitions make
+        // every partition too large to fully load under a modest budget, forcing the
+        // lazy adaptive split (turso-src/core/vdbe/hash_table.rs
+        // choose_partition_count/MIN_PARTITIONS/MAX_PARTITIONS) rather than the old
+        // pathological "rescan the whole partition on every probe" fallback.
+        const long budget = 32768;
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var payload = new string('x', 300);
+        var right = Enumerable.Range(0, 2000)
+            .Select(value => Row(value, payload))
+            .ToArray();
+        var probedKeys = new[] { 0, 500, 1000, 1500, 1999 };
+        var left = probedKeys.Select(value => Row(value, $"l{value}")).ToArray();
+        var program = JoinProgram(left, right, VdbeJoinKind.Inner);
+        var options = Options(fileSystem, metrics, budget);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = Drain(statement);
+
+        rows.Select(Labels).Should().Equal(
+            probedKeys.Select(value => ((string?)$"l{value}", (string?)payload)));
+        metrics.HashPartitionSplits.Should().BeGreaterThan(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void InterleavedProbesBetweenTwoDistinctPartitionsAvoidReloadThrashing()
+    {
+        // "N3" and "N1" are precomputed (via the same StableHash/GetPartition the compiled
+        // hash join runtime uses) to land in two different top-level partitions, so this
+        // test deterministically exercises cross-partition interleaving instead of guessing
+        // at runtime bucketing. The padding rows (from other partitions) exist purely to
+        // force the build side to spill under the given budget.
+        const long budget = 16384;
+        var metrics = new VdbeExecutionMetrics();
+        var padding = new[]
+        {
+            205, 208, 211, 213, 215, 227, 228, 231, 233, 237, 241, 248, 251, 255, 257, 258,
+            263, 273, 275, 277, 280, 282, 284, 294, 299, 304, 309, 310, 312, 314, 326, 329,
+            330, 332, 336, 340, 349, 350, 354, 356, 359, 362, 372, 374, 376, 381, 383, 385,
+            395, 398, 403, 413, 415, 417, 421, 428, 431, 435, 437, 438,
+        };
+        var right = new[] { Row(3, "r3"), Row(1, "r1") }
+            .Concat(padding.Select(value => Row(value, $"pad{value}")))
+            .ToArray();
+        const int cycles = 50;
+        var left = Enumerable.Range(0, cycles)
+            .SelectMany(i => new[] { Row(3, $"p{i}a"), Row(1, $"p{i}b") })
+            .ToArray();
+        var program = JoinProgram(left, right, VdbeJoinKind.Inner);
+        var options = Options(new InMemoryFileSystem(), metrics, budget);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = Drain(statement);
+
+        var expected = Enumerable.Range(0, cycles)
+            .SelectMany(i => new (string? Left, string? Right)[]
+            {
+                ($"p{i}a", "r3"),
+                ($"p{i}b", "r1"),
+            });
+        rows.Select(Labels).Should().Equal(expected);
+
+        // Only 2 distinct partitions are ever probed; a bounded residency cache that can
+        // hold both at once should load each at most once across all 100 probes, not once
+        // per probe as the old single-slot "reload whenever the hash changes" design did.
+        metrics.HashPartitionLoads.Should().BeLessThanOrEqualTo(2);
+        metrics.HashPartitionResidencyReuses.Should().BeGreaterThan(0);
+        metrics.HashPartitionFallbackScans.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
+    [Test]
+    public void CyclicProbesExceedingResidentCapacityStillAvoidRawRescans()
+    {
+        // Documents a known, bounded limitation rather than an eliminated one: no
+        // recency-based cache, however designed, can avoid reloading when a cyclic working
+        // set genuinely exceeds its capacity. Here, 80 build rows spread naturally over all
+        // 16 top-level partitions (~5 each) are probed round-robin across 8 distinct
+        // partitions, under a budget deliberately sized so the 8 corresponding lightweight
+        // key indexes cannot all stay resident at once (each index alone is comfortably
+        // affordable; several at once are not - see the budget/margin comment below). What
+        // the added index tier changes is the *cost* of each reload: instead of the old
+        // per-probe full-partition rescan, a miss here still only pays for a cheap
+        // header-only index rebuild (turso-src/core/vdbe/hash_table.rs's grace-style
+        // adaptive handling caps unnecessary partition reloads/rescans; it does not claim
+        // to make a genuinely over-capacity cyclic pattern free).
+        const long budget = 10240;
+        var metrics = new VdbeExecutionMetrics();
+        var payload = new string('y', 40);
+        var right = Enumerable.Range(0, 80)
+            .Select(value => Row(value, $"r{value}-{payload}"))
+            .ToArray();
+        // Precomputed (via the same StableHash/GetPartition the runtime uses) to be 8
+        // pairwise-distinct top-level partitions among keys 0..79.
+        var representative = new[] { 3, 20, 1, 8, 7, 24, 5, 26 };
+        const int cycles = 5;
+        var left = Enumerable.Range(0, cycles)
+            .SelectMany(_ => representative.Select(key => Row(key, $"p{key}")))
+            .ToArray();
+        var program = JoinProgram(left, right, VdbeJoinKind.Inner);
+        var options = Options(new InMemoryFileSystem(), metrics, budget);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = Drain(statement);
+
+        var expected = Enumerable.Range(0, cycles)
+            .SelectMany(_ => representative.Select(key =>
+                ((string?)$"p{key}", (string?)$"r{key}-{payload}")));
+        rows.Select(Labels).Should().Equal(expected);
+
+        metrics.HashPartitionSplits.Should().Be(0);
+        metrics.HashPartitionsCreated.Should().Be(16);
+        // The working set (8 distinct partitions) exceeds what fits at once, so repeated
+        // index rebuilds are expected (thrashing is not eliminated): more rebuilds than one
+        // per distinct partition would mean at least one had to be re-established.
+        metrics.HashPartitionIndexBuilds.Should().BeGreaterThan(representative.Length);
+        // ...but every one of those reloads must be cheap header-only index rebuilds, never
+        // the old full-partition raw rescan.
+        metrics.HashPartitionFallbackScans.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
     }
 
     private static VdbeExecutionOptions Options(
