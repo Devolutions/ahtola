@@ -326,7 +326,7 @@ public sealed class ManagedAttachCrossDatabaseTests
             Execute(connection, "CREATE TABLE aux.t1(x INTEGER, y TEXT);");
             // Autocommit: the write target (aux) is ':memory:', but the CDC owner (main, holding
             // turso_cdc) is physical. Nothing in the routed statement's own commit persists main,
-            // since main isn't the routed database - only ForeignCdcOwnerToPublish does that.
+            // since main isn't the routed database - only PublishForeignCdcCommitIfNeeded does that.
             Execute(connection, "INSERT INTO aux.t1 VALUES (1, 'hello');");
             ReadRows(connection, "SELECT table_name, change_type FROM turso_cdc WHERE table_name != 'sqlite_schema';")
                 .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("t1"), SqlValue.Integer(1));
@@ -386,6 +386,75 @@ public sealed class ManagedAttachCrossDatabaseTests
         ReadRows(connection, "SELECT count(*) FROM aux.t1;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
         ReadRows(connection, "SELECT count(*) FROM turso_cdc WHERE table_name != 'sqlite_schema';")
             .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+    }
+
+    [Test]
+    public void CdcCaptureOnAttachedDatabasePersistsThePartialPrefixAfterOnConflictFail()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var main = EmbeddedDatabase.OpenFile("xdb-cdc-conflict-fail-main.db", fileSystem))
+        using (var connection = main.Connect())
+        {
+            Execute(
+                connection,
+                "CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, "
+                + "change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);");
+            Execute(connection, "PRAGMA capture_data_changes_conn('full');");
+            Execute(connection, "ATTACH DATABASE ':memory:' AS aux;");
+            Execute(connection, "CREATE TABLE aux.t1(x INTEGER UNIQUE);");
+
+            // ON CONFLICT FAIL durably keeps the rows already written before the conflict
+            // (x=1) even though the statement as a whole throws - including whatever the
+            // foreign CDC owner's clone captured for that prefix. Before the outer
+            // EmbeddedConflictFailException catch also called PublishForeignCdcCommitIfNeeded,
+            // this row was silently dropped: the publish only ran on the success path, which a
+            // thrown EmbeddedConflictFailException never reaches.
+            var conflicting = () => Execute(connection, "INSERT OR FAIL INTO aux.t1 VALUES (1), (1);");
+            conflicting.Should().Throw<EmbeddedSqlException>();
+
+            ReadRows(connection, "SELECT count(*) FROM aux.t1;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
+            ReadRows(connection, "SELECT table_name, change_type FROM turso_cdc WHERE table_name != 'sqlite_schema';")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("t1"), SqlValue.Integer(1));
+        }
+
+        // main is physical: reopening it alone must still show the CDC row for the preserved
+        // prefix, proving the ON CONFLICT FAIL path durably published the foreign owner.
+        using var reopenedMain = EmbeddedDatabase.OpenFile("xdb-cdc-conflict-fail-main.db", fileSystem);
+        using var reopenedConnection = reopenedMain.Connect();
+        ReadRows(reopenedConnection, "SELECT table_name, change_type FROM turso_cdc WHERE table_name != 'sqlite_schema';")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("t1"), SqlValue.Integer(1));
+    }
+
+    [Test]
+    public void CdcRoutingToASecondPhysicalOwnerIsRejectedImmediatelyNotAtCommit()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var main = EmbeddedDatabase.OpenFile("xdb-cdc-gate-main.db", fileSystem);
+        using var connection = main.Connect();
+        // PRAGMA capture_data_changes_conn always auto-provisions its turso_cdc table on main
+        // (CurrentMainCatalog), regardless of any same-named table elsewhere - so the only
+        // reachable "foreign CDC owner" is main itself when the write target is a different
+        // schema, never an arbitrary attached database the user pre-created the table in.
+        Execute(connection, "PRAGMA capture_data_changes_conn('full');");
+        Execute(connection, "ATTACH DATABASE 'xdb-cdc-gate-aux.db' AS auxphys;");
+        Execute(connection, "CREATE TABLE auxphys.p(value TEXT);");
+
+        Execute(connection, "BEGIN;");
+        // auxphys (physical #1, the routed write target) and main (physical #2, the CDC owner)
+        // are two DIFFERENT physical databases this single statement would need to make change
+        // together, which is just as much an immediate two-physical-database violation as if an
+        // earlier statement had already completed a write to some other physical database - and
+        // must be rejected right here (fail fast), not silently allowed until the unrelated,
+        // much later InvalidOperationException CommitTransaction would otherwise throw once both
+        // physical databases' HasChanges finally surface together at COMMIT.
+        var cdcThroughSecondPhysical = () => Execute(connection, "INSERT INTO auxphys.p VALUES ('should-not-run');");
+        cdcThroughSecondPhysical.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*cannot modify more than one physical (disk-backed) database*");
+
+        // The rejected statement must not have partially mutated anything - not auxphys (its own
+        // write target) and not the CDC owner's backing table.
+        ReadRows(connection, "SELECT count(*) FROM auxphys.p;").Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+        Execute(connection, "ROLLBACK;");
     }
 
     private sealed class FlushFailingFileSystem(IFileSystem inner, string targetPath) : IFileSystem

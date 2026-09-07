@@ -58047,6 +58047,31 @@ public sealed partial class EmbeddedConnection : IDisposable
         // depends only on the statement's own shape (not which database it is checked against),
         // and this statement is already known to be mutating (StatementMayMutate above), so this
         // reuses the exact same guard the routed database's own write went through.
+        //
+        // EnsureTransactionMayMutate's own check only sees an ALREADY-established HasChanges on
+        // some OTHER tracked database - it cannot see the routed database's own pending write,
+        // since that flag is only set after Execute() succeeds, strictly later than this routing
+        // step. A single EXPLICIT-TRANSACTION statement whose routed target and CDC owner are
+        // two DIFFERENT physical databases is therefore just as much an immediate two-physical-
+        // database violation as if the routed write had already completed and set HasChanges -
+        // StatementMayMutate already confirmed this statement mutates routed.Database above, so
+        // that write is unconditional (barring failure) regardless of whether its own HasChanges
+        // flag exists yet. Scoped to _transactionDatabases is not null for the same reason
+        // EnsureTransactionMayMutate's own multi-physical check is: an autocommit statement's
+        // routed-database write and its separate foreign-CDC-owner publish are each their own
+        // independent single-file commit, with no combined-COMMIT atomicity ever claimed between
+        // them, so two different physical databases across (or even within) autocommit
+        // statements over time is not the same hazard this guard exists to prevent.
+        if (_transactionDatabases is not null
+            && foreignCdcDatabase.IsFileBacked
+            && routed.Database.IsFileBacked
+            && !ReferenceEquals(routed.Database, foreignCdcDatabase))
+        {
+            throw new EmbeddedSqlException(
+                "Managed ATTACH transactions cannot modify more than one physical (disk-backed) "
+                + "database because independent WAL files cannot be committed atomically.");
+        }
+
         EnsureTransactionMayMutate(foreignCdcDatabase, routed.Statement);
 
         var foreignCdcTable = foreignCdcCatalog.Tables[tableName];
