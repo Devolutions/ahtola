@@ -2295,6 +2295,126 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         }
     }
 
+    [TestCase(RevertWalStagedBoundary)]
+    [TestCase(RevertWalPublishedBoundary)]
+    public async Task IncrementalPendingProtectedSnapshotCaptureWithFingerprintHintsIsCrashSafeAtEveryPublicationBoundary(
+        int boundaryValue)
+    {
+        // PublishProtectedSnapshots/StageFileCapture's own publication boundaries (RevertWalStaged,
+        // RevertWalPublished) are pre-existing, but the code path that reaches them via the new
+        // knownOriginalFingerprint/knownCommittedFingerprint hints (see faf4dad) had not previously
+        // been exercised by a dedicated crash-recovery test at these exact boundaries: the only
+        // existing coverage for them (ReplaceBaseCheckpointRevertCaptureIsCrashSafeAtEveryPublicationBoundary)
+        // goes through CaptureAndCheckpoint/StageCapture, a completely different, unmodified
+        // capture routine. This proves the hinted capture path is equally crash-safe at both
+        // boundaries that fire strictly before any durable metadata references the captured
+        // RevertState: the revert-WAL sidecar StageFileCapture produced with hints is byte-for-byte
+        // identical to what the unhinted path would have produced, so an interruption here must
+        // leave metadata exactly as untouched as it always did, and a plain retry must converge.
+        // (RevertRemoteApplyIntentPublished, fired after WritePhaseMetadata durably records the
+        // captured RevertState, exercises the pre-existing, unmodified "ambiguous push outcome"
+        // CommittedReady state machine -- unrelated to this specific optimization and already
+        // covered in spirit by the existing CaptureAndCheckpoint-based boundary tests below.)
+        var boundary = (ManagedReplicaDurableBoundary)boundaryValue;
+        var path = NewReplicaPath($"managed-replica-protected-hinted-capture-{boundary}");
+        var sourcePath = path + ".source";
+        byte[] initialImage;
+        try
+        {
+            using (var source = new AhtolaConnection($"Data Source={sourcePath};Local Provider=Managed"))
+            {
+                source.Open();
+                source.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                source.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (42);");
+                source.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            initialImage = File.ReadAllBytes(sourcePath);
+        }
+        finally
+        {
+            DeleteReplicaFiles(sourcePath);
+        }
+
+        var incrementedSource = path + ".incremented";
+        byte[] incrementedImage;
+        try
+        {
+            using (var incremented = new AhtolaConnection($"Data Source={incrementedSource};Local Provider=Managed"))
+            {
+                incremented.Open();
+                incremented.ExecuteNonQuery("CREATE TABLE bootstrap_marker(value INTEGER NOT NULL);");
+                incremented.ExecuteNonQuery("INSERT INTO bootstrap_marker VALUES (84);");
+                incremented.ExecuteNonQuery("CREATE TABLE local_items(id INTEGER PRIMARY KEY, x TEXT);");
+            }
+
+            incrementedImage = File.ReadAllBytes(incrementedSource);
+        }
+        finally
+        {
+            DeleteReplicaFiles(incrementedSource);
+        }
+
+        var handler = new ReplicaPushHandler(
+        [
+            CreatePullResponse("revision-42", initialImage, protocol: 2),
+            CreateLogicalPullResponse("revision-42", body: []),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+            CreatePullResponse("revision-43", incrementedImage, protocol: 2, applyMode: 0),
+        ],
+        _ => ReplicaPushHandler.SuccessfulBatchResponse(5));
+        var options = CreateOptions(path, handler, pushOperationsThreshold: 1);
+
+        try
+        {
+            using (var connection = AhtolaConnection.CreateReplica(options))
+            {
+                connection.Open();
+
+                // ADD COLUMN is oldest so PushOperationsThreshold=1 pushes/acknowledges it first,
+                // leaving the row INSERT pending -- reaching the Incremental+pending branch, whose
+                // remote-base reconstruction and protected-snapshot capture both use the new
+                // fingerprint hints.
+                connection.ExecuteNonQuery("ALTER TABLE local_items ADD COLUMN extra TEXT;");
+                connection.ExecuteNonQuery("INSERT INTO local_items(id, x) VALUES (1, 'first');");
+
+                using (ManagedReplicaFaultInjection.Push(point =>
+                       {
+                           if (point == boundary)
+                               throw new InvalidOperationException("Injected protected-snapshot capture interruption.");
+                       }))
+                {
+                    Assert.ThrowsAsync<InvalidOperationException>(
+                        () => connection.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None));
+                }
+            }
+
+            // Both boundaries fire strictly before WritePhaseMetadata durably records the captured
+            // RevertState, so metadata must be completely untouched by the interrupted attempt.
+            var metadata = ManagedReplicaBootstrapper.LoadMetadata(path)!.Value;
+            metadata.Revision.Should().Be("revision-42");
+            metadata.RevertState.Should().BeNull();
+            ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes
+                .Should().ContainSingle(change => change.Kind == ReplicaLocalChangeKind.Row);
+
+            using (var reopened = AhtolaConnection.CreateReplica(options))
+            {
+                reopened.Open();
+
+                var result = await reopened.SyncAsync(new AhtolaSyncOptions(), CancellationToken.None);
+                result.Outcome.Should().Be(AhtolaSyncOutcome.RemoteChangesApplied);
+
+                ReadBootstrapMarker(reopened).Should().Be(84);
+                ManagedReplicaChangeJournal.Open(path).ReadBatch(int.MaxValue).Changes.Should().BeEmpty();
+                ManagedReplicaBootstrapper.LoadMetadata(path)!.Value.Revision.Should().Be("revision-43");
+            }
+        }
+        finally
+        {
+            DeleteReplicaFiles(path);
+        }
+    }
+
     [Test]
     public void PublishProtectedSnapshotsStillDetectsAMismatchedKnownFingerprintHint()
     {
