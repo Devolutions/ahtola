@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
+using Ahtola.Core.Collation;
 using Ahtola.Core.Compilation;
 using Ahtola.Core.Execution;
 using Ahtola.Core.Mvcc;
@@ -7259,7 +7260,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return name.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("RTRIM", StringComparison.OrdinalIgnoreCase)
-                || _collations.ContainsKey(name);
+                || _collations.ContainsKey(name)
+                || LocaleCollationRegistry.TryResolve(name, out _);
         }
     }
 
@@ -23354,11 +23356,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// <summary>
     /// True when <paramref name="collation"/> can be handed to <see cref="Compare"/> without it
     /// throwing "no such collation sequence": every built-in name always resolves (falling back
-    /// to its built-in behavior if not overridden), and a custom name resolves once it has a
-    /// registered <see cref="RegisterCollation"/> callback.
+    /// to its built-in behavior if not overridden), a custom name resolves once it has a
+    /// registered <see cref="RegisterCollation"/> callback, and a BCP-47 locale collation tag
+    /// (e.g. <c>es-u-co-trad</c>) resolves via <see cref="LocaleCollationRegistry"/>.
     /// </summary>
     private bool IsCollationResolvable(string? collation)
-        => IsBuiltInCollation(collation) || _collations.ContainsKey(collation!);
+        => IsBuiltInCollation(collation)
+            || _collations.ContainsKey(collation!)
+            || LocaleCollationRegistry.TryResolve(collation, out _);
 
     private static bool CollationsEquivalent(string? left, string? right) =>
         string.Equals(
@@ -46783,6 +46788,14 @@ out bool hasReturning)
         if (_externalCollationResolver?.Invoke(collation) is not null)
             return;
 
+        // A locale/BCP-47 collation tag (e.g. "es-u-co-trad") is not registered
+        // per-connection like a custom callback; it resolves lazily against the
+        // process-wide LocaleCollationRegistry the same way Turso's
+        // CollationSeq::new falls back to LocaleCollationRegistry::get_or_register
+        // once a name isn't one of the three built-ins.
+        if (LocaleCollationRegistry.TryResolve(collation, out _))
+            return;
+
         throw new EmbeddedSqlException($"no such collation sequence: {collation}");
     }
 
@@ -46836,6 +46849,9 @@ out bool hasReturning)
                 return SqliteIndexRecordComparer.CompareNoCaseText(left.AsText(), right.AsText());
             if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
                 return SqliteIndexRecordComparer.CompareRTrimText(left.AsText(), right.AsText());
+
+            if (LocaleCollationRegistry.TryResolve(collation, out var localeCompare))
+                return InvokeManagedCallback(() => localeCompare!(left.AsText(), right.AsText()));
 
             throw new EmbeddedSqlException($"no such collation sequence: {collation}");
         }

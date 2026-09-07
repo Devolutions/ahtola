@@ -1266,7 +1266,7 @@ internal sealed class SqlParser
             var columnName = nameToken.Text;
             string? collation = null;
             if (ConsumeKeyword("COLLATE"))
-                collation = ExpectIdentifier();
+                collation = ExpectIdentifierOrString();
 
             var descending = false;
             if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
@@ -3597,7 +3597,7 @@ internal sealed class SqlParser
     {
         var expression = ParseUnary();
         while (ConsumeKeyword("COLLATE"))
-            expression = new CollationExpression(expression, ExpectIdentifier());
+            expression = new CollationExpression(expression, ExpectIdentifierOrString());
 
         return expression;
     }
@@ -4229,7 +4229,7 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("COLLATE"))
             {
-                collation = ExpectIdentifier();
+                collation = ExpectIdentifierOrString();
                 collationConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
                 continue;

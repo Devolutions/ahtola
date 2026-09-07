@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Ahtola.Core.Collation;
 
 namespace Ahtola.Core.Storage;
 
@@ -68,12 +69,35 @@ public sealed record SqliteKeyCollation
     public bool IsSupportedByManagedIndexWriter => IsBuiltIn || Comparison is not null;
 
     /// <summary>Creates a descriptor for a concrete SQLite collation name.</summary>
+    /// <remarks>
+    /// A name that is not one of the three built-ins is resolved against
+    /// <see cref="LocaleCollationRegistry"/>: a valid BCP-47 locale collation tag
+    /// (for example <c>es-u-co-trad</c>) is bound to its comparator here, the
+    /// same way an application-registered custom collation is bound, so the
+    /// persisted managed index writer (see
+    /// <see cref="IsSupportedByManagedIndexWriter"/>) can materialize a
+    /// <c>CREATE INDEX ... COLLATE 'locale-tag'</c> b-tree without any further
+    /// index-layer changes. A name that neither matches a built-in nor resolves
+    /// as a locale tag is retained with no bound comparison, exactly like an
+    /// unregistered custom collation, and stays unsupported until/unless a
+    /// caller binds one via <see cref="WithComparison"/>.
+    /// </remarks>
     public static SqliteKeyCollation FromName(string name)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
-        return string.Equals(name, "BINARY", StringComparison.OrdinalIgnoreCase)
-            ? Binary
-            : new SqliteKeyCollation(name.ToUpperInvariant());
+        if (string.Equals(name, "BINARY", StringComparison.OrdinalIgnoreCase))
+            return Binary;
+
+        var normalized = name.ToUpperInvariant();
+        if (string.Equals(normalized, "NOCASE", StringComparison.Ordinal)
+            || string.Equals(normalized, "RTRIM", StringComparison.Ordinal))
+        {
+            return new SqliteKeyCollation(normalized);
+        }
+
+        return LocaleCollationRegistry.TryResolve(name, out var compare)
+            ? new SqliteKeyCollation(normalized, compare)
+            : new SqliteKeyCollation(normalized);
     }
 
     /// <summary>
