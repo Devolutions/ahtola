@@ -142,6 +142,19 @@ backend filtering. Preserve genuine CLI-only and unadopted-capability exclusions
 Newly exposed failures become explicit owned follow-up work; do not silently
 expand the expected-failures file to declare coverage green.
 
+The expanded audit exposed 116 additional recorded differences. Ownership is
+split into schema migration (33), attached database/sequence behavior (41),
+SQL extensions and ANALYZE (25), generated-column plan reporting (7), and
+explicit policy review (10). Three legacy-view loader cases are additional
+schema work. In particular, losing a sequence watermark on COMMIT is a bug;
+reusing rolled-back allocations is the existing managed contract.
+
+Corrupt-image rejection during open must remain fail-closed. Such behavior is
+not permission to skip the fixture or remove the existing empty-harness-exclusion
+assertion. Exercise and classify the rejection explicitly. Schema rendering,
+private bookkeeping layout, and richer covering-index plans must be distinguished
+from actual wrong values or unsupported valid SQL before choosing a fix.
+
 LOCALE was exposed by the broader audit: `fr-FR`, traditional Spanish tailoring,
 upper-first ordering, numeric collation, and strength/case distinctions have
 seven positive upstream cases. A host-dependent approximate comparator or

@@ -125,7 +125,9 @@ internal static class SqltestCorpus
 
         foreach (var database in file.Databases)
         {
-            if (database.Kind == SqltestDatabaseKind.Path)
+            if (database.Kind == SqltestDatabaseKind.Path
+                && database.Path is { } path
+                && !SqltestPhysicalFixtures.IsKnown(path))
             {
                 return
                     $"path fixture '{database.Path}' has no equivalent managed generator; " +
