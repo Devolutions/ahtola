@@ -263,9 +263,9 @@ This slice is not general asynchronous SQL execution or encrypted-page support.
 
 ### Later checkpoint: `b383ae6`
 
-The live inventory now contains 115 recorded differences. Eleven planner
+The live inventory now contains 113 recorded differences. Eleven planner
 markers closed (eight correlated-query descriptions and three generated-column
-index descriptions); adoption of the 15-case JSON EQP file exposed 14 remaining
+index descriptions); adoption of the 15-case JSON EQP file exposed 12 remaining
 contract differences. The compiled LEFT JOIN suffix change does not close the
 cancelable evaluator route used by the corpus, so that case remains explicitly
 assigned rather than being reported as passing.
