@@ -5181,8 +5181,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             readOnly: true,
             foreignReadOnly: foreignReadOnly);
         var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
-        if (header.VersionValidFor != header.ChangeCounter
-            || header.DatabaseSizeInPages != pager.CommittedPageCount)
+        // The in-header database size is only authoritative when the change counter exactly
+        // matches the version-valid-for number (file format spec 1.3.7 "Database Size"); when
+        // they differ the header's declared size is merely untrusted, not evidence of
+        // corruption (see the matching comment on SqlitePager.InitializeCleanWalView), so the
+        // size check only applies once that precondition holds.
+        if (header.VersionValidFor == header.ChangeCounter
+            && header.DatabaseSizeInPages != pager.CommittedPageCount)
         {
             throw new InvalidDataException(
                 "The managed file catalog does not have an authoritative committed SQLite header.");
@@ -37033,6 +37038,21 @@ out bool hasReturning)
     {
         if (context.Views is not null && context.Views.TryGetValue(name, out var found))
         {
+            // A view row whose stored SQL failed to (re)parse at schema load stays visible in
+            // sqlite_schema/sqlite_master (SQLite's own "malformed row, not corruption" contract
+            // for a legacy CREATE VIEW column list an older build wrote without identifier
+            // quoting), but resolving it as a query source fails closed here -- mirroring
+            // Turso's schema.broken_views check in translate/planner.rs -- rather than running a
+            // Query this class never actually parsed. DROP VIEW bypasses this helper (it reads
+            // catalog.Views directly in DdlStatementCompiler.CompileDropView), so the row can
+            // still be removed.
+            if (found.BrokenReason is { } reason)
+            {
+                throw new EmbeddedSqlException(
+                    $"view '{name}' could not be loaded: its SQL in sqlite_schema does not parse ({reason}). "
+                        + "Use DROP VIEW to remove it, then recreate it.");
+            }
+
             view = found;
             return true;
         }

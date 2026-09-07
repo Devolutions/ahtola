@@ -135,7 +135,14 @@ internal sealed record ViewDefinition(
     string Name,
     IReadOnlyList<string>? Columns,
     QueryStatement Query,
-    string Sql);
+    string Sql,
+    // Set when the row's stored SQL failed to (re)parse while reopening a persisted database
+    // (e.g. a CREATE VIEW column list an older Turso/Ahtola build wrote without identifier
+    // quoting). The view stays listed in sqlite_schema/sqlite_master with its raw stored text,
+    // but every attempt to resolve it as a query source fails closed instead of running a
+    // Query this class never actually parsed; DROP VIEW still removes the row. See
+    // ManagedSchemaRowParser.ParseView and EmbeddedDatabase.TryGetView.
+    string? BrokenReason = null);
 
 internal sealed record TriggerDefinition(
     string Name,

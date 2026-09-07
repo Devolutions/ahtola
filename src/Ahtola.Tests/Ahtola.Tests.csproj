@@ -61,5 +61,12 @@
                  CopyToOutputDirectory="PreserveNewest" />
         <Content Include="Conformance\managed-sqltest-harness-exclusions.txt"
                  CopyToOutputDirectory="PreserveNewest" />
+        <!-- A private copy of database/testing_legacy_unquoted_view_columns.db (identical bytes;
+             see the Content item above) for LegacyUnquotedViewColumnsFixtureTests, which opens it
+             directly rather than through the sqltest harness: the harness has no @database <path>
+             fixture support yet, so this file keeps the direct NUnit regression independent of
+             that workstream landing. -->
+        <Content Include="Fixtures\testing_legacy_unquoted_view_columns.db"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>
