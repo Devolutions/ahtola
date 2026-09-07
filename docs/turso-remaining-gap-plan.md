@@ -40,6 +40,11 @@ a missing feature relative to this pin; both engines reject it.
   integration; do not select one worker's whole file over another's.
 - Workers report commit IDs, exact closed case IDs, executed validation commands
   and counts, upstream citations, remaining blockers, and any new failures.
+- Concurrent heavy validation uses two shared process leases through a
+  session-local wrapper around the existing commands. Workers acquire/release
+  leases automatically instead of waiting for chat approvals, which can arrive
+  after an active turn. No new test framework or repository build entrypoint is
+  introduced.
 - No worker pushes, creates a PR, or changes another worktree. The coordinator
   brings every accepted worker commit back to `copilot/closeable-turso-gaps`,
   resolves overlaps, and validates the combined result here. The deliverable is
@@ -108,7 +113,7 @@ rejection parity, not a promise of general recursive FULL JOIN support.
 | --- | --- | --- | --- |
 | PLAN | Remaining 18 EQP/EXPLAIN entries | SQL, CTE | EQP describes actual rewrites; cost original versus decorrelated plans; reuse identical aggregate subqueries; lower eligible semi/anti/grouped shapes for real EXPLAIN |
 | EQP | Complete FORMAT=JSON | PLAN | Structured op variants, CTE materializations, null root parents, original SQL, correct result columns; adopt the 15 pinned upstream cases |
-| NULLIDX | Explicit index NULLS FIRST/LAST | Integrated Wave 1 parser/schema | Metadata, persisted ordering, forward/reverse seeks, bounds, ORDER BY satisfaction, uniqueness/UPSERT, reopen and corruption checks; adopt 83 upstream cases |
+| NULLIDX | Explicit index and PK/UNIQUE constraint NULLS FIRST/LAST | Integrated Wave 1 parser/schema | Metadata, persisted ordering, forward/reverse seeks, bounds, ORDER BY satisfaction, uniqueness, rowid aliases, reopen and corruption checks; adopt 83 upstream cases |
 | LOCALE | Newly discovered ICU-locale collation parity | Coordinate NULLIDX comparator integration | Generalized locale/tag options, consistent equality/order, and durable index ordering through pure-managed, trim/AOT-safe facilities; adopt 7 upstream cases without replacing the canonical SQLite collation corpus |
 | COVER | Expand upstream coverage | Harness work parallel with Wave 1; engine-dependent adoption after integration | Classify all remaining Turso-specific files, run eligible backend-tagged SQL, and provide equivalents for path fixtures without rewriting expected SQL |
 
@@ -119,6 +124,9 @@ NULLIDX is not a parser-only change. Propagate null ordering through indexed
 column definitions, schema round-trip, key comparators, range termination, and
 planner properties, following core/schema.rs, core/types.rs, and
 core/translate/optimizer/order.rs. Preserve default SQLite index behavior.
+The pinned 83-case fixture also positively covers PRIMARY KEY and UNIQUE table
+constraints; implement those instead of preserving their historical rejection.
+Explicit NULLS clauses on UPSERT conflict targets remain rejected upstream.
 Document nonstandard index SQL/file interoperability and fail closed when a
 consumer cannot honor the physical ordering.
 
