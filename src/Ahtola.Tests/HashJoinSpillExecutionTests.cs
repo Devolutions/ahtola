@@ -754,6 +754,74 @@ public class HashJoinSpillExecutionTests
         metrics.CurrentRetainedBytes.Should().Be(0);
     }
 
+    [Test]
+    public void StatefulResidualPredicateIsEvaluatedExactlyOnceUnderMemoryPressureForFullJoin()
+    {
+        // Regression for a HIGH-severity correctness bug: a batched group's residual
+        // predicate (VdbeJoinCondition) must never be evaluated more than once for the same
+        // (build, probe) pair, and HashSpill.MarkMatched must never be called for a pair
+        // whose predicate result was later discarded (e.g. because the group that evaluated
+        // it could not afford to buffer its output and was rolled back for a re-evaluation
+        // elsewhere) - either defect would let a nondeterministic or stateful predicate
+        // silently drop a FULL join's unmatched-build output, since a build row's matched
+        // flag could end up permanently out of sync with its real, final match status.
+        //
+        // The predicate below returns true only the FIRST time it is asked about a given
+        // (probe key, build key) pair, and false on any later call for that SAME pair -
+        // simulating exactly the kind of stateful/nondeterministic condition a
+        // rollback-and-replay design could observe differently on a second evaluation. With
+        // every build/probe key here unique and 1:1 matched, a correct implementation
+        // evaluates each pair exactly once (getting true), so every build row is matched and
+        // the FULL join's unmatched-build pass contributes zero extra rows - total output
+        // must be exactly rowCount rows. A design that re-evaluates a pair after discarding
+        // its first (matching) result would get false on the replay, permanently losing that
+        // build row from the output entirely (it is marked matched - excluded from the
+        // unmatched scan - yet also never emitted as a match), so rowCount would come up
+        // short.
+        const int rowCount = 200;
+        const long budget = 8192;
+        var seenPairs = new HashSet<(long ProbeKey, long BuildKey)>();
+        var doubleEvaluatedPairs = new List<(long ProbeKey, long BuildKey)>();
+
+        bool Condition(VdbeJoinRow probeSide, VdbeJoinRow buildSide, VdbeJoinRow combined)
+        {
+            var pair = (probeSide.Values[0].AsInteger(), buildSide.Values[0].AsInteger());
+            if (!seenPairs.Add(pair))
+            {
+                doubleEvaluatedPairs.Add(pair);
+                return false;
+            }
+            return true;
+        }
+
+        var metrics = new VdbeExecutionMetrics();
+        var right = Enumerable.Range(0, rowCount)
+            .Select(value => Row(value, $"r{value}"))
+            .ToArray();
+        var left = Enumerable.Range(0, rowCount)
+            .Reverse()
+            .Select(value => Row(value, $"l{value}"))
+            .ToArray();
+        var program = JoinProgram(left, right, VdbeJoinKind.Full, condition: Condition);
+        var options = Options(new InMemoryFileSystem(), metrics, budget);
+
+        using var statement = ResumableStatement.CreateWithExecutionOptions(program, options);
+        var rows = Drain(statement);
+
+        doubleEvaluatedPairs.Should().BeEmpty(
+            "the residual predicate must never be evaluated more than once for the same (build, probe) pair");
+        rows.Should().HaveCount(
+            rowCount,
+            "every build row has exactly one matching probe under this 1:1 key design, so a FULL join must " +
+            "emit exactly one row per build row - never fewer (a silently dropped build row) or more " +
+            "(a duplicated one)");
+        rows.Select(Labels).Should().BeEquivalentTo(
+            Enumerable.Range(0, rowCount).Select(value => ((string?)$"l{value}", (string?)$"r{value}")));
+        metrics.HashPartitionsCreated.Should().Be(16);
+        metrics.HashProbeBatchesFlushed.Should().BeGreaterThan(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
     private static VdbeExecutionOptions Options(
         IFileSystem fileSystem,
         VdbeExecutionMetrics metrics,
