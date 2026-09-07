@@ -218,6 +218,20 @@ internal static class VdbeHashJoinRuntime
         VdbeMemoryReservation? spillInfrastructureReservation = null;
         HashBuildBuffer? buffered = null;
         var emitted = 0;
+        // Tracks the largest single build-row retained-bytes estimate observed during the
+        // build phase (regardless of whether that row ends up buffered or spilled). Used as
+        // a reserve when deciding how many probes may accumulate into one probe-scheduling
+        // batch (see the accumulation loop below): no single spilled build-side entry decode
+        // can ever need more than this many bytes (every build row was itself required to
+        // fit within the shared budget before being written), so keeping at least this much
+        // headroom free whenever a SECOND-OR-LATER probe joins a batch guarantees that at
+        // least one such decode can always succeed later, without ever needing to release
+        // any probe's own accounting early. This is a genuine, unavoidable cost of grouping
+        // (the pre-batching design never needed it, since it never held more than one probe
+        // at a time): TryProcessGroup's own graceful fallback (see its remarks) handles
+        // pressure this reserve does not anticipate (e.g. several buffered output rows from
+        // duplicate-key fanout), so this reserve only needs to cover the single-decode case.
+        var maxBuildEntryBytes = 0L;
 
         try
         {
@@ -244,6 +258,7 @@ internal static class VdbeHashJoinRuntime
                         row.RowIds.Length));
                 if (retainedBytes > context.Memory.LimitBytes)
                     throw new VdbeMemoryLimitExceededException(context.Memory.LimitBytes, retainedBytes);
+                maxBuildEntryBytes = Math.Max(maxBuildEntryBytes, retainedBytes);
                 var currentOrdinal = ordinal++;
 
                 if (spill is null
@@ -300,14 +315,19 @@ internal static class VdbeHashJoinRuntime
             // probeNode enumerator exactly once, in order, and accumulated into a bounded
             // batch (see ProbeBatchEntry) rather than answered immediately one at a time.
             // Once a batch is flushed, every probe in it that targets the same spill
-            // partition is answered together - loading/building/scanning that partition
-            // exactly once for the whole group, not once per probe - which is the actual
-            // structural fix for repeated reload/rescan under a cyclic or interleaved probe
-            // order, not merely a cheaper fallback tier (see FlushProbeBatch remarks).
-            // Batching never changes emission order: FlushProbeBatch always replays its
-            // batch's results in original within-batch probe order, and batches themselves
-            // are flushed and yielded strictly in probe-arrival order, so the final sequence
-            // is identical to fully streaming per-probe processing.
+            // partition is normally answered together - loading/building/scanning that
+            // partition exactly once for the whole group, not once per probe - which is the
+            // actual structural fix for repeated reload/rescan under a cyclic or interleaved
+            // probe order, not merely a cheaper fallback tier. Batching never changes
+            // emission order or drops/duplicates a match: FlushProbeBatch always replays
+            // results in original within-batch probe order (buffering a group's results,
+            // with their own accounted memory, only until every earlier probe in the batch
+            // is also ready), and gracefully falls back to unbuffered, immediately-streamed
+            // per-probe resolution - identical in memory profile to this file's original,
+            // pre-batching design - for whatever it cannot afford to buffer (see
+            // FlushProbeBatch remarks for the full accounting and fallback contract).
+            // Batches themselves are flushed and yielded strictly in probe-arrival order, so
+            // the final sequence is always identical to fully streaming per-probe processing.
             List<ProbeBatchEntry>? pendingBatch = null;
 
             IEnumerable<VdbeJoinRow> DrainPendingBatch()
@@ -315,20 +335,13 @@ internal static class VdbeHashJoinRuntime
                 if (pendingBatch is not { Count: > 0 } batch)
                     yield break;
 
-                // Release the batch's buffering-cap accounting up front, before any actual
-                // partition resolution/scanning: it exists only to bound how much can
-                // accumulate while WAITING to be processed, not to persist through
-                // processing itself. Holding it through the flush would compete with the
-                // scan/load tiers' own transient per-entry retention for the exact same
-                // shared budget - memory the original, unbatched per-probe design never had
-                // to share, since a single in-flight probe was never itself charged against
-                // the budget while its match was being resolved. Releasing here restores
-                // that same headroom for FlushProbeBatch's actual work.
-                foreach (var entry in batch)
-                {
-                    if (entry.RetainedBytes > 0)
-                        context.Memory.Release(entry.RetainedBytes);
-                }
+                // Ownership of each entry's retained-memory accounting transfers to
+                // FlushProbeBatch here: it releases each probe's bytes itself, exactly when
+                // that probe's row data is genuinely no longer needed (after it is answered,
+                // whether via a successful group or the individual streaming fallback),
+                // never earlier. This is deliberate: an early bulk release here (before the
+                // row data is actually done being used) would underreport real memory
+                // usage for as long as FlushProbeBatch is still working with these rows.
                 pendingBatch = null;
 
                 foreach (var row in FlushProbeBatch(
@@ -373,10 +386,6 @@ internal static class VdbeHashJoinRuntime
                 }
 
                 var probeKeyValue = probeKey(probe);
-                var entryBytes = VdbeManagedFootprint.EstimateHashBuildEntry(
-                    probe.Values,
-                    probeKeyValue,
-                    probe.RowIds.Length);
 
                 if (pendingBatch is { Count: >= MaxProbeBatchRows })
                 {
@@ -388,14 +397,49 @@ internal static class VdbeHashJoinRuntime
                     }
                 }
 
-                if (context.Memory.TryRetain(entryBytes))
+                if (pendingBatch is not { Count: > 0 })
                 {
-                    (pendingBatch ??= []).Add(new ProbeBatchEntry(probe, probeKeyValue, entryBytes));
+                    // First probe of a fresh batch: exactly like the pre-batching per-probe
+                    // design, one lone buffered probe costs nothing extra to retain -
+                    // nothing else is competing for headroom yet, and it may end up being
+                    // the ONLY entry in this batch (no grouping benefit either way). Only
+                    // once a SECOND probe wants to join it (below) does this become genuine
+                    // extra concurrent memory pressure the original design never had, and
+                    // that is where honest retention applies.
+                    pendingBatch = [new ProbeBatchEntry(probe, probeKeyValue, RetainedBytes: 0)];
                     continue;
                 }
 
-                // Not enough headroom for another buffered probe: flush what is pending
-                // (freeing its retained bytes) and retry once before falling back further.
+                var entryBytes = VdbeManagedFootprint.EstimateHashBuildEntry(
+                    probe.Values,
+                    probeKeyValue,
+                    probe.RowIds.Length);
+
+                // Joining an already-started batch additionally requires that enough
+                // headroom remains, after retaining this probe, to cover BOTH a transient
+                // build-entry decode (maxBuildEntryBytes - see that field's remarks) AND the
+                // residency cache's own need to establish (load or index) at least one
+                // partition concurrently with the batch's retained input/output: a reserve
+                // of only the former lets batch accumulation greedily consume nearly the
+                // entire budget regardless of how large it is (since a single-row decode is
+                // typically tiny relative to the budget), starving the residency cache down
+                // to zero admissible partitions and forcing every probe through the raw
+                // fallback-scan tier - defeating grouping's whole purpose even when the
+                // overall budget is otherwise generous. Reserving a fraction of the total
+                // budget in addition keeps that headroom scaling WITH the budget.
+                var residencyReserve = context.Memory.LimitBytes / 4;
+                var reserve = Math.Max(maxBuildEntryBytes, residencyReserve);
+                if (context.Memory.AvailableBytes - entryBytes >= reserve
+                    && context.Memory.TryRetain(entryBytes))
+                {
+                    pendingBatch.Add(new ProbeBatchEntry(probe, probeKeyValue, entryBytes));
+                    continue;
+                }
+
+                // Not enough reserve headroom to add a second probe to the current batch:
+                // flush what is pending (its entries release their own accounting, if any, as
+                // FlushProbeBatch finishes with them) and let this probe become the fresh,
+                // again cost-free first entry of a new batch.
                 foreach (var row in DrainPendingBatch())
                 {
                     yield return row;
@@ -403,32 +447,7 @@ internal static class VdbeHashJoinRuntime
                         yield break;
                 }
 
-                if (context.Memory.TryRetain(entryBytes))
-                {
-                    (pendingBatch ??= []).Add(new ProbeBatchEntry(probe, probeKeyValue, entryBytes));
-                    continue;
-                }
-
-                // Even a fully empty batch cannot afford to buffer this one probe: process
-                // it immediately, completely unbatched (RetainedBytes: 0 means
-                // DrainPendingBatch's cleanup never attempts to release anything for it), so
-                // a pathologically tight budget never regresses versus plain per-probe
-                // streaming - this reuses the exact same grouped resolution/match logic via
-                // a singleton batch, it just never benefits from cross-probe grouping.
-                foreach (var row in FlushProbeBatch(
-                    [new ProbeBatchEntry(probe, probeKeyValue, RetainedBytes: 0)],
-                    spill,
-                    residency,
-                    plan,
-                    buildNode,
-                    buildIsRight,
-                    trackUnmatchedBuild,
-                    context))
-                {
-                    yield return row;
-                    if (maximumRows is { } maximum && ++emitted >= maximum)
-                        yield break;
-                }
+                pendingBatch = [new ProbeBatchEntry(probe, probeKeyValue, RetainedBytes: 0)];
             }
 
             if (spill is not null)
@@ -511,14 +530,15 @@ internal static class VdbeHashJoinRuntime
 
     /// <summary>
     /// Answers every buffered probe in <paramref name="batch"/> that targets the spilled
-    /// build side, grouped so each distinct partition it touches is resolved
-    /// (loaded/index-built/scanned) exactly once for the whole group - the actual
-    /// probe-side scheduling fix for repeated reload/rescan under an interleaved or cyclic
-    /// probe order, not merely a cheaper fallback tier. Also serves the unbatched
-    /// (<see cref="ProbeBatchEntry.RetainedBytes"/> == 0) singleton fallback path in
+    /// build side, grouping probes by the distinct partition they touch so that partition is
+    /// resolved (loaded/index-built/scanned) exactly once for the whole group instead of once
+    /// per probe - the actual probe-side scheduling fix for repeated reload/rescan under an
+    /// interleaved or cyclic probe order, not merely a cheaper fallback tier. Also serves the
+    /// unbatched (<see cref="ProbeBatchEntry.RetainedBytes"/> == 0) singleton fallback path in
     /// EnumerateCore, so both share one correctness-checked implementation.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Grouping happens in two passes because splitting a top-level partition (see
     /// <c>HashSpill.TrySplitPartition</c>) can only be decided the first time any probe in
     /// this batch (or an earlier one) touches it, and a split reroutes different keys within
@@ -528,9 +548,27 @@ internal static class VdbeHashJoinRuntime
     /// finalize as a side effect (the resolution result itself is discarded). Pass 2 then
     /// re-derives each probe's final (possibly post-split) <see cref="PartitionKey"/> and
     /// groups by that, so every probe is matched against the exact partition it actually
-    /// belongs to, regardless of when the split happened. Output order is preserved by
-    /// buffering every result per batch-local index during grouped processing and only
-    /// replaying them, strictly in original batch order, in the final loop.
+    /// belongs to, regardless of when the split happened.
+    /// </para>
+    /// <para>
+    /// Output-order preservation and memory accounting: a probe's own input row bytes stay
+    /// retained for as long as that probe's data is genuinely still needed (through whichever
+    /// group answers it, or through the individual streaming path below), never released
+    /// early. Because grouping necessarily answers probes out of original order (by
+    /// partition, not by arrival), a group's *results* must be buffered until every earlier
+    /// probe's results are also ready, so they can be replayed strictly in original batch
+    /// order; every buffered result row is itself retained via the shared memory budget
+    /// (<see cref="EstimateCombinedRowBytes"/>), and released the moment it is replayed. A
+    /// group's results are committed all-or-nothing: if retaining any one of its result rows
+    /// fails, every result already retained for that group is rolled back and discarded (see
+    /// <c>TryProcessGroup</c>), and every probe in that group - plus every probe in every
+    /// group not yet processed - falls back to individual, unbuffered, immediately-streamed
+    /// resolution (see <c>EmitOneIndex</c>'s unsettled branch), exactly mirroring the
+    /// unbatched per-probe design and its memory profile, so a memory-constrained batch can
+    /// never drop, reorder, or fail a match that streaming alone could always answer; it only
+    /// loses the cross-probe reload/rescan-avoidance benefit for whatever could not be
+    /// buffered.
+    /// </para>
     /// </remarks>
     private static IEnumerable<VdbeJoinRow> FlushProbeBatch(
         IReadOnlyList<ProbeBatchEntry> batch,
@@ -545,60 +583,129 @@ internal static class VdbeHashJoinRuntime
         context.Options.Metrics.HashProbeBatchFlushed();
 
         var matchesByLocalIndex = new List<VdbeJoinRow>?[batch.Count];
+        var outputRetainedBytes = new long[batch.Count];
+        var settled = new bool[batch.Count];
+        var inputReleased = new bool[batch.Count];
+        var nextEmitIndex = 0;
 
-        var topLevelGroups = new Dictionary<int, List<int>>();
-        var orderedTopLevelIndices = new List<int>();
+        // NULL join keys never match anything (SQL semantics), so they never join a group;
+        // they are "settled" from the start and only ever eligible for outer null-extension.
         for (var localIndex = 0; localIndex < batch.Count; localIndex++)
         {
-            var key = batch[localIndex].Key;
-            if (key is null)
-                continue; // NULL join keys never match; only eligible for outer null-extension below.
-
-            var topIndex = GetPartition(key);
-            if (!topLevelGroups.TryGetValue(topIndex, out var indices))
-            {
-                indices = [];
-                topLevelGroups.Add(topIndex, indices);
-                orderedTopLevelIndices.Add(topIndex);
-            }
-            indices.Add(localIndex);
+            if (batch[localIndex].Key is null)
+                settled[localIndex] = true;
         }
 
-        foreach (var topIndex in orderedTopLevelIndices)
+        void ReleaseInput(int localIndex)
         {
-            context.ThrowIfCancellationRequested();
-            var topLevelLocalIndices = topLevelGroups[topIndex];
+            if (inputReleased[localIndex])
+                return;
+            inputReleased[localIndex] = true;
+            if (batch[localIndex].RetainedBytes > 0)
+                context.Memory.Release(batch[localIndex].RetainedBytes);
+        }
 
-            // Trigger any pending split decision for this top-level partition exactly once
-            // (HashSpill.TrySplitPartition itself only ever attempts a split the first time
-            // any caller touches a given top-level index); the resolution this call returns
-            // is discarded; it only serves to finalize routing before the real regroup below.
-            _ = residency.Resolve(spill, batch[topLevelLocalIndices[0]].Key!, context);
-
-            var finalGroups = new Dictionary<PartitionKey, List<int>>();
-            var orderedFinalIds = new List<PartitionKey>();
-            foreach (var localIndex in topLevelLocalIndices)
+        IEnumerable<VdbeJoinRow> EmitOneIndex(int localIndex)
+        {
+            if (settled[localIndex])
             {
-                var id = spill.GetPartitionKey(batch[localIndex].Key!);
-                if (!finalGroups.TryGetValue(id, out var indices))
+                var matches = matchesByLocalIndex[localIndex];
+                if (matches is not null)
                 {
-                    indices = [];
-                    finalGroups.Add(id, indices);
-                    orderedFinalIds.Add(id);
+                    foreach (var row in matches)
+                        yield return row;
+                    if (outputRetainedBytes[localIndex] > 0)
+                    {
+                        context.Memory.Release(outputRetainedBytes[localIndex], rows: matches.Count);
+                        outputRetainedBytes[localIndex] = 0;
+                    }
                 }
-                indices.Add(localIndex);
+                else if (buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                {
+                    yield return Combine(batch[localIndex].Probe, NullRow(buildNode));
+                }
+            }
+            else
+            {
+                // Not answered via grouping - its own group's buffered output could not be
+                // retained (see TryProcessGroup's remarks), so this index alone falls back
+                // to individual streaming while every other group still attempts (and often
+                // succeeds at) real grouping. Resolve and stream matches immediately, exactly
+                // like the pre-batching per-probe design: nothing here is buffered beyond
+                // the one match being yielded, so it carries no extra memory risk versus
+                // that original design.
+                var key = batch[localIndex].Key;
+                var probe = batch[localIndex].Probe;
+                var matchedProbe = false;
+                if (key is not null)
+                {
+                    var resolution = residency.Resolve(spill, key, context);
+                    foreach (var combined in MatchAgainstResolution(
+                        resolution, spill, key, probe, plan, buildIsRight, trackUnmatchedBuild, context, residency))
+                    {
+                        matchedProbe = true;
+                        yield return combined;
+                    }
+                }
+
+                if (!matchedProbe && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                    yield return Combine(probe, NullRow(buildNode));
             }
 
-            foreach (var id in orderedFinalIds)
-            {
-                context.ThrowIfCancellationRequested();
-                var localIndices = finalGroups[id];
-                var resolution = residency.Resolve(spill, batch[localIndices[0]].Key!, context);
+            ReleaseInput(localIndex);
+        }
 
+        IEnumerable<VdbeJoinRow> EmitReadyPrefix()
+        {
+            while (nextEmitIndex < batch.Count && settled[nextEmitIndex])
+            {
+                foreach (var row in EmitOneIndex(nextEmitIndex))
+                    yield return row;
+                nextEmitIndex++;
+            }
+        }
+
+        // Attempts to answer every probe in localIndices against resolution, retaining each
+        // result row's memory as it is produced. All-or-nothing: if any single row's
+        // retention fails, every row already retained for THIS group is rolled back
+        // (released) and discarded, and this returns false without committing anything -
+        // only THIS group's own probes fall back to the individual/streaming path (see
+        // EmitOneIndex's unsettled branch), which never needs this buffering (and thus never
+        // fails this same way); every OTHER group in the batch still attempts real grouping
+        // (see the caller's remarks for why one group's failure must not be treated as
+        // permanent for the rest of the batch). The finally below guarantees this rollback
+        // happens even when a DIFFERENT exception (cancellation, a user predicate fault, an
+        // unrelated I/O fault) propagates out mid-group: such exceptions are never swallowed
+        // - only their in-progress retained bytes are still released before they continue
+        // propagating - unlike VdbeMemoryLimitExceededException, which IS deliberately
+        // absorbed here (see
+        // the catch below) to trigger the graceful streaming fallback instead of faulting
+        // the whole statement.
+        bool TryProcessGroup(IReadOnlyList<int> localIndices, PartitionResidencyCache.Resolution resolution)
+        {
+            var groupMatches = new List<VdbeJoinRow>?[localIndices.Count];
+            var totalRetainedBytes = 0L;
+            var totalRetainedRows = 0L;
+            var committed = false;
+
+            bool TryAddMatch(int slot, VdbeJoinRow combined)
+            {
+                var bytes = EstimateCombinedRowBytes(combined);
+                if (!context.Memory.TryRetain(bytes))
+                    return false;
+                (groupMatches[slot] ??= []).Add(combined);
+                totalRetainedBytes = checked(totalRetainedBytes + bytes);
+                totalRetainedRows = checked(totalRetainedRows + 1);
+                return true;
+            }
+
+            try
+            {
                 if (resolution.Loaded is not null)
                 {
-                    foreach (var localIndex in localIndices)
+                    for (var slot = 0; slot < localIndices.Count; slot++)
                     {
+                        var localIndex = localIndices[slot];
                         var key = batch[localIndex].Key!;
                         var probe = batch[localIndex].Probe;
                         foreach (var build in resolution.Loaded.Find(key))
@@ -608,93 +715,354 @@ internal static class VdbeHashJoinRuntime
                             if (!Matches(plan, build.Row, probe, combined, buildIsRight))
                                 continue;
 
+                            if (!TryAddMatch(slot, combined))
+                                return false;
                             if (trackUnmatchedBuild)
                                 spill.MarkMatched(build.Ordinal, context);
-                            (matchesByLocalIndex[localIndex] ??= []).Add(combined);
                         }
                     }
                 }
                 else if (resolution.Index is not null)
                 {
-                    foreach (var localIndex in localIndices)
+                    for (var slot = 0; slot < localIndices.Count; slot++)
                     {
+                        var localIndex = localIndices[slot];
                         var key = batch[localIndex].Key!;
                         var probe = batch[localIndex].Probe;
                         foreach (var lease in spill.ReadPartitionIndexMatches(
                             resolution.Id, resolution.Index, key, context, residency))
                         {
+                            VdbeJoinRow? combined = null;
+                            long? matchedOrdinal = null;
                             using (lease)
                             {
                                 context.ThrowIfCancellationRequested();
                                 var build = lease.Entry;
-                                var combined = Combine(build.Row, probe, buildIsRight);
-                                if (!Matches(plan, build.Row, probe, combined, buildIsRight))
-                                    continue;
-
-                                if (trackUnmatchedBuild)
-                                    spill.MarkMatched(build.Ordinal, context);
-                                (matchesByLocalIndex[localIndex] ??= []).Add(combined);
+                                var candidate = Combine(build.Row, probe, buildIsRight);
+                                if (Matches(plan, build.Row, probe, candidate, buildIsRight))
+                                {
+                                    combined = candidate;
+                                    if (trackUnmatchedBuild)
+                                        matchedOrdinal = build.Ordinal;
+                                }
                             }
+
+                            if (combined is null)
+                                continue;
+                            if (!TryAddMatch(slot, combined))
+                                return false;
+                            if (matchedOrdinal is { } ordinal)
+                                spill.MarkMatched(ordinal, context);
                         }
                     }
                 }
                 else
                 {
-                    // Neither tier fit this partition: answer every probe in this group with
-                    // ONE sequential scan instead of one scan per probe - the actual,
+                    // Neither tier fit this partition: answer every probe in this group
+                    // with ONE sequential scan instead of one scan per probe - the actual,
                     // measurable I/O reduction for a partition too large for even the
                     // lightweight index, and the direct fix for "oversized partitions
                     // rescan per probe" when several such probes share a batch.
                     context.Options.Metrics.HashPartitionFallbackScan();
                     var byKey = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-                    foreach (var localIndex in localIndices)
+                    for (var slot = 0; slot < localIndices.Count; slot++)
                     {
-                        var key = batch[localIndex].Key!;
-                        if (!byKey.TryGetValue(key, out var indicesForKey))
+                        var key = batch[localIndices[slot]].Key!;
+                        if (!byKey.TryGetValue(key, out var slotsForKey))
                         {
-                            indicesForKey = [];
-                            byKey.Add(key, indicesForKey);
+                            slotsForKey = [];
+                            byKey.Add(key, slotsForKey);
                         }
-                        indicesForKey.Add(localIndex);
+                        slotsForKey.Add(slot);
                     }
 
-                    foreach (var lease in spill.ReadPartitionByKey(resolution.Id, context))
+                    foreach (var lease in spill.ReadPartitionByKey(resolution.Id, context, residency))
                     {
                         using (lease)
                         {
                             context.ThrowIfCancellationRequested();
                             var build = lease.Entry;
-                            if (build.Key is null || !byKey.TryGetValue(build.Key, out var indicesForKey))
+                            if (build.Key is null || !byKey.TryGetValue(build.Key, out var slotsForKey))
                                 continue;
 
-                            foreach (var localIndex in indicesForKey)
+                            foreach (var slot in slotsForKey)
                             {
+                                var localIndex = localIndices[slot];
                                 var probe = batch[localIndex].Probe;
                                 var combined = Combine(build.Row, probe, buildIsRight);
                                 if (!Matches(plan, build.Row, probe, combined, buildIsRight))
                                     continue;
 
+                                if (!TryAddMatch(slot, combined))
+                                    return false;
                                 if (trackUnmatchedBuild)
                                     spill.MarkMatched(build.Ordinal, context);
-                                (matchesByLocalIndex[localIndex] ??= []).Add(combined);
                             }
                         }
                     }
                 }
+
+                for (var slot = 0; slot < localIndices.Count; slot++)
+                {
+                    var localIndex = localIndices[slot];
+                    var matchList = groupMatches[slot];
+                    if (matchList is null && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                    {
+                        // Eagerly materialize the null-extension now, while this probe's row
+                        // data is still safely available, so its input bytes can be released
+                        // immediately below exactly like a genuine match. Deferring this to
+                        // emission time (as EmitOneIndex's unsettled branch does for probes
+                        // that never join a group) would require keeping this probe's own
+                        // accounting alive until then - reintroducing the same early-release
+                        // risk the immediate release below exists to avoid. This still goes
+                        // through TryAddMatch's own accounting/rollback, so a null-extension
+                        // that cannot be retained fails this group exactly like any other
+                        // match would.
+                        if (!TryAddMatch(slot, Combine(batch[localIndex].Probe, NullRow(buildNode))))
+                            return false;
+                        matchList = groupMatches[slot];
+                    }
+
+                    matchesByLocalIndex[localIndex] = matchList;
+                    settled[localIndex] = true;
+
+                    if (matchList is not null)
+                    {
+                        var bytes = 0L;
+                        foreach (var row in matchList)
+                            bytes = checked(bytes + EstimateCombinedRowBytes(row));
+                        outputRetainedBytes[localIndex] = bytes;
+                    }
+
+                    // Release this probe's OWN input bytes now, decoupled from when it is
+                    // finally emitted: every combined output row this probe could ever
+                    // produce (real matches, or the eagerly-materialized null-extension
+                    // above) has already been copied into its own, separately-accounted
+                    // output row, so the original probe row's bytes are genuinely no longer
+                    // needed once this group commits. Waiting for EmitReadyPrefix to reach
+                    // this index in strict original-order would be wrong here: a cyclic
+                    // probe order spreads one group's members across non-contiguous indices
+                    // (e.g. every 8th probe for an 8-key round-robin), so nothing would ever
+                    // become emit-ready until EVERY group in the batch has committed -
+                    // holding the ENTIRE batch's input retained throughout, which starves
+                    // the residency cache of the very headroom grouping is supposed to free
+                    // up. Releasing here instead bounds concurrent retention to
+                    // "not-yet-committed groups plus committed-but-not-yet-emitted output",
+                    // never "the whole original batch".
+                    ReleaseInput(localIndex);
+                }
+                committed = true;
+                return true;
+            }
+            catch (VdbeMemoryLimitExceededException)
+            {
+                // A transient build-side entry read (not one of THIS group's own buffered
+                // output rows - those fail gracefully via TryAddMatch above) could not be
+                // retained, because the batch's own buffered probes plus whatever this
+                // group has already accumulated as output consumed the remaining budget.
+                // Treat it exactly like a graceful TryAddMatch failure: fall back to
+                // individual, unbuffered streaming for this group and everything after it
+                // (never accumulates output, so it never competes with the budget this
+                // way). Actual rollback happens in the finally below, uniformly with every
+                // other early-return path.
+                return false;
+            }
+            finally
+            {
+                if (!committed && (totalRetainedBytes > 0 || totalRetainedRows > 0))
+                    context.Memory.Release(totalRetainedBytes, totalRetainedRows);
             }
         }
 
-        for (var localIndex = 0; localIndex < batch.Count; localIndex++)
+        try
         {
-            var matches = matchesByLocalIndex[localIndex];
-            if (matches is not null)
+            var topLevelGroups = new Dictionary<int, List<int>>();
+            var orderedTopLevelIndices = new List<int>();
+            for (var localIndex = 0; localIndex < batch.Count; localIndex++)
             {
-                foreach (var row in matches)
-                    yield return row;
+                var key = batch[localIndex].Key;
+                if (key is null)
+                    continue;
+
+                var topIndex = GetPartition(key);
+                if (!topLevelGroups.TryGetValue(topIndex, out var indices))
+                {
+                    indices = [];
+                    topLevelGroups.Add(topIndex, indices);
+                    orderedTopLevelIndices.Add(topIndex);
+                }
+                indices.Add(localIndex);
             }
-            else if (buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+
+            foreach (var topIndex in orderedTopLevelIndices)
             {
-                yield return Combine(batch[localIndex].Probe, NullRow(buildNode));
+                context.ThrowIfCancellationRequested();
+                var topLevelLocalIndices = topLevelGroups[topIndex];
+
+                // Trigger any pending split decision for this top-level partition exactly
+                // once (HashSpill.TrySplitPartition itself only ever attempts a split the
+                // first time any caller touches a given top-level index); the resolution
+                // this call returns is discarded; it only serves to finalize routing before
+                // the real regroup below.
+                _ = residency.Resolve(spill, batch[topLevelLocalIndices[0]].Key!, context);
+
+                var finalGroups = new Dictionary<PartitionKey, List<int>>();
+                var orderedFinalIds = new List<PartitionKey>();
+                foreach (var localIndex in topLevelLocalIndices)
+                {
+                    var id = spill.GetPartitionKey(batch[localIndex].Key!);
+                    if (!finalGroups.TryGetValue(id, out var indices))
+                    {
+                        indices = [];
+                        finalGroups.Add(id, indices);
+                        orderedFinalIds.Add(id);
+                    }
+                    indices.Add(localIndex);
+                }
+
+                foreach (var id in orderedFinalIds)
+                {
+                    context.ThrowIfCancellationRequested();
+                    var localIndices = finalGroups[id];
+                    var resolution = residency.Resolve(spill, batch[localIndices[0]].Key!, context);
+
+                    // A failure here (see TryProcessGroup's remarks) leaves only THIS
+                    // group's own indices unsettled - handled later via individual streaming
+                    // in the catch-up loop below - and does not abandon grouping for the
+                    // REST of the batch: memory pressure that defeats one group (e.g. a
+                    // transient spike from duplicate-key output fanout) does not imply every
+                    // other, unrelated partition's group will also fail, and treating one
+                    // failure as permanent for the whole batch would force the remaining,
+                    // potentially large tail through individual streaming - which keeps that
+                    // whole tail's input bytes retained throughout (see EnumerateCore's
+                    // per-probe retention) and can starve the residency cache down to a
+                    // single resident entry, causing exactly the reload thrashing this
+                    // batching mechanism exists to avoid.
+                    if (!TryProcessGroup(localIndices, resolution))
+                        continue;
+
+                    foreach (var row in EmitReadyPrefix())
+                        yield return row;
+                }
+            }
+
+            while (nextEmitIndex < batch.Count)
+            {
+                foreach (var row in EmitOneIndex(nextEmitIndex))
+                    yield return row;
+                nextEmitIndex++;
+            }
+        }
+        finally
+        {
+            // Safety net for any exception that unwinds this iterator before every entry
+            // reached its normal release point above (cancellation, a user predicate fault,
+            // an unrelated I/O fault, or an early Dispose() from the caller's own
+            // maximumRows early-exit): release whatever input/output accounting is still
+            // outstanding so a fault never leaks retained bytes, matching the same
+            // exception-safety contract EnumerateCore's own outer try/finally already
+            // provides for the rest of this join operator.
+            for (var localIndex = 0; localIndex < batch.Count; localIndex++)
+            {
+                if (outputRetainedBytes[localIndex] > 0)
+                {
+                    var matches = matchesByLocalIndex[localIndex];
+                    context.Memory.Release(outputRetainedBytes[localIndex], rows: matches?.Count ?? 0);
+                    outputRetainedBytes[localIndex] = 0;
+                }
+                ReleaseInput(localIndex);
+            }
+        }
+    }
+
+    /// <summary>Approximates the retained-memory footprint of one buffered join-result row,
+    /// for accounting output rows produced during grouped probe-batch processing (see
+    /// <c>FlushProbeBatch</c>). Reuses the build-entry estimator (no join key applies to an
+    /// already-combined row) since its array/value-payload shape is the same.</summary>
+    private static long EstimateCombinedRowBytes(VdbeJoinRow combined) =>
+        VdbeManagedFootprint.EstimateHashBuildEntry(combined.Values, key: null, combined.RowIds.Length);
+
+    /// <summary>
+    /// Streams every build-side match for a single probe against an already-resolved
+    /// partition (<paramref name="resolution"/>), marking matched build ordinals as it goes.
+    /// Used only by the individual/unbuffered path (<c>FlushProbeBatch.EmitOneIndex</c>'s
+    /// unsettled branch): each yielded row is transient, never buffered, so this carries no
+    /// memory-accounting risk of its own - identical in shape to the pre-batching per-probe
+    /// design.
+    /// </summary>
+    private static IEnumerable<VdbeJoinRow> MatchAgainstResolution(
+        PartitionResidencyCache.Resolution resolution,
+        HashSpill spill,
+        string key,
+        VdbeJoinRow probe,
+        VdbeJoinOperatorPlan plan,
+        bool buildIsRight,
+        bool trackUnmatchedBuild,
+        VdbeJoinExecutionContext context,
+        PartitionResidencyCache residency)
+    {
+        if (resolution.Loaded is not null)
+        {
+            foreach (var build in resolution.Loaded.Find(key))
+            {
+                context.ThrowIfCancellationRequested();
+                var combined = Combine(build.Row, probe, buildIsRight);
+                if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                    continue;
+                if (trackUnmatchedBuild)
+                    spill.MarkMatched(build.Ordinal, context);
+                yield return combined;
+            }
+        }
+        else if (resolution.Index is not null)
+        {
+            foreach (var lease in spill.ReadPartitionIndexMatches(resolution.Id, resolution.Index, key, context, residency))
+            {
+                VdbeJoinRow? combined = null;
+                long? matchedOrdinal = null;
+                using (lease)
+                {
+                    context.ThrowIfCancellationRequested();
+                    var build = lease.Entry;
+                    var candidate = Combine(build.Row, probe, buildIsRight);
+                    if (Matches(plan, build.Row, probe, candidate, buildIsRight))
+                    {
+                        combined = candidate;
+                        if (trackUnmatchedBuild)
+                            matchedOrdinal = build.Ordinal;
+                    }
+                }
+
+                if (combined is null)
+                    continue;
+                if (matchedOrdinal is { } ordinal)
+                    spill.MarkMatched(ordinal, context);
+                yield return combined;
+            }
+        }
+        else
+        {
+            context.Options.Metrics.HashPartitionFallbackScan();
+            foreach (var lease in spill.ReadPartitionByKey(resolution.Id, context, residency))
+            {
+                VdbeJoinRow? combinedResult = null;
+                using (lease)
+                {
+                    context.ThrowIfCancellationRequested();
+                    var build = lease.Entry;
+                    if (!string.Equals(build.Key, key, StringComparison.Ordinal))
+                        continue;
+
+                    var combined = Combine(build.Row, probe, buildIsRight);
+                    if (!Matches(plan, build.Row, probe, combined, buildIsRight))
+                        continue;
+
+                    if (trackUnmatchedBuild)
+                        spill.MarkMatched(build.Ordinal, context);
+                    combinedResult = combined;
+                }
+
+                yield return combinedResult;
             }
         }
     }
@@ -1432,7 +1800,8 @@ internal static class VdbeHashJoinRuntime
 
         public IEnumerable<BuildEntryLease> ReadPartitionByKey(
             PartitionKey id,
-            VdbeJoinExecutionContext context)
+            VdbeJoinExecutionContext context,
+            PartitionResidencyCache residency)
         {
             var partition = GetPartitionFile(id);
             _options.Metrics.HashPartitionScanned();
@@ -1440,7 +1809,7 @@ internal static class VdbeHashJoinRuntime
                 partition.File.File,
                 VdbeSpillFileKind.HashPartition,
                 _options.Metrics);
-            return ReadEntries(partition.File.File, partition.Count, context);
+            return ReadEntriesWithEviction(partition.File.File, partition.Count, context, id, residency);
         }
 
         public LoadedPartition? TryLoadPartitionByKey(
@@ -1987,6 +2356,44 @@ internal static class VdbeHashJoinRuntime
                     ref position,
                     context,
                     requireAvailable: true)!;
+            }
+        }
+
+        /// <summary>
+        /// Like <see cref="ReadEntries"/>, but for a raw partition scan that may run
+        /// alongside other still-resident cache entries and buffered probe rows a caller
+        /// legitimately needs to keep alive (see <c>VdbeHashJoinRuntime.EnumerateCore</c>'s
+        /// probe-batch scheduling): before giving up on a single entry's decode, this evicts
+        /// other resident partitions (never the probe-side data this scan itself is
+        /// answering) to make room, exactly mirroring <see cref="ReadPartitionIndexMatches"/>'s
+        /// existing degradation, so a tight-but-not-truly-impossible budget never hard-faults
+        /// here purely because of a scan that could have succeeded moments later once
+        /// something else was evicted.
+        /// </summary>
+        private IEnumerable<BuildEntryLease> ReadEntriesWithEviction(
+            IFile file,
+            int count,
+            VdbeJoinExecutionContext context,
+            PartitionKey protectId,
+            PartitionResidencyCache residency)
+        {
+            long position = VdbeSpillRecordCodec.FileHeaderSize;
+            for (var index = 0; index < count; index++)
+            {
+                // TryReadEntry rolls its own `position` argument back to this record's start
+                // whenever it fails (requireAvailable: false), so retrying with the SAME
+                // `position` variable after an eviction always re-attempts the same record,
+                // and a successful attempt always leaves `position` correctly advanced to
+                // the next one - no separate bookkeeping is needed here.
+                var lease = TryReadEntry(file, ref position, context, requireAvailable: false);
+                while (lease is null && residency.EvictOneExcept(protectId, context))
+                    lease = TryReadEntry(file, ref position, context, requireAvailable: false);
+
+                // Truly out of options; let TryReadEntry throw with its precise,
+                // already-computed byte accounting rather than approximating it here.
+                lease ??= TryReadEntry(file, ref position, context, requireAvailable: true)!;
+
+                yield return lease;
             }
         }
 
