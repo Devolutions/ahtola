@@ -107,6 +107,135 @@ public sealed class StorageAuditBoundedGapTests
     }
 
     [Test]
+    public void TableInteriorPageAcceptsFiveContiguousDeclaredFragmentedBytes()
+    {
+        var page = new byte[SqlitePageSize.Minimum];
+        var cell = SqliteTableInteriorCell.Create(leftChildPage: 2, rowId: 10);
+        var cellOffset = page.Length - cell.EncodedLength;
+        var header = SqliteBtreePageHeader.CreateEmpty(
+            SqliteBtreePageType.TableInterior,
+            page.Length) with
+        {
+            CellCount = 1,
+            CellContentAreaOffset = cellOffset - 5,
+            FragmentedFreeBytes = 5,
+            RightMostChildPage = 3,
+        };
+        header.WriteTo(page);
+        cell.WriteTo(page.AsSpan(cellOffset));
+        SqliteCellPointerArray.WriteTo(page, header, [checked((ushort)cellOffset)], page.Length);
+
+        SqliteTableInteriorPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
+
+        (header with { FragmentedFreeBytes = 0 }).WriteTo(page);
+        Assert.Throws<InvalidDataException>(() => SqliteTableInteriorPageView.Parse(page, page.Length));
+    }
+
+    [Test]
+    public void IndexLeafPageAcceptsFiveContiguousDeclaredFragmentedBytes()
+    {
+        var page = new byte[SqlitePageSize.Minimum];
+        // Record: header size 2, one serial type 1 (single-byte integer), body 1.
+        var cell = SqliteIndexLeafCell.Create([0x02, 0x01, 0x01], page.Length);
+        var cellOffset = page.Length - cell.EncodedLength;
+        var header = SqliteBtreePageHeader.CreateEmpty(
+            SqliteBtreePageType.IndexLeaf,
+            page.Length) with
+        {
+            CellCount = 1,
+            CellContentAreaOffset = cellOffset - 5,
+            FragmentedFreeBytes = 5,
+        };
+        header.WriteTo(page);
+        cell.WriteTo(page.AsSpan(cellOffset));
+        SqliteCellPointerArray.WriteTo(page, header, [checked((ushort)cellOffset)], page.Length);
+
+        SqliteIndexLeafPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
+
+        (header with { FragmentedFreeBytes = 0 }).WriteTo(page);
+        Assert.Throws<InvalidDataException>(() => SqliteIndexLeafPageView.Parse(page, page.Length));
+    }
+
+    [Test]
+    public void IndexInteriorPageAcceptsFiveContiguousDeclaredFragmentedBytes()
+    {
+        var page = new byte[SqlitePageSize.Minimum];
+        var cell = SqliteIndexInteriorCell.Create(leftChildPage: 2, [0x02, 0x01, 0x01], page.Length);
+        var cellOffset = page.Length - cell.EncodedLength;
+        var header = SqliteBtreePageHeader.CreateEmpty(
+            SqliteBtreePageType.IndexInterior,
+            page.Length) with
+        {
+            CellCount = 1,
+            CellContentAreaOffset = cellOffset - 5,
+            FragmentedFreeBytes = 5,
+            RightMostChildPage = 3,
+        };
+        header.WriteTo(page);
+        cell.WriteTo(page.AsSpan(cellOffset));
+        SqliteCellPointerArray.WriteTo(page, header, [checked((ushort)cellOffset)], page.Length);
+
+        SqliteIndexInteriorPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
+
+        (header with { FragmentedFreeBytes = 0 }).WriteTo(page);
+        Assert.Throws<InvalidDataException>(() => SqliteIndexInteriorPageView.Parse(page, page.Length));
+    }
+
+    [Test]
+    public void TableLeafPageAcceptsDeclaredTrailingFragmentedBytes()
+    {
+        var page = new byte[SqlitePageSize.Minimum];
+        var cell = SqliteTableLeafCell.Create(1, [0x2a], page.Length);
+        var cellOffset = page.Length - cell.EncodedLength - 5;
+        var header = SqliteBtreePageHeader.CreateEmpty(
+            SqliteBtreePageType.TableLeaf,
+            page.Length) with
+        {
+            CellCount = 1,
+            CellContentAreaOffset = cellOffset,
+            FragmentedFreeBytes = 5,
+        };
+        header.WriteTo(page);
+        cell.WriteTo(page.AsSpan(cellOffset));
+        SqliteCellPointerArray.WriteTo(page, header, [checked((ushort)cellOffset)], page.Length);
+
+        // The region between the last occupied byte and the end of usable space
+        // feeds the same aggregate fragmented-byte accounting as interior gaps;
+        // only the declared total matters, not the physical gap shape.
+        SqliteTableLeafPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
+
+        (header with { FragmentedFreeBytes = 0 }).WriteTo(page);
+        Assert.Throws<InvalidDataException>(() => SqliteTableLeafPageView.Parse(page, page.Length));
+    }
+
+    [Test]
+    public void BtreeHeaderAcceptsSixtyDeclaredFragmentedBytesAndRejectsSixtyOne()
+    {
+        var page = new byte[SqlitePageSize.Minimum];
+        var cell = SqliteTableLeafCell.Create(1, [0x2a], page.Length);
+        var cellOffset = page.Length - cell.EncodedLength;
+        var header = SqliteBtreePageHeader.CreateEmpty(
+            SqliteBtreePageType.TableLeaf,
+            page.Length) with
+        {
+            CellCount = 1,
+            CellContentAreaOffset = cellOffset - 60,
+            FragmentedFreeBytes = 60,
+        };
+        header.WriteTo(page);
+        cell.WriteTo(page.AsSpan(cellOffset));
+        SqliteCellPointerArray.WriteTo(page, header, [checked((ushort)cellOffset)], page.Length);
+
+        // "In a well-formed b-tree page, the total number of bytes in fragments
+        // may not exceed 60" (SQLite file format, section 1.6): the full budget
+        // stays valid while the declared total still has to match the layout.
+        SqliteTableLeafPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
+
+        page[7] = 61;
+        Assert.Throws<InvalidDataException>(() => SqliteTableLeafPageView.Parse(page, page.Length));
+    }
+
+    [Test]
     public void WalHeaderUsesLiteral64KPageSizeAndRejectsZero()
     {
         var bytes = SqliteWalHeader.Create(
