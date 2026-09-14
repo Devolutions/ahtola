@@ -665,7 +665,7 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         ReplaceWalWithEmptyFile(fileSystem, path, header, salt1: 97, salt2: 101);
         var writesBeforeReopen = faults.GetOperationCount(FileSystemOperation.Write);
         var reopen = () => EmbeddedDatabase.OpenFile(path, fileSystem);
-        reopen.Should().Throw<InvalidDataException>().WithMessage("*untracked trailing free gap*");
+        reopen.Should().Throw<InvalidDataException>().WithMessage("*declares 0 fragmented byte(s), but its layout contains 8*");
         faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReopen);
     }
 

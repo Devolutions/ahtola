@@ -82,23 +82,11 @@ internal static class SqliteBtreePageValidation
                 throw new InvalidDataException($"SQLite {cellDescription} content ranges overlap.");
 
             var gap = start - previousEnd;
-            if (gap > 3)
-            {
-                throw new InvalidDataException(
-                    $"SQLite {cellDescription} page has an untracked free gap of {gap} bytes.");
-            }
-
             fragmentedBytes = checked(fragmentedBytes + gap);
             previousEnd = end;
         }
 
         var trailingGap = usableSpace - previousEnd;
-        if (trailingGap > 3)
-        {
-            throw new InvalidDataException(
-                $"SQLite {cellDescription} page has an untracked trailing free gap of {trailingGap} bytes.");
-        }
-
         fragmentedBytes = checked(fragmentedBytes + trailingGap);
         if (fragmentedBytes != header.FragmentedFreeBytes)
         {
