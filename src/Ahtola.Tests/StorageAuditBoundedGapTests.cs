@@ -79,21 +79,31 @@ public sealed class StorageAuditBoundedGapTests
 
         (header with { FragmentedFreeBytes = 0 }).WriteTo(page);
         Assert.Throws<InvalidDataException>(() => SqliteTableLeafPageView.Parse(page, page.Length));
+    }
 
-        page.AsSpan().Clear();
-        var untrackedGapHeader = header with
+    [Test]
+    public void TableLeafPageAcceptsFiveContiguousDeclaredFragmentedBytes()
+    {
+        var page = new byte[SqlitePageSize.Minimum];
+        var cell = SqliteTableLeafCell.Create(1, [0x2a], page.Length);
+        var cellOffset = page.Length - cell.EncodedLength;
+        var header = SqliteBtreePageHeader.CreateEmpty(
+            SqliteBtreePageType.TableLeaf,
+            page.Length) with
         {
-            CellContentAreaOffset = cellOffset - 4,
-            FragmentedFreeBytes = 4,
+            CellCount = 1,
+            CellContentAreaOffset = cellOffset - 5,
+            FragmentedFreeBytes = 5,
         };
-        untrackedGapHeader.WriteTo(page);
+        header.WriteTo(page);
         cell.WriteTo(page.AsSpan(cellOffset));
         SqliteCellPointerArray.WriteTo(
             page,
-            untrackedGapHeader,
+            header,
             [checked((ushort)cellOffset)],
             page.Length);
-        Assert.Throws<InvalidDataException>(() => SqliteTableLeafPageView.Parse(page, page.Length));
+
+        SqliteTableLeafPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
     }
 
     [Test]
