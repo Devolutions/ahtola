@@ -209,7 +209,7 @@ public sealed class StorageAuditBoundedGapTests
     }
 
     [Test]
-    public void BtreeHeaderAcceptsSixtyDeclaredFragmentedBytesAndRejectsSixtyOne()
+    public void BtreePageReaderIgnoresFragmentBudgetWhileWriterEnforcesIt()
     {
         var page = new byte[SqlitePageSize.Minimum];
         var cell = SqliteTableLeafCell.Create(1, [0x2a], page.Length);
@@ -226,13 +226,42 @@ public sealed class StorageAuditBoundedGapTests
         cell.WriteTo(page.AsSpan(cellOffset));
         SqliteCellPointerArray.WriteTo(page, header, [checked((ushort)cellOffset)], page.Length);
 
-        // "In a well-formed b-tree page, the total number of bytes in fragments
-        // may not exceed 60" (SQLite file format, section 1.6): the full budget
-        // stays valid while the declared total still has to match the layout.
-        SqliteTableLeafPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
+        // "In a well-formed b-tree page, the total number of bytes in fragments may
+                // not exceed 60" (SQLite file format, section 1.6) — but SQLite's
+                // reader never enforces that budget (a 61-fragment page with matching
+                // layout opens and passes quick_check), and neither does Turso's
+                // compute_free_space. The reader validates only that the declared
+                // count matches the actual layout; the budget is writer-side.
+                SqliteTableLeafPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
 
-        page[7] = 61;
-        Assert.Throws<InvalidDataException>(() => SqliteTableLeafPageView.Parse(page, page.Length));
+                // Author the 61-fragment page by patching the header bytes directly,
+                // since Ahtola's own writer refuses to emit it.
+                BinaryPrimitives.WriteUInt16BigEndian(page.AsSpan(5), (ushort)(cellOffset - 61));
+                page[7] = 61;
+                SqliteTableLeafPageView.Parse(page, page.Length).Cells.Should().ContainSingle();
+
+                // The declared count still has to match the layout exactly.
+                page[7] = 60;
+                Assert.Throws<InvalidDataException>(() => SqliteTableLeafPageView.Parse(page, page.Length));
+
+        // Ahtola's writer keeps enforcing the 60-byte budget.
+                Assert.Throws<InvalidOperationException>(
+                    () => (header with { FragmentedFreeBytes = 61 }).WriteTo(page));
+    }
+
+    [Test]
+    public void DatabaseHeaderParseIgnoresReservedExpansionBytes()
+    {
+        // SQLite's reader ignores the 20 reserved-for-expansion bytes at
+        // offsets 72..91 entirely (nonzero bytes there open and pass
+        // quick_check); only the documented layout is parsed.
+        var header = SqliteDatabaseHeader.CreateDefault();
+        var bytes = header.ToArray();
+        bytes[75] = 0xAA;
+        bytes[90] = 0x55;
+
+        var parsed = SqliteDatabaseHeader.Parse(bytes);
+        parsed.Should().Be(header);
     }
 
     [Test]
