@@ -104,12 +104,13 @@ Additional current behavior:
 - The carrier handle is retained while any range is held and closed once the last
   range is released, because closing a descriptor would drop process-owned POSIX
   record locks.
-- Reader carriers requested by a read-only pager open with `FileMode.Open`. A
-  missing `-shm` therefore fails with `InvalidOperationException` instead of being
-  created, so a read-only open never mutates storage. Writer and checkpoint
-  carriers use `FileMode.OpenOrCreate`, and so does a reader lock taken by a
-  read-write pager: like a native read-write connection, such a pager recreates
-  the carrier on demand after a stock SQLite client removed it on clean close.
+- A read-only WAL-mode pager with no `-wal` sidecar reads the fully checkpointed
+  main file under its main-file SHARED lease and does not require or create a
+  `-shm` carrier. When a WAL sidecar is present, reader carriers open with
+  `FileMode.Open`; a missing `-shm` fails with `InvalidOperationException`
+  instead of being created, so a read-only open never mutates storage. Writer
+  and checkpoint carriers use `FileMode.OpenOrCreate`, and so does a reader lock
+  taken by a read-write pager.
 - Byte-range locking is enabled on Windows, 64-bit Linux, and macOS; anything
   else throws `PlatformNotSupportedException` rather than falling back to
   process-local locks.
@@ -324,9 +325,10 @@ and is only refreshed on pooling reset.
 - **Writable open** holds the write byte and the recovery byte, recovers a hot
   rollback journal, scans the WAL, truncates it to the last committed frame, and
   requires the post-repair scan to match the authenticated pre-repair scan exactly.
-- **Read-only open** takes only a reader byte, never repairs anything, refuses to
-  create a missing `-shm`, and refuses to establish a snapshot that would require
-  WAL repair.
+- **Read-only open** takes a reader byte when a WAL sidecar exists, never repairs
+  anything, refuses to create a missing `-shm`, and refuses to establish a
+  snapshot that would require WAL repair. With no WAL sidecar it reads the fully
+  checkpointed main file under its main-file SHARED lease.
 - **WAL coexistence is live.** Managed and stock SQLite readers/writers coordinate
   through the mapped WAL-index, `-shm` locks, and the lifetime main-file SHARED
   lock.
@@ -676,7 +678,7 @@ the attached WAL boundary:
 | `ManagedCheckpointPublishesWalIndexBackfillProgress` | Stage 3 — `nBackfill`/`nBackfillAttempted` published after install |
 | `PassiveCheckpointEvidenceBindsInclusiveWatermarkToWalIncarnation` | Stage 3 — sync-facing inclusive watermark is bound to validated WAL salts/`iChange` |
 | `ManagedRolesStayInsideSqliteReservedSharedMemoryLockArea` | §1.2 — no locks outside bytes 120–127 |
-| `ManagedReadOnlyOpenRefusesToCreateAMissingSharedMemoryLockCarrier` | §1.2, §3 — read-only opens never create `-shm` |
+| `ManagedReadOnlyOpenWithWalRefusesToCreateAMissingSharedMemoryLockCarrier` | §1.2, §3 — read-only opens never create `-shm` when WAL locking is required |
 | `PooledReopenSurvivesSharedMemoryCarrierRemovedByNativeClose` (`ManagedConnectionPoolingTests.cs`) | §1.2 — a read-write pager recreates a missing carrier on demand like a native read-write connection, and the pooling catalog refresh tolerates its absence |
 
 `src/Ahtola.Tests/ForeignReadOnlyOpenTests.cs` pins the §1.9
