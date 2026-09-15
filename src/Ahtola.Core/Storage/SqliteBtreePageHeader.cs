@@ -120,15 +120,23 @@ public sealed record SqliteBtreePageHeader(
         var expectedHeaderSize = IsLeaf ? LeafHeaderSize : InteriorHeaderSize;
         if (page.Length < expectedOffset + expectedHeaderSize)
             throw new ArgumentException("SQLite B-tree page is too small for its header.", nameof(page));
+                // The 60-byte fragment budget is a writer-side invariant ("In a
+                // well-formed b-tree page, the total number of bytes in fragments may
+                // not exceed 60"); Ahtola-authored pages never exceed it.
+                if (FragmentedFreeBytes > 60)
+                {
+                    throw new InvalidOperationException(
+                        $"SQLite B-tree page has too many fragmented free bytes ({FragmentedFreeBytes}).");
+                }
 
-        ValidateLayout(
-            contentBound,
-            expectedOffset,
-            expectedHeaderSize,
-            FirstFreeblockOffset,
-            CellCount,
-            CellContentAreaOffset,
-            FragmentedFreeBytes);
+                ValidateLayout(
+                    contentBound,
+                    expectedOffset,
+                    expectedHeaderSize,
+                    FirstFreeblockOffset,
+                    CellCount,
+                    CellContentAreaOffset,
+                    FragmentedFreeBytes);
 
         page[expectedOffset] = (byte)PageType;
         BinaryPrimitives.WriteUInt16BigEndian(page[(expectedOffset + 1)..], FirstFreeblockOffset);
@@ -196,10 +204,14 @@ public sealed record SqliteBtreePageHeader(
         int cellContentAreaOffset,
         byte fragmentedFreeBytes)
     {
-        if (fragmentedFreeBytes > 60)
-            throw new InvalidDataException("SQLite B-tree page has too many fragmented free bytes.");
-        if (cellContentAreaOffset < offset + headerSize || cellContentAreaOffset > contentBound)
-            throw new InvalidDataException("SQLite B-tree cell content area is invalid.");
+            // No read-side cap on fragmentedFreeBytes: SQLite's reader never
+            // enforces the documented 60-byte fragment budget (a page declaring 61
+            // fragmented bytes with matching layout opens and passes quick_check),
+            // and Turso's compute_free_space only checks that the declared count
+            // matches the page's actual free space. The budget is a writer-side
+            // invariant only; Ahtola's writer keeps emitting zero-fragment pages.
+            if (cellContentAreaOffset < offset + headerSize || cellContentAreaOffset > contentBound)
+                throw new InvalidDataException("SQLite B-tree cell content area is invalid.");
 
         var cellPointerArrayEnd = offset + headerSize + cellCount * sizeof(ushort);
         if (cellPointerArrayEnd > cellContentAreaOffset)

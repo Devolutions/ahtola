@@ -1678,6 +1678,29 @@ internal sealed class EmbeddedFileStore : IDisposable
         return new EmbeddedFileCatalog(tables, views, triggers, virtualTables);
     }
 
+    /// <summary>
+    /// Counts the pointer-map pages an auto-vacuum database of this size
+    /// contains, using SQLite's layout (see Turso <c>ptrmap</c>): page 2 is the
+    /// first pointer-map page, each maps <c>usable/5</c> following pages, and
+    /// the cycle length is <c>usable/5 + 1</c>. Returns zero for non-auto-vacuum
+    /// databases.
+    /// </summary>
+    private static int CountPointerMapPages(SqliteDatabaseHeader header, uint pageCount)
+    {
+        if (header.LargestRootBtreePage == 0)
+            return 0;
+
+        var cycleLength = SqlitePointerMap.CycleLength(header.UsableSpace);
+        if (cycleLength <= 1)
+            return 0;
+
+        // Page 1 is the schema page; pointer-map pages occupy one slot in every
+        // cycle starting from page 2, so the count is the number of complete
+        // or partial cycles spanned by pages 2..pageCount.
+        var dataPageCount = checked((ulong)pageCount - 1);
+        return checked((int)((dataPageCount + (ulong)cycleLength - 1) / (ulong)cycleLength));
+    }
+
     private void ValidateAllocationMap(
         IReadOnlyList<ManagedSchemaRow> schemaEntries,
         IReadOnlyDictionary<string, EmbeddedTable> tables,
@@ -1760,7 +1783,14 @@ internal sealed class EmbeddedFileStore : IDisposable
                 }
             }
 
-            var accountedPageCount = checked(activePages.Count + freelist.PageNumbers.Count);
+            // Auto-vacuum databases reserve pointer-map pages (one per
+            // usable/5 + 1 database pages, starting at page 2). They are
+            // neither b-tree-reachable nor freelist pages, so they must be
+            // accounted separately or every auto-vacuum database fails this
+            // check even though SQLite itself accepts it.
+            var ptrmapPageCount = CountPointerMapPages(_header, pageCount);
+
+            var accountedPageCount = checked(activePages.Count + freelist.PageNumbers.Count + ptrmapPageCount);
             if (accountedPageCount != pageCount)
             {
                 throw new InvalidDataException(
@@ -3387,6 +3417,16 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
+
+        // Auto-vacuum databases carry pointer-map pages that Ahtola's writer
+        // does not maintain: a write would leave the map stale and corrupt the
+        // file for SQLite itself. Fail closed (SQLITE_READONLY-style) until the
+        // writer maintains ptrmap entries.
+        if (_header.LargestRootBtreePage != 0)
+        {
+            throw new EmbeddedSqlException(
+                "The managed file engine cannot write an auto-vacuum database because pointer-map maintenance is not implemented.");
+        }
 
         // Validate first: a reject must leave the existing database untouched.
         foreach (var (name, table) in tables)

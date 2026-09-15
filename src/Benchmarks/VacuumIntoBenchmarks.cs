@@ -213,11 +213,14 @@ public class VacuumIntoBenchmarks
     /// deletes so VACUUM actually has free space to reclaim.
     /// </summary>
     /// <remarks>
-    /// The managed engine currently rejects some index-interior page layouts
-    /// that native SQLite emits after deletes ("untracked free gap"), so the
-    /// fixture is authored managed-side; native SQLite reads it back fine,
-    /// which keeps the comparison on one identical input.
-    /// </remarks>
+        /// The fixture stays managed-authored so both engines vacuum one
+        /// byte-identical input. The authoring used to be forced: the managed
+        /// reader rejected the fragmented index-interior page layouts native
+        /// SQLite emits after deletes ("untracked free gap"). That gap-shape
+        /// inference was replaced by declared fragmented-byte accounting, so
+        /// native-authored inputs now open as well; the managed fixture is kept
+        /// for determinism.
+        /// </remarks>
     private static void BuildDeterministicFixture(string path, int rowCount)
     {
         DeleteDatabaseFiles(path);

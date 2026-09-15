@@ -106,8 +106,11 @@ public sealed record SqliteDatabaseHeader(
             ReadUInt32(source, 64),
             databaseSizeInPages,
             static message => new InvalidDataException(message));
-        if (source.Slice(72, 20).IndexOfAnyExcept((byte)0) >= 0)
-            throw new InvalidDataException("SQLite database header reserved bytes must be zero.");
+                // The 20 reserved-for-expansion bytes at offsets 72..91 are documented
+                // as "must be zero", but SQLite's reader ignores them entirely (a file
+                // with nonzero bytes there opens and passes quick_check), so they are
+                // skipped rather than validated on read. Ahtola's writer keeps
+                // emitting zeros.
 
         return new SqliteDatabaseHeader(
             pageSize,
