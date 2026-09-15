@@ -684,6 +684,7 @@ public sealed class SqlitePager : IDisposable
             var openContext = AcquireOpenContext(
                             storageFileSystem,
                             databasePath,
+                            walPath,
                             readOnly,
                             encryption,
                             pageCodec,
@@ -695,6 +696,7 @@ public sealed class SqlitePager : IDisposable
             using var openLock = openContext.OpenLock;
             var pageStore = openContext.PageStore;
             var journalMode = openContext.JournalMode;
+            var useExternalCoordinator = openContext.UseExternalCoordinator;
             using var recoveryLock = readOnly || !UsesWalStorage(journalMode)
                             ? null
                             : effectiveLockManager.EnterRecoveryLock(
@@ -707,7 +709,8 @@ public sealed class SqlitePager : IDisposable
                 {
                     if (UsesWalStorage(journalMode))
                     {
-                        if (storageFileSystem.FileExists(walPath))
+                        if (storageFileSystem.FileExists(walPath)
+                            && (!readOnly || useExternalCoordinator))
                         {
                             // Stock SQLite often leaves a zero-length -wal while a
                             // connection is live (post-checkpoint / reopen). Open it
@@ -857,9 +860,11 @@ public sealed class SqlitePager : IDisposable
         SqliteMainFileLockLease? MainFileLock,
         SqlitePagerLockLease OpenLock,
         SqlitePageStore PageStore,
-        SqliteJournalMode JournalMode) AcquireOpenContext(
+        SqliteJournalMode JournalMode,
+        bool UseExternalCoordinator) AcquireOpenContext(
             IFileSystem fileSystem,
             string databasePath,
+            string walPath,
             bool readOnly,
             AhtolaEncryptionOptions? encryption,
             IPageCodec? pageCodec,
@@ -895,7 +900,8 @@ public sealed class SqlitePager : IDisposable
                     readOnly,
                     encryption,
                     pageCodec);
-                return (null, openLock, pageStore, GetJournalMode(pageStore.Header));
+                var journalMode = GetJournalMode(pageStore.Header);
+                return (null, openLock, pageStore, journalMode, UsesWalStorage(journalMode));
             }
             catch
             {
@@ -934,6 +940,8 @@ public sealed class SqlitePager : IDisposable
                     encryption,
                     pageCodec);
                 var journalMode = GetJournalMode(pageStore.Header);
+                var useExternalCoordinator = UsesWalStorage(journalMode)
+                    && (!readOnly || fileSystem.FileExists(walPath));
                 try
                 {
                     openLock = EnterLockWithinBudget(
@@ -942,7 +950,7 @@ public sealed class SqlitePager : IDisposable
                         configuredTimeout: TimeSpan.Zero,
                         stopwatch: null,
                         pagerReadOnly: readOnly,
-                        useExternalCoordinator: UsesWalStorage(journalMode));
+                        useExternalCoordinator);
                 }
                 catch (SqlitePagerBusyException exception)
                 {
@@ -973,7 +981,7 @@ public sealed class SqlitePager : IDisposable
                     continue;
                 }
 
-                return (mainFileLock, openLock, pageStore, journalMode);
+                return (mainFileLock, openLock, pageStore, journalMode, useExternalCoordinator);
             }
             catch
             {
@@ -1146,13 +1154,15 @@ public sealed class SqlitePager : IDisposable
             bool readOnly;
             bool persistentExclusive;
             bool useExternalCoordinator;
+            bool walPresent;
             lock (_gate)
             {
                 ThrowIfNotReadable();
                 deleteMode = _journalMode == SqliteJournalMode.Delete;
                 readOnly = IsReadOnly;
                 persistentExclusive = _exclusiveLockingMode;
-                useExternalCoordinator = !deleteMode && !persistentExclusive;
+                walPresent = _wal is not null;
+                useExternalCoordinator = !deleteMode && !persistentExclusive && walPresent;
             }
 
             mainFileLock = null;
@@ -1194,7 +1204,8 @@ public sealed class SqlitePager : IDisposable
                     ThrowIfNotReadable();
                     if ((_journalMode == SqliteJournalMode.Delete) == deleteMode
                         && _exclusiveLockingMode == persistentExclusive
-                        && (!_exclusiveLockingMode && !deleteMode) == useExternalCoordinator)
+                        && (_wal is not null) == walPresent
+                        && (!_exclusiveLockingMode && !deleteMode && _wal is not null) == useExternalCoordinator)
                         return readerLock;
                 }
             }

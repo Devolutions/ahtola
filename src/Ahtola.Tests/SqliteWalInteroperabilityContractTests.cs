@@ -444,7 +444,7 @@ public class SqliteWalInteroperabilityContractTests
 
     [Test]
     [NonParallelizable]
-    public void ManagedReadOnlyOpenRefusesToCreateAMissingSharedMemoryLockCarrier()
+    public void ManagedReadOnlyOpenWithWalRefusesToCreateAMissingSharedMemoryLockCarrier()
     {
         var workDirectory = CreateWorkDirectory();
         try
