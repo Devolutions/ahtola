@@ -5,6 +5,7 @@ using Ahtola.Data.Sqlite;
 using Ahtola.Tests.Oracle;
 using AwesomeAssertions;
 using MsData = Microsoft.Data.Sqlite;
+using AhtolaSqliteException = Ahtola.Data.Sqlite.SqliteException;
 
 namespace Ahtola.Tests;
 
@@ -404,6 +405,93 @@ public sealed class NativeSqliteChurnInteropTests
     }
 
     [Test]
+    public void ManagedReaderOpensAutoVacuumDatabaseReadOnlyAndRefusesWrites()
+    {
+        var path = CreateDatabasePath("churn-autovacuum");
+        try
+        {
+            using (var connection = OpenNative(path, readOnly: false))
+            {
+                Execute(connection, "PRAGMA auto_vacuum=FULL;");
+                Execute(connection, "PRAGMA page_size=512;");
+                Execute(connection, "PRAGMA journal_mode=delete;");
+                Execute(
+                    connection,
+                    "CREATE TABLE churn(id INTEGER PRIMARY KEY, v TEXT NOT NULL);");
+
+                var random = new Random(0xA170);
+                using (var transaction = connection.BeginTransaction())
+                {
+                    using (var insert = connection.CreateCommand())
+                    {
+                        insert.Transaction = transaction;
+                        insert.CommandText = "INSERT INTO churn VALUES ($id, $v);";
+                        for (var id = 1; id <= 500; id++)
+                        {
+                            insert.Parameters.Clear();
+                            insert.Parameters.AddWithValue("$id", (long)id);
+                            insert.Parameters.AddWithValue("$v", new string('v', 30 + random.Next(200)));
+                            insert.ExecuteNonQuery();
+                        }
+                    }
+
+                    // Deleting a third of the rows makes the next native write
+                    // actually relocate pages, so the pointer map is genuinely
+                    // exercised by the author.
+                    Execute(connection, transaction, "DELETE FROM churn WHERE id % 3 = 0;");
+                    transaction.Commit();
+                }
+
+                ScalarString(connection, "PRAGMA integrity_check;").Should().Be("ok",
+                    "the native author must leave a database SQLite itself accepts");
+                ScalarLong(connection, "PRAGMA auto_vacuum;").Should().Be(1,
+                    "the fixture must actually be an auto-vacuum database");
+            }
+
+            using var reference = OpenNative(path, readOnly: true);
+            using var managed = OpenManaged(path);
+
+            // Reading an auto-vacuum database must work: its pointer-map pages
+            // are neither b-tree-reachable nor freelist pages, but they are a
+            // documented part of the format SQLite accepts.
+            ScalarString(managed, "PRAGMA quick_check;").Should().Be("ok",
+                "the managed reader must accept the auto-vacuum database");
+            var diagnostics = "native churn interop (auto-vacuum)";
+            TypedSqliteOracle.AssertEquivalent(
+                managed,
+                reference,
+                "SELECT id, v FROM churn ORDER BY id;",
+                ordered: true,
+                diagnostics);
+
+            // Writing must fail closed: the managed writer does not maintain
+            // pointer-map entries, and a silent write would corrupt the file
+            // for SQLite itself (verified upstream of this gate: native
+            // integrity_check fails with 'Bad ptr map entry' once the map is
+            // stale).
+            using (var command = managed.CreateCommand())
+            {
+                command.CommandText = "INSERT INTO churn VALUES (1001, 'must-not-land');";
+                var rejected = Assert.Throws<AhtolaSqliteException>(() => command.ExecuteNonQuery());
+                rejected.Message.Should().Contain("auto-vacuum");
+            }
+
+            // The rejected write must leave the file untouched and valid for
+            // native SQLite.
+            using (var verify = OpenNative(path, readOnly: true))
+            {
+                ScalarString(verify, "PRAGMA integrity_check;").Should().Be("ok",
+                    "a rejected write must not corrupt the auto-vacuum database");
+                ScalarLong(verify, "SELECT COUNT(*) FROM churn;").Should().Be(500 - (500 / 3));
+            }
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void ManagedReaderOpensNativeChurnedNocaseIndexDatabase()
     {
         var path = CreateDatabasePath("churn-nocase");
@@ -620,6 +708,9 @@ public sealed class NativeSqliteChurnInteropTests
 
     private static string ScalarString(DbConnection connection, string commandText)
             => Convert.ToString(Scalar(connection, commandText), CultureInfo.InvariantCulture)!;
+
+        private static long ScalarLong(DbConnection connection, string commandText)
+            => Convert.ToInt64(Scalar(connection, commandText), CultureInfo.InvariantCulture);
 
         private static object Scalar(DbConnection connection, string commandText)
     {
