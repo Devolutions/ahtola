@@ -10,9 +10,9 @@ namespace Ahtola.Data.Sqlite.Browser;
 /// been created.
 /// </summary>
 /// <remarks>
-/// The browser derives and imports keys through Web Crypto, so the resulting
-/// AES-GCM key never leaves the JavaScript realm as extractable material. The
-/// on-disk bytes match the desktop <see cref="AhtolaEncryptionOptions"/> format
+/// The browser imports raw keys through Web Crypto, so the resulting AES-GCM
+/// key never leaves the JavaScript realm as extractable material. The on-disk
+/// bytes match the desktop <see cref="AhtolaEncryptionOptions"/> format
 /// exactly, so a database written by one can be opened by the other.
 /// </remarks>
 public sealed class AhtolaBrowserEncryptionOptions : IDisposable
@@ -69,7 +69,7 @@ public sealed class AhtolaBrowserEncryptionOptions : IDisposable
         }
     }
 
-    /// <summary>Zeros this instance's copy of the passphrase or key material.</summary>
+    /// <summary>Zeros this instance's copy of the key material.</summary>
     public void Dispose()
     {
         var secret = Interlocked.Exchange(ref _secret, null);
