@@ -376,40 +376,12 @@ public class AhtolaConnectionOptions
         ManagedLocalOpenMode mode,
         string dataSource)
     {
-        var password = _builder.GetOption("Password");
-        var hasPassword = !string.IsNullOrEmpty(password);
-        var passwordScheme = _builder.GetOption("Password Scheme");
         var cipher = _builder.GetOption("Encryption Cipher");
         var key = _builder.GetOption("Encryption Key");
         var hasKey = !string.IsNullOrWhiteSpace(key);
 
-        if (!hasPassword && !string.IsNullOrWhiteSpace(passwordScheme))
-        {
-            throw new InvalidOperationException(
-                "Password Scheme requires Password=; it only selects passphrase key derivation.");
-        }
-
-        if (hasPassword && hasKey)
-        {
-            throw new InvalidOperationException(
-                "Password and Encryption Key cannot be combined; use one passphrase or one hex key.");
-        }
-
         ManagedEncryptionOptions? options;
-        if (hasPassword)
-        {
-            var scheme = AhtolaPassphraseSchemes.Resolve(passwordScheme);
-            if (!string.IsNullOrWhiteSpace(cipher)
-                && !CipherNameMatches(cipher, scheme.PageCipher))
-            {
-                throw new NotSupportedException(
-                    $"Password Scheme '{scheme.Id}' derives {scheme.PageCipher}; "
-                    + "Encryption Cipher must be omitted or match that page cipher.");
-            }
-
-            options = scheme.DeriveEncryptionOptions(password!);
-        }
-        else if (string.IsNullOrWhiteSpace(cipher))
+        if (string.IsNullOrWhiteSpace(cipher))
         {
             if (key is not null)
             {
@@ -468,27 +440,6 @@ public class AhtolaConnectionOptions
         return options;
     }
 
-    private static bool CipherNameMatches(string cipherName, Ahtola.Core.Storage.AhtolaEncryptionCipher cipher)
-        => cipherName.ToLowerInvariant() switch
-        {
-            "aes128gcm" or "aes-128-gcm" or "aes_128_gcm"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
-            "aes256gcm" or "aes-256-gcm" or "aes_256_gcm"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
-            "aegis256" or "aegis-256" or "aegis_256"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256,
-            "aegis256x2" or "aegis-256x2" or "aegis_256x2"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X2,
-            "aegis256x4" or "aegis-256x4" or "aegis_256x4"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X4,
-            "aegis128l" or "aegis-128l" or "aegis_128l"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128L,
-            "aegis128x2" or "aegis-128x2" or "aegis_128x2"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X2,
-            "aegis128x4" or "aegis-128x4" or "aegis_128x4"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X4,
-            _ => false,
-        };
 }
 
 internal readonly record struct ManagedLocalOpenOptions(

@@ -233,7 +233,7 @@ public sealed class AhtolaBrowserEncryptedStorageTests
 
         var failure = await ThrowsAsync(() => BrowserHarness.CreateAsync(store, Aes256Key));
         failure.Should().BeOfType<InvalidDataException>();
-        failure!.Message.Should().Contain(AhtolaPasswordEncryption.EncryptedOrNotDatabaseMessage);
+        failure!.Message.Should().Contain(AhtolaEncryptionOptions.EncryptedOrNotDatabaseMessage);
     }
 
     [Test]
@@ -648,4 +648,3 @@ public sealed class AhtolaBrowserEncryptedStorageTests
         }
     }
 }
-

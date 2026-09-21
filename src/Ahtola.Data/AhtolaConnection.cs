@@ -1646,16 +1646,6 @@ public class AhtolaConnection :
         if (_nativeDatabase is not null || _managedReplicaHost is not null || _managedDatabase is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
         ValidateAutomaticSyncPolicy();
-        if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
-        {
-            if (_connectionOptions.IsRemote
-                || _connectionOptions.LocalProvider != AhtolaLocalProvider.Managed)
-            {
-                throw new NotSupportedException(
-                    "Password requires Local Provider=Managed for file-backed Ahtola AES-GCM databases.");
-            }
-        }
-
         ValidatePoolingOptions();
     }
 
@@ -1680,8 +1670,7 @@ public class AhtolaConnection :
             && !dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
             && !mode.Equals("Memory", StringComparison.OrdinalIgnoreCase)
             && !_connectionOptions.GetEncryptionCipher().HasValue
-                        && string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"])
-                        && string.IsNullOrWhiteSpace(_connectionOptions["Password"]);
+                        && string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]);
         if (!eligibleManagedFile)
         {
             throw new NotSupportedException(

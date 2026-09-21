@@ -182,8 +182,8 @@ publishes).
 
 Common connection-string keywords: `Data Source`, `Mode`, `Cache`, `Pooling`,
 `Foreign Keys`, `Recursive Triggers`, `Default Timeout` / `Command Timeout`, `Foreign Read Only`,
-`DateTimeKind`, `BinaryGUID`, `Password` (passphrase → AES-256-GCM), or
-`Encryption Cipher` + `Encryption Key` (hex AES-GCM or AEGIS keys). Turso/Hrana URLs
+`DateTimeKind`, `BinaryGUID`, or `Encryption Cipher` + `Encryption Key` (hex
+AES-GCM or AEGIS keys). Turso/Hrana URLs
 also accept `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`,
 and `Tls` through either ADO.NET facade. Default local provider is managed-only.
 
@@ -196,32 +196,23 @@ read/write workloads.
 
 ### File encryption (not SEE / SQLCipher)
 
-Encryption is layered so new recipes can be added without rewriting the pager:
+Encryption uses Turso-compatible raw keys:
 
 | Layer | Role | Extension point |
 | --- | --- | --- |
-| **Passphrase scheme** | Password to AES key | `IAhtolaPassphraseScheme` + `AhtolaPassphraseSchemes`; CS `Password Scheme=` |
 | **Built-in AHTLA page crypto** | On-disk AES-GCM or AEGIS pages (`AHTLA` header) | `AhtolaEncryptionOptions` / `Encryption Cipher` + `Encryption Key` |
 | **External page codec** | Entirely different page layout | `IPageCodec` (mutually exclusive with built-in encryption) |
 
-| Mechanism | Connection string | Notes |
-| --- | --- | --- |
-| Passphrase (explicit scheme) | `Password=secret;Password Scheme=Ahtola.Password.v1` | **Preferred** for apps (e.g. RDM). Scheme id is a stable KDF contract. |
-| Passphrase (default scheme) | `Password=secret` | Same as `Ahtola.Password.v1` when `Password Scheme` is omitted |
-| Raw key | `Encryption Cipher=Aes256Gcm; Encryption Key=<64 hex chars>` | Same on-disk AHTLA format |
-| Rekey | `SqliteConnection.ChangePassword` / `ClearPassword` / `SetPassword` | Rewrite backup + atomic file replace; exclusive access |
+| Connection string | Notes |
+| --- | --- |
+| `Encryption Cipher=Aes256Gcm; Encryption Key=<64 hex chars>` | Exact 32-byte raw key |
+| `Encryption Cipher=Aes128Gcm; Encryption Key=<32 hex chars>` | Exact 16-byte raw key |
 
-Built-in scheme `Ahtola.Password.v1`: PBKDF2-HMAC-SHA256, fixed domain salt
-`Ahtola.Password.v1`, 210k iterations to AES-256-GCM. Changing KDF bytes requires a
-**new scheme id** (via `AhtolaPassphraseSchemes.Register` or a future built-in),
-never a silent change to `v1`.
-
-Do **not** combine `Password` and `Encryption Key`. Legacy SEE/SQLCipher files are
-**not** opened by passphrase schemes — use a dedicated `IPageCodec` or
-export/recreate under Ahtola password / plain SQLite.
-
-Wrong/missing password failures include the phrase
-`file is encrypted or is not a database` for SDS-shaped detection.
+Like Turso, Ahtola performs no password-based key derivation. `Password` and
+`Password Scheme` are unsupported. Legacy SEE/SQLCipher files require a
+dedicated `IPageCodec` or export/recreation under Ahtola encryption or plain
+SQLite. Wrong or missing keys include the phrase
+`file is encrypted or is not a database`.
 
 ## PowerShell module
 
@@ -266,7 +257,6 @@ Model types are available as module-qualified type accelerators, e.g.
 | `Get-AhtolaSqliteSchema` / `Get-AhtolaSqliteTable` / `Get-AhtolaSqliteIndex` / `Get-AhtolaSqliteDatabaseInfo` | Inspect provider schema, database objects, and database page/journal information |
 | `Test-AhtolaSqliteIntegrity` / `Optimize-AhtolaSqliteDatabase` / `Checkpoint-AhtolaSqliteDatabase` / `Invoke-AhtolaSqliteMaintenance` | Run focused integrity, optimization, WAL checkpoint, and constrained maintenance operations |
 | `Export-AhtolaSqliteTable` / `Import-AhtolaSqliteTable` | Move table data as portable JSON or CSV; this is distinct from a database backup |
-| `Set-AhtolaSqlitePassword` / `Clear-AhtolaSqlitePassword` | Encrypt, rekey, or decrypt file-backed managed Ahtola databases using a `SecureString` passphrase |
 | `Get-AhtolaSqliteRow` / `New-AhtolaSqliteRow` / `Set-AhtolaSqliteRow` / `Remove-AhtolaSqliteRow` | CRUD driven by a programmatically constructed `SQLiteDBConfig` + `-Table` (+ `-Values` / `-Where`); update/delete emit affected-row counts |
 | `Get-AhtolaSqliteDatabaseMetadata` / `Compare-AhtolaSqliteDatabaseVersion` | Read stored metadata; compare deployed vs expected configuration version |
 

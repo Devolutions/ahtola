@@ -7,7 +7,7 @@ using Ahtola.Data.Sqlite.Browser.Interop;
 namespace Ahtola.Data.Sqlite.Browser;
 
 /// <summary>
-/// Provides AHTLA-compatible PBKDF2-HMAC-SHA256 and AES-GCM through browser Web Crypto.
+/// Provides AHTLA-compatible AES-GCM through browser Web Crypto.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -45,23 +45,6 @@ public sealed class AhtolaBrowserCryptoService : IDisposable, IAsyncDisposable
     /// and always the algorithm the imported Web Crypto key actually runs.
     /// </summary>
     public AhtolaEncryptionCipher Cipher { get; }
-
-    /// <summary>
-    /// Derives a non-extractable AES-256-GCM key using <c>Ahtola.Password.v1</c>.
-    /// </summary>
-    public static async ValueTask<AhtolaBrowserCryptoService> CreateFromPasswordAsync(string password)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(password);
-
-        await AhtolaBrowserCryptoRuntime.InitializeAsync().ConfigureAwait(false);
-        var handle = await BrowserCryptoInterop.CreatePasswordKeyAsync(
-                password,
-                AhtolaBrowserCryptoParameters.PasswordSalt,
-                AhtolaBrowserCryptoParameters.PasswordIterations,
-                AhtolaBrowserCryptoParameters.PasswordKeySize * 8)
-            .ConfigureAwait(false);
-        return new AhtolaBrowserCryptoService(AhtolaEncryptionCipher.Aes256Gcm, handle);
-    }
 
     /// <summary>
     /// Imports an exact AES-128 or AES-256 key as a non-extractable Web Crypto key.
@@ -113,31 +96,6 @@ public sealed class AhtolaBrowserCryptoService : IDisposable, IAsyncDisposable
         {
             CryptographicOperations.ZeroMemory(keyCopy);
         }
-    }
-
-    /// <summary>
-    /// Derives the raw 32-byte <c>Ahtola.Password.v1</c> key for interoperability diagnostics.
-    /// The caller owns and should clear the returned key.
-    /// </summary>
-    public static async ValueTask<byte[]> DerivePasswordKeyBytesAsync(string password)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(password);
-
-        await AhtolaBrowserCryptoRuntime.InitializeAsync().ConfigureAwait(false);
-        using var result = await BrowserCryptoInterop.DerivePasswordBitsAsync(
-                password,
-                AhtolaBrowserCryptoParameters.PasswordSalt,
-                AhtolaBrowserCryptoParameters.PasswordIterations,
-                AhtolaBrowserCryptoParameters.PasswordKeySize * 8)
-            .ConfigureAwait(false);
-        var key = BrowserCryptoInterop.ConsumeByteArray(result);
-        if (key.Length != AhtolaBrowserCryptoParameters.PasswordKeySize)
-        {
-            CryptographicOperations.ZeroMemory(key);
-            throw new CryptographicException("Web Crypto returned an invalid Ahtola.Password.v1 key length.");
-        }
-
-        return key;
     }
 
     /// <summary>Encrypts bytes with a caller-supplied AHTLA nonce and associated data.</summary>

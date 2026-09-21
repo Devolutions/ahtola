@@ -173,7 +173,7 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 | `Recursive Triggers` | `PRAGMA recursive_triggers` |
 | `Default Timeout` / `Command Timeout` | Busy timeout in seconds |
 | `Vfs` | Named VFS registration |
-| `Password` / `Password Scheme` | Passphrase-based encryption (see [Encryption](#encryption)) |
+| `Encryption Cipher` / `Encryption Key` | Raw hexadecimal page-encryption key (see [Encryption](#encryption)) |
 | `Encryption Cipher` / `Encryption Key` | Raw-key encryption (hex AES-GCM or AEGIS keys) |
 | `Local Provider` | `Managed` (default) or `Native`. `Native` requires the optional, non-shipped native companion to have called `AhtolaNativeProvider.Register(factory)` (typically from a `[ModuleInitializer]`); nothing is loaded by assembly name, so without a registration the connection fails closed with `NotSupportedException`. |
 | `Foreign Read Only` | Read another engine's open database without taking main-file locks (`Mode=ReadOnly` + `Pooling=False`) |
@@ -310,38 +310,30 @@ for the full port contract):
 
 ## Encryption
 
-Encryption is layered so new recipes can be added without rewriting the pager:
+Encryption uses Turso-compatible raw keys:
 
 | Layer | Role | Extension point |
 | --- | --- | --- |
-| **Passphrase scheme** | Password to AES key | `IAhtolaPassphraseScheme` + `AhtolaPassphraseSchemes`; CS `Password Scheme=` |
 | **Built-in AHTLA page crypto** | On-disk AES-GCM or AEGIS pages (`AHTLA` header) | `AhtolaEncryptionOptions` / `Encryption Cipher` + `Encryption Key` |
 | **External page codec** | Entirely different page layout | `IPageCodec` (mutually exclusive with built-in encryption; see [`samples/PageCodecExamples`](../samples/PageCodecExamples)) |
 
 ```csharp
 using Ahtola.Data.Sqlite;
 
-var passphrase = GetPassphraseFromSecretManager();
 using var connection = new SqliteConnection(
-    $"Data Source=app.db;Password Scheme=Ahtola.Password.v1;Password={passphrase}");
+    "Data Source=app.db;Local Provider=Managed;"
+    + "Encryption Cipher=Aes256Gcm;"
+    + "Encryption Key=000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
 connection.Open();
-
-// Rekey later without recreating the connection string:
-connection.ChangePassword(newPassphrase);
-// ...or decrypt in place, moving the file to plaintext:
-connection.ClearPassword();
-// ...or encrypt a currently-plaintext, already-open connection:
-connection.SetPassword(newPassphrase);
 ```
 
-Built-in scheme `Ahtola.Password.v1`: PBKDF2-HMAC-SHA256, fixed domain salt
-`Ahtola.Password.v1`, 210k iterations to AES-256-GCM. Raw-key encryption
-(`Encryption Cipher=Aes256Gcm; Encryption Key=<64 hex chars>`) uses the same
-on-disk AHTLA format without a passphrase KDF. Do **not** combine `Password`
-and `Encryption Key`. Legacy SEE/SQLCipher files are **not** opened by
-passphrase schemes — use a dedicated `IPageCodec` or export/recreate under
-Ahtola password or plain SQLite. Wrong/missing password failures include the
-phrase `file is encrypted or is not a database`.
+Like Turso's `EncryptionKey::from_hex_string`, Ahtola accepts only exact
+16-byte or 32-byte hexadecimal keys; select a cipher that requires that key
+size. It performs no password-based key derivation, and `Password` /
+`Password Scheme` are unsupported. Legacy SEE/SQLCipher files require a
+dedicated `IPageCodec` or export/recreation under Ahtola encryption or plain
+SQLite. Wrong or missing keys fail with the phrase
+`file is encrypted or is not a database`.
 
 ## Entity Framework Core
 

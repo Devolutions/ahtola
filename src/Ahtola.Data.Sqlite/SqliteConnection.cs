@@ -260,9 +260,6 @@ public partial class SqliteConnection :
         ValidateManagedSharedCacheOptions();
         ValidateForeignReadOnlyOptions();
         var useManaged = _connectionOptions.EffectiveLocalProvider == AhtolaLocalProvider.Managed;
-        if (!useManaged && !string.IsNullOrEmpty(_connectionOptions.Password))
-            throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
-
         var localOriginalState = State;
         var filename = NormalizeDataSource(_connectionOptions);
         var readOnly = _connectionOptions.Mode == SqliteOpenMode.ReadOnly;
@@ -317,7 +314,7 @@ public partial class SqliteConnection :
                 if (_connectionOptions.HasEncryptionOptions)
                 {
                     throw new InvalidOperationException(
-                        "Password, Encryption Cipher, and Encryption Key require Local Provider=Managed.");
+                        "Encryption Cipher and Encryption Key require Local Provider=Managed.");
                 }
 
                 _database = AhtolaNativeProvider.OpenDatabase(filename, cipher: null, encryptionKey: null);
@@ -698,52 +695,6 @@ public partial class SqliteConnection :
     public override void ChangeDatabase(string databaseName)
     {
         throw new NotSupportedException("Changing databases is not supported.");
-    }
-
-    /// <summary>
-    /// Rewrites the open managed database under a new passphrase (or plaintext when
-    /// <paramref name="newPassword"/> is null/empty). Exclusive access required.
-    /// </summary>
-    /// <remarks>
-    /// Ahtola AES-256-GCM only (via <see cref="AhtolaPasswordEncryption"/>). Not SEE/SQLCipher.
-    /// </remarks>
-    public virtual void ChangePassword(string? newPassword)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (State != ConnectionState.Open)
-            throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection(nameof(ChangePassword)));
-        if (!IsManagedConnection)
-            throw new NotSupportedException("ChangePassword requires Local Provider=Managed.");
-        if (_readOnly)
-            throw new InvalidOperationException("Cannot change the password of a read-only connection.");
-        if (_managedSharedMemory)
-            throw new NotSupportedException("ChangePassword is not supported for shared-memory databases.");
-        if (Transaction is not null || HasOpenReader || _openManagedBlobs.Count > 0)
-            throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
-
-        var path = _dataSource;
-        if (string.IsNullOrEmpty(path)
-            || path.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("file:memory:", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new NotSupportedException("ChangePassword is supported only for file-backed managed databases.");
-        }
-
-        RewriteManagedFilePassword(Path.GetFullPath(path), newPassword);
-    }
-
-    /// <summary>Clears file encryption by rewriting the managed database as plaintext.</summary>
-    public virtual void ClearPassword() => ChangePassword(newPassword: null);
-
-    /// <summary>
-    /// Encrypts an open plaintext managed database with <paramref name="password"/>.
-    /// Empty/null is a no-op (SDS CreateFile + SetPassword("") compatibility).
-    /// </summary>
-    public virtual void SetPassword(string? password)
-    {
-        if (string.IsNullOrEmpty(password))
-            return;
-        ChangePassword(password);
     }
 
     public override DataTable GetSchema()
@@ -1841,7 +1792,6 @@ public partial class SqliteConnection :
             || _connectionOptions.Pooling
             || _connectionOptions.Cache == SqliteCacheMode.Shared
             || _connectionOptions.HasEncryptionOptions
-            || !string.IsNullOrEmpty(_connectionOptions.Password)
             || string.IsNullOrWhiteSpace(_connectionOptions.DataSource)
             || _connectionOptions.DataSource.Equals(":memory:", StringComparison.Ordinal))
         {
@@ -1925,105 +1875,6 @@ public partial class SqliteConnection :
         }
     }
 
-    private void RewriteManagedFilePassword(string databasePath, string? newPassword)
-    {
-        var directory = Path.GetDirectoryName(databasePath);
-        if (string.IsNullOrEmpty(directory))
-            directory = Path.GetTempPath();
-
-        var tempPath = Path.Combine(directory, $".ahtola-rekey-{Guid.NewGuid():N}.db");
-        var previousConnectionString = ConnectionString;
-        var reopenConnectionString = BuildPasswordRewriteConnectionString(databasePath, newPassword);
-
-        try
-        {
-            try
-            {
-                ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
-            }
-            catch
-            {
-                // Best-effort; snapshot backup still copies a consistent catalog view.
-            }
-
-            var destinationConnectionString = BuildPasswordRewriteConnectionString(tempPath, newPassword);
-            using (var destination = new SqliteConnection(destinationConnectionString))
-            {
-                destination.Open();
-                BackupDatabase(destination);
-                destination.Close();
-            }
-
-            ReleaseManagedHandlesForFileReplace();
-
-            try
-            {
-                ReplaceDatabaseFiles(databasePath, tempPath);
-            }
-            catch
-            {
-                ConnectionString = previousConnectionString;
-                Open();
-                throw;
-            }
-
-            ConnectionString = reopenConnectionString;
-            Open();
-        }
-        finally
-        {
-            DeleteDatabaseFiles(tempPath);
-        }
-    }
-
-    private string BuildPasswordRewriteConnectionString(string dataSource, string? newPassword)
-    {
-        var builder = new SqliteConnectionStringBuilder(ConnectionString)
-        {
-            DataSource = dataSource,
-            Mode = SqliteOpenMode.ReadWriteCreate,
-            Pooling = false,
-            ForeignReadOnly = false,
-            LocalProvider = AhtolaLocalProvider.Managed,
-            Cache = SqliteCacheMode.Default,
-        };
-
-        builder.Remove("Encryption Cipher");
-        builder.Remove("Encryption Key");
-        if (string.IsNullOrEmpty(newPassword))
-        {
-            builder.Remove("Password");
-            // Scheme without Password is invalid; drop both for plaintext reopen.
-            builder.Remove("Password Scheme");
-        }
-        else
-        {
-            builder.Password = newPassword;
-            // Keep Password Scheme from the source connection string when present.
-        }
-        return builder.ConnectionString;
-    }
-
-    private void ReleaseManagedHandlesForFileReplace()
-    {
-        CloseOpenManagedBlobs();
-        CloseOpenReaders();
-        Transaction?.Dispose();
-        ResetOpenCommands();
-        var originalState = State;
-        DisposeDatabaseAndManagedEncryptionFileSystem(pooledReusable: false);
-        _dataSource = null;
-        _readOnly = false;
-        _managedSharedMemory = false;
-        if (_sharedMemoryPath is not null)
-        {
-            ReleaseSharedMemoryFile(_sharedMemoryPath);
-            _sharedMemoryPath = null;
-        }
-
-        OnStateChange(new StateChangeEventArgs(originalState, State));
-    }
-
     private static void ReplaceDatabaseFiles(string databasePath, string tempPath)
     {
         if (!File.Exists(tempPath))
@@ -2091,25 +1942,25 @@ public partial class SqliteConnection :
 
     /// <summary>
     /// Maps managed encryption/open authentication failures to include the SDS-shaped
-    /// phrase RDM uses for password-protected file detection.
+    /// phrase RDM uses for encrypted file detection.
     /// </summary>
     private static Exception MapManagedEncryptionOpenFailure(Exception exception, bool encryptionAttempted)
     {
-        // Configuration mistakes (unknown Password Scheme, bad CS combo) must
+        // Configuration mistakes (invalid cipher/key combinations) must
         // surface as-is — do not wrap them as "encrypted or not a database".
         if (IsManagedEncryptionConfigurationException(exception))
             return exception;
 
-        // Map when a passphrase or Encryption Key was supplied, or the engine/file already
-        // looks encrypted/corrupt — so empty-password open of AHTLA files also gets
+        // Map when an Encryption Key was supplied, or the engine/file already
+        // looks encrypted/corrupt — so an unkeyed open of AHTLA files also gets
         // the classic SDS detection phrase on Exception.Message.
         if (!encryptionAttempted && !LooksLikeEncryptedOrCorruptDatabase(exception))
             return exception;
 
-        if (AhtolaPasswordEncryption.ContainsEncryptedOrNotDatabasePhrase(exception.Message))
+        if (AhtolaEncryptionOptions.ContainsEncryptedOrNotDatabasePhrase(exception.Message))
             return exception;
 
-        var mapped = AhtolaPasswordEncryption.EnsureEncryptedOrNotDatabasePhrase(exception.Message);
+        var mapped = AhtolaEncryptionOptions.EnsureEncryptedOrNotDatabasePhrase(exception.Message);
         return exception switch
         {
             SqliteException sqlite => new SqliteException(
@@ -2141,7 +1992,7 @@ public partial class SqliteConnection :
             var message = current.Message;
             if (string.IsNullOrEmpty(message))
                 continue;
-            if (AhtolaPasswordEncryption.ContainsEncryptedOrNotDatabasePhrase(message))
+            if (AhtolaEncryptionOptions.ContainsEncryptedOrNotDatabasePhrase(message))
                 return true;
             if (message.Contains("failed authentication", StringComparison.OrdinalIgnoreCase)
                 || message.Contains("authentication tag", StringComparison.OrdinalIgnoreCase)

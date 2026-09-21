@@ -378,7 +378,9 @@ boundary.
 
 ```csharp
 using var encryption =
-    AhtolaBrowserEncryptionOptions.FromPassword("correct horse battery staple");
+    AhtolaBrowserEncryptionOptions.FromHex(
+        AhtolaEncryptionCipher.Aes256Gcm,
+        "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
 using var browserOptions = new AhtolaBrowserOptions(
     databasePath: "secure/main.db",
     encryption: encryption);
@@ -390,10 +392,10 @@ command.CommandText = "CREATE TABLE IF NOT EXISTS secrets(value TEXT NOT NULL)";
 await command.ExecuteNonQueryAsync();
 ```
 
-For exact key material, use `FromKey(AhtolaEncryptionCipher, ReadOnlySpan<byte>)`
-or `FromHex(AhtolaEncryptionCipher, string)`. Password mode is the stable
-`Ahtola.Password.v1` scheme: PBKDF2-HMAC-SHA256 with its fixed domain salt,
-210,000 iterations, and an AES-256-GCM key.
+Use `FromKey(AhtolaEncryptionCipher, ReadOnlySpan<byte>)` or
+`FromHex(AhtolaEncryptionCipher, string)` with an exact 16-byte or 32-byte
+key. Browser encryption performs no password-based key derivation, matching
+Turso's raw-key encryption API.
 
 Encryption options are copied by both `AhtolaBrowserOptions` and
 `AhtolaBrowserDataSource`. Dispose caller-owned option objects after constructing
@@ -402,9 +404,9 @@ cipher mismatch, plaintext file, or authentication failure is rejected without
 fallback.
 
 The on-disk bytes are desktop/browser compatible. A browser-written file can be
-opened by the desktop provider with the matching `Password` or
-`Encryption Cipher`/`Encryption Key` settings, and the browser can open a
-desktop-written AHTLA database and retained WAL.
+opened by the desktop provider with matching `Encryption Cipher` and
+`Encryption Key` settings, and the browser can open a desktop-written AHTLA
+database and retained WAL.
 
 See [Browser encrypted storage](browser-encrypted-storage.md) for byte layout,
 WAL/journal checksum handling, cancellation, retry, and durability details.

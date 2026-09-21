@@ -171,16 +171,6 @@ public sealed class AhtolaBrowserAegisStorageTests
     public void WebCryptoBacksOnlyTheAesCiphers(AhtolaEncryptionCipher cipher, bool expected)
         => AhtolaBrowserCryptoParameters.UsesWebCrypto(cipher).Should().Be(expected);
 
-    /// <summary>Passphrase derivation stays AES-256-GCM, so it cannot produce an AEGIS cipher.</summary>
-    [Test]
-    public void PasswordDerivedOptionsCannotCreateAnAegisPageCipher()
-    {
-        using var options = AhtolaBrowserEncryptionOptions.FromPassword("correct horse battery staple");
-
-        options.Cipher.Should().Be(AhtolaEncryptionCipher.Aes256Gcm);
-        Assert.Throws<InvalidOperationException>(() => options.CreateManagedAegisPageCipher());
-    }
-
     private static byte[] CreatePlaintextPage(int pageSize, uint pageNumber, byte reservedBytes)
     {
         var page = new byte[pageSize];

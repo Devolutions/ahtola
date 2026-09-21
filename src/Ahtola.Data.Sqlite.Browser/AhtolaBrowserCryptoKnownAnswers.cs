@@ -4,11 +4,6 @@ namespace Ahtola.Data.Sqlite.Browser;
 
 internal static class AhtolaBrowserCryptoKnownAnswers
 {
-    internal const string Password = "ahtola-browser-test";
-
-    internal static byte[] GetPasswordKey()
-        => Convert.FromHexString("F320F26F76939AF6E9D2F8997A4B40B13A78BDC088F0178DA97C66748CD562F5");
-
     internal static AhtolaBrowserAesGcmKnownAnswer GetAes128()
         => new(
             key: Convert.FromHexString("FEFFE9928665731C6D6A8F9467308308"),

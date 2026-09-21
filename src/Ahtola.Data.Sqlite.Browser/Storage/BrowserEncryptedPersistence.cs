@@ -1093,7 +1093,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         if (!AhtolaEncryptedPageFormat.IsAhtolaEncrypted(encryptedImage))
         {
             throw new InvalidDataException(
-                AhtolaPasswordEncryption.EnsureEncryptedOrNotDatabasePhrase(
+                AhtolaEncryptionOptions.EnsureEncryptedOrNotDatabasePhrase(
                     "Encryption was requested, but the browser database contains a plaintext SQLite header. "
                     + "Plaintext fallback is not permitted."));
         }

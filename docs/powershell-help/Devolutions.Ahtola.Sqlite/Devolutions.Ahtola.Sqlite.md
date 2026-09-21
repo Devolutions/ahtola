@@ -32,8 +32,6 @@ Runs a WAL checkpoint on a local Ahtola database.
 
 Clears the pool for a local Ahtola connection.
 
-### [Clear-AhtolaSqlitePassword](Clear-AhtolaSqlitePassword.md)
-
 Clears the Ahtola-managed password from a local database.
 
 ### [Close-AhtolaSqliteConnection](Close-AhtolaSqliteConnection.md)
@@ -127,8 +125,6 @@ Rebases eligible changes or discards unresolved managed-replica changes.
 ### [Save-AhtolaSqliteTransaction](Save-AhtolaSqliteTransaction.md)
 
 Creates a named savepoint in an active transaction.
-
-### [Set-AhtolaSqlitePassword](Set-AhtolaSqlitePassword.md)
 
 Sets or rotates the Ahtola-managed password for a local database.
 
