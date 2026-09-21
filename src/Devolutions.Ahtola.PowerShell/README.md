@@ -15,17 +15,13 @@ Microsoft.Data.Sqlite / SQLitePCLRaw.
 - A collision-resistant `*-AhtolaSqlite*` public command surface for managed SQLite operations.
 - Targets PowerShell 7+ only (`net8.0` / `net9.0` / `net10.0`). No Windows PowerShell 5.1 / netstandard2.0 path.
 - Adds managed operational cmdlets for connections, transactions, backups, schema
-  inspection, maintenance, bulk copy, JSON/CSV table interchange, and Ahtola
-  file-password rotation.
+  inspection, maintenance, bulk copy, and JSON/CSV table interchange.
 - Replica administration includes long-poll and batch thresholds, partial or
   encrypted bootstrap, progress, conflict inspection/resolution, and pending
   CDC projection.
 - `DataReader` is a backward-compatible name for a detached materialized result
   reader. It is not a live streaming reader and does not retain command or
   connection ownership.
-- File-password cmdlets are available only for Ahtola's file-backed managed
-  AES-256-GCM format. They do not support SQLCipher, SEE, or loadable
-  extensions.
 
 ## Build / stage
 
@@ -101,4 +97,4 @@ pwsh ./scripts/Invoke-PowerShellModuleTests.ps1
   `Csv` from the file extension when `-Format` is omitted. Export can select a
   table or a parameterized `-Query`.
 - Destructive cmdlets implement `SupportsShouldProcess`, so use `-WhatIf` to
-  preview database writes, imports, backups, maintenance, and password changes.
+  preview database writes, imports, backups, and maintenance.

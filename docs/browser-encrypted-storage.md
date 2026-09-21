@@ -65,9 +65,8 @@ chose.
 > AEGIS in the browser for on-disk compatibility with an AEGIS database, not for
 > throughput.
 
-Passphrase derivation (`Ahtola.Password.v1`) always produces an AES-256-GCM key,
-so it never selects an AEGIS cipher. `ChaCha20Poly1305` is rejected: Turso
-format version 0 assigns it no on-disk cipher id. See
+`ChaCha20Poly1305` is rejected: Turso format version 0 assigns it no on-disk
+cipher id. See
 [`page-encryption-contract.md`](page-encryption-contract.md).
 
 ### The two backends are not interchangeable
@@ -263,13 +262,12 @@ persisting plaintext.
 
 ## Key material
 
-`AhtolaBrowserEncryptionOptions` accepts an `Ahtola.Password.v1` passphrase
-(PBKDF2-HMAC-SHA256, 210,000 iterations, the same domain salt as the desktop
-scheme) or an exact AES-128/AES-256 key as raw bytes or hex. Key material is
-copied defensively, zeroed on disposal, and **never placed in a connection
-string**. The Web Crypto key handle is non-extractable and is released during
-disposal, after connections are drained and pending writes are persisted, and
-before the OPFS store is closed.
+`AhtolaBrowserEncryptionOptions` accepts an exact AES-128/AES-256 key as raw
+bytes or hex. It performs no password-based key derivation, matching Turso's
+raw-key encryption API. Key material is copied defensively, zeroed on disposal,
+and **never placed in a connection string**. The Web Crypto key handle is
+non-extractable and is released during disposal, after connections are drained
+and pending writes are persisted, and before the OPFS store is closed.
 
 ```csharp
 using var encryption =

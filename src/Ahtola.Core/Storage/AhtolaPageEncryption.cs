@@ -46,6 +46,12 @@ public sealed class AhtolaEncryptionOptions : IDisposable
 {
     private byte[]? _key;
 
+    /// <summary>
+    /// Substring used when detecting an encrypted or non-database file.
+    /// </summary>
+    public const string EncryptedOrNotDatabaseMessage =
+        "file is encrypted or is not a database";
+
     /// <summary>Initializes encryption options from an exact key.</summary>
     public AhtolaEncryptionOptions(AhtolaEncryptionCipher cipher, ReadOnlySpan<byte> key)
     {
@@ -94,6 +100,26 @@ public sealed class AhtolaEncryptionOptions : IDisposable
         {
             throw new ArgumentException("Encryption keys must be hexadecimal.", nameof(hexKey), exception);
         }
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="message"/> identifies an encrypted or
+    /// non-database file.
+    /// </summary>
+    public static bool ContainsEncryptedOrNotDatabasePhrase(string? message)
+        => !string.IsNullOrEmpty(message)
+           && message.Contains(EncryptedOrNotDatabaseMessage, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Ensures failure text identifies an encrypted or non-database file.
+    /// </summary>
+    public static string EnsureEncryptedOrNotDatabasePhrase(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return EncryptedOrNotDatabaseMessage;
+        if (ContainsEncryptedOrNotDatabasePhrase(message))
+            return message;
+        return $"{EncryptedOrNotDatabaseMessage}: {message}";
     }
 
     /// <summary>

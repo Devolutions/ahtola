@@ -9,28 +9,11 @@ namespace Ahtola.Data.Sqlite.Browser;
 [SupportedOSPlatform("browser")]
 public static class AhtolaBrowserCryptoDiagnostics
 {
-    /// <summary>Runs PBKDF2, AES-128-GCM, AES-256-GCM, AAD, and key-release checks.</summary>
+    /// <summary>Runs AES-128-GCM, AES-256-GCM, AAD, and key-release checks.</summary>
     public static async ValueTask<AhtolaBrowserCryptoDiagnosticResult> RunKnownAnswersAsync()
     {
         await AhtolaBrowserCryptoRuntime.InitializeAsync().ConfigureAwait(false);
         var retainedKeysBefore = BrowserCryptoInterop.GetRetainedKeyCount();
-
-        var expectedPasswordKey = AhtolaBrowserCryptoKnownAnswers.GetPasswordKey();
-        var actualPasswordKey = await AhtolaBrowserCryptoService
-            .DerivePasswordKeyBytesAsync(AhtolaBrowserCryptoKnownAnswers.Password)
-            .ConfigureAwait(false);
-        bool passwordMatches;
-        try
-        {
-            passwordMatches = CryptographicOperations.FixedTimeEquals(
-                expectedPasswordKey,
-                actualPasswordKey);
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(expectedPasswordKey);
-            CryptographicOperations.ZeroMemory(actualPasswordKey);
-        }
 
         bool aes128Matches;
         using (var vector = AhtolaBrowserCryptoKnownAnswers.GetAes128())
@@ -52,7 +35,6 @@ public static class AhtolaBrowserCryptoDiagnostics
 
         var retainedKeysAfter = BrowserCryptoInterop.GetRetainedKeyCount();
         return new AhtolaBrowserCryptoDiagnosticResult(
-            passwordMatches,
             aes128Matches,
             aes256Matches,
             retainedKeysBefore,
@@ -128,7 +110,6 @@ public static class AhtolaBrowserCryptoDiagnostics
 
 /// <summary>Results from the browser Web Crypto known-answer diagnostic.</summary>
 public readonly record struct AhtolaBrowserCryptoDiagnosticResult(
-    bool PasswordV1Matches,
     bool Aes128GcmMatches,
     bool Aes256GcmMatches,
     int RetainedKeysBefore,
@@ -136,8 +117,7 @@ public readonly record struct AhtolaBrowserCryptoDiagnosticResult(
 {
     /// <summary>Whether all vectors matched and the diagnostic released every key it created.</summary>
     public bool Succeeded =>
-        PasswordV1Matches
-        && Aes128GcmMatches
+        Aes128GcmMatches
         && Aes256GcmMatches
         && RetainedKeysAfter == RetainedKeysBefore;
 }

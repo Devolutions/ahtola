@@ -45,21 +45,6 @@ internal static partial class BrowserCryptoInterop
 {
     private const string ModuleName = "Devolutions.Ahtola.Data.Sqlite.Browser.Crypto";
 
-    [JSImport("createPasswordKey", ModuleName)]
-    internal static partial Task<int> CreatePasswordKeyAsync(
-        string password,
-        string salt,
-        int iterations,
-        int keyLengthBits);
-
-    [JSImport("derivePasswordBits", ModuleName)]
-    [return: JSMarshalAs<JSType.Promise<JSType.Object>>]
-    internal static partial Task<JSObject> DerivePasswordBitsAsync(
-        string password,
-        string salt,
-        int iterations,
-        int outputLengthBits);
-
     [JSImport("importAesGcmKey", ModuleName)]
     internal static partial Task<int> ImportAesGcmKeyAsync(byte[] key);
 

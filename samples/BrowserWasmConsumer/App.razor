@@ -40,7 +40,7 @@
             var persistentInboundBackup = await RunPersistentInboundBackupAsync();
             var persistentEncrypted = await RunPersistentEncryptedAsync();
             var encryptedMaintenance = await RunEncryptedMaintenanceAsync();
-            var persistentEncryptedPassword = await RunPersistentEncryptedPasswordAsync();
+            var persistentEncryptedRawKey = await RunPersistentEncryptedRawKeyAsync();
             var encryptedWrongKeyRejected = await RunEncryptedWrongKeyAsync();
             var encryptedCipherMismatchRejected = await RunEncryptedCipherMismatchAsync();
             var syncReadMirror = await RunSynchronousReadMirrorAsync();
@@ -60,7 +60,7 @@
                 + $"persistent-inbound-backup={persistentInboundBackup};"
                 + $"persistent-encrypted={persistentEncrypted};"
                 + $"encrypted-maintenance={encryptedMaintenance};"
-                + $"persistent-encrypted-password={persistentEncryptedPassword};"
+                + $"persistent-encrypted-raw-key={persistentEncryptedRawKey};"
                 + $"encrypted-wrong-key-rejected={encryptedWrongKeyRejected};"
                 + $"encrypted-cipher-mismatch-rejected={encryptedCipherMismatchRejected};"
                 + $"sync-read-mirror={syncReadMirror}";
@@ -555,16 +555,16 @@
         return mainValue + pageSize + vacuumValue;
     }
 
-    private static async Task<long> RunPersistentEncryptedPasswordAsync()
+    private static async Task<long> RunPersistentEncryptedRawKeyAsync()
     {
-        const string path = "packed-consumer-encrypted-password/main.db";
-        const string password = "packed-consumer-passphrase";
+        const string path = "packed-consumer-encrypted-raw-key/main.db";
+        const string key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
 
-        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword(password))
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(AhtolaEncryptionCipher.Aes256Gcm, key))
         using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
         {
-            if (options.ConnectionString.Contains(password, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("The connection string leaked the passphrase.");
+            if (options.ConnectionString.Contains(key, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The connection string leaked the encryption key.");
 
             await using var source = new AhtolaBrowserDataSource(options);
             await using var connection = await source.OpenConnectionAsync();
@@ -572,10 +572,10 @@
                 connection,
                 "CREATE TABLE probe(value INTEGER NOT NULL);"
                 + "INSERT INTO probe(value) VALUES (462);",
-                "encrypted password setup");
+                "encrypted raw-key setup");
         }
 
-        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword(password))
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(AhtolaEncryptionCipher.Aes256Gcm, key))
         using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
         {
             await using var source = new AhtolaBrowserDataSource(options);
@@ -591,7 +591,9 @@
     private static async Task<bool> RunEncryptedWrongKeyAsync()
     {
         const string path = "packed-consumer-encrypted-wrong-key/main.db";
-        using (var encryption = AhtolaBrowserEncryptionOptions.FromPassword("first-passphrase"))
+        using (var encryption = AhtolaBrowserEncryptionOptions.FromHex(
+                   AhtolaEncryptionCipher.Aes256Gcm,
+                   "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F"))
         using (var options = new AhtolaBrowserOptions(path, encryption: encryption))
         {
             await using var source = new AhtolaBrowserDataSource(options);
@@ -603,7 +605,9 @@
                 "wrong-key setup");
         }
 
-        using var wrong = AhtolaBrowserEncryptionOptions.FromPassword("second-passphrase");
+        using var wrong = AhtolaBrowserEncryptionOptions.FromHex(
+            AhtolaEncryptionCipher.Aes256Gcm,
+            "F00102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
         using var wrongOptions = new AhtolaBrowserOptions(path, encryption: wrong);
         try
         {

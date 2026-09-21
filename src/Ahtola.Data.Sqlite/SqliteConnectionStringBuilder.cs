@@ -14,8 +14,6 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Data Source",
         "Mode",
         "Cache",
-        "Password",
-        "Password Scheme",
         "Encryption Cipher",
         "Encryption Key",
         "Foreign Keys",
@@ -48,9 +46,6 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["Filename"] = "Data Source",
         ["Mode"] = "Mode",
         ["Cache"] = "Cache",
-        ["Password"] = "Password",
-        ["Password Scheme"] = "Password Scheme",
-        ["PasswordScheme"] = "Password Scheme",
         ["Encryption Cipher"] = "Encryption Cipher",
         ["EncryptionCipher"] = "Encryption Cipher",
         ["Encryption Key"] = "Encryption Key",
@@ -137,22 +132,6 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetEnum("Cache", SqliteCacheMode.Default);
         set => this["Cache"] = value;
-    }
-
-    public string Password
-    {
-        get => GetString("Password");
-        set => SetString("Password", value);
-    }
-
-    /// <summary>
-    /// Passphrase key-derivation scheme id (for example <c>Ahtola.Password.v1</c>).
-    /// Empty selects the catalog default. See <see cref="AhtolaPassphraseSchemes"/>.
-    /// </summary>
-    public string PasswordScheme
-    {
-        get => GetString("Password Scheme");
-        set => SetString("Password Scheme", value);
     }
 
     public string EncryptionCipher
@@ -458,10 +437,6 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             builder["Encryption Cipher"] = EncryptionCipher;
         if (base.ContainsKey("Encryption Key"))
             builder["Encryption Key"] = EncryptionKey;
-        if (base.ContainsKey("Password"))
-            builder["Password"] = Password;
-        if (base.ContainsKey("Password Scheme"))
-            builder["Password Scheme"] = PasswordScheme;
         if (base.ContainsKey("Local Provider"))
             builder["Local Provider"] = LocalProvider.ToString();
         else if (base.ContainsKey("Replica Path"))
@@ -472,41 +447,12 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 
     internal AhtolaEncryptionOptions? CreateManagedEncryptionOptions()
     {
-        var password = Password;
-        var hasPassword = !string.IsNullOrEmpty(password);
-        var passwordScheme = PasswordScheme;
         var cipher = GetString("Encryption Cipher");
         var keyConfigured = base.TryGetValue("Encryption Key", out var keyValue);
         var key = keyConfigured
             ? Convert.ToString(keyValue, CultureInfo.InvariantCulture)
             : null;
         var hasKey = !string.IsNullOrWhiteSpace(key);
-
-        if (!hasPassword && !string.IsNullOrWhiteSpace(passwordScheme))
-        {
-            throw new InvalidOperationException(
-                "Password Scheme requires Password=; it only selects passphrase key derivation.");
-        }
-
-        if (hasPassword && hasKey)
-        {
-            throw new InvalidOperationException(
-                "Password and Encryption Key cannot be combined; use one passphrase or one hex key.");
-        }
-
-        if (hasPassword)
-        {
-            var scheme = AhtolaPassphraseSchemes.Resolve(passwordScheme);
-            if (!string.IsNullOrWhiteSpace(cipher)
-                && !CipherNameMatches(cipher, scheme.PageCipher))
-            {
-                throw new NotSupportedException(
-                    $"Password Scheme '{scheme.Id}' derives {scheme.PageCipher}; "
-                    + "Encryption Cipher must be omitted or match that page cipher.");
-            }
-
-            return scheme.DeriveEncryptionOptions(password);
-        }
 
         if (string.IsNullOrWhiteSpace(cipher))
         {
@@ -546,30 +492,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 
     internal bool HasEncryptionOptions
         => base.ContainsKey("Encryption Cipher")
-           || base.ContainsKey("Encryption Key")
-           || !string.IsNullOrEmpty(Password);
-
-    private static bool CipherNameMatches(string cipherName, Ahtola.Core.Storage.AhtolaEncryptionCipher cipher)
-        => cipherName.ToLowerInvariant() switch
-        {
-            "aes128gcm" or "aes-128-gcm" or "aes_128_gcm"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes128Gcm,
-            "aes256gcm" or "aes-256-gcm" or "aes_256_gcm"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aes256Gcm,
-            "aegis256" or "aegis-256" or "aegis_256"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256,
-            "aegis256x2" or "aegis-256x2" or "aegis_256x2"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X2,
-            "aegis256x4" or "aegis-256x4" or "aegis_256x4"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis256X4,
-            "aegis128l" or "aegis-128l" or "aegis_128l"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128L,
-            "aegis128x2" or "aegis-128x2" or "aegis_128x2"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X2,
-            "aegis128x4" or "aegis-128x4" or "aegis_128x4"
-                => cipher == Ahtola.Core.Storage.AhtolaEncryptionCipher.Aegis128X4,
-            _ => false,
-        };
+           || base.ContainsKey("Encryption Key");
 
     private static string NormalizeKeyword(string keyword)
     {

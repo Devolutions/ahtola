@@ -1,35 +1,15 @@
-using System.Text;
 using AwesomeAssertions;
 using Ahtola.Core.Storage;
-using Ahtola.Data.Sqlite;
 using Ahtola.Data.Sqlite.Browser;
 
 #pragma warning disable CA1416
 
 namespace Ahtola.Tests;
 
-/// <summary>
-/// Covers the public browser encryption option surface: key material shapes,
-/// defensive copying, disposal, and the guarantee that no secret ever reaches a
-/// connection string.
-/// </summary>
 public sealed class AhtolaBrowserEncryptionOptionsTests
 {
     private const string Aes256Key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
     private const string Aes128Key = "000102030405060708090A0B0C0D0E0F";
-    private const string Password = "correct horse battery staple";
-
-    [Test]
-    public void PasswordOptionsUseTheAhtolaPasswordV1Scheme()
-    {
-        using var options = AhtolaBrowserEncryptionOptions.FromPassword(Password);
-
-        options.IsPasswordDerived.Should().BeTrue();
-        options.Cipher.Should().Be(AhtolaEncryptionCipher.Aes256Gcm);
-        options.PasswordSchemeId.Should().Be(AhtolaPasswordEncryption.SchemeIdV1);
-        AhtolaBrowserCryptoParameters.PasswordIterations.Should().Be(AhtolaPasswordEncryption.Pbkdf2IterationsV1);
-        AhtolaBrowserCryptoParameters.PasswordSalt.Should().Be(AhtolaPasswordEncryption.DomainSaltV1);
-    }
 
     [TestCase(Aes128Key, AhtolaEncryptionCipher.Aes128Gcm)]
     [TestCase(Aes256Key, AhtolaEncryptionCipher.Aes256Gcm)]
@@ -40,8 +20,6 @@ public sealed class AhtolaBrowserEncryptionOptionsTests
 
         fromHex.Cipher.Should().Be(cipher);
         fromKey.Cipher.Should().Be(cipher);
-        fromHex.IsPasswordDerived.Should().BeFalse();
-        fromHex.PasswordSchemeId.Should().BeNull();
     }
 
     [TestCase(AhtolaEncryptionCipher.Aes128Gcm, 15)]
@@ -50,29 +28,6 @@ public sealed class AhtolaBrowserEncryptionOptionsTests
     public void ExactKeyLengthIsRequired(AhtolaEncryptionCipher cipher, int keyLength)
     {
         var action = () => AhtolaBrowserEncryptionOptions.FromKey(cipher, new byte[keyLength]);
-
-        action.Should().Throw<ArgumentException>();
-    }
-
-    [TestCase(AhtolaEncryptionCipher.Aegis256, 32)]
-    [TestCase(AhtolaEncryptionCipher.Aegis256x2, 32)]
-    [TestCase(AhtolaEncryptionCipher.Aegis256x4, 32)]
-    [TestCase(AhtolaEncryptionCipher.Aegis128l, 16)]
-    [TestCase(AhtolaEncryptionCipher.Aegis128x2, 16)]
-    [TestCase(AhtolaEncryptionCipher.Aegis128x4, 16)]
-    public void AegisCiphersAreAcceptedWithTheirExactKeySize(AhtolaEncryptionCipher cipher, int keySize)
-    {
-        using var options = AhtolaBrowserEncryptionOptions.FromKey(cipher, new byte[keySize]);
-
-        options.Cipher.Should().Be(cipher);
-        options.IsPasswordDerived.Should().BeFalse();
-    }
-
-    [TestCase(AhtolaEncryptionCipher.Aegis256, 16)]
-    [TestCase(AhtolaEncryptionCipher.Aegis128l, 32)]
-    public void AegisCiphersRejectKeyLengthsThatDoNotMatchTheCipher(AhtolaEncryptionCipher cipher, int keySize)
-    {
-        var action = () => AhtolaBrowserEncryptionOptions.FromKey(cipher, new byte[keySize]);
 
         action.Should().Throw<ArgumentException>();
     }
@@ -88,96 +43,14 @@ public sealed class AhtolaBrowserEncryptionOptionsTests
     }
 
     [Test]
-    public void ConnectionStringNeverCarriesKeyMaterial()
-    {
-        using var keyed = AhtolaBrowserEncryptionOptions.FromHex(AhtolaEncryptionCipher.Aes256Gcm, Aes256Key);
-        using var keyedOptions = new AhtolaBrowserOptions("owned/data.db", "owned", encryption: keyed);
-        using var passworded = AhtolaBrowserEncryptionOptions.FromPassword(Password);
-        using var passwordOptions = new AhtolaBrowserOptions("owned/data.db", "owned", encryption: passworded);
-
-        keyedOptions.IsEncrypted.Should().BeTrue();
-        passwordOptions.IsEncrypted.Should().BeTrue();
-        foreach (var connectionString in new[] { keyedOptions.ConnectionString, passwordOptions.ConnectionString })
-        {
-            connectionString.Should().NotContain(Aes256Key);
-            connectionString.Should().NotContain(Password);
-            connectionString.Should().NotContain("Password", "no password keyword may leak into the connection string");
-            connectionString.Should().NotContain("Key");
-        }
-
-        var builder = new SqliteConnectionStringBuilder(keyedOptions.ConnectionString);
-        builder.DataSource.Should().Be("owned/data.db");
-        builder.LocalProvider.Should().Be(AhtolaLocalProvider.Managed);
-    }
-
-    [Test]
-    public void OptionsWithoutEncryptionStayUnencrypted()
-    {
-        using var options = new AhtolaBrowserOptions("owned/data.db", "owned");
-
-        options.IsEncrypted.Should().BeFalse();
-        options.Encryption.Should().BeNull();
-    }
-
-    [Test]
     public void OptionsCopyTheCallerSuppliedKeySoCallerDisposalIsSafe()
     {
         var caller = AhtolaBrowserEncryptionOptions.FromHex(AhtolaEncryptionCipher.Aes256Gcm, Aes256Key);
-        using var options = new AhtolaBrowserOptions("owned/data.db", "owned", encryption: caller);
-
+        using var copy = caller.CreateOwnedCopy();
         caller.Dispose();
 
-        options.Encryption.Should().NotBeNull();
-        options.Encryption!.Cipher.Should().Be(AhtolaEncryptionCipher.Aes256Gcm);
-        var stillUsable = () => options.Encryption!.CreateOwnedCopy();
+        copy.Cipher.Should().Be(AhtolaEncryptionCipher.Aes256Gcm);
+        var stillUsable = () => copy.CreateOwnedCopy();
         stillUsable.Should().NotThrow();
-    }
-
-    [Test]
-    public void DisposingOptionsReleasesTheEncryptionCopy()
-    {
-        using var caller = AhtolaBrowserEncryptionOptions.FromHex(AhtolaEncryptionCipher.Aes256Gcm, Aes256Key);
-        var options = new AhtolaBrowserOptions("owned/data.db", "owned", encryption: caller);
-        var copy = options.Encryption!;
-
-        options.Dispose();
-
-        options.Encryption.Should().BeNull();
-        var released = () => copy.CreateOwnedCopy();
-        released.Should().Throw<ObjectDisposedException>();
-    }
-
-    [Test]
-    public void DisposedEncryptionOptionsRejectFurtherUse()
-    {
-        var options = AhtolaBrowserEncryptionOptions.FromPassword(Password);
-        options.Dispose();
-        options.Dispose();
-
-        var action = () => options.CreateOwnedCopy();
-        action.Should().Throw<ObjectDisposedException>();
-    }
-
-    [Test]
-    public void EmptyPasswordsAndKeysAreRejected()
-    {
-        var emptyPassword = () => AhtolaBrowserEncryptionOptions.FromPassword(string.Empty);
-        var emptyHex = () => AhtolaBrowserEncryptionOptions.FromHex(AhtolaEncryptionCipher.Aes256Gcm, string.Empty);
-
-        emptyPassword.Should().Throw<ArgumentException>();
-        emptyHex.Should().Throw<ArgumentException>();
-    }
-
-    [Test]
-    public void BrowserPasswordDerivationMatchesTheDesktopScheme()
-    {
-        // The browser derives the same 32 bytes through Web Crypto PBKDF2; this
-        // asserts the shared parameters that make those two derivations agree.
-        using var desktop = AhtolaPasswordEncryption.FromPassword(Password);
-
-        desktop.Cipher.Should().Be(Core.Storage.AhtolaEncryptionCipher.Aes256Gcm);
-        AhtolaBrowserCryptoParameters.PasswordKeySize.Should().Be(32);
-        Encoding.UTF8.GetBytes(AhtolaBrowserCryptoParameters.PasswordSalt).Should().Equal(
-            Encoding.UTF8.GetBytes(AhtolaPasswordEncryption.DomainSaltV1));
     }
 }

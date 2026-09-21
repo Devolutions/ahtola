@@ -16,7 +16,7 @@ Cloud** — both a direct connection and a **managed embedded replica**.
 - [Maintenance](#maintenance)
 - [Backup](#backup)
 - [Bulk copy and table interchange](#bulk-copy-and-table-interchange)
-- [Encryption / passwords](#encryption--passwords)
+- [Encryption](#encryption)
 - [Metadata and version comparison](#metadata-and-version-comparison)
 - [Working with a local SQLite file](#working-with-a-local-sqlite-file)
 - [Concurrent writes on a local file (MVCC)](#concurrent-writes-on-a-local-file-mvcc)
@@ -60,8 +60,8 @@ Model types are available as module-qualified type accelerators once the
 module is imported, e.g. `[Devolutions.Ahtola.Sqlite.SqliteDBConfig]` for the
 CRUD-row cmdlets below.
 
-Every destructive cmdlet (writes, imports, backups, maintenance, password
-changes, connection close, pool clear) implements `SupportsShouldProcess`, so
+Every destructive cmdlet (writes, imports, backups, maintenance, connection
+close, pool clear) implements `SupportsShouldProcess`, so
 `-WhatIf` / `-Confirm` work everywhere you'd expect.
 
 A connection you pass via `-Connection` is always **caller-owned**: a cmdlet
@@ -274,19 +274,17 @@ sets) and writes `Json` or `Csv` (`-Format` overrides extension inference).
 `Import-AhtolaSqliteTable` reads the same two formats back in with the same
 batching/transaction semantics as bulk copy.
 
-## Encryption / passwords
+## Encryption
 
 ```powershell
-$secure = Read-Host -AsSecureString
-Set-AhtolaSqlitePassword -Connection $file -Password $secure     # encrypt or rotate
-Clear-AhtolaSqlitePassword -Connection $file                     # decrypt back to plaintext
+$key = '000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F'
+$encrypted = New-AhtolaSqliteConnection -ConnectionString (
+    "Data Source=secure.db;Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key=$key")
 ```
 
-These cmdlets are available only for Ahtola's own file-backed managed
-AES-256-GCM format (`AHTLA` header) — not SQLCipher, SEE, or loadable
-extensions. See the [README's file-encryption section](../README.md#file-encryption-not-see--sqlcipher)
-for the underlying passphrase-scheme / raw-key connection-string mechanics
-that these cmdlets wrap.
+Ahtola accepts only raw hexadecimal 16-byte or 32-byte keys; it performs no
+password-based key derivation. Encryption applies only to Ahtola's file-backed
+managed format (`AHTLA` header), not SQLCipher, SEE, or loadable extensions.
 
 ## Metadata and version comparison
 

@@ -53,64 +53,6 @@ function normalizeError(error) {
     return normalized;
 }
 
-export async function createPasswordKey(password, salt, iterations, keyLengthBits) {
-    const subtle = getSubtleCrypto();
-    const encoder = new TextEncoder();
-    const passwordBytes = encoder.encode(password);
-    const saltBytes = encoder.encode(salt);
-    try {
-        const material = await subtle.importKey(
-            "raw",
-            passwordBytes,
-            "PBKDF2",
-            false,
-            ["deriveKey"]);
-        const key = await subtle.deriveKey(
-            {
-                name: "PBKDF2",
-                salt: saltBytes,
-                iterations,
-                hash: "SHA-256",
-            },
-            material,
-            { name: "AES-GCM", length: keyLengthBits },
-            false,
-            ["encrypt", "decrypt"]);
-        return retainKey(key);
-    } finally {
-        passwordBytes.fill(0);
-        saltBytes.fill(0);
-    }
-}
-
-export async function derivePasswordBits(password, salt, iterations, outputLengthBits) {
-    const subtle = getSubtleCrypto();
-    const encoder = new TextEncoder();
-    const passwordBytes = encoder.encode(password);
-    const saltBytes = encoder.encode(salt);
-    try {
-        const material = await subtle.importKey(
-            "raw",
-            passwordBytes,
-            "PBKDF2",
-            false,
-            ["deriveBits"]);
-        const bits = await subtle.deriveBits(
-            {
-                name: "PBKDF2",
-                salt: saltBytes,
-                iterations,
-                hash: "SHA-256",
-            },
-            material,
-            outputLengthBits);
-        return new Uint8Array(bits);
-    } finally {
-        passwordBytes.fill(0);
-        saltBytes.fill(0);
-    }
-}
-
 export async function importAesGcmKey(key) {
     const subtle = getSubtleCrypto();
     const keyBytes = copyBytes(key, "key");

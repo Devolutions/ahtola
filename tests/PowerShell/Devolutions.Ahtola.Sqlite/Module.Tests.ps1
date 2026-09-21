@@ -53,7 +53,6 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             'Backup-AhtolaSqliteDatabase'
             'Checkpoint-AhtolaSqliteDatabase'
             'Clear-AhtolaSqliteConnectionPool'
-            'Clear-AhtolaSqlitePassword'
             'Close-AhtolaSqliteConnection'
             'Compare-AhtolaSqliteDatabaseVersion'
             'Complete-AhtolaSqliteTransaction'
@@ -77,7 +76,6 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             'Remove-AhtolaSqliteRow'
             'Resolve-AhtolaSqliteReplicaConflict'
             'Save-AhtolaSqliteTransaction'
-            'Set-AhtolaSqlitePassword'
             'Set-AhtolaSqliteRow'
             'Start-AhtolaSqliteTransaction'
             'Test-AhtolaSqliteConnection'
@@ -126,8 +124,6 @@ Describe 'Devolutions.Ahtola.Sqlite module packaging' {
             'Checkpoint-AhtolaSqliteDatabase'
             'Optimize-AhtolaSqliteDatabase'
             'Clear-AhtolaSqliteConnectionPool'
-            'Set-AhtolaSqlitePassword'
-            'Clear-AhtolaSqlitePassword'
             'Export-AhtolaSqliteTable'
             'Import-AhtolaSqliteTable'
         )
@@ -780,47 +776,6 @@ Describe 'Devolutions.Ahtola.Sqlite backup and table interchange' {
         }
     }
 
-    It 'encrypts, rekeys, and clears a managed file-backed database password' {
-        $encryptedPath = Join-Path $script:TempRoot 'encrypted.sqlite'
-        $password = ConvertTo-SecureString 'first-secret' -AsPlainText -Force
-        $replacementPassword = ConvertTo-SecureString 'second-secret' -AsPlainText -Force
-        $connection = New-AhtolaSqliteConnection -ConnectionString "Data Source=$encryptedPath;Pooling=False"
-        try {
-            $null = Invoke-AhtolaSqliteQuery `
-                -SqliteConnection $connection `
-                -CommandText 'CREATE TABLE secrets(id INTEGER PRIMARY KEY); INSERT INTO secrets VALUES (1);' `
-                -As NonQuery
-            Set-AhtolaSqlitePassword -SqliteConnection $connection -Password $password -Confirm:$false
-        }
-        finally {
-            $connection | Close-AhtolaSqliteConnection -Confirm:$false
-        }
-
-        $connection = New-AhtolaSqliteConnection -ConnectionString "Data Source=$encryptedPath;Password=first-secret;Pooling=False"
-        try {
-            [int](Invoke-AhtolaSqliteQuery -SqliteConnection $connection -CommandText 'SELECT COUNT(*) FROM secrets;' -As Scalar) | Should-Be 1
-            Set-AhtolaSqlitePassword -SqliteConnection $connection -Password $replacementPassword -Confirm:$false
-        }
-        finally {
-            $connection | Close-AhtolaSqliteConnection -Confirm:$false
-        }
-
-        $connection = New-AhtolaSqliteConnection -ConnectionString "Data Source=$encryptedPath;Password=second-secret;Pooling=False"
-        try {
-            Clear-AhtolaSqlitePassword -SqliteConnection $connection -Confirm:$false
-        }
-        finally {
-            $connection | Close-AhtolaSqliteConnection -Confirm:$false
-        }
-
-        $connection = New-AhtolaSqliteConnection -ConnectionString "Data Source=$encryptedPath;Pooling=False"
-        try {
-            [int](Invoke-AhtolaSqliteQuery -SqliteConnection $connection -CommandText 'SELECT COUNT(*) FROM secrets;' -As Scalar) | Should-Be 1
-        }
-        finally {
-            $connection | Close-AhtolaSqliteConnection -Confirm:$false
-        }
-    }
 }
 
 Describe 'Devolutions.Ahtola.Sqlite programmatic configuration and CRUD' {
