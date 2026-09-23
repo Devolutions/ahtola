@@ -35,6 +35,27 @@ public class AggregateOpcodeExecutionTests
     }
 
     [Test]
+    public void AggFinalProducesAReusableGroupedResult()
+    {
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(10)),
+            new AggStepInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new RegisterRange(new Register(0), 1)),
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(20)),
+            new AggStepInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new RegisterRange(new Register(0), 1)),
+            new AggFinalInstruction(new Accumulator(0), AggregateTestSupport.Sum(), new Register(1)),
+            new CopyInstruction(new Register(1), new Register(0)),
+            new ResultRowInstruction(new RegisterRange(new Register(0), 1)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 2, cursorCount: 0, instructions, accumulatorCount: 1);
+
+        RunToCompletion(program)[0].Should().Equal(SqlValue.Integer(30));
+        VdbeExplain.Describe(program).Select(row => row[1].AsText()).Should().Contain("AggFinal");
+    }
+
+    [Test]
     public void FinalizingAnUnsteppedAccumulatorYieldsTheEmptyInputValue()
     {
         // No AggStep runs, so SUM finalizes to NULL and COUNT(*) to 0 from fresh contexts,

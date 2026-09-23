@@ -318,6 +318,10 @@ public sealed class ResumableStatement : IDisposable
                     _registers[loadConstant.Destination.Index] = loadConstant.Value;
                     AdvanceInstructionPointer();
                     break;
+                case IntegerInstruction integer:
+                    _registers[integer.Destination.Index] = SqlValue.Integer(integer.Value);
+                    AdvanceInstructionPointer();
+                    break;
                 case LoadParameterInstruction loadParameter:
                     _registers[loadParameter.Destination.Index] = RequireBinding().Get(loadParameter.Slot);
                     AdvanceInstructionPointer();
@@ -1056,6 +1060,16 @@ public sealed class ResumableStatement : IDisposable
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = seekKey.NotFoundTarget;
+                        break;
+                    }
+                case IdxGTCheckInstruction indexRangeCheck:
+                    {
+                        var current = CurrentCursorRow(indexRangeCheck.Cursor);
+                        var key = ReadRegisters(indexRangeCheck.Key);
+                        if (CompareKeyPrefix(current, key, indexRangeCheck.KeyColumns) > 0)
+                            _instructionPointer = indexRangeCheck.PastEndTarget;
+                        else
+                            AdvanceInstructionPointer();
                         break;
                     }
                 case IdxRowIdInstruction idxRowId:
@@ -1882,6 +1896,26 @@ public sealed class ResumableStatement : IDisposable
                                 : aggFinalize.Aggregate.CreateContext();
                             _registers[aggFinalize.Destination.Index] =
                                 aggFinalize.Aggregate.Finalize(context);
+                            AdvanceInstructionPointer();
+                        }
+                        catch
+                        {
+                            State = ResumableStatementState.Faulted;
+                            throw;
+                        }
+
+                        break;
+                    }
+                case AggFinalInstruction aggFinal:
+                    {
+                        try
+                        {
+                            var index = aggFinal.Accumulator.Index;
+                            var context = _accumulatorInitialized[index]
+                                ? _accumulatorContexts[index]
+                                : aggFinal.Aggregate.CreateContext();
+                            _registers[aggFinal.Destination.Index] =
+                                aggFinal.Aggregate.Finalize(context);
                             AdvanceInstructionPointer();
                         }
                         catch

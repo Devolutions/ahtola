@@ -7,6 +7,47 @@ namespace Ahtola.Tests;
 public class CompiledJoinVdbeSqlRoutingTests
 {
     [Test]
+    public void CorrelatedInUsesAnAutomaticSemiJoinIndex()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE outer_items(k INTEGER, x INTEGER);");
+        Execute(connection, "CREATE TABLE inner_items(k INTEGER, x INTEGER);");
+        Execute(connection, "INSERT INTO outer_items VALUES (1, 10), (1, 11), (2, 20), (3, 30);");
+        Execute(connection, "INSERT INTO inner_items VALUES (1, 10), (1, 12), (2, 20), (4, 40);");
+
+        var explain = Opcodes(
+            connection,
+            """
+            EXPLAIN SELECT o.k, o.x
+            FROM outer_items o
+            WHERE o.x IN (SELECT i.x FROM inner_items i WHERE i.k = o.k);
+            """);
+        explain.Should().ContainInOrder(
+            "OpenRead",
+            "OpenRead",
+            "OpenAutoindex",
+            "IdxInsert",
+            "NoConflict",
+            "ResultRow");
+        explain.Should().NotContain("OpenJoinCursor");
+        var rows = ReadRows(
+            connection,
+            """
+            SELECT o.k, o.x
+            FROM outer_items o
+            WHERE o.x IN (SELECT i.x FROM inner_items i WHERE i.k = o.k)
+            ORDER BY o.k;
+            """);
+        rows.Should().HaveCount(2);
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(10));
+        rows[1].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(20));
+        database.JoinIndexSeekMetrics.AutomaticIndexesBuilt.Should().Be(1);
+        database.JoinIndexSeekMetrics.SeeksAttempted.Should().Be(4);
+        database.JoinIndexSeekMetrics.CandidateRowsVisited.Should().Be(2);
+    }
+
+    [Test]
     public void ThreeWayInnerJoinRoutesThroughMaterializingJoinCursor()
     {
         using var connection = new EmbeddedDatabase().Connect();

@@ -181,6 +181,112 @@ public sealed class ExplainQueryPlanTests
     }
 
     [Test]
+    public void ChainedExistsSemiJoinsExposeTheirDistinctTransientLookups()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE outer_t(id INTEGER PRIMARY KEY, key1 INTEGER, key2 INTEGER);");
+        Execute(connection, "CREATE TABLE first_inner(key1 INTEGER);");
+        Execute(connection, "CREATE TABLE second_inner(key2 INTEGER);");
+
+        var plan = ReadPlan(
+            connection,
+            """
+            EXPLAIN QUERY PLAN
+            SELECT o.id
+            FROM outer_t o
+            WHERE EXISTS (SELECT 1 FROM first_inner i WHERE i.key1 = o.key1)
+              AND EXISTS (SELECT 1 FROM second_inner j WHERE j.key2 = o.key2);
+            """);
+
+        plan.Rows.Select(static row => row[3].AsText()).Should().Equal(
+            "SCAN outer_t AS o",
+            "SEARCH i USING COVERING INDEX ephemeral_first_inner_t3 (key1=?)",
+            "SEARCH j USING COVERING INDEX ephemeral_second_inner_t5 (key2=?)");
+    }
+
+    [Test]
+    public void LimitedCorrelatedInDescribesItsNestedListScan()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE outer_t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);");
+        Execute(connection, "CREATE TABLE inner_t(k INTEGER, x INTEGER);");
+
+        var plan = ReadPlan(
+            connection,
+            """
+            EXPLAIN QUERY PLAN
+            SELECT o.id
+            FROM outer_t o
+            WHERE o.v IN (SELECT i.x FROM inner_t i WHERE i.k = o.k)
+            LIMIT 1;
+            """);
+
+        plan.Rows.Select(static row => row[3].AsText()).Should().Equal(
+            "SCAN outer_t AS o",
+            "CORRELATED LIST SUBQUERY 1",
+            "SCAN inner_t AS i");
+        plan.Rows[2][1].Should().Be(SqlValue.Integer(6));
+    }
+
+    [Test]
+    public void UnboundedCorrelatedInDescribesItsCompositeTransientLookup()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE outer_t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);");
+        Execute(connection, "CREATE TABLE inner_t(k INTEGER, x INTEGER);");
+
+        var plan = ReadPlan(
+            connection,
+            """
+            EXPLAIN QUERY PLAN
+            SELECT o.id
+            FROM outer_t o
+            WHERE o.v IN (SELECT i.x FROM inner_t i WHERE i.k = o.k);
+            """);
+
+        plan.Rows.Select(static row => row[3].AsText()).Should().Equal(
+            "SCAN outer_t AS o",
+            "SEARCH i USING COVERING INDEX ephemeral_inner_t_t3 (k=? AND x=?)");
+    }
+
+    [Test]
+    public void FilteredExistsUsesItsTransientSemiJoinLookup()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE outer_t(id INTEGER PRIMARY KEY, k INTEGER, body TEXT);");
+        Execute(connection, "CREATE TABLE inner_t(k INTEGER);");
+
+        var plan = ReadPlan(
+            connection,
+            """
+            EXPLAIN QUERY PLAN
+            SELECT o.id
+            FROM outer_t o
+            WHERE o.body LIKE 'apple%'
+              AND EXISTS (SELECT 1 FROM inner_t i WHERE i.k = o.k);
+            """);
+
+        plan.Rows.Select(static row => row[3].AsText()).Should().Equal(
+            "SCAN outer_t AS o",
+            "SEARCH i USING COVERING INDEX ephemeral_inner_t_t3 (k=?)");
+    }
+
+    [Test]
+    public void MixedIndexedAndUnindexedOrderByUsesASorter()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(a INT, b INT, v INT GENERATED ALWAYS AS (a * 2 + b) VIRTUAL);");
+        Execute(connection, "CREATE INDEX tv ON t(v);");
+
+        var plan = ReadPlan(connection, "EXPLAIN QUERY PLAN SELECT v FROM t ORDER BY v, b;");
+
+        plan.Rows.Select(static row => row[3].AsText()).Should().Equal(
+            "SCAN t",
+            "USE SORTER FOR ORDER BY");
+    }
+
+
+    [Test]
     public void StreamingCallbackProjectionKeepsItsFailureAtTheLaterRead()
     {
         using var connection = new EmbeddedDatabase().Connect();
@@ -397,6 +503,26 @@ public sealed class ExplainQueryPlanTests
                 connection,
                 "EXPLAIN QUERY PLAN SELECT id FROM products WHERE status = 'inactive' AND sku = 'X';")
             .Rows[0][3].Should().Be(SqlValue.Text("SCAN products"));
+    }
+
+    [Test]
+    public void ReverseIndexScanReversesExplicitNullPlacement()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(a INTEGER);");
+        Execute(connection, "CREATE INDEX idx_t_a ON t(a NULLS LAST);");
+        Execute(connection, "INSERT INTO t VALUES (NULL), (2), (1);");
+
+        ReadPlan(connection, "EXPLAIN QUERY PLAN SELECT a FROM t ORDER BY a DESC NULLS FIRST;")
+            .Rows.Should().ContainSingle()
+            .Which[3].Should().Be(SqlValue.Text("SCAN t USING COVERING INDEX idx_t_a"));
+
+        using var statement = connection.Prepare("SELECT a FROM t ORDER BY a DESC NULLS FIRST;");
+        var values = new List<SqlValue>();
+        while (statement.Step() == StatementStepResult.Row)
+            values.Add(statement.GetValue(0));
+
+        values.Should().Equal(SqlValue.Null, SqlValue.Integer(2), SqlValue.Integer(1));
     }
 
     private static string ReadDetail(EmbeddedStatement statement)

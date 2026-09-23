@@ -575,7 +575,8 @@ public static class AggregateProgramBuilder
         VdbeRowPredicate? predicate = null,
         AggregateFinalizerFilter? having = null,
         VdbeRowEquality? distinctEquality = null,
-        VdbeGroupHasher? groupHasher = null)
+        VdbeGroupHasher? groupHasher = null,
+        bool reuseGroupResultRegisters = false)
     {
         ValidateRowPlan(tableName, tableColumnCount, collector, outputs, having);
         ArgumentNullException.ThrowIfNull(groupKeyProjector);
@@ -587,6 +588,13 @@ public static class AggregateProgramBuilder
             throw new ArgumentOutOfRangeException(nameof(groupKeyCount));
         foreach (var orderKey in orderKeys)
             ValidateAggregate(orderKey, nameof(orderKeys));
+        if (reuseGroupResultRegisters
+            && (groupKeyCount != 1 || outputs.Count != 2 || orderKeys.Count != 0 || having is not null))
+        {
+            throw new ArgumentException(
+                "Grouped result-register reuse requires one group key, aggregate/key outputs, no ORDER BY aggregates, and no HAVING.",
+                nameof(reuseGroupResultRegisters));
+        }
 
         // Source sorter record: [group key | row columns | group id]. Staging the key
         // lets the source sorter order by key without re-projecting per comparison.
@@ -700,9 +708,12 @@ public static class AggregateProgramBuilder
             havingBase,
             outputKeyBase,
             savedKey,
-            having);
+            having,
+            reuseGroupResultRegisters);
         ins.Add(new AggResetInstruction(accumulator));
         ins.Add(new CopyInstruction(new Register(groupIdRegister), new Register(savedGroupIdRegister)));
+        if (reuseGroupResultRegisters)
+            ins.Add(new SorterDataInstruction(sourceSorter, sourceRecord));
 
         var sameGroupStep = ins.Count;
         ins.Add(new AggStepInstruction(accumulator, collector, row));
@@ -730,7 +741,8 @@ public static class AggregateProgramBuilder
             havingBase,
             outputKeyBase,
             savedKey,
-            having);
+            having,
+            reuseGroupResultRegisters);
 
         var closeSourceAddress = ins.Count;
         ins.Add(new CloseSorterInstruction(sourceSorter));
@@ -818,14 +830,29 @@ public static class AggregateProgramBuilder
         int havingBase,
         int outputKeyBase,
         RegisterRange savedKey,
-        AggregateFinalizerFilter? having)
+        AggregateFinalizerFilter? having,
+        bool reuseGroupResultRegisters)
     {
-        for (var index = 0; index < outputs.Count; index++)
+        if (reuseGroupResultRegisters)
         {
-            ins.Add(new AggFinalizeInstruction(
+            ins.Add(new AggFinalInstruction(
                 accumulator,
-                outputs[index],
-                new Register(outputBase + index)));
+                outputs[0],
+                new Register(outputBase)));
+            ins.Add(new CopyInstruction(new Register(outputBase), new Register(1)));
+            ins.Add(new CopyInstruction(savedKey.Start, new Register(2)));
+            ins.Add(new CopyInstruction(new Register(1), new Register(outputBase)));
+            ins.Add(new CopyInstruction(new Register(2), new Register(outputBase + 1)));
+        }
+        else
+        {
+            for (var index = 0; index < outputs.Count; index++)
+            {
+                ins.Add(new AggFinalizeInstruction(
+                    accumulator,
+                    outputs[index],
+                    new Register(outputBase + index)));
+            }
         }
 
         if (having is null)

@@ -129,7 +129,7 @@ internal sealed class SqlParser
                 var format = ParseExplainQueryPlanFormat();
                 var inner = ParseStatement();
                 var innerSql = _sql[innerStart..].TrimEnd();
-                return new ExplainQueryPlanStatement(inner, format, InnerSql: innerSql);
+                return new ExplainQueryPlanStatement(inner, format, InnerSql: innerSql, Sql: _sql);
             }
 
             return new ExplainStatement(ParseStatement());

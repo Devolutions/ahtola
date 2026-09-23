@@ -86,6 +86,52 @@ public sealed class VdbeIndexCursorOpcodeTests
     }
 
     [Test]
+    public void IdxGTChecksTheCurrentSeekPositionWithoutRepositioning()
+    {
+        var source = new VdbeCursorSource(
+        [
+            [SqlValue.Integer(10)],
+            [SqlValue.Integer(20)],
+            [SqlValue.Integer(30)],
+        ]);
+
+        SqlValue Execute(SqlValue key)
+        {
+            VdbeInstruction[] instructions =
+            [
+                new OpenReadCursorInstruction(new Cursor(0), ColumnCount: 1),
+                new LoadConstantInstruction(new Register(0), key),
+                new SeekKeyInstruction(
+                    new Cursor(0),
+                    new RegisterRange(new Register(0), 1),
+                    VdbeKeySeekOperator.GreaterThanOrEqual,
+                    EqOnly: false,
+                    IsIndex: false,
+                    new ProgramCounter(7),
+                    "seekge"),
+                new IdxGTCheckInstruction(
+                    new Cursor(0),
+                    new RegisterRange(new Register(0), 1),
+                    new ProgramCounter(7)),
+                new ColumnInstruction(new Cursor(0), 0, new Register(1)),
+                new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+                new GotoInstruction(new ProgramCounter(9)),
+                new LoadConstantInstruction(new Register(1), SqlValue.Integer(-1)),
+                new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+                new HaltInstruction(),
+            ];
+
+            var program = new VdbeProgram(registerCount: 2, cursorCount: 1, instructions);
+            using var statement = new ResumableStatement(program, cursorSources: [source]);
+            statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+            return statement.CurrentRow![0];
+        }
+
+        Execute(SqlValue.Integer(20)).Should().Be(SqlValue.Integer(20));
+        Execute(SqlValue.Integer(15)).Should().Be(SqlValue.Integer(-1));
+    }
+
+    [Test]
     public void SeekLEEqOnlyRequiresExactMatch()
     {
         var rows = new List<SqlValue[]>
