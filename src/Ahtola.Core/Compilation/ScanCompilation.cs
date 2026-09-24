@@ -80,7 +80,8 @@ internal sealed record CompiledSelect(
     IReadOnlyList<VdbeCursorSource> CursorSources,
     IReadOnlyList<int>? ParameterIndices = null,
     IReadOnlyList<VdbeVirtualTableBinding?>? VirtualTableBindings = null,
-    bool StreamResults = false);
+    bool StreamResults = false,
+    IReadOnlyList<VdbeProgram>? SupportingPrograms = null);
 
 /// <summary>
 /// Equality prefix for a managed index SEARCH: table-column ordinals aligned with

@@ -58,7 +58,7 @@ public class VdbeProgramTests
                 "IfPos=166", "IfNeg=167", "DecrJumpZero=168", "MustBeInt=169",
                 "SoftNull=170", "MemMax=171", "AddImm=172", "ZeroOrNull=173",
                 "Gosub=174", "Return=175", "BeginSubrtn=176",
-                "Sequence=177", "SequenceTest=178");
+                "Sequence=177", "SequenceTest=178", "Integer=179", "AggFinal=181");
 
         var constructors = typeof(VdbeProgram).GetConstructors();
         Type[] legacyParameterTypes =

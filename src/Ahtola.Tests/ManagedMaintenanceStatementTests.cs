@@ -158,6 +158,27 @@ public sealed class ManagedMaintenanceStatementTests
     }
 
     [Test]
+    public void AnalyzeSqliteSchemaPreservesManuallyEditedPlannerStatistics()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(
+            connection,
+            """
+            CREATE TABLE data(value TEXT);
+            CREATE INDEX data_value ON data(value);
+            INSERT INTO data VALUES ('one'), ('two');
+            ANALYZE;
+            DELETE FROM sqlite_stat1;
+            INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('data', 'data_value', '1000000 1');
+            ANALYZE sqlite_schema;
+            """);
+
+        ReadText(connection, "SELECT stat FROM sqlite_stat1 WHERE idx = 'data_value';")
+            .Should().Be("1000000 1");
+    }
+
+    [Test]
     public void AnalyzeRoutesAttachedDatabaseAndQualifiedTargets()
     {
         var fileSystem = new InMemoryFileSystem();

@@ -611,6 +611,14 @@ public enum VdbeOpcode
     /// incremented regardless of whether the jump is taken (Turso <c>SequenceTest</c>).
     /// </summary>
     SequenceTest = 178,
+
+    /// <summary>Loads an integer literal (Turso <c>Integer</c>).</summary>
+    Integer = 179,
+
+    /// <summary>
+    /// Finalizes a grouped aggregate into its reusable result register (Turso <c>AggFinal</c>).
+    /// </summary>
+    AggFinal = 181,
 }
 
 /// <summary>
@@ -1164,9 +1172,35 @@ internal static class VdbeValueOperations
 /// </summary>
 public sealed class VdbeCursorSource
 {
+    private readonly Lazy<(IReadOnlyList<SqlValue[]> Rows, IReadOnlyList<long>? RowIds)>? _deferredRows;
+
     public VdbeCursorSource(IReadOnlyList<SqlValue[]> rows, IReadOnlyList<long>? rowIds = null)
         : this(rows, rowIds, largestRowId: null)
     {
+    }
+
+    /// <summary>
+    /// Defers creation of a read cursor's rows until the program actually opens or reads it.
+    /// EXPLAIN therefore never evaluates a derived source, while normal VDBE execution sees a
+    /// stable statement-scoped cursor source for the entire run.
+    /// </summary>
+    public VdbeCursorSource(Func<(IReadOnlyList<SqlValue[]> Rows, IReadOnlyList<long>? RowIds)> materialize)
+    {
+        ArgumentNullException.ThrowIfNull(materialize);
+        _deferredRows = new Lazy<(IReadOnlyList<SqlValue[]> Rows, IReadOnlyList<long>? RowIds)>(
+            () =>
+            {
+                var source = materialize();
+                ArgumentNullException.ThrowIfNull(source.Rows);
+                if (source.RowIds is not null && source.RowIds.Count != source.Rows.Count)
+                {
+                    throw new InvalidOperationException(
+                        "A deferred cursor source with rowids must have exactly one rowid per row.");
+                }
+
+                return source;
+            },
+            LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
     internal VdbeCursorSource(
@@ -1182,20 +1216,24 @@ public sealed class VdbeCursorSource
                 nameof(rowIds));
         }
 
-        Rows = rows;
-        RowIds = rowIds;
+        _rows = rows;
+        _rowIds = rowIds;
         LargestRowId = largestRowId;
     }
 
-    public IReadOnlyList<SqlValue[]> Rows { get; }
+    public IReadOnlyList<SqlValue[]> Rows => _deferredRows?.Value.Rows ?? _rows!;
 
     /// <summary>
     /// Optional hidden rowids aligned with <see cref="Rows"/>. A source without
     /// these is a value-only cursor and cannot satisfy <see cref="RowIdInstruction"/>.
     /// </summary>
-    public IReadOnlyList<long>? RowIds { get; }
+    public IReadOnlyList<long>? RowIds => _deferredRows?.Value.RowIds ?? _rowIds;
 
     internal Func<long?>? LargestRowId { get; }
+
+    private readonly IReadOnlyList<SqlValue[]>? _rows;
+
+    private readonly IReadOnlyList<long>? _rowIds;
 }
 
 /// <summary>
@@ -1216,6 +1254,8 @@ public enum VdbeJoinKind
     Left,
     Right,
     Full,
+    Semi,
+    Anti,
 }
 
 /// <summary>A materialized row in a join plan, including one optional hidden rowid per leaf source.</summary>
@@ -1323,6 +1363,63 @@ public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
             yield return new VdbeJoinRow(
                 [.. values],
                 [Source.RowIds is null ? null : Source.RowIds[index]]);
+        }
+    }
+}
+
+/// <summary>
+/// A join leaf whose fixed-width rows are produced by a separately compiled VDBE program at
+/// execution time. This keeps derived SELECT compilation lazy: preparing or explaining the
+/// parent never evaluates the derived query.
+/// </summary>
+public sealed class VdbeJoinDerivedRowsPlan : VdbeJoinPlanNode
+{
+    private readonly Func<IReadOnlyList<SqlValue[]>> _materializeRows;
+
+    public VdbeJoinDerivedRowsPlan(
+        string name,
+        int columnCount,
+        Func<IReadOnlyList<SqlValue[]>> materializeRows)
+        : base(columnCount, sourceCount: 1)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        ArgumentNullException.ThrowIfNull(materializeRows);
+        Name = name;
+        _materializeRows = materializeRows;
+    }
+
+    public string Name { get; }
+
+    /// <summary>
+    /// Materializes the independently compiled derived SELECT for a parent access method.
+    /// Calling this is a run-time operation only; preparing or explaining the parent remains
+    /// side-effect-free.
+    /// </summary>
+    internal IReadOnlyList<SqlValue[]> MaterializeRows() => _materializeRows();
+
+    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows)
+        => Enumerate(maximumRows).ToArray();
+
+    internal override IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows)
+        => Enumerate(maximumRows, VdbeJoinExecutionContext.CreateDefault());
+
+    internal override IEnumerable<VdbeJoinRow> Enumerate(
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
+    {
+        var rows = MaterializeRows();
+        var count = maximumRows is { } maximum ? Math.Min(rows.Count, maximum) : rows.Count;
+        for (var index = 0; index < count; index++)
+        {
+            context.ThrowIfCancellationRequested();
+            var values = rows[index];
+            if (values.Length != ColumnCount)
+            {
+                throw new InvalidOperationException(
+                    $"Derived join source '{Name}' declares {ColumnCount} columns but row {index} has {values.Length}.");
+            }
+
+            yield return new VdbeJoinRow([.. values], [null]);
         }
     }
 }
@@ -1762,7 +1859,7 @@ public sealed class VdbeJoinEquiProbe
     public Func<VdbeJoinRow, string?> BuildRightKey { get; }
 }
 
-/// <summary>An INNER, LEFT, RIGHT, or FULL node in a materializing join plan.</summary>
+/// <summary>An INNER, LEFT, RIGHT, FULL, SEMI, or ANTI node in a materializing join plan.</summary>
 public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
 {
     public VdbeJoinOperatorPlan(
@@ -1773,9 +1870,13 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
         VdbeJoinEquiProbe? equiProbe = null,
         bool hashBuildRight = true)
         : base(
-            checked((left ?? throw new ArgumentNullException(nameof(left))).ColumnCount
-                + (right ?? throw new ArgumentNullException(nameof(right))).ColumnCount),
-            checked(left.SourceCount + right.SourceCount))
+            kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti
+                ? (left ?? throw new ArgumentNullException(nameof(left))).ColumnCount
+                : checked((left ?? throw new ArgumentNullException(nameof(left))).ColumnCount
+                    + (right ?? throw new ArgumentNullException(nameof(right))).ColumnCount),
+            kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti
+                ? left.SourceCount
+                : checked(left.SourceCount + right.SourceCount))
     {
         if (!Enum.IsDefined(kind))
             throw new ArgumentOutOfRangeException(nameof(kind));
@@ -1818,6 +1919,9 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
         int? maximumRows,
         VdbeJoinExecutionContext context)
     {
+        if (Kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti)
+            return EnumerateSemiOrAnti(maximumRows, context);
+
         if (Right is IVdbeJoinSeekPlan indexSeek)
             return EnumerateIndexSeekRight(indexSeek, maximumRows, context);
 
@@ -1829,6 +1933,81 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
         if (!HashBuildRight)
             return EnumerateHashBuildLeft(maximumRows, context);
         return EnumerateHashBuildRight(maximumRows, context);
+    }
+
+    private IEnumerable<VdbeJoinRow> EnumerateSemiOrAnti(
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
+    {
+        var keepOnMatch = Kind == VdbeJoinKind.Semi;
+        if (Right is IVdbeJoinSeekPlan indexSeek)
+        {
+            foreach (var row in EnumerateSemiOrAntiIndexSeek(indexSeek, keepOnMatch, maximumRows, context))
+                yield return row;
+            yield break;
+        }
+
+        var rightRows = Right.Enumerate(maximumRows: null, context).ToArray();
+        var emitted = 0;
+        foreach (var left in Left.Enumerate(maximumRows: null, context))
+        {
+            context.ThrowIfCancellationRequested();
+            var matched = false;
+            foreach (var right in rightRows)
+            {
+                context.ThrowIfCancellationRequested();
+                if (Condition is null || Condition(left, right, Combine(left, right)))
+                {
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (matched != keepOnMatch)
+                continue;
+
+            yield return left;
+            if (maximumRows is { } maximum && ++emitted >= maximum)
+                yield break;
+        }
+    }
+
+    private IEnumerable<VdbeJoinRow> EnumerateSemiOrAntiIndexSeek(
+        IVdbeJoinSeekPlan indexSeek,
+        bool keepOnMatch,
+        int? maximumRows,
+        VdbeJoinExecutionContext context)
+    {
+        try
+        {
+            indexSeek.Open();
+            var emitted = 0;
+            foreach (var left in Left.Enumerate(maximumRows: null, context))
+            {
+                context.ThrowIfCancellationRequested();
+                var matched = false;
+                foreach (var right in indexSeek.Seek(left))
+                {
+                    context.ThrowIfCancellationRequested();
+                    if (Condition is null || Condition(left, right, Combine(left, right)))
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+
+                if (matched != keepOnMatch)
+                    continue;
+
+                yield return left;
+                if (maximumRows is { } maximum && ++emitted >= maximum)
+                    yield break;
+            }
+        }
+        finally
+        {
+            indexSeek.Dispose();
+        }
     }
 
     private IEnumerable<VdbeJoinRow> EnumerateIndexSeekRight(
@@ -2365,6 +2544,12 @@ public sealed record LoadConstantInstruction(Register Destination, SqlValue Valu
     public override VdbeOpcode Opcode => VdbeOpcode.LoadConstant;
 }
 
+/// <summary>Loads an integer literal without widening it through the generic constant opcode.</summary>
+public sealed record IntegerInstruction(long Value, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Integer;
+}
+
 /// <summary>
 /// Loads the late-bound value of parameter slot <paramref name="Slot"/> into
 /// <paramref name="Destination"/>. It is the late-binding sibling of <see cref="LoadConstantInstruction"/>:
@@ -2478,7 +2663,11 @@ internal sealed record CastInstruction(Register Value, string TypeName) : VdbeIn
     public override VdbeOpcode Opcode => VdbeOpcode.Cast;
 }
 
-public sealed record OpenReadCursorInstruction(Cursor Cursor, string? TableName = null, int ColumnCount = 0)
+public sealed record OpenReadCursorInstruction(
+    Cursor Cursor,
+    string? TableName = null,
+    int ColumnCount = 0,
+    bool ExplainAsOpenRead = false)
     : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.OpenReadCursor;
@@ -3395,6 +3584,17 @@ public sealed record AggFinalizeInstruction(
     Register Destination) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.AggFinalize;
+}
+
+/// <summary>Finalizes <paramref name="Accumulator"/> for a grouped result whose value is
+/// immediately reused by the result-record layout. This is Turso's <c>AggFinal</c> spelling;
+/// it has the same aggregate lifecycle semantics as <see cref="AggFinalizeInstruction"/>.</summary>
+public sealed record AggFinalInstruction(
+    Accumulator Accumulator,
+    VdbeAggregate Aggregate,
+    Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AggFinal;
 }
 
 /// <summary>Reads the current value of <paramref name="Accumulator"/> with
@@ -4381,6 +4581,20 @@ public sealed record SeekKeyInstruction(
 }
 
 /// <summary>
+/// Compares the current index cursor key to an equality-prefix register range and jumps when the
+/// cursor is past that prefix. Unlike <see cref="SeekKeyInstruction"/>, this does not reposition
+/// the cursor; it is Turso's positioned <c>IdxGT</c> range guard after <c>SeekGE</c>.
+/// </summary>
+public sealed record IdxGTCheckInstruction(
+    Cursor Cursor,
+    RegisterRange Key,
+    ProgramCounter PastEndTarget,
+    IReadOnlyList<int>? KeyColumns = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.IdxGT;
+}
+
+/// <summary>
 /// Writes the current cursor row's rowid into <paramref name="Destination"/> (Turso
 /// <c>IdxRowid</c>). Works for any cursor that exposes rowids.
 /// </summary>
@@ -4823,6 +5037,9 @@ public sealed class VdbeProgram
             {
                 case LoadConstantInstruction loadConstant:
                     ValidateRegister(loadConstant.Destination, instructionIndex);
+                    break;
+                case IntegerInstruction integer:
+                    ValidateRegister(integer.Destination, instructionIndex);
                     break;
                 case LoadParameterInstruction loadParameter:
                     ValidateRegister(loadParameter.Destination, instructionIndex);
@@ -5719,6 +5936,24 @@ public sealed class VdbeProgram
 
                     ValidateJumpTarget(seekKey.NotFoundTarget, instructionIndex);
                     break;
+                case IdxGTCheckInstruction indexRangeCheck:
+                    ValidateOpenCursor(indexRangeCheck.Cursor, openCursors, instructionIndex);
+                    ValidateRegisterRange(indexRangeCheck.Key, instructionIndex);
+                    if (indexRangeCheck.Key.Count <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} IdxGT requires a positive key width.");
+                    }
+
+                    if (indexRangeCheck.KeyColumns is not null
+                        && indexRangeCheck.KeyColumns.Count != indexRangeCheck.Key.Count)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} IdxGT KeyColumns length must match key width.");
+                    }
+
+                    ValidateJumpTarget(indexRangeCheck.PastEndTarget, instructionIndex);
+                    break;
                 case IdxRowIdInstruction idxRowId:
                     ValidateOpenCursor(idxRowId.Cursor, openCursors, instructionIndex);
                     ValidateRegister(idxRowId.Destination, instructionIndex);
@@ -5936,6 +6171,16 @@ public sealed class VdbeProgram
                     }
 
                     ValidateRegister(aggFinalize.Destination, instructionIndex);
+                    break;
+                case AggFinalInstruction aggFinal:
+                    ValidateAccumulator(aggFinal.Accumulator, instructionIndex);
+                    if (aggFinal.Aggregate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} finalizes accumulator {aggFinal.Accumulator.Index} with a null aggregate.");
+                    }
+
+                    ValidateRegister(aggFinal.Destination, instructionIndex);
                     break;
                 case AggValueInstruction aggValue:
                     ValidateAccumulator(aggValue.Accumulator, instructionIndex);

@@ -1213,12 +1213,21 @@ public sealed partial class EmbeddedDatabase
 
         var rewritten = select;
         var applied = 0L;
+        var rewrittenSubqueries = new List<ScalarSubqueryExpression>();
         foreach (var shape in shapes)
         {
+            if (rewrittenSubqueries.Any(previous =>
+                    AreEquivalentAggregateSubqueries(previous, shape.Subquery)))
+            {
+                continue;
+            }
+
             if (shape.CanRunForUnusedKeys
+                && ShouldPreferAggregateGroupFirst(rewritten.Source!, shape, context)
                 && TryRewriteAggregateGroupFirst(rewritten, context, shape, out var grouped))
             {
                 rewritten = grouped;
+                rewrittenSubqueries.Add(shape.Subquery);
                 applied++;
                 continue;
             }
@@ -1237,6 +1246,29 @@ public sealed partial class EmbeddedDatabase
             if (count > 0)
                 _ = Interlocked.Add(ref _aggregateDecorrelationDeclines, count);
         }
+    }
+
+    private bool ShouldPreferAggregateGroupFirst(
+        TableSource outerSource,
+        AggregateSubqueryShape shape,
+        QueryContext context)
+    {
+        if (outerSource is not NamedTableSource outer
+            || !TryGetSqliteStat1TableRowCount(context, outer.Name, out var outerRows)
+            || !TryGetSqliteStat1TableRowCount(context, shape.InnerTable.Name, out var innerRows)
+            || TryPlanDeclaredIndexLookup(shape.InnerTable, shape.Inner.Where, context) is not { } innerIndex
+            || !TryGetSqliteStat1LeadingAverage(
+                context,
+                shape.InnerTable.Name,
+                innerIndex.Index.Name,
+                out var rowsPerOuterKey))
+        {
+            return true;
+        }
+
+        // A correlated aggregate now executes a real declared-index equality probe. Prefer it
+        // while its estimated work is smaller than grouping all inner keys once.
+        return (double)outerRows * rowsPerOuterKey >= innerRows;
     }
 
     /// <summary>
@@ -1639,7 +1671,7 @@ public sealed partial class EmbeddedDatabase
         var innerColumns = new HashSet<string>(
             GetSourceColumns(shape.InnerTable, context),
             StringComparer.OrdinalIgnoreCase);
-        if (!JoinFirstNamesStayUnambiguous(select, shape, innerColumns))
+        if (!JoinFirstNamesStayUnambiguous(select, shape, innerColumns, outerNames, context))
             return false;
 
         foreach (var projection in select.Projections)
@@ -1729,10 +1761,12 @@ public sealed partial class EmbeddedDatabase
     /// candidates.
     /// </para>
     /// </summary>
-    private static bool JoinFirstNamesStayUnambiguous(
+    private bool JoinFirstNamesStayUnambiguous(
         SelectStatement select,
         AggregateSubqueryShape shape,
-        HashSet<string> innerColumns)
+        HashSet<string> innerColumns,
+        HashSet<string> outerNames,
+        QueryContext context)
     {
         var safe = true;
         bool VisitEnclosing(Expression expression)
@@ -1751,7 +1785,12 @@ public sealed partial class EmbeddedDatabase
                 }
                 else if (candidate is ExistsExpression or InSubqueryExpression)
                 {
-                    safe = false;
+                    // Keep a nested query only when every reference it owns is demonstrably
+                    // local to one named source. An unqualified reference can otherwise fall
+                    // through to the enclosing scope and become ambiguous when the aggregate
+                    // input table is moved into it.
+                    if (!IsSelfContainedNestedListSubquery(candidate, outerNames, context))
+                        safe = false;
                 }
 
                 if (candidate is ColumnExpression { BooleanKeyword: null } column)
@@ -1868,6 +1907,67 @@ public sealed partial class EmbeddedDatabase
         return true;
     }
 
+    private bool IsSelfContainedNestedListSubquery(
+        Expression expression,
+        HashSet<string> outerNames,
+        QueryContext context)
+    {
+        if (expression is not InSubqueryExpression
+            {
+                Query: SelectStatement
+                {
+                    Source: NamedTableSource source,
+                } query,
+            }
+            || ExpressionContainsCorrelatedSubquery(expression, outerNames))
+        {
+            return false;
+        }
+
+        var columns = new HashSet<string>(
+            GetSourceColumns(source, context),
+            StringComparer.OrdinalIgnoreCase);
+        var qualifiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            source.Name,
+        };
+        if (source.Alias is not null)
+            qualifiers.Add(source.Alias);
+
+        var expressions = new List<Expression>();
+        foreach (var projection in query.Projections)
+            expressions.Add(projection.Expression);
+        if (query.Where is not null)
+            expressions.Add(query.Where);
+        expressions.AddRange(query.GroupBy);
+        if (query.Having is not null)
+            expressions.Add(query.Having);
+        foreach (var order in query.OrderBy)
+            expressions.Add(order.Expression);
+        if (query.Limit is not null)
+            expressions.Add(query.Limit);
+        if (query.Offset is not null)
+            expressions.Add(query.Offset);
+
+        foreach (var candidate in expressions)
+        {
+            if (!ForEachScopedExpression(candidate, node =>
+                {
+                    if (node is not ColumnExpression { BooleanKeyword: null } column)
+                        return true;
+
+                    var name = column.UnqualifiedName ?? column.Name;
+                    return columns.Contains(name)
+                        && (column.Qualifier is null || qualifiers.Contains(column.Qualifier));
+                }))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /// <summary>
     /// Replaces every use of one scalar subquery's value with <paramref name="replacement"/>,
     /// mirroring <c>replace_subquery_value</c> (unnest.rs:1235-1297). Returns false when the
@@ -1886,7 +1986,7 @@ public sealed partial class EmbeddedDatabase
             Column: null,
             ScalarSubquery: candidate =>
             {
-                if (!ReferenceEquals(candidate, subquery))
+                if (!AreEquivalentAggregateSubqueries(candidate, subquery))
                     return null;
 
                 found = true;
@@ -1936,6 +2036,128 @@ public sealed partial class EmbeddedDatabase
             Limit = limit,
             Offset = offset,
         };
+        return true;
+    }
+
+    /// <summary>
+    /// The parser represents list-valued AST properties with separate objects for each
+    /// occurrence, so record equality is reference-sensitive for two textually identical
+    /// subqueries. This is the bounded managed counterpart to Turso's <c>same_query</c> plan
+    /// identity: it recognizes only the aggregate-rewrite shape already proven safe by
+    /// <see cref="TryAnalyzeAggregateSubquery"/> and declines every unmodelled expression.
+    /// </summary>
+    private static bool AreEquivalentAggregateSubqueries(
+        ScalarSubqueryExpression left,
+        ScalarSubqueryExpression right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+
+        if (left.Query is not SelectStatement first
+            || right.Query is not SelectStatement second
+            || first.Distinct != second.Distinct
+            || first.Projections.Count != 1
+            || second.Projections.Count != 1
+            || first.Source is not NamedTableSource firstSource
+            || second.Source is not NamedTableSource secondSource
+            || firstSource != secondSource
+            || first.GroupBy.Count != 0
+            || second.GroupBy.Count != 0
+            || first.Having is not null
+            || second.Having is not null
+            || first.NamedWindows.Count != 0
+            || second.NamedWindows.Count != 0
+            || first.OrderBy.Count != 0
+            || second.OrderBy.Count != 0
+            || first.Limit is not null
+            || second.Limit is not null
+            || first.Offset is not null
+            || second.Offset is not null)
+        {
+            return false;
+        }
+
+        return AreEquivalentAggregateExpressions(
+                   first.Projections[0].Expression,
+                   second.Projections[0].Expression)
+            && AreEquivalentOptionalAggregateExpressions(first.Where, second.Where);
+    }
+
+    private static bool AreEquivalentOptionalAggregateExpressions(Expression? left, Expression? right)
+        => left is null
+            ? right is null
+            : right is not null && AreEquivalentAggregateExpressions(left, right);
+
+    private static bool AreEquivalentAggregateExpressions(Expression left, Expression right)
+        => (left, right) switch
+        {
+            (LiteralExpression first, LiteralExpression second) => first.Value == second.Value,
+            (ColumnExpression first, ColumnExpression second) =>
+                string.Equals(first.Name, second.Name, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(first.Qualifier, second.Qualifier, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(first.UnqualifiedName, second.UnqualifiedName, StringComparison.OrdinalIgnoreCase)
+                && first.BooleanKeyword == second.BooleanKeyword
+                && string.Equals(first.Schema, second.Schema, StringComparison.OrdinalIgnoreCase),
+            (UnaryExpression first, UnaryExpression second) =>
+                first.Operator == second.Operator
+                && AreEquivalentAggregateExpressions(first.Operand, second.Operand),
+            (BinaryExpression first, BinaryExpression second) =>
+                first.Operator == second.Operator
+                && AreEquivalentAggregateExpressions(first.Left, second.Left)
+                && AreEquivalentAggregateExpressions(first.Right, second.Right),
+            (CastExpression first, CastExpression second) =>
+                string.Equals(first.TypeName, second.TypeName, StringComparison.OrdinalIgnoreCase)
+                && AreEquivalentAggregateExpressions(first.Expression, second.Expression),
+            (CollationExpression first, CollationExpression second) =>
+                string.Equals(first.Name, second.Name, StringComparison.OrdinalIgnoreCase)
+                && AreEquivalentAggregateExpressions(first.Expression, second.Expression),
+            (BetweenExpression first, BetweenExpression second) =>
+                first.Negated == second.Negated
+                && AreEquivalentAggregateExpressions(first.Value, second.Value)
+                && AreEquivalentAggregateExpressions(first.Lower, second.Lower)
+                && AreEquivalentAggregateExpressions(first.Upper, second.Upper),
+            (LikeExpression first, LikeExpression second) =>
+                first.Negated == second.Negated
+                && AreEquivalentAggregateExpressions(first.Value, second.Value)
+                && AreEquivalentAggregateExpressions(first.Pattern, second.Pattern)
+                && AreEquivalentOptionalAggregateExpressions(first.Escape, second.Escape),
+            (GlobExpression first, GlobExpression second) =>
+                first.Negated == second.Negated
+                && AreEquivalentAggregateExpressions(first.Value, second.Value)
+                && AreEquivalentAggregateExpressions(first.Pattern, second.Pattern),
+            (FunctionExpression first, FunctionExpression second) =>
+                string.Equals(first.Name, second.Name, StringComparison.OrdinalIgnoreCase)
+                && first.CountStar == second.CountStar
+                && first.Distinct == second.Distinct
+                && first.Window is null
+                && second.Window is null
+                && !HasAggregateOrderBy(first)
+                && !HasAggregateOrderBy(second)
+                && !first.OrderedSet
+                && !second.OrderedSet
+                && first.OrderedSetOrderBy is null
+                && second.OrderedSetOrderBy is null
+                && AreEquivalentOptionalAggregateExpressions(first.Filter, second.Filter)
+                && AreEquivalentAggregateExpressionLists(first.Arguments, second.Arguments),
+            _ => false,
+        };
+
+    private static bool HasAggregateOrderBy(FunctionExpression expression)
+        => expression.AggregateOrderBy is { Count: > 0 };
+
+    private static bool AreEquivalentAggregateExpressionLists(
+        IReadOnlyList<Expression> left,
+        IReadOnlyList<Expression> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!AreEquivalentAggregateExpressions(left[index], right[index]))
+                return false;
+        }
+
         return true;
     }
 
@@ -2340,6 +2562,17 @@ public sealed partial class EmbeddedDatabase
 
     private const string AggregateValueAlias = "ahtola_aggregate_value";
 
+    private static bool IsGroupFirstDerivedProjectionLayout(SelectStatement select)
+        => select.Projections.Count == 2
+            && string.Equals(
+                select.Projections[0].Alias,
+                AggregateValueAlias,
+                StringComparison.Ordinal)
+            && string.Equals(
+                select.Projections[1].Alias,
+                CorrelationKeyAlias(0),
+                StringComparison.Ordinal);
+
     private static string CorrelationKeyAlias(int index)
         => string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
@@ -2480,9 +2713,10 @@ public sealed partial class EmbeddedDatabase
     /// <summary>
     /// True when evaluating the expression can raise instead of producing a value, using the
     /// same strict rules as <c>expression_can_fail_on_input</c>: every function call counts
-    /// (an application-defined one can throw), <c>LIKE</c> and <c>GLOB</c> count because they
-    /// can dispatch to a registered implementation, <c>RAISE</c> exists to fail, and the JSON
-    /// operators reject malformed input.
+    /// (an application-defined one can throw), <c>GLOB</c> counts because it can dispatch to a
+    /// registered implementation, <c>RAISE</c> exists to fail, and the JSON operators reject
+    /// malformed input. A plain <c>LIKE</c> is evaluated directly by this engine and is total;
+    /// only its optional <c>ESCAPE</c> clause can reject a non-single-character value.
     /// </summary>
     private static bool ExpressionCanFailOnInput(Expression? expression)
     {
@@ -2495,7 +2729,7 @@ public sealed partial class EmbeddedDatabase
             switch (candidate)
             {
                 case FunctionExpression:
-                case LikeExpression:
+                case LikeExpression { Escape: not null }:
                 case GlobExpression:
                 case RaiseExpression:
                 case BinaryExpression { Operator: BinaryOperator.JsonArrow or BinaryOperator.JsonArrowText }:

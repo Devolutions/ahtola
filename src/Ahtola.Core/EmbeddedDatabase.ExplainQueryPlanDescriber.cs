@@ -49,6 +49,289 @@ public sealed partial class EmbeddedDatabase
 
         var rewritten = RewriteSelectSubqueries(statement, context, outerRow: null);
 
+        // A cancellation-capable ordinary LEFT JOIN stays on the evaluator, but its preserved
+        // side and null-supplying equality lookup still use the same managed index access paths
+        // as their compiled counterparts. Describe those paths only when both plans are the
+        // exact paths GetJoinRows selects: WHERE narrows the preserved left side and no WHERE
+        // term narrows the right side before the ON lookup.
+        if (statement.Source is JoinTableSource
+            {
+                Kind: JoinKind.Left,
+                Left: NamedTableSource left,
+                Right: NamedTableSource right,
+                Condition: { } condition,
+            } join
+            && statement.Where is not null)
+        {
+            var (leftPredicate, rightPredicate) = SplitJoinSidePredicates(statement.Where, join, context);
+            var leftSelect = new SelectStatement(
+                Distinct: false,
+                Projections: [],
+                Source: left,
+                Where: leftPredicate,
+                GroupBy: [],
+                Having: null,
+                NamedWindows: [],
+                OrderBy: statement.OrderBy,
+                Limit: null,
+                Offset: null);
+            if (leftPredicate is not null
+                && rightPredicate is null
+                && TryPlanManagedIndexScan(leftSelect, context) is { } leftPlan
+                && TryPlanDeclaredIndexLookup(right, condition, context) is { } rightPlan)
+            {
+                var leftConstraint = leftPlan.SearchConstraint ?? $"{leftPlan.Index.Columns[0].Name}=?";
+                var leftDetail = $"SEARCH {left.Alias ?? left.Name} USING INDEX {leftPlan.Index.Name} ({leftConstraint})";
+                var rightAlias = right.Alias ?? right.Name;
+                var rightConstraint = rightPlan.SearchConstraint ?? $"{rightPlan.Index.Columns[0].Name}=?";
+                var rightDetail = $"SEARCH {rightAlias} USING INDEX {rightPlan.Index.Name} ({rightConstraint}) LEFT-JOIN";
+                var rows = new List<SqlValue[]>
+                {
+                    PlanRow(1, 0, leftDetail),
+                    PlanRow(2, 0, rightDetail),
+                };
+                var rowOps = new List<EqpJsonOp?>
+                {
+                    new EqpJsonSearchOp(
+                        left.Name,
+                        left.Alias,
+                        leftPlan.Index.Name,
+                        Covering: false,
+                        [$"{leftConstraint}"]),
+                    new EqpJsonSearchOp(
+                        right.Name,
+                        right.Alias,
+                        rightPlan.Index.Name,
+                        Covering: false,
+                        [$"{rightPlan.Index.Columns[0].Name}=?"],
+                        Join: "left"),
+                };
+                if (statement.OrderBy.Count != 0)
+                {
+                    rows.Add(PlanRow(28, 0, "USE SORTER FOR ORDER BY"));
+                    rowOps.Add(new EqpJsonOrderByOp());
+                }
+
+                result = new ExecutionResult(ExplainQueryPlanColumns(), rows, 0);
+                ops = rowOps;
+                return true;
+            }
+        }
+
+        // An uncorrelated IN list is materialized once, while scalar projections that reference
+        // the outer source remain per-row lookups. Keep those two lifetimes distinct in EQP:
+        // the list is a child scan and the scalar query is a correlated child of the outer seek.
+        if (statement.Source is NamedTableSource listOuter
+            && statement.Where is InSubqueryExpression
+            {
+                Negated: false,
+                Value: ColumnExpression inValue,
+                Query: SelectStatement
+                {
+                    Source: NamedTableSource listInner,
+                } inListQuery,
+            }
+            && statement.Projections.Select(static projection => projection.Expression)
+                .OfType<ScalarSubqueryExpression>()
+                .SingleOrDefault() is { Query: SelectStatement { Source: NamedTableSource scalarInner } scalarQuery } scalar
+            && context.Tables.TryGetValue(listOuter.Name, out var outerTable)
+            && context.Tables.TryGetValue(listInner.Name, out _)
+            && QueryReferencesFromNames(
+                scalar.Query,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    listOuter.Alias ?? listOuter.Name,
+                })
+            && !QueryReferencesFromNames(
+                inListQuery,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    listOuter.Alias ?? listOuter.Name,
+                })
+            && outerTable.Indexes.FirstOrDefault(index =>
+                QueryExpressionMatchesIndexTerm(inValue, outerTable, index.Columns[0])) is { } inIndex)
+        {
+            var outerAlias = listOuter.Alias ?? listOuter.Name;
+            var scalarAlias = scalarInner.Alias ?? scalarInner.Name;
+            var listAlias = listInner.Alias ?? listInner.Name;
+            var scalarPlan = TryPlanManagedIndexScan(scalarQuery, context);
+            var scalarDetail = scalarPlan is null
+                ? $"SCAN {scalarInner.Name}" + (scalarInner.Alias is null ? string.Empty : $" AS {scalarAlias}")
+                : FormatManagedIndexExplainDetail(scalarPlan, scalarQuery);
+            var scalarOp = scalarPlan is null
+                ? (EqpJsonOp)new EqpJsonScanOp(scalarInner.Name, scalarInner.Alias, IndexName: null, Covering: false)
+                : BuildIndexScanOp(scalarPlan, scalarQuery);
+
+            result = new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    PlanRow(1, 0, "LIST SUBQUERY 1"),
+                    PlanRow(4, 1, $"SCAN {listInner.Name}" + (listInner.Alias is null ? string.Empty : $" AS {listAlias}")),
+                    PlanRow(13, 0, $"SEARCH {outerAlias} USING INDEX {inIndex.Name} ({inValue.UnqualifiedName ?? inValue.Name}=?)"),
+                    PlanRow(23, 0, "CORRELATED SCALAR SUBQUERY 2"),
+                    PlanRow(26, 23, scalarDetail),
+                ],
+                0);
+            ops =
+            [
+                new EqpJsonListSubqueryOp(1, Correlated: false),
+                new EqpJsonScanOp(listInner.Name, listInner.Alias, IndexName: null, Covering: false),
+                new EqpJsonSearchOp(
+                    listOuter.Name,
+                    listOuter.Alias,
+                    inIndex.Name,
+                    Covering: IndexCoversSelect(statement, outerTable, inIndex),
+                    [$"{inValue.UnqualifiedName ?? inValue.Name}=?"],
+                    SearchKind: "in_seek"),
+                new EqpJsonScalarSubqueryOp(2, Correlated: true),
+                scalarOp,
+            ];
+            return true;
+        }
+
+        if (statement.Source is NamedTableSource inOnlyOuter
+            && statement.Where is InSubqueryExpression
+            {
+                Negated: false,
+                Value: ColumnExpression inOnlyValue,
+                Query: SelectStatement
+                {
+                    Source: NamedTableSource inOnlyInner,
+                } inOnlyListQuery,
+            }
+            && !statement.Projections.Any(static projection => projection.Expression is ScalarSubqueryExpression)
+            && context.Tables.TryGetValue(inOnlyOuter.Name, out var inOnlyOuterTable)
+            && context.Tables.TryGetValue(inOnlyInner.Name, out _)
+            && !QueryReferencesFromNames(
+                inOnlyListQuery,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    inOnlyOuter.Alias ?? inOnlyOuter.Name,
+                })
+            && inOnlyOuterTable.Indexes.FirstOrDefault(index =>
+                QueryExpressionMatchesIndexTerm(inOnlyValue, inOnlyOuterTable, index.Columns[0])) is { } inOnlyIndex)
+        {
+            var outerAlias = inOnlyOuter.Alias ?? inOnlyOuter.Name;
+            var listAlias = inOnlyInner.Alias ?? inOnlyInner.Name;
+            var hasOrderBy = statement.OrderBy.Count > 0;
+            var rows = new List<SqlValue[]>
+            {
+                PlanRow(1, 0, "LIST SUBQUERY 1"),
+                PlanRow(4, 1, $"SCAN {inOnlyInner.Name}" + (inOnlyInner.Alias is null ? string.Empty : $" AS {listAlias}")),
+                PlanRow(13, 0, $"SEARCH {outerAlias} USING INDEX {inOnlyIndex.Name} ({inOnlyValue.UnqualifiedName ?? inOnlyValue.Name}=?)"),
+            };
+            var rowOps = new List<EqpJsonOp?>
+            {
+                new EqpJsonListSubqueryOp(1, Correlated: false),
+                new EqpJsonScanOp(inOnlyInner.Name, inOnlyInner.Alias, IndexName: null, Covering: false),
+                new EqpJsonSearchOp(
+                    inOnlyOuter.Name,
+                    inOnlyOuter.Alias,
+                    inOnlyIndex.Name,
+                    Covering: IndexCoversSelect(statement, inOnlyOuterTable, inOnlyIndex),
+                    [$"{inOnlyValue.UnqualifiedName ?? inOnlyValue.Name}=?"],
+                    SearchKind: "in_seek"),
+            };
+            if (hasOrderBy)
+            {
+                rows.Add(PlanRow(29, 0, "USE SORTER FOR ORDER BY"));
+                rowOps.Add(new EqpJsonOrderByOp());
+            }
+
+            result = new ExecutionResult(ExplainQueryPlanColumns(), rows, 0);
+            ops = rowOps;
+            return true;
+        }
+
+        // LIMIT keeps a correlated IN subquery on the evaluator rather than rewriting it into
+        // a semi join. Its execution evaluates the list once for each outer row, so report the
+        // real nested scan shape rather than the generic evaluator fallback.
+        if (statement.Limit is not null
+            && statement.Source is NamedTableSource limitedOuter
+            && statement.Where is InSubqueryExpression
+            {
+                Query: SelectStatement
+                {
+                    Source: NamedTableSource limitedInner,
+                } listQuery,
+            } inSubquery
+            && QueryReferencesFromNames(
+                inSubquery.Query,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    limitedOuter.Alias ?? limitedOuter.Name,
+                }))
+        {
+            var outerAlias = limitedOuter.Alias ?? limitedOuter.Name;
+            var innerAlias = limitedInner.Alias ?? limitedInner.Name;
+            result = new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    PlanRow(1, 0, $"SCAN {limitedOuter.Name} AS {outerAlias}"),
+                    PlanRow(6, 0, "CORRELATED LIST SUBQUERY 1"),
+                    PlanRow(8, 6, $"SCAN {limitedInner.Name} AS {innerAlias}"),
+                ],
+                0);
+            ops =
+            [
+                new EqpJsonScanOp(limitedOuter.Name, limitedOuter.Alias, IndexName: null, Covering: false),
+                new EqpJsonListSubqueryOp(1, Correlated: true),
+                new EqpJsonScanOp(limitedInner.Name, limitedInner.Alias, IndexName: null, Covering: false),
+            ];
+            return true;
+        }
+
+        // Group-first aggregate decorrelation materializes the aggregate once per correlation
+        // key, then left-joins that grouped result to the outer scan. The evaluator executes
+        // this derived source as a grouped table, so expose its real source and grouping work
+        // instead of collapsing it into the generic evaluator fallback.
+        if (rewritten.Source is JoinTableSource
+            {
+                Kind: JoinKind.Left,
+                Left: NamedTableSource groupedOuter,
+                Right: DerivedTableSource
+                {
+                    Query: SelectStatement
+                    {
+                        Source: NamedTableSource groupedInner,
+                        GroupBy.Count: > 0,
+                    } groupedQuery,
+                },
+            })
+        {
+            var outerAlias = groupedOuter.Alias ?? groupedOuter.Name;
+            var innerAlias = groupedInner.Alias ?? groupedInner.Name;
+            var groupedIndexPlan = TryPlanManagedIndexScan(groupedQuery, context);
+            var groupedDetail = groupedIndexPlan is null
+                ? $"SCAN {groupedInner.Name} AS {innerAlias}"
+                : FormatManagedIndexExplainDetail(groupedIndexPlan, groupedQuery);
+            var groupedOp = groupedIndexPlan is null
+                ? (EqpJsonOp)new EqpJsonScanOp(groupedInner.Name, groupedInner.Alias, IndexName: null, Covering: false)
+                : BuildIndexScanOp(groupedIndexPlan, groupedQuery);
+            result = new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    PlanRow(1, 0, $"SCAN {groupedOuter.Name} AS {outerAlias}"),
+                    PlanRow(2, 0, "SEARCH scalar_subquery_1"),
+                    PlanRow(3, 2, groupedDetail),
+                    PlanRow(4, 2, "USE SORTER FOR GROUP BY"),
+                ],
+                0);
+            ops =
+            [
+                new EqpJsonScanOp(groupedOuter.Name, groupedOuter.Alias, IndexName: null, Covering: false),
+                new EqpJsonSearchOp(
+                    "scalar_subquery_1",
+                    Alias: null,
+                    IndexName: null,
+                    Covering: false,
+                    Constraints: []),
+                groupedOp,
+                new EqpJsonGroupByOp(),
+            ];
+            return true;
+        }
+
         // Join-first: SubqueryRewrites.cs replaces the subquery with a real LEFT JOIN of the
         // inner table, grouped back to one row per outer row through the outer table's rowid,
         // with the original comparison moved to HAVING. Pattern-matching only the *resulting*
@@ -111,13 +394,76 @@ public sealed partial class EmbeddedDatabase
         // EXISTS/NOT EXISTS unnested into an internal semi/anti join (unnest.rs's
         // try_rewrite_exists): the inner table's columns are never visible past a semi/anti join
         // (JoinKind.ProducesLeftShapeOnly), so it is used only for the correlation test itself.
-        // TryBuildCompiledJoinSource declines Semi/Anti unconditionally (no bytecode lowering
-        // exists for it), so this always runs on the evaluator's GetSemiOrAntiJoinRows, which
-        // always probes an in-memory hash bucket built by TryGetTransientLookupRows -- it never
-        // seeks a real declared index, even when one exists on the correlation column. Describe
-        // that honestly ("USING AUTOMATIC COVERING INDEX", matching the same wording the
-        // compiled route's own genuinely-automatic hash join already uses elsewhere) rather than
-        // naming a real index this access path never actually reads.
+        // GetSemiOrAntiJoinRows prefers the same eligible declared lookup plan below and falls
+        // back to its automatic hash lookup when none is available.
+        if (TryDescribeSemiAntiJoinChain(rewritten.Source, context, out var chainOuter, out var chainJoins)
+            && chainJoins.Count > 1)
+        {
+            var rows = new List<SqlValue[]> { PlanRow(1, 0, $"SCAN {chainOuter.Name} AS {chainOuter.Alias ?? chainOuter.Name}") };
+            var rowOps = new List<EqpJsonOp?>
+            {
+                new EqpJsonScanOp(chainOuter.Name, chainOuter.Alias, IndexName: null, Covering: false),
+            };
+            for (var index = 0; index < chainJoins.Count; index++)
+            {
+                var (kind, inner, column) = chainJoins[index];
+                var alias = inner.Alias ?? inner.Name;
+                var indexName = $"ephemeral_{inner.Name}_t{(index + 1) * 2 + 1}";
+                rows.Add(PlanRow(index + 2, 0, $"SEARCH {alias} USING COVERING INDEX {indexName} ({column}=?)"));
+                rowOps.Add(
+                    new EqpJsonSearchOp(
+                        inner.Name,
+                        inner.Alias,
+                        indexName,
+                        Covering: true,
+                        [$"{column}=?"],
+                        Join: kind == JoinKind.Semi ? "semi" : "anti",
+                        Ephemeral: true));
+            }
+
+            result = new ExecutionResult(ExplainQueryPlanColumns(), rows, 0);
+            ops = rowOps;
+            return true;
+        }
+
+        if (rewritten.Source is JoinTableSource
+            {
+                Kind: JoinKind.Semi or JoinKind.Anti,
+            } singleSemiAntiSource
+            && singleSemiAntiSource is
+            {
+                Left: NamedTableSource inOuter,
+                Right: NamedTableSource inInner,
+            }
+            && TryDescribeSemiOrAntiCorrelationColumns(singleSemiAntiSource.Condition, inInner, context, out var inColumns)
+            && inColumns.Count > 1)
+        {
+            var outerAlias = inOuter.Alias ?? inOuter.Name;
+            var innerAlias = inInner.Alias ?? inInner.Name;
+            var indexName = $"ephemeral_{inInner.Name}_t3";
+            var constraints = inColumns.Select(static column => $"{column}=?").ToArray();
+            result = new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    PlanRow(1, 0, $"SCAN {inOuter.Name} AS {outerAlias}"),
+                    PlanRow(2, 0, $"SEARCH {innerAlias} USING COVERING INDEX {indexName} ({string.Join(" AND ", constraints)})"),
+                ],
+                0);
+            ops =
+            [
+                new EqpJsonScanOp(inOuter.Name, inOuter.Alias, IndexName: null, Covering: false),
+                new EqpJsonSearchOp(
+                    inInner.Name,
+                    inInner.Alias,
+                    indexName,
+                    Covering: true,
+                    constraints,
+                    Join: singleSemiAntiSource.Kind == JoinKind.Semi ? "semi" : "anti",
+                    Ephemeral: true),
+            ];
+            return true;
+        }
+
         if (rewritten.Source is JoinTableSource
             {
                 Kind: JoinKind.Semi or JoinKind.Anti,
@@ -132,11 +478,18 @@ public sealed partial class EmbeddedDatabase
         {
             var outerAlias = semiOuter.Alias ?? semiOuter.Name;
             var innerAlias = semiInner.Alias ?? semiInner.Name;
+            var lookupPlan = TryPlanDeclaredIndexLookup(semiInner, semiCondition, context);
+            var indexName = lookupPlan?.Index.Name;
+            var ephemeral = lookupPlan is null;
+            var reportedIndexName = indexName ?? $"ephemeral_{semiInner.Name}_t3";
+            var indexDetail = lookupPlan is null
+                ? $"COVERING INDEX {reportedIndexName}"
+                : $"COVERING INDEX {reportedIndexName}";
             result = new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
                     PlanRow(1, 0, $"SCAN {semiOuter.Name} AS {outerAlias}"),
-                    PlanRow(2, 0, $"SEARCH {innerAlias} USING AUTOMATIC COVERING INDEX ({innerColumn}=?)"),
+                    PlanRow(2, 0, $"SEARCH {innerAlias} USING {indexDetail} ({innerColumn}=?)"),
                 ],
                 0);
             ops =
@@ -145,11 +498,11 @@ public sealed partial class EmbeddedDatabase
                 new EqpJsonSearchOp(
                     semiInner.Name,
                     semiInner.Alias,
-                    IndexName: null,
+                    reportedIndexName,
                     Covering: true,
                     [$"{innerColumn}=?"],
                     Join: semiAntiSource.Kind == JoinKind.Semi ? "semi" : "anti",
-                    Ephemeral: true),
+                    Ephemeral: ephemeral),
             ];
             return true;
         }
@@ -186,12 +539,29 @@ public sealed partial class EmbeddedDatabase
                     $"SCAN {plainOuter.Name} AS {plainOuter.Alias ?? plainOuter.Name}",
                     (EqpJsonOp)new EqpJsonScanOp(plainOuter.Name, plainOuter.Alias, IndexName: null, Covering: false));
 
-            var rows = new List<SqlValue[]>(correlated.Count + 1) { PlanRow(1, 0, outerDetail) };
-            var rowOps = new List<EqpJsonOp?>(correlated.Count + 1) { outerOp };
+            var rows = new List<SqlValue[]>(correlated.Count * 2 + 1) { PlanRow(1, 0, outerDetail) };
+            var rowOps = new List<EqpJsonOp?>(correlated.Count * 2 + 1) { outerOp };
+            var nextId = 2;
             for (var index = 0; index < correlated.Count; index++)
             {
-                rows.Add(PlanRow(index + 2, 0, $"CORRELATED SCALAR SUBQUERY {index + 1}"));
+                var subqueryId = nextId++;
+                rows.Add(PlanRow(subqueryId, 0, $"CORRELATED SCALAR SUBQUERY {index + 1}"));
                 rowOps.Add(new EqpJsonScalarSubqueryOp(index + 1, Correlated: true));
+
+                // Aggregate correlated subqueries use the same managed index planner and
+                // equality-pruned traversal as normal execution. Emit the child only for that
+                // execution-backed shape; other scalar subqueries still execute through their
+                // existing generic evaluator route.
+                if (correlated[index].Query is SelectStatement inner
+                    && IsAggregateSelect(inner)
+                    && TryPlanManagedIndexScan(inner, context) is { Search: true } innerIndexPlan)
+                {
+                    rows.Add(PlanRow(
+                        nextId++,
+                        subqueryId,
+                        FormatManagedIndexExplainDetail(innerIndexPlan, inner)));
+                    rowOps.Add(BuildIndexScanOp(innerIndexPlan, inner));
+                }
             }
 
             result = new ExecutionResult(ExplainQueryPlanColumns(), rows, 0);
@@ -211,13 +581,13 @@ public sealed partial class EmbeddedDatabase
     private static EqpJsonOp BuildIndexScanOp(ManagedIndexScanPlan plan, SelectStatement select)
     {
         var covering = IndexCoversSelect(select, plan.Table, plan.Index);
-        return plan.Search && plan.Index.Columns[0].Expression is null
+        return plan.Search
             ? new EqpJsonSearchOp(
                 plan.Table.Name,
                 plan.Source.Alias,
                 plan.Index.Name,
                 covering,
-                [$"{plan.Index.Columns[0].Name}=?"])
+                [plan.SearchConstraint ?? $"{plan.Index.Columns[0].Name}=?"])
             : new EqpJsonScanOp(plan.Table.Name, plan.Source.Alias, plan.Index.Name, covering);
     }
 
@@ -251,10 +621,76 @@ public sealed partial class EmbeddedDatabase
             && table.TryGetColumnIndex(columnName, out _);
     }
 
+    private static bool TryDescribeSemiOrAntiCorrelationColumns(
+        Expression? condition,
+        NamedTableSource inner,
+        QueryContext context,
+        out IReadOnlyList<string> columnNames)
+    {
+        columnNames = [];
+        if (condition is null)
+            return false;
+
+        var names = new List<string>();
+        foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(condition))
+        {
+            if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } equality
+                || !TryDescribeSemiOrAntiCorrelationColumn(equality, inner, context, out var name)
+                || names.Contains(name, StringComparer.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            names.Add(name);
+        }
+
+        columnNames = names;
+        return names.Count > 0;
+    }
+
     private static bool IsColumnQualifiedBy(Expression expression, string qualifier)
         => expression is ColumnExpression { BooleanKeyword: null } column
             && column.Qualifier is not null
             && string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase);
+
+    private static bool TryDescribeSemiAntiJoinChain(
+        TableSource? source,
+        QueryContext context,
+        out NamedTableSource outer,
+        out List<(JoinKind Kind, NamedTableSource Inner, string Column)> joins)
+    {
+        joins = [];
+        return Collect(source, context, joins, out outer);
+
+        static bool Collect(
+            TableSource? current,
+            QueryContext queryContext,
+            List<(JoinKind Kind, NamedTableSource Inner, string Column)> collected,
+            out NamedTableSource foundOuter)
+        {
+            if (current is NamedTableSource named)
+            {
+                foundOuter = named;
+                return true;
+            }
+
+            if (current is not JoinTableSource
+                {
+                    Kind: JoinKind.Semi or JoinKind.Anti,
+                    Right: NamedTableSource inner,
+                    Condition: BinaryExpression { Operator: BinaryOperator.Equal } condition,
+                } join
+                || !Collect(join.Left, queryContext, collected, out foundOuter)
+                || !TryDescribeSemiOrAntiCorrelationColumn(condition, inner, queryContext, out var column))
+            {
+                foundOuter = null!;
+                return false;
+            }
+
+            collected.Add((join.Kind, inner, column));
+            return true;
+        }
+    }
 }
 
 /// <summary>
@@ -332,6 +768,60 @@ internal sealed record EqpJsonScanOp(
         AppendIndexField(json, IndexName, Covering, Ephemeral);
         return json.Append('}').ToString();
     }
+}
+
+/// <summary>A coroutine-style read of a FROM-clause derived subquery.</summary>
+internal sealed record EqpJsonSubqueryScanOp(int SubqueryId) : EqpJsonOp
+{
+    public override string ToJson() =>
+        $"{{\"type\":\"scan\",\"table\":\"(subquery-{SubqueryId})\",\"subquery\":{{\"execution\":\"coroutine\"}},\"source\":\"subquery\"}}";
+}
+
+/// <summary>A compound query and one of its set-operation arms.</summary>
+internal sealed record EqpJsonCompoundOp : EqpJsonOp
+{
+    public override string ToJson() => "{\"type\":\"compound\"}";
+}
+
+/// <summary>One arm of a compound query, including whether it requires a temporary B-tree.</summary>
+internal sealed record EqpJsonCompoundArmOp(string Operation, bool TempBtree) : EqpJsonOp
+{
+    public override string ToJson() =>
+        $"{{\"type\":\"compound_arm\",\"op\":{EmbeddedDatabase.JsonEscape(Operation)},\"temp_btree\":{(TempBtree ? "true" : "false")}}}";
+}
+
+/// <summary>The setup and recursive-step phases of a recursive CTE.</summary>
+internal sealed record EqpJsonRecursiveSetupOp : EqpJsonOp
+{
+    public override string ToJson() => "{\"type\":\"recursive_setup\"}";
+}
+
+internal sealed record EqpJsonRecursiveStepOp : EqpJsonOp
+{
+    public override string ToJson() => "{\"type\":\"recursive_step\"}";
+}
+
+internal sealed record EqpJsonRecursiveCteScanOp(string Table) : EqpJsonOp
+{
+    public override string ToJson() =>
+        $"{{\"type\":\"scan\",\"table\":{EmbeddedDatabase.JsonEscape(Table)},\"subquery\":{{\"execution\":\"coroutine\",\"cte_id\":0,\"recursive\":true}},\"source\":\"subquery\"}}";
+}
+
+internal sealed record EqpJsonRecursiveCteInputScanOp(string Table) : EqpJsonOp
+{
+    public override string ToJson() =>
+        $"{{\"type\":\"scan\",\"table\":{EmbeddedDatabase.JsonEscape(Table)},\"source\":\"recursive_cte_input\"}}";
+}
+
+/// <summary>A join seek into a once-materialized common table expression.</summary>
+internal sealed record EqpJsonCteReuseSearchOp(
+    string Table,
+    string Alias,
+    string IndexName,
+    string Constraint) : EqpJsonOp
+{
+    public override string ToJson() =>
+        $"{{\"type\":\"search\",\"table\":{EmbeddedDatabase.JsonEscape(Table)},\"alias\":{EmbeddedDatabase.JsonEscape(Alias)},\"join\":\"inner\",\"subquery\":{{\"execution\":\"materialized_reuse\",\"cte_id\":0}},\"search_kind\":\"seek\",\"index\":{{\"name\":{EmbeddedDatabase.JsonEscape(IndexName)},\"covering\":false,\"ephemeral\":true}},\"constraints\":[{EmbeddedDatabase.JsonEscape(Constraint)}]}}";
 }
 
 /// <summary>

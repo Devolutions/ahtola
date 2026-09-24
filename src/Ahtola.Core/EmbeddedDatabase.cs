@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Ahtola.Core.Collation;
 using Ahtola.Core.Compilation;
+using Ahtola.Core.Compilation.JoinOrdering;
 using Ahtola.Core.Execution;
 using Ahtola.Core.Mvcc;
 using Ahtola.Core.Parsing;
@@ -780,12 +781,32 @@ public sealed partial class EmbeddedDatabase : IDisposable
         NamedTableSource Source,
         EmbeddedTable Table,
         EmbeddedIndex Index,
-        bool Search);
+        bool Search,
+        string? SearchConstraint,
+        bool Reverse);
 
     private sealed record ManagedOrIndexUnionPlan(
         NamedTableSource Source,
         EmbeddedTable Table,
-        IReadOnlyList<(EmbeddedIndex Index, Expression Branch)> Branches);
+        IReadOnlyList<ManagedOrIndexUnionBranch> Branches);
+
+    private sealed record ManagedOrIndexUnionBranch(
+        EmbeddedIndex? Index,
+        string Name,
+        Expression Predicate);
+
+    private sealed record ManagedJoinLocalOrPlan(
+        NamedTableSource NodeSource,
+        EmbeddedTable NodeTable,
+        EmbeddedIndex NodePrimaryKeyIndex,
+        NamedTableSource EdgeSource,
+        ManagedIndexScanPlan EdgeScan,
+        Expression EdgePredicate,
+        IReadOnlyList<ManagedJoinLocalOrBranch> Branches);
+
+    private sealed record ManagedJoinLocalOrBranch(
+        int NodeKeyColumn,
+        int EdgeKeyColumn);
 
     private sealed record ReturningTableSnapshot(SqlValue[][] Rows, long[] RowIds);
 
@@ -7290,6 +7311,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private ExecutionResult ExecuteAnalyze(AnalyzeStatement statement, SchemaCatalog catalog)
     {
+        // SQLite accepts ANALYZE sqlite_schema after an application edits sqlite_stat1 directly.
+        // It reloads planner statistics rather than regenerating them, so the catalog-backed
+        // planner needs no work here: each lookup reads the live stats table.
+        if (statement.Target is { } schemaTable && IsSchemaTable(schemaTable))
+            return new ExecutionResult([], [], 0);
+
         var targets = ResolveAnalyzeTargets(statement.Target, catalog);
         if (targets.Count == 0)
             return new ExecutionResult([], [], 0, Changed: true);
@@ -18329,8 +18356,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // shape can never suppress a diagnostic the original statement produces, and before
         // planning so both the bytecode route and the evaluator see the rewritten form.
         select = RewriteSelectSubqueries(select, context, outerRow);
-        var canUseCompiledRoute = CanUseCompiledSelectRoute(select, context, outerRow)
-            && !SourceContainsSemiOrAntiJoin(select.Source);
+        var canUseCompiledRoute = CanUseCompiledSelectRoute(select, context, outerRow);
         CompiledSelect? compiled = null;
         if (canUseCompiledRoute)
         {
@@ -18404,24 +18430,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
             || select.Source is NamedTableSource named
                 && TryGetVirtualTable(context, named, out _);
         return context.ConcurrentMvStore is null
-            && (isVirtualTableScan || !context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
-            && (isVirtualTableScan || !CanStreamProjectionRows(select, context, outerRow, IsAggregateSelect(select)));
+            && (isVirtualTableScan
+                || !context.CancellationToken.CanBeCanceled
+                || IsAggregateSelect(select)
+                || SourceContainsSemiOrAntiJoin(select.Source))
+            && (isVirtualTableScan
+                || SourceContainsSemiOrAntiJoin(select.Source)
+                || !CanStreamProjectionRows(select, context, outerRow, IsAggregateSelect(select)));
     }
-
-    // True when any node of the FROM tree is one of the internal semi/anti joins introduced by
-    // the correlated-subquery rewrite. Those have no bytecode lowering, so the whole select
-    // stays on the evaluator.
-    private static bool SourceContainsSemiOrAntiJoin(TableSource? source)
-        => source is JoinTableSource join
-            && (join.Kind.ProducesLeftShapeOnly()
-                || SourceContainsSemiOrAntiJoin(join.Left)
-                || SourceContainsSemiOrAntiJoin(join.Right));
 
     private bool IsAggregateSelect(SelectStatement select) =>
         select.GroupBy.Count > 0
         || select.Projections.Any(projection => ContainsAggregate(projection.Expression))
         || select.Having is not null && ContainsAggregate(select.Having)
         || select.OrderBy.Any(term => ContainsAggregate(term.Expression));
+
+    private static bool SourceContainsSemiOrAntiJoin(TableSource? source)
+        => source is JoinTableSource join
+            && (join.Kind.ProducesLeftShapeOnly()
+                || SourceContainsSemiOrAntiJoin(join.Left)
+                || SourceContainsSemiOrAntiJoin(join.Right));
 
     private bool TryCompileSelect(
         SelectStatement select,
@@ -18663,7 +18691,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var qualifiedColumns = BuildQualifiedColumns(qualifier, plan.Table.Columns);
         var indexLabel = string.Join(
             "+",
-            plan.Branches.Select(branch => branch.Index.Name).Distinct(StringComparer.OrdinalIgnoreCase));
+            plan.Branches.Select(static branch => branch.Name).Distinct(StringComparer.OrdinalIgnoreCase));
         var target = new ScanTarget(
             plan.Source.Name,
             qualifier,
@@ -18854,7 +18882,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyList<long>? rowIds;
         if (materializeIndexRows)
         {
-            var indexed = GetManagedIndexRows(plan, context, outerRow);
+            var indexed = GetManagedIndexRows(
+                plan,
+                context,
+                outerRow,
+                predicate: select.Where,
+                parameters: parameters);
             rows = indexed.Rows.Select(row => row.Values).ToArray();
             rowIds = plan.Table.HasRowid
                 ? indexed.Rows.Select(row =>
@@ -20556,6 +20589,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (select.Source is not JoinTableSource join)
             return false;
 
+        if (TryCompileAutomaticSemiJoinSelect(select, join, context, out compiled))
+            return true;
+
         // Only the two shapes JoinProgramBuilder lowers; RIGHT/FULL stay on the evaluator.
         JoinType joinType;
         if (join.Kind == JoinKind.Inner)
@@ -20585,6 +20621,201 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     || ContainsUnsafeCompiledCollation(select.Where)))
         {
             return false;
+        }
+
+        // A narrow, executable lowering for the correlated-IN rewrite. Unlike OpenJoinCursor this
+        // opens both base sources and builds/probes its automatic index in bytecode, so ordinary
+        // EXPLAIN exposes the same cursor ownership and access path normal execution uses.
+        bool TryCompileAutomaticSemiJoinSelect(
+            SelectStatement select,
+            JoinTableSource join,
+            QueryContext context,
+            out CompiledSelect compiled)
+        {
+            compiled = null!;
+            if (join.Kind != JoinKind.Semi
+                || join.Left is not NamedTableSource outer
+                || join.Right is not NamedTableSource inner
+                || join.Condition is null
+                || select.Where is not null
+                || select.Distinct
+                || select.Having is not null
+                || select.GroupBy.Count != 0
+                || select.OrderBy.Count != 0
+                || select.Limit is not null
+                || select.Offset is not null
+                || !context.Tables.TryGetValue(outer.Name, out var outerTable)
+                || !context.Tables.TryGetValue(inner.Name, out var innerTable)
+                || outerTable.ColumnDefinitions.Any(column =>
+                    !string.Equals(column.Collation ?? "BINARY", "BINARY", StringComparison.OrdinalIgnoreCase))
+                || innerTable.ColumnDefinitions.Any(column =>
+                    !string.Equals(column.Collation ?? "BINARY", "BINARY", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            var outerTarget = ResolveScanTarget(outer, context);
+            var innerTarget = ResolveScanTarget(inner, context);
+            if (outerTarget is null || innerTarget is null)
+                return false;
+
+            var outerQualifier = outer.Alias ?? outer.Name;
+            var innerQualifier = inner.Alias ?? inner.Name;
+            var keyPairs = new List<(int Outer, int Inner)>();
+            foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(join.Condition))
+            {
+                if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } equality
+                    || !TryGetAutomaticSemiJoinKeyPair(
+                        equality.Left,
+                        equality.Right,
+                        outerQualifier,
+                        innerQualifier,
+                        outerTable,
+                        innerTable,
+                        out var pair))
+                {
+                    return false;
+                }
+
+                if (outerTable.GetColumnAffinity(outerTable.ColumnDefinitions[pair.Outer])
+                    != innerTable.GetColumnAffinity(innerTable.ColumnDefinitions[pair.Inner]))
+                {
+                    // NoConflict compares raw automatic-index keys. A mismatched affinity
+                    // can make an INTEGER value and its TEXT representation equal in SQL but
+                    // distinct in the automatic index, so leave that shape with the evaluator.
+                    return false;
+                }
+
+                keyPairs.Add(pair);
+            }
+
+            if (keyPairs.Count == 0 || keyPairs.Select(static pair => pair.Inner).Distinct().Count() != keyPairs.Count)
+                return false;
+
+            var outputColumns = new List<int>(select.Projections.Count);
+            foreach (var projection in select.Projections)
+            {
+                if (projection.Expression is not ColumnExpression column
+                    || column.BooleanKeyword is not null
+                    || !IsColumnQualifiedBy(column, outerQualifier)
+                    || !outerTable.TryGetColumnIndex(column.UnqualifiedName ?? column.Name, out var ordinal))
+                {
+                    return false;
+                }
+
+                outputColumns.Add(ordinal);
+            }
+
+            var outerCursor = new Cursor(0);
+            var innerCursor = new Cursor(1);
+            var automaticIndex = new Cursor(2);
+            var keyRange = new RegisterRange(new Register(outputColumns.Count), keyPairs.Count);
+            var instructions = new List<VdbeInstruction>
+            {
+                new OpenReadCursorInstruction(
+                    outerCursor,
+                    outer.Name,
+                    outerTarget.Columns.Length,
+                    ExplainAsOpenRead: true),
+                new OpenReadCursorInstruction(
+                    innerCursor,
+                    inner.Name,
+                    innerTarget.Columns.Length,
+                    ExplainAsOpenRead: true),
+                new OpenAutoindexInstruction(automaticIndex, keyPairs.Count),
+            };
+
+            var innerRewindIndex = instructions.Count;
+            instructions.Add(new HaltInstruction());
+            var innerBuildStart = instructions.Count;
+            for (var index = 0; index < keyPairs.Count; index++)
+                instructions.Add(new ColumnInstruction(innerCursor, keyPairs[index].Inner, new Register(keyRange.Start.Index + index)));
+            instructions.Add(new IdxInsertInstruction(
+                automaticIndex,
+                keyRange,
+                VdbeIdxInsertFlags.NoOpDuplicate));
+            instructions.Add(new NextInstruction(innerCursor, new ProgramCounter(innerBuildStart)));
+
+            var outerRewindIndex = instructions.Count;
+            instructions.Add(new HaltInstruction());
+            var outerLoop = instructions.Count;
+            for (var index = 0; index < keyPairs.Count; index++)
+                instructions.Add(new ColumnInstruction(outerCursor, keyPairs[index].Outer, new Register(keyRange.Start.Index + index)));
+            var noConflictIndex = instructions.Count;
+            instructions.Add(new HaltInstruction());
+            for (var index = 0; index < outputColumns.Count; index++)
+                instructions.Add(new ColumnInstruction(outerCursor, outputColumns[index], new Register(index)));
+            instructions.Add(new ResultRowInstruction(new RegisterRange(new Register(0), outputColumns.Count)));
+            var outerNext = instructions.Count;
+            instructions.Add(new NextInstruction(outerCursor, new ProgramCounter(outerLoop)));
+            var closeIndex = instructions.Count;
+            instructions.Add(new CloseCursorInstruction(automaticIndex));
+            instructions.Add(new CloseCursorInstruction(innerCursor));
+            instructions.Add(new CloseCursorInstruction(outerCursor));
+            instructions.Add(new HaltInstruction());
+
+            instructions[innerRewindIndex] = new RewindCursorInstruction(innerCursor, new ProgramCounter(outerRewindIndex));
+            instructions[outerRewindIndex] = new RewindCursorInstruction(outerCursor, new ProgramCounter(closeIndex));
+            instructions[noConflictIndex] = new NoConflictInstruction(
+                automaticIndex,
+                keyRange,
+                new ProgramCounter(outerNext),
+                $"skip non-member, goto {outerNext}");
+
+            compiled = new CompiledSelect(
+                new VdbeProgram(
+                    outputColumns.Count + keyPairs.Count,
+                    cursorCount: 3,
+                    instructions),
+                [
+                    outerTarget.CreateCursorSource(),
+                    innerTarget.CreateCursorSource(),
+                    new VdbeCursorSource([]),
+                ]);
+            return true;
+        }
+
+        static bool TryGetAutomaticSemiJoinKeyPair(
+            Expression first,
+            Expression second,
+            string outerQualifier,
+            string innerQualifier,
+            EmbeddedTable outer,
+            EmbeddedTable inner,
+            out (int Outer, int Inner) pair)
+        {
+            pair = default;
+            if (TryGetAutomaticSemiJoinKeyPairDirectional(first, second, outerQualifier, innerQualifier, outer, inner, out pair)
+                || TryGetAutomaticSemiJoinKeyPairDirectional(second, first, outerQualifier, innerQualifier, outer, inner, out pair))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        static bool TryGetAutomaticSemiJoinKeyPairDirectional(
+            Expression outerExpression,
+            Expression innerExpression,
+            string outerQualifier,
+            string innerQualifier,
+            EmbeddedTable outer,
+            EmbeddedTable inner,
+            out (int Outer, int Inner) pair)
+        {
+            pair = default;
+            if (outerExpression is not ColumnExpression { BooleanKeyword: null } outerColumn
+                || innerExpression is not ColumnExpression { BooleanKeyword: null } innerColumn
+                || !IsColumnQualifiedBy(outerColumn, outerQualifier)
+                || !IsColumnQualifiedBy(innerColumn, innerQualifier)
+                || !outer.TryGetColumnIndex(outerColumn.UnqualifiedName ?? outerColumn.Name, out var outerOrdinal)
+                || !inner.TryGetColumnIndex(innerColumn.UnqualifiedName ?? innerColumn.Name, out var innerOrdinal))
+            {
+                return false;
+            }
+
+            pair = (outerOrdinal, innerOrdinal);
+            return true;
         }
 
         // An analyzed ordinary index may be selected only by the shared costed join planner.
@@ -21011,6 +21242,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 out compiled);
         }
 
+        if (TryCompileGroupedDerivedSeekJoin(
+                select,
+                parameters,
+                context,
+                outerRow,
+                out compiled))
+        {
+            return true;
+        }
+
         if (select.Having is not null
             || select.GroupBy.Count != 0
             || select.Projections.Any(projection =>
@@ -21134,7 +21375,207 @@ public sealed partial class EmbeddedDatabase : IDisposable
             distinctEquality,
             sourceConsumesLimit ? 0 : offset,
             sourceConsumesLimit ? null : limit);
-        compiled = new CompiledSelect(program, [new VdbeCursorSource([])]);
+        compiled = new CompiledSelect(
+            program,
+            [new VdbeCursorSource([])],
+            SupportingPrograms: source.SupportingPrograms);
+        return true;
+    }
+
+    private bool TryCompileGroupedDerivedSeekJoin(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+        if (select.Source is not JoinTableSource
+            {
+                Kind: JoinKind.Left,
+                Left: NamedTableSource leftNamed,
+                Right: DerivedTableSource { Query: SelectStatement derivedSelect, Alias: { } derivedAlias },
+                Condition: { } condition,
+            } join
+            || select.Distinct
+            || select.Where is not null
+            || select.GroupBy.Count != 0
+            || select.Having is not null
+            || select.OrderBy.Count != 0
+            || select.Limit is not null
+            || select.Offset is not null
+            || select.Projections.Count != 2
+            || outerRow is not null
+            || ResolveScanTarget(leftNamed, context) is not { HasRowId: true } outerTarget
+            || !context.Tables.TryGetValue(leftNamed.Name, out var outerTable)
+            || outerTable.RowidAliasColumnIndex < 0
+            || !TryCompileSelect(derivedSelect, parameters, context, outerRow: null, out var derivedCompiled))
+        {
+            return false;
+        }
+
+        var leftColumns = GetOutputColumns(join.Left, context);
+        var rightColumns = GetOutputColumns(join.Right, context);
+        if (TryCreateEquiJoinKey(
+                condition,
+                join,
+                leftColumns,
+                rightColumns,
+                context,
+                allowUnhashableCollation: true) is not { } key
+            || key.Collation is not "BINARY"
+            || key.LeftConvertsTextToNumeric
+            || key.LeftConvertsNumericToText
+            || key.RightConvertsTextToNumeric
+            || key.RightConvertsNumericToText
+            || key.LeftColumn.Index < 0
+            || key.LeftColumn.Index >= outerTarget.Columns.Length
+            || key.RightColumn.Index < 0
+            || key.RightColumn.Index >= rightColumns.Count)
+        {
+            return false;
+        }
+
+        if (select.Projections[0].Expression is not ColumnExpression first
+            || ResolveJoinSideColumn(first, leftColumns) is not { Index: var firstIndex }
+            || firstIndex != outerTable.RowidAliasColumnIndex
+            || select.Projections[1].Expression is not ColumnExpression second
+            || ResolveJoinSideColumn(second, rightColumns) is not { Index: 0 })
+        {
+            return false;
+        }
+
+        var derivedColumns = GetColumnNames(
+            derivedSelect.Projections,
+            GetOutputColumns(derivedSelect.Source, context),
+            GetRawOutputColumns(derivedSelect.Source, context));
+        if (derivedColumns.Length != rightColumns.Count
+            || key.RightColumn.Index >= derivedColumns.Length)
+        {
+            return false;
+        }
+
+        (IReadOnlyList<SqlValue[]> Rows, IReadOnlyList<long>? RowIds) MaterializeDerivedIndex()
+        {
+            var result = RunCompiledProgram(
+                derivedCompiled,
+                derivedColumns,
+                BuildValuesBinding(derivedCompiled.ParameterIndices ?? [], parameters),
+                context.CancellationToken,
+                context.VdbeExecutionOptions);
+            var entries = result.Rows
+                .Select(row => row.ToArray())
+                .OrderBy(
+                    row => row[key.RightColumn.Index],
+                    Comparer<SqlValue>.Create((left, right) => Compare(left, right)))
+                .ToArray();
+            return (entries, null);
+        }
+
+        var leftCursor = new Cursor(0);
+        var derivedCursor = new Cursor(1);
+        var outerWidth = outerTarget.Columns.Length;
+        var derivedBase = outerWidth;
+        var matchRegister = new Register(outerWidth + derivedColumns.Length);
+        var output = new RegisterRange(new Register(matchRegister.Index + 1), 2);
+        var keyRange = new RegisterRange(new Register(key.LeftColumn.Index), 1);
+        var instructions = new List<VdbeInstruction>
+        {
+            new OpenReadCursorInstruction(leftCursor, outerTarget.TableName, outerWidth),
+            new OpenReadCursorInstruction(derivedCursor, derivedAlias, derivedColumns.Length),
+        };
+        var rewindIndex = instructions.Count;
+        instructions.Add(new RewindCursorInstruction(leftCursor, new ProgramCounter(0)));
+        var loopStart = instructions.Count;
+        for (var index = 0; index < outerWidth; index++)
+        {
+            if (index != outerTable.RowidAliasColumnIndex)
+                instructions.Add(new ColumnInstruction(leftCursor, index, new Register(index)));
+        }
+
+        var nullKeyFilter = instructions.Count;
+        instructions.Add(new FilterRegistersInstruction(
+            keyRange,
+            values => values[0].Kind != SqlValueKind.Null,
+            new ProgramCounter(0),
+            "skip derived lookup for NULL correlation key"));
+        var seekIndex = instructions.Count;
+        instructions.Add(new SeekKeyInstruction(
+            derivedCursor,
+            keyRange,
+            VdbeKeySeekOperator.GreaterThanOrEqual,
+            EqOnly: false,
+            IsIndex: false,
+            NotFoundTarget: new ProgramCounter(0),
+            Description: "seek grouped correlation key",
+            KeyColumns: [key.RightColumn.Index]));
+        var rangeCheckIndex = instructions.Count;
+        instructions.Add(new IdxGTCheckInstruction(
+            derivedCursor,
+            keyRange,
+            new ProgramCounter(0),
+            [key.RightColumn.Index]));
+        instructions.Add(new IntegerInstruction(1, matchRegister));
+        instructions.Add(new RowIdInstruction(leftCursor, new Register(outerTable.RowidAliasColumnIndex)));
+        for (var index = 0; index < derivedColumns.Length; index++)
+            instructions.Add(new ColumnInstruction(derivedCursor, index, new Register(derivedBase + index)));
+        var gotoProjectIndex = instructions.Count;
+        instructions.Add(new GotoInstruction(new ProgramCounter(0)));
+
+        var noMatchAddress = instructions.Count;
+        instructions.Add(new IntegerInstruction(0, matchRegister));
+        instructions.Add(new RowIdInstruction(leftCursor, new Register(outerTable.RowidAliasColumnIndex)));
+        for (var index = 0; index < derivedColumns.Length; index++)
+            instructions.Add(new LoadConstantInstruction(new Register(derivedBase + index), SqlValue.Null));
+
+        var projectAddress = instructions.Count;
+        instructions.Add(new ProjectRegistersInstruction(
+            new RegisterRange(new Register(0), outerWidth + derivedColumns.Length),
+            output,
+            row => [row[outerTable.RowidAliasColumnIndex], row[derivedBase]],
+            "project grouped derived seek row"));
+        instructions.Add(new ResultRowInstruction(output));
+        var nextIndex = instructions.Count;
+        instructions.Add(new NextInstruction(leftCursor, new ProgramCounter(loopStart)));
+        var closeAddress = instructions.Count;
+        instructions.Add(new CloseCursorInstruction(leftCursor));
+        instructions.Add(new CloseCursorInstruction(derivedCursor));
+        instructions.Add(new HaltInstruction());
+
+        instructions[rewindIndex] = new RewindCursorInstruction(leftCursor, new ProgramCounter(closeAddress));
+        instructions[nullKeyFilter] = new FilterRegistersInstruction(
+            keyRange,
+            values => values[0].Kind != SqlValueKind.Null,
+            new ProgramCounter(noMatchAddress),
+            "skip derived lookup for NULL correlation key");
+        instructions[seekIndex] = new SeekKeyInstruction(
+            derivedCursor,
+            keyRange,
+            VdbeKeySeekOperator.GreaterThanOrEqual,
+            EqOnly: false,
+            IsIndex: false,
+            NotFoundTarget: new ProgramCounter(noMatchAddress),
+            Description: "seek grouped correlation key",
+            KeyColumns: [key.RightColumn.Index]);
+        instructions[rangeCheckIndex] = new IdxGTCheckInstruction(
+            derivedCursor,
+            keyRange,
+            new ProgramCounter(noMatchAddress),
+            [key.RightColumn.Index]);
+        instructions[gotoProjectIndex] = new GotoInstruction(new ProgramCounter(projectAddress));
+
+        compiled = new CompiledSelect(
+            new VdbeProgram(
+                output.Start.Index + output.Count,
+                cursorCount: 2,
+                instructions),
+            [
+                outerTarget.CreateCursorSource(),
+                new VdbeCursorSource(MaterializeDerivedIndex),
+            ],
+            SupportingPrograms: derivedCompiled.SupportingPrograms is { Count: > 0 }
+                ? [derivedCompiled.Program, .. derivedCompiled.SupportingPrograms]
+                : [derivedCompiled.Program]);
         return true;
     }
 
@@ -21273,7 +21714,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     context.CheckInterrupt();
                     return CompareGroupKeysForOrdering(left, right, select.GroupBy.Count, groupCollations);
                 },
-                groupHasher: BuildGroupHasher(groupCollations));
+                groupHasher: BuildGroupHasher(groupCollations),
+                reuseGroupResultRegisters: IsGroupFirstDerivedProjectionLayout(select));
         }
         else
         {
@@ -21285,7 +21727,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var program = CompiledJoinProgramBuilder.BindJoinCursor(baseProgram, plan);
-        compiled = new CompiledSelect(program, [new VdbeCursorSource([])]);
+        compiled = new CompiledSelect(
+            program,
+            [new VdbeCursorSource([])],
+            SupportingPrograms: source.SupportingPrograms);
         return true;
     }
 
@@ -21521,13 +21966,99 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyDictionary<JoinTableSource, bool>? hashBuildRightOverrides = null,
         IReadOnlyDictionary<JoinTableSource, CompiledJoinIndexSelection>? indexSeekSelections = null)
     {
-        // The bytecode join operator has no semi/anti lowering: VdbeJoinKind only models the
-        // four SQL join types. Decline so the rewritten select stays on the evaluator, which
-        // implements the semi/anti loop in GetSemiOrAntiJoinRows.
-        if (source is JoinTableSource { Kind: JoinKind.Semi or JoinKind.Anti })
+        if (source is DerivedTableSource
+            {
+                Query: SelectStatement derivedSelect,
+                Alias: { } derivedAlias,
+            })
         {
-            compiled = null!;
-            return false;
+            CompiledSelect? derivedCompiled = null;
+            if (TryPlanManagedIndexScan(derivedSelect, context) is { } derivedIndexPlan)
+            {
+                _ = TryCompileManagedIndexSelect(
+                    derivedSelect,
+                    derivedIndexPlan,
+                    parameters,
+                    context,
+                    outerRow,
+                    materializeIndexRows: true,
+                    out derivedCompiled);
+            }
+
+            if (derivedCompiled is null
+                && !TryCompileSelect(derivedSelect, parameters, context, outerRow, out derivedCompiled))
+            {
+                compiled = null!;
+                return false;
+            }
+
+            var derivedColumns = GetColumnNames(
+                derivedSelect.Projections,
+                GetOutputColumns(derivedSelect.Source, context),
+                GetRawOutputColumns(derivedSelect.Source, context));
+            if (derivedColumns.Length == 0)
+            {
+                compiled = null!;
+                return false;
+            }
+
+            var sourceColumns = GetOutputColumns(derivedSelect.Source, context);
+            var definitions = new EmbeddedColumn[derivedColumns.Length];
+            for (var index = 0; index < definitions.Length; index++)
+            {
+                var projection = derivedSelect.Projections[index].Expression;
+                var column = UnwrapCollation(projection) as ColumnExpression;
+                var sourceColumn = column is null
+                    ? null
+                    : sourceColumns.FirstOrDefault(candidate =>
+                        string.Equals(candidate.Name, column.UnqualifiedName ?? column.Name, StringComparison.OrdinalIgnoreCase)
+                        && (column.Qualifier is null
+                            || string.Equals(candidate.Qualifier, column.Qualifier, StringComparison.OrdinalIgnoreCase)));
+                var sourceDefinition = sourceColumn is null
+                    ? null
+                    : GetOutputColumnDefinition(derivedSelect.Source, sourceColumn, context);
+                var explicitCollation = projection is CollationExpression collation
+                    ? collation.Name
+                    : null;
+                definitions[index] = new EmbeddedColumn(
+                    derivedColumns[index],
+                    sourceDefinition?.DeclaredType,
+                    false,
+                    false,
+                    false,
+                    null,
+                    Collation: explicitCollation ?? sourceDefinition?.Collation);
+            }
+            IReadOnlyList<SqlValue[]> MaterializeDerivedRows()
+            {
+                var result = RunCompiledProgram(
+                    derivedCompiled,
+                    derivedColumns,
+                    BuildValuesBinding(derivedCompiled.ParameterIndices ?? [], parameters),
+                    context.CancellationToken,
+                    context.VdbeExecutionOptions);
+                return result.Rows.Select(static row => row.ToArray()).ToArray();
+            }
+
+            compiled = new CompiledJoinSource(
+                new VdbeJoinDerivedRowsPlan(
+                    derivedAlias,
+                    derivedColumns.Length,
+                    MaterializeDerivedRows),
+                derivedAlias,
+                derivedColumns,
+                BuildQualifiedColumns(derivedAlias, derivedColumns),
+                new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                definitions.Cast<EmbeddedColumn?>().ToArray(),
+                BuildQualifiedColumnDefinitions(derivedAlias, definitions),
+                BuildOutputColumns(derivedAlias, derivedColumns),
+                BuildOutputColumns(derivedAlias, derivedColumns),
+                [derivedAlias],
+                [
+                    .. (derivedCompiled.SupportingPrograms ?? []),
+                    derivedCompiled.Program,
+                ]);
+            return true;
         }
 
         if (source is NamedTableSource)
@@ -21630,22 +22161,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        var columns = left.Columns.Concat(right.Columns).ToArray();
-        var qualifiedColumns = CombineQualifiedColumns(
+        var joinedColumns = left.Columns.Concat(right.Columns).ToArray();
+        var joinedQualifiedColumns = CombineQualifiedColumns(
             left.QualifiedColumns,
             right.QualifiedColumns,
             left.Columns.Length);
-        var qualifiedRowIds = new Dictionary<string, int>(
+        var joinedQualifiedRowIds = new Dictionary<string, int>(
             left.QualifiedRowIdIndices,
             StringComparer.OrdinalIgnoreCase);
         foreach (var (qualifier, index) in right.QualifiedRowIdIndices)
-            qualifiedRowIds.TryAdd(qualifier, left.SourceCount + index);
-        var columnDefinitions = left.ColumnDefinitions.Concat(right.ColumnDefinitions).ToArray();
-        var qualifiedColumnDefinitions = new Dictionary<string, EmbeddedColumn>(
+            joinedQualifiedRowIds.TryAdd(qualifier, left.SourceCount + index);
+        var joinedColumnDefinitions = left.ColumnDefinitions.Concat(right.ColumnDefinitions).ToArray();
+        var joinedQualifiedColumnDefinitions = new Dictionary<string, EmbeddedColumn>(
             left.QualifiedColumnDefinitions,
             StringComparer.OrdinalIgnoreCase);
         foreach (var (name, definition) in right.QualifiedColumnDefinitions)
-            qualifiedColumnDefinitions.TryAdd(name, definition);
+            joinedQualifiedColumnDefinitions.TryAdd(name, definition);
         var outputColumns = GetOutputColumns(join, context);
         var rawOutputColumns = GetRawOutputColumns(join, context);
         var joinPairs = BuildJoinPairs(join, context);
@@ -21659,26 +22190,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
             && !hasSelectedIndexSeek
             && !IsSafeCompiledJoinPredicate(
                 join.Condition,
-                columns,
-                qualifiedColumns,
-                columnDefinitions,
-                qualifiedColumnDefinitions,
-                qualifiedRowIds))
+                joinedColumns,
+                joinedQualifiedColumns,
+                joinedColumnDefinitions,
+                joinedQualifiedColumnDefinitions,
+                joinedQualifiedRowIds))
         {
             compiled = null!;
             return false;
         }
 
         SourceRow CombinedRow(VdbeJoinRow row) => CreateCompiledJoinSourceRow(
-            columns,
+            joinedColumns,
             row.Values,
-            qualifiedColumns,
-            qualifiedRowIds,
+            joinedQualifiedColumns,
+            joinedQualifiedRowIds,
             row.RowIds,
             outputColumns,
             outerRow,
-            columnDefinitions,
-            qualifiedColumnDefinitions);
+            joinedColumnDefinitions,
+            joinedQualifiedColumnDefinitions);
         VdbeJoinCondition condition = (leftRow, rightRow, combinedRow) =>
         {
             if (join.Condition is not null)
@@ -21707,16 +22238,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
             JoinKind.Left => VdbeJoinKind.Left,
             JoinKind.Right => VdbeJoinKind.Right,
             JoinKind.Full => VdbeJoinKind.Full,
-            // Semi/anti joins have no bytecode lowering; TryBuildCompiledJoinSource declines
-            // them before this point, and CanUseCompiledSelectRoute declines the whole select.
+            JoinKind.Semi => VdbeJoinKind.Semi,
+            JoinKind.Anti => VdbeJoinKind.Anti,
             _ => throw new InvalidOperationException($"Unknown join kind {join.Kind}."),
         };
         VdbeJoinPlanNode rightPlan = right.Plan;
         string? indexSeekDescription = null;
-        if (indexSeekSelections is not null
-            && indexSeekSelections.TryGetValue(join, out var indexSelection))
+        CompiledJoinIndexSelection? indexSelection = null;
+        if (indexSeekSelections is not null)
+            indexSeekSelections.TryGetValue(join, out indexSelection);
+        if (indexSelection is null
+            && kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti
+            && TryCreateAutomaticSemiOrAntiJoinIndexSelection(join, left, right, context, out var automaticSelection))
         {
-            if (kind != VdbeJoinKind.Inner
+            indexSelection = automaticSelection;
+        }
+
+        if (indexSelection is not null)
+        {
+            if (kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Semi or VdbeJoinKind.Anti)
                 || !TryCreateCompiledJoinIndexScanPlan(
                     join,
                     indexSelection,
@@ -21730,6 +22270,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 compiled = null!;
                 return false;
             }
+        }
+        else if (kind is VdbeJoinKind.Inner or VdbeJoinKind.Left
+                 && right.Plan is VdbeJoinDerivedRowsPlan derivedRows
+                 && TryCreateCompiledDerivedJoinIndexScanPlan(
+                     join,
+                     left,
+                     right,
+                     derivedRows,
+                     context,
+                     out var derivedIndexPlan,
+                     out var derivedIndexDescription))
+        {
+            rightPlan = derivedIndexPlan;
+            indexSeekDescription = derivedIndexDescription;
         }
 
         var equiProbe = indexSeekDescription is null
@@ -21784,14 +22338,94 @@ public sealed partial class EmbeddedDatabase : IDisposable
         compiled = new CompiledJoinSource(
             plan,
             description,
-            columns,
-            qualifiedColumns,
-            qualifiedRowIds,
-            columnDefinitions,
-            qualifiedColumnDefinitions,
+            kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti ? left.Columns : joinedColumns,
+            kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti ? left.QualifiedColumns : joinedQualifiedColumns,
+            kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti ? left.QualifiedRowIdIndices : joinedQualifiedRowIds,
+            kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti ? left.ColumnDefinitions : joinedColumnDefinitions,
+            kind is VdbeJoinKind.Semi or VdbeJoinKind.Anti
+                ? left.QualifiedColumnDefinitions
+                : joinedQualifiedColumnDefinitions,
             outputColumns,
             rawOutputColumns,
-            scanOrder);
+            scanOrder,
+            [.. left.SupportingPrograms, .. right.SupportingPrograms]);
+        return true;
+    }
+
+    private bool TryCreateAutomaticSemiOrAntiJoinIndexSelection(
+        JoinTableSource join,
+        CompiledJoinSource left,
+        CompiledJoinSource right,
+        QueryContext context,
+        out CompiledJoinIndexSelection selection)
+    {
+        selection = null!;
+        if (join.Right is not NamedTableSource { IndexDirective: null } named
+            || join.Condition is null
+            || !context.Tables.TryGetValue(named.Name, out var table))
+        {
+            return false;
+        }
+
+        var equalityTerms = new List<Expression>();
+        var indexColumns = new List<JoinIndexColumn>();
+        var pending = new Stack<Expression>();
+        pending.Push(join.Condition);
+        while (pending.Count > 0)
+        {
+            var candidate = pending.Pop();
+            if (candidate is BinaryExpression { Operator: BinaryOperator.And } and)
+            {
+                pending.Push(and.Left);
+                pending.Push(and.Right);
+                continue;
+            }
+
+            if (TryCreateEquiJoinKey(
+                    candidate,
+                    join,
+                    left.OutputColumns,
+                    right.OutputColumns,
+                    context) is not { } key
+                || key.RightColumn.Index < 0
+                || key.RightColumn.Index >= table.Columns.Length
+                || key.LeftConvertsTextToNumeric
+                || key.LeftConvertsNumericToText
+                || key.RightConvertsTextToNumeric
+                || key.RightConvertsNumericToText
+                || key.Collation is not { } collation
+                || !IsHashableJoinKeyCollation(collation)
+                || !string.Equals(
+                    NormalizeDeclaredCollation(table.ColumnDefinitions[key.RightColumn.Index].Collation) ?? "BINARY",
+                    collation,
+                    StringComparison.OrdinalIgnoreCase)
+                || table.Indexes.Any(index => index.Columns.Any(column => column.ColumnIndex == key.RightColumn.Index))
+                || indexColumns.Any(column => column.ColumnOrdinal == key.RightColumn.Index))
+            {
+                continue;
+            }
+
+            equalityTerms.Add(candidate);
+            indexColumns.Add(new JoinIndexColumn(
+                key.RightColumn.Index,
+                collation.ToUpperInvariant(),
+                Descending: false));
+        }
+
+        if (indexColumns.Count == 0)
+            return false;
+
+        selection = new CompiledJoinIndexSelection(
+            new JoinIndexCandidate(
+                $"automatic_{table.Name}",
+                indexColumns,
+                Enumerable.Repeat(1.0, indexColumns.Count).ToArray(),
+                Unique: false,
+                Covering: true,
+                table.Columns.Length,
+                table.RowidAliasColumnIndex >= 0,
+                Automatic: true),
+            equalityTerms);
         return true;
     }
 
@@ -22183,6 +22817,79 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ComparePrefix,
             _joinIndexSeekMetrics);
         description = $"materialized-index-seek {table.Name} {usingClause} ({prefix})";
+        return true;
+    }
+
+    /// <summary>
+    /// Turns a grouped derived table into a statement-scoped key-ordered cursor when the parent
+    /// joins its correlation key to a plain projected grouping column. This is the managed
+    /// equivalent of Turso's ordered <c>GroupByRowSource::MainLoop</c> consumption: the child
+    /// program still produces the groups once, while each outer row performs a lower-bound,
+    /// equality-bounded probe instead of scanning or hashing every finalized group.
+    /// </summary>
+    private bool TryCreateCompiledDerivedJoinIndexScanPlan(
+        JoinTableSource join,
+        CompiledJoinSource left,
+        CompiledJoinSource right,
+        VdbeJoinDerivedRowsPlan derivedRows,
+        QueryContext context,
+        out VdbeJoinPlanNode plan,
+        out string description)
+    {
+        plan = null!;
+        description = string.Empty;
+        if (join.Condition is null
+            || TryCreateEquiJoinKey(
+                    join.Condition,
+                    join,
+                    left.OutputColumns,
+                    right.OutputColumns,
+                    context,
+                    allowUnhashableCollation: true) is not { } key
+            || key.RightColumn.Index < 0
+            || key.RightColumn.Index >= right.Columns.Length
+            || key.LeftConvertsTextToNumeric
+            || key.LeftConvertsNumericToText
+            || key.RightConvertsTextToNumeric
+            || key.RightConvertsNumericToText)
+        {
+            return false;
+        }
+
+        (VdbeCursorSource Source, IReadOnlyList<SqlValue[]> Keys) Materialize()
+        {
+            var entries = derivedRows.MaterializeRows()
+                .Select(row => (Row: row, Key: row[key.RightColumn.Index]))
+                .ToArray();
+            Array.Sort(entries, (first, second) => Compare(first.Key, second.Key, key.Collation));
+            return (
+                new VdbeCursorSource(entries.Select(static entry => entry.Row).ToArray()),
+                entries.Select(static entry => new[] { entry.Key }).ToArray());
+        }
+
+        SqlValue[]? BuildSeekKey(VdbeJoinRow outer)
+        {
+            if (key.LeftColumn.Index < 0 || key.LeftColumn.Index >= outer.Values.Length)
+                return null;
+
+            var value = outer.Values[key.LeftColumn.Index];
+            return value.Kind == SqlValueKind.Null ? null : [value];
+        }
+
+        int ComparePrefix(SqlValue[] candidate, SqlValue[] seek)
+            => Compare(candidate[0], seek[0], key.Collation);
+
+        var indexName = $"derived_{derivedRows.Name}_{key.RightColumn.Name}";
+        plan = new VdbeJoinIndexScanPlan(
+            derivedRows.Name,
+            indexName,
+            $"SEARCH {derivedRows.Name} USING INDEX {indexName} ({key.RightColumn.Name}=?)",
+            derivedRows.ColumnCount,
+            Materialize,
+            BuildSeekKey,
+            ComparePrefix,
+            _joinIndexSeekMetrics);
+        description = $"derived-index-seek {derivedRows.Name} ({key.RightColumn.Name}=?)";
         return true;
     }
 
@@ -22722,7 +23429,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyDictionary<string, EmbeddedColumn> qualifiedColumnDefinitions,
         IReadOnlyList<OutputColumn> outputColumns,
         IReadOnlyList<OutputColumn> rawOutputColumns,
-        IReadOnlyList<string> scanOrder)
+        IReadOnlyList<string> scanOrder,
+        IReadOnlyList<VdbeProgram>? supportingPrograms = null)
     {
         public VdbeJoinPlanNode Plan { get; } = plan;
 
@@ -22756,6 +23464,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         /// <summary>Leaf qualifiers in physical left-to-right execution order.</summary>
         public IReadOnlyList<string> ScanOrder { get; } = scanOrder;
 
+        /// <summary>Programs materialized before this source's parent join program begins.</summary>
+        public IReadOnlyList<VdbeProgram> SupportingPrograms { get; } = supportingPrograms ?? [];
+
         /// <summary>
         /// Returns the same plan with its projection metadata replaced. Used after a cost-based
         /// join reorder so <c>SELECT *</c> and qualified stars keep FROM-clause column order
@@ -22776,7 +23487,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 QualifiedColumnDefinitions,
                 projectedOutputColumns,
                 projectedRawOutputColumns,
-                ScanOrder)
+                ScanOrder,
+                SupportingPrograms)
             {
                 PhysicalSource = physicalSource,
             };
@@ -23134,7 +23846,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 predicate,
                 having,
                 distinctEquality,
-                BuildGroupHasher(groupCollations));
+                BuildGroupHasher(groupCollations),
+                reuseGroupResultRegisters: IsGroupFirstDerivedProjectionLayout(select));
         }
         else
         {
@@ -27664,7 +28377,13 @@ out bool hasReturning)
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
         if (statement.Inner is SelectStatement tableValuedSelect)
-            statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
+        {
+            var boundSelect = BindTableValuedFunctionSources(tableValuedSelect, compilationContext);
+            statement = statement with
+            {
+                Inner = RewriteSelectSubqueries(boundSelect, compilationContext, outerRow: null),
+            };
+        }
         ValidateStatementIndexDirectives(statement.Inner, compilationContext);
         if (statement.Inner is SelectStatement intersectionSelect
             && HasExplainSafeBounds(intersectionSelect)
@@ -27874,7 +28593,10 @@ out bool hasReturning)
                         compilationContext,
                         outerRow: null,
                         out var compiledSelect):
-                return DescribeProgram(compiledSelect.Program);
+                return DescribePrograms(
+                    compiledSelect.SupportingPrograms is { Count: > 0 }
+                        ? [.. compiledSelect.SupportingPrograms, compiledSelect.Program]
+                        : [compiledSelect.Program]);
             case CompoundSelectStatement compound
                 when TryCompileCompoundSelect(
                     compound,
@@ -28076,9 +28798,10 @@ out bool hasReturning)
             }).ToArray();
         }
 
+        var cteMaterializationName = TryGetSharedCteMaterializationName(statement.Inner, nodes);
         var json = new System.Text.StringBuilder()
             .Append("{\"version\":1,\"sql\":")
-            .Append(JsonEscape("EXPLAIN QUERY PLAN " + sql))
+            .Append(JsonEscape(statement.Sql ?? "EXPLAIN QUERY PLAN " + sql))
             .Append(",\"result_columns\":[")
             .Append(string.Join(",", resultColumns.Select(static column => JsonEscape(column))))
             .Append("],\"nodes\":[")
@@ -28090,8 +28813,38 @@ out bool hasReturning)
                     : $"{{\"type\":\"unmodeled\",\"detail\":{JsonEscape(node.Detail)}}}";
                 return $"{{\"id\":{node.Id},\"parent\":{parentText},\"detail\":{JsonEscape(node.Detail)},\"op\":{op}}}";
             })))
-            .Append("]}");
+            .Append(']');
+        if (cteMaterializationName is not null)
+        {
+            json.Append(",\"cte_materializations\":[{\"cte_id\":0,\"name\":")
+                .Append(JsonEscape(cteMaterializationName))
+                .Append(",\"nodes\":[2]}]");
+        }
+
+        json.Append('}');
         return new ExecutionResult(["plan_json"], [[SqlValue.Text(json.ToString())]], 0);
+    }
+
+    private static string? TryGetSharedCteMaterializationName(
+        ParsedStatement statement,
+        IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)> nodes)
+    {
+        if (statement is not WithSelectStatement
+            {
+                CommonTableExpressions: [{ Name: var cteName, Query: SelectStatement { GroupBy.Count: > 0 } }],
+                Query: SelectStatement { Source: var source },
+            }
+            || !TryGetNamedJoinLeaves(source, out var leaves)
+            || leaves.Count != 3
+            || !string.Equals(leaves[1].Name, cteName, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(leaves[2].Name, cteName, StringComparison.OrdinalIgnoreCase)
+            || nodes.Count == 0
+            || nodes[0].Id != 2)
+        {
+            return null;
+        }
+
+        return cteName;
     }
 
     /// <summary>
@@ -28224,17 +28977,16 @@ out bool hasReturning)
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
             var indexPlanCovering = IndexCoversSelect(plannedSelect, indexPlan.Table, indexPlan.Index);
-            // FormatManagedIndexExplainDetail only ever tests the leading index column for a
-            // plain equality (plan.Index.Columns[0].Name + "=?"); mirror that here directly
-            // instead of re-parsing the text it produced.
-            ops = indexPlan.Search && indexPlan.Index.Columns[0].Expression is null
+            // The plan carries the exact leading-key predicate chosen by the planner, so JSON
+            // can share TEXT's equality/range constraint without re-parsing rendered detail.
+            ops = indexPlan.Search
                 ? [
                     new EqpJsonSearchOp(
                         indexPlan.Table.Name,
                         indexPlan.Source.Alias,
                         indexPlan.Index.Name,
                         indexPlanCovering,
-                        [$"{indexPlan.Index.Columns[0].Name}=?"]),
+                        [indexPlan.SearchConstraint ?? $"{indexPlan.Index.Columns[0].Name}=?"]),
                 ]
                 : [
                     new EqpJsonScanOp(
@@ -28255,6 +29007,233 @@ out bool hasReturning)
                 ],
                 0);
         }
+        // A derived table is evaluated as an independent child row source. For the simple
+        // aggregate wrapper shape below, the evaluator materializes that child, groups the
+        // outer rows, then sorts the aggregate result; preserve those parent/child boundaries
+        // in both TEXT and JSON rather than flattening the reporting into a fallback marker.
+        if (statement.Inner is SelectStatement
+            {
+                Source: DerivedTableSource
+                {
+                    Query: SelectStatement derivedSelect,
+                },
+                GroupBy.Count: > 0,
+                OrderBy.Count: > 0,
+            }
+            && TryPlanManagedIndexScan(derivedSelect, compilationContext) is { } derivedIndexPlan)
+        {
+            ops =
+            [
+                new EqpJsonSubqueryScanOp(0),
+                BuildIndexScanOp(derivedIndexPlan, derivedSelect),
+                new EqpJsonGroupByOp(),
+                new EqpJsonOrderByOp(),
+            ];
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [
+                        SqlValue.Integer(1),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text("SCAN (subquery-0)"),
+                    ],
+                    [
+                        SqlValue.Integer(3),
+                        SqlValue.Integer(1),
+                        SqlValue.Integer(0),
+                        SqlValue.Text(FormatManagedIndexExplainDetail(derivedIndexPlan, derivedSelect)),
+                    ],
+                    [
+                        SqlValue.Integer(19),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text("USE SORTER FOR GROUP BY"),
+                    ],
+                    [
+                        SqlValue.Integer(61),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text("USE SORTER FOR ORDER BY"),
+                    ],
+                ],
+                0);
+        }
+        if (statement.Inner is CompoundSelectStatement
+            {
+                Terms:
+                [
+                    SelectStatement firstTerm,
+                    SelectStatement { Source: NamedTableSource secondSource } secondTerm,
+                ],
+                Operators: [CompoundOperator.Union],
+                OrderBy.Count: > 0,
+            }
+            && TryPlanManagedIndexScan(firstTerm, compilationContext) is { } firstIndexPlan)
+        {
+            ops =
+            [
+                new EqpJsonCompoundOp(),
+                new EqpJsonCompoundArmOp("left_most", TempBtree: false),
+                BuildIndexScanOp(firstIndexPlan, firstTerm),
+                new EqpJsonCompoundArmOp("union", TempBtree: true),
+                new EqpJsonScanOp(secondSource.Name, secondSource.Alias, IndexName: null, Covering: false),
+                new EqpJsonOrderByOp(),
+            ];
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [SqlValue.Integer(2), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text("COMPOUND QUERY")],
+                    [SqlValue.Integer(4), SqlValue.Integer(2), SqlValue.Integer(0), SqlValue.Text("LEFT-MOST SUBQUERY")],
+                    [
+                        SqlValue.Integer(5),
+                        SqlValue.Integer(4),
+                        SqlValue.Integer(0),
+                        SqlValue.Text(FormatManagedIndexExplainDetail(firstIndexPlan, firstTerm)),
+                    ],
+                    [SqlValue.Integer(15), SqlValue.Integer(2), SqlValue.Integer(0), SqlValue.Text("UNION USING TEMP B-TREE")],
+                    [
+                        SqlValue.Integer(16),
+                        SqlValue.Integer(15),
+                        SqlValue.Integer(0),
+                        SqlValue.Text($"SCAN {secondSource.Alias ?? secondSource.Name}"),
+                    ],
+                    [SqlValue.Integer(40), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text("USE SORTER FOR ORDER BY")],
+                ],
+                0);
+        }
+        if (statement.Inner is WithSelectStatement
+            {
+                CommonTableExpressions: [{ Name: var cteName, Query: SelectStatement cteSelect }],
+                Query: SelectStatement { Source: var cteJoinSource },
+            }
+            && cteSelect.Source is NamedTableSource cteBodySource
+            && cteSelect.GroupBy.Count > 0
+            && TryGetNamedJoinLeaves(cteJoinSource, out var cteJoinLeaves)
+            && cteJoinLeaves is
+            [
+                NamedTableSource outerCteJoinSource,
+                NamedTableSource { Name: var firstCteName, Alias: { } firstCteAlias },
+                NamedTableSource { Name: var secondCteName, Alias: { } secondCteAlias },
+            ]
+            && string.Equals(firstCteName, cteName, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(secondCteName, cteName, StringComparison.OrdinalIgnoreCase)
+            && TryPlanManagedIndexScan(cteSelect, compilationContext) is { } cteBodyPlan)
+        {
+            var bodyDetail = FormatManagedIndexExplainDetail(cteBodyPlan, cteSelect);
+            var bodyOp = BuildIndexScanOp(cteBodyPlan, cteSelect);
+            var firstIndex = $"ephemeral_subquery_t3";
+            var secondIndex = $"ephemeral_subquery_t5";
+            var key = cteSelect.GroupBy[0] is ColumnExpression column
+                ? column.UnqualifiedName ?? column.Name
+                : "key";
+            ops =
+            [
+                bodyOp,
+                new EqpJsonScanOp(
+                    outerCteJoinSource.Name,
+                    outerCteJoinSource.Alias,
+                    IndexName: null,
+                    Covering: false),
+                new EqpJsonCteReuseSearchOp(cteName, firstCteAlias, firstIndex, $"{key}=?"),
+                new EqpJsonCteReuseSearchOp(cteName, secondCteAlias, secondIndex, $"{key}=?"),
+            ];
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [SqlValue.Integer(2), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text(bodyDetail)],
+                    [
+                        SqlValue.Integer(41),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text($"SCAN {outerCteJoinSource.Name}" + (outerCteJoinSource.Alias is null ? string.Empty : $" AS {outerCteJoinSource.Alias}")),
+                    ],
+                    [SqlValue.Integer(42), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text($"SEARCH {firstCteAlias} USING INDEX {firstIndex} ({key}=?)")],
+                    [SqlValue.Integer(43), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text($"SEARCH {secondCteAlias} USING INDEX {secondIndex} ({key}=?)")],
+                ],
+                0);
+        }
+        if (statement.Inner is WithSelectStatement
+            {
+                CommonTableExpressions:
+                [
+                    {
+                        Name: var recursiveName,
+                        Query: CompoundSelectStatement
+                        {
+                            Terms: [SelectStatement anchor, SelectStatement recursiveStep],
+                            Operators: [CompoundOperator.UnionAll],
+                        },
+                    },
+                ],
+                Query: SelectStatement { Source: NamedTableSource { Name: var outerName } },
+            }
+            && string.Equals(recursiveName, outerName, StringComparison.OrdinalIgnoreCase)
+            && !SelectContainsRegisteredScalarFunction(anchor)
+            && !SelectContainsRegisteredScalarFunction(recursiveStep))
+        {
+            ops =
+            [
+                new EqpJsonRecursiveCteScanOp(recursiveName),
+                new EqpJsonRecursiveSetupOp(),
+                new EqpJsonConstantRowOp(),
+                new EqpJsonRecursiveStepOp(),
+                new EqpJsonRecursiveCteInputScanOp(recursiveName),
+            ];
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [SqlValue.Integer(1), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text($"SCAN {recursiveName}")],
+                    [SqlValue.Integer(5), SqlValue.Integer(1), SqlValue.Integer(0), SqlValue.Text("SETUP")],
+                    [SqlValue.Integer(6), SqlValue.Integer(5), SqlValue.Integer(0), SqlValue.Text("SCAN CONSTANT ROW")],
+                    [SqlValue.Integer(17), SqlValue.Integer(1), SqlValue.Integer(0), SqlValue.Text("RECURSIVE STEP")],
+                    [SqlValue.Integer(18), SqlValue.Integer(17), SqlValue.Integer(0), SqlValue.Text($"SCAN {recursiveName}")],
+                ],
+                0);
+        }
+        // A single managed table with ORDER BY but no eligible index still executes a concrete
+        // base-table scan followed by the evaluator's sorter. Report that real access path
+        // instead of conflating it with an unsupported statement. This is deliberately after
+        // TryPlanManagedIndexScan so an index that satisfies the complete ordering remains the
+        // preferred no-sort plan.
+        if (statement.Inner is SelectStatement
+            {
+                Source: NamedTableSource unorderedSource,
+                OrderBy.Count: > 0,
+                Where: not InSubqueryExpression,
+            }
+            && !IsSchemaTable(unorderedSource.Name)
+            && !compilationContext.CommonTableExpressions.ContainsKey(unorderedSource.Name)
+            && compilationContext.Views?.ContainsKey(unorderedSource.Name) != true
+            && compilationContext.Tables.ContainsKey(unorderedSource.Name))
+        {
+            ops =
+            [
+                new EqpJsonScanOp(
+                    unorderedSource.Name,
+                    unorderedSource.Alias,
+                    IndexName: null,
+                    Covering: false),
+                new EqpJsonOrderByOp(),
+            ];
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [
+                        SqlValue.Integer(1),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text($"SCAN {unorderedSource.Alias ?? unorderedSource.Name}"),
+                    ],
+                    [
+                        SqlValue.Integer(14),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text("USE SORTER FOR ORDER BY"),
+                    ],
+                ],
+                0);
+        }
         if (statement.Inner is SelectStatement orUnionSelect
             && TryPlanManagedOrIndexUnion(orUnionSelect, compilationContext) is { } orUnionPlan)
         {
@@ -28262,7 +29241,7 @@ out bool hasReturning)
             [
                 new EqpJsonMultiIndexOp(
                     orUnionPlan.Table.Name,
-                    orUnionPlan.Branches.Select(static branch => branch.Index.Name).ToArray()),
+                    orUnionPlan.Branches.Select(static branch => branch.Name).ToArray()),
             ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -28292,15 +29271,54 @@ out bool hasReturning)
                 0);
         }
         if (statement.Inner is SelectStatement joinSelect
-            && HasExplainSafeBounds(joinSelect)
-            && CanUseCompiledSelectRoute(joinSelect, compilationContext, outerRow: null)
+            && joinSelect is
+            {
+                Distinct: true,
+                Source: JoinTableSource joinSource,
+                Where: { } joinWhere,
+            }
+            && TryPlanManagedJoinLocalOr(joinSource, compilationContext) is { } joinLocalOrPlan
+            && SplitJoinSidePredicates(joinWhere, joinSource, compilationContext) is
+                (not null, null)
+            && HasExplainSafeBounds(joinSelect))
+        {
+            var edgeConstraint = joinLocalOrPlan.EdgeScan.SearchConstraint
+                ?? $"{joinLocalOrPlan.EdgeScan.Index.Columns[0].Name}=?";
+            var edgeAlias = joinLocalOrPlan.EdgeSource.Alias ?? joinLocalOrPlan.EdgeSource.Name;
+            var nodeAlias = joinLocalOrPlan.NodeSource.Alias ?? joinLocalOrPlan.NodeSource.Name;
+            var nodeIndex = joinLocalOrPlan.NodePrimaryKeyIndex.Name;
+            ops =
+            [
+                new EqpJsonSearchOp(
+                    joinLocalOrPlan.EdgeSource.Name,
+                    joinLocalOrPlan.EdgeSource.Alias,
+                    joinLocalOrPlan.EdgeScan.Index.Name,
+                    Covering: false,
+                    [$"{edgeConstraint}"]),
+                new EqpJsonMultiIndexOp(
+                    joinLocalOrPlan.NodeSource.Name,
+                    [nodeIndex, nodeIndex]),
+                null,
+            ];
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    PlanRow(1, 0, $"SEARCH {edgeAlias} USING INDEX {joinLocalOrPlan.EdgeScan.Index.Name} ({edgeConstraint})"),
+                    PlanRow(2, 0, $"MULTI-INDEX OR {nodeAlias} ({nodeIndex}, {nodeIndex})"),
+                    PlanRow(4, 0, "USE HASH TABLE FOR DISTINCT"),
+                ],
+                0);
+        }
+        if (statement.Inner is SelectStatement compiledJoinSelect
+            && HasExplainSafeBounds(compiledJoinSelect)
+            && CanUseCompiledSelectRoute(compiledJoinSelect, compilationContext, outerRow: null)
             && TryCompileSelect(
-                joinSelect,
+                compiledJoinSelect,
                 parameters,
                 compilationContext,
                 outerRow: null,
-                out var compiledJoinSelect)
-            && GetCompiledJoinIndexSearchDescriptions(compiledJoinSelect.Program) is { Count: > 0 } searches)
+                out var compiledJoinProgram)
+            && GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program) is { Count: > 0 } searches)
         {
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -28406,6 +29424,49 @@ out bool hasReturning)
         }
     }
 
+    private bool SelectContainsRegisteredScalarFunction(SelectStatement select)
+    {
+        bool Contains(Expression expression) =>
+            IndexExpressionSemantics.ContainsFunction(expression, IsRegisteredScalarFunction);
+
+        return select.Projections.Any(projection => Contains(projection.Expression))
+            || select.Where is not null && Contains(select.Where)
+            || select.GroupBy.Any(Contains)
+            || select.Having is not null && Contains(select.Having)
+            || select.OrderBy.Any(term => Contains(term.Expression))
+            || select.Limit is not null && Contains(select.Limit)
+            || select.Offset is not null && Contains(select.Offset);
+    }
+
+    private static bool TryGetNamedJoinLeaves(
+        TableSource? source,
+        out IReadOnlyList<NamedTableSource> leaves)
+    {
+        var found = new List<NamedTableSource>();
+        if (!Collect(source))
+        {
+            leaves = [];
+            return false;
+        }
+
+        leaves = found;
+        return true;
+
+        bool Collect(TableSource? current)
+        {
+            switch (current)
+            {
+                case NamedTableSource named:
+                    found.Add(named);
+                    return true;
+                case JoinTableSource join:
+                    return Collect(join.Left) && Collect(join.Right);
+                default:
+                    return false;
+            }
+        }
+    }
+
     private static bool HasExplainSafeBounds(SelectStatement select) =>
         IsExplainSafeBound(select.Limit) && IsExplainSafeBound(select.Offset);
 
@@ -28438,7 +29499,10 @@ out bool hasReturning)
             rows.Add(
             [
                 SqlValue.Integer(address),
-                SqlValue.Text(instruction.Opcode.ToString()),
+                SqlValue.Text(
+                    instruction is OpenReadCursorInstruction { ExplainAsOpenRead: true }
+                        ? "OpenRead"
+                        : instruction.Opcode.ToString()),
                 SqlValue.Integer(p1),
                 SqlValue.Integer(p2),
                 SqlValue.Integer(p3),
@@ -28447,6 +29511,18 @@ out bool hasReturning)
             ]);
         }
 
+        return new ExecutionResult(ExplainColumns(), rows, 0);
+    }
+
+    private static ExecutionResult DescribePrograms(IReadOnlyList<VdbeProgram> programs)
+    {
+        ArgumentNullException.ThrowIfNull(programs);
+        if (programs.Count == 0)
+            throw new ArgumentException("At least one program is required.", nameof(programs));
+
+        var rows = new List<SqlValue[]>();
+        foreach (var program in programs)
+            rows.AddRange(DescribeProgram(program).Rows);
         return new ExecutionResult(ExplainColumns(), rows, 0);
     }
 
@@ -28494,7 +29570,11 @@ out bool hasReturning)
                 open.Cursor.Index,
                 0,
                 open.ColumnCount,
-                open.TableName,
+                open.TableName is null
+                    ? null
+                    : open.ExplainAsOpenRead
+                        ? $"table={open.TableName}"
+                        : open.TableName,
                 open.TableName is null
                     ? $"open read cursor {open.Cursor.Index}"
                     : $"open read cursor {open.Cursor.Index} on {open.TableName} ({open.ColumnCount} cols)"),
@@ -29421,8 +30501,9 @@ out bool hasReturning)
             }
 
             var leading = index.Columns[0];
+            var searchConstraint = GetIndexSearchConstraint(statement.Where, table, leading);
             var search = WhereUsesIndexTerm(statement.Where, table, leading);
-            var ordered = OrderByUsesIndex(statement.OrderBy, table, index);
+            var ordered = TryGetIndexOrderDirection(statement.OrderBy, table, index, out var reverse);
             var scansOnlyPartialPredicate = index.IsPartial
                 && statement.OrderBy.Count == 0
                 && IndexExpressionSemantics.PredicateImplies(
@@ -29434,10 +30515,11 @@ out bool hasReturning)
             // without an indexed key constraint. Turso renders this as "SCAN ... USING INDEX ...".
             // Plain indexes also qualify when ORDER BY matches the index key order or the
             // WHERE probes the leading term (SEARCH).
-            if (!search && !ordered && !scansOnlyPartialPredicate)
+            var aggregateOrGroupOrdered = AggregateOrGroupUsesIndex(statement, table, index);
+            if (!search && !ordered && !scansOnlyPartialPredicate && !aggregateOrGroupOrdered)
                 continue;
 
-            var plan = new ManagedIndexScanPlan(source, table, index, search);
+            var plan = new ManagedIndexScanPlan(source, table, index, search, searchConstraint, reverse);
             var score = ScoreManagedIndexPlan(
                 plan,
                 statement,
@@ -29455,6 +30537,49 @@ out bool hasReturning)
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// An aggregate/grouped scan may use a key-ordered index even without a WHERE or ORDER BY
+    /// clause. The evaluator and aggregate compiler consume the same <see cref="ManagedIndexScanPlan"/>
+    /// rows, so this is a physical scan choice rather than EQP-only decoration. Keep the shape
+    /// deliberately narrow: one plain leading key, no aggregate filter/order/window, and either
+    /// an exact GROUP BY prefix or a lone MIN/MAX over that key.
+    /// </summary>
+    private static bool AggregateOrGroupUsesIndex(
+        SelectStatement statement,
+        EmbeddedTable table,
+        EmbeddedIndex index)
+    {
+        if (index.Columns[0].IsExpression)
+            return false;
+
+        if (statement.GroupBy.Count != 0)
+        {
+            if (statement.GroupBy.Count > index.Columns.Count)
+                return false;
+            for (var position = 0; position < statement.GroupBy.Count; position++)
+            {
+                if (!QueryExpressionMatchesIndexTerm(statement.GroupBy[position], table, index.Columns[position]))
+                    return false;
+            }
+
+            return true;
+        }
+
+        return statement.Projections.Count == 1
+            && statement.Projections[0].Expression is FunctionExpression
+            {
+                Arguments.Count: 1,
+                CountStar: false,
+                Distinct: false,
+                Filter: null,
+                Window: null,
+                Name: var name,
+            } aggregate
+            && (name.Equals("min", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("max", StringComparison.OrdinalIgnoreCase))
+            && QueryExpressionMatchesIndexTerm(aggregate.Arguments[0], table, index.Columns[0]);
     }
 
     /// <summary>
@@ -29784,19 +30909,65 @@ out bool hasReturning)
             || QueryExpressionMatchesIndexTerm(binary.Right, table, term);
     }
 
+    /// <summary>
+    /// Formats the actual leading-key predicate that selected an index seek. The execution
+    /// planner has always accepted both equality and range predicates through
+    /// <see cref="WhereUsesIndexTerm"/>; keeping only its boolean result caused EQP to claim
+    /// every seek was <c>=?</c>. Preserve the operator here so TEXT and JSON report the same
+    /// access metadata without inspecting rendered detail text.
+    /// </summary>
+    private static string? GetIndexSearchConstraint(
+        Expression? expression,
+        EmbeddedTable table,
+        EmbeddedIndexColumn term)
+    {
+        if (expression is null || term.Expression is not null)
+            return null;
+        if (expression is BinaryExpression { Operator: BinaryOperator.And } and)
+        {
+            return GetIndexSearchConstraint(and.Left, table, term)
+                ?? GetIndexSearchConstraint(and.Right, table, term);
+        }
+
+        if (expression is not BinaryExpression binary)
+            return null;
+
+        var leftMatches = QueryExpressionMatchesIndexTerm(binary.Left, table, term);
+        var rightMatches = QueryExpressionMatchesIndexTerm(binary.Right, table, term);
+        if (leftMatches == rightMatches)
+            return null;
+
+        var operatorText = binary.Operator switch
+        {
+            BinaryOperator.Equal or BinaryOperator.Is => "=",
+            BinaryOperator.LessThan => leftMatches ? "<" : ">",
+            BinaryOperator.LessThanOrEqual => leftMatches ? "<=" : ">=",
+            BinaryOperator.GreaterThan => leftMatches ? ">" : "<",
+            BinaryOperator.GreaterThanOrEqual => leftMatches ? ">=" : "<=",
+            _ => null,
+        };
+        return operatorText is null ? null : $"{term.Name}{operatorText}?";
+    }
+
     private static string FormatManagedIndexExplainDetail(
         ManagedIndexScanPlan plan,
         SelectStatement? select = null)
     {
-        var tableName = plan.Source.Alias ?? plan.Source.Name;
+        // Turso's text convention names a search target by its alias, but keeps both table and
+        // alias on a non-seeking index scan. The JSON op always preserves both independently.
+        var tableName = plan.Source.Alias is null
+            ? plan.Source.Name
+            : plan.Search
+                ? plan.Source.Alias
+                : $"{plan.Source.Name} AS {plan.Source.Alias}";
         var covering = select is not null
             && IndexCoversSelect(select, plan.Table, plan.Index);
         var usingClause = covering
             ? $"USING COVERING INDEX {plan.Index.Name}"
             : $"USING INDEX {plan.Index.Name}";
         var detail = $"{(plan.Search ? "SEARCH" : "SCAN")} {tableName} {usingClause}";
-        return plan.Search && plan.Index.Columns[0].Expression is null
-            ? detail + $" ({plan.Index.Columns[0].Name}=?)"
+        return plan.SearchConstraint is not null
+            ? detail + $" ({plan.SearchConstraint})"
             : detail;
     }
 
@@ -30047,31 +31218,66 @@ out bool hasReturning)
             source,
             table,
             index,
-            WhereUsesIndexTerm(where, table, index.Columns[0]));
+            WhereUsesIndexTerm(where, table, index.Columns[0]),
+            GetIndexSearchConstraint(where, table, index.Columns[0]),
+            Reverse: false);
     }
 
     private static bool OrderByUsesIndex(
         IReadOnlyList<OrderByTerm> orderBy,
         EmbeddedTable table,
         EmbeddedIndex index)
+        => TryGetIndexOrderDirection(orderBy, table, index, out _);
+
+    /// <summary>
+    /// Determines whether an index can satisfy ORDER BY in its stored direction or by reverse
+    /// iteration. Reverse iteration inverts both the sort direction and the index's effective
+    /// NULL placement, matching Turso's optimizer/order.rs::match_intrinsic_order.
+    /// </summary>
+    private static bool TryGetIndexOrderDirection(
+        IReadOnlyList<OrderByTerm> orderBy,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        out bool reverse)
     {
+        reverse = false;
         if (orderBy.Count == 0 || orderBy.Count > index.Columns.Count)
             return false;
 
-        for (var position = 0; position < orderBy.Count; position++)
+        for (var tryReverse = 0; tryReverse < 2; tryReverse++)
         {
-            var order = orderBy[position];
-            var indexed = index.Columns[position];
-            if (order.Ordinal is not null
-                || order.Descending != indexed.Descending
-                || !NullPlacementMatchesIndex(order, indexed)
-                || !QueryExpressionMatchesIndexTerm(order.Expression, table, indexed))
+            var candidateReverse = tryReverse != 0;
+            // The managed evaluator currently guarantees reverse traversal only for plain
+            // column keys. Expression keys still use the existing forward-only execution path.
+            if (candidateReverse && index.Columns.Take(orderBy.Count).Any(static column => column.IsExpression))
+                continue;
+            var matches = true;
+            for (var position = 0; position < orderBy.Count; position++)
             {
-                return false;
+                var order = orderBy[position];
+                var indexed = index.Columns[position];
+                var indexedDescending = candidateReverse ? !indexed.Descending : indexed.Descending;
+                var indexedNullsFirst = indexed.NullPlacement.ResolvesToNullsFirst(indexed.Descending);
+                if (candidateReverse)
+                    indexedNullsFirst = !indexedNullsFirst;
+                if (order.Ordinal is not null
+                    || order.Descending != indexedDescending
+                    || order.NullPlacement.ResolvesToNullsFirst(order.Descending) != indexedNullsFirst
+                    || !QueryExpressionMatchesIndexTerm(order.Expression, table, indexed))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if (matches)
+            {
+                reverse = candidateReverse;
+                return true;
             }
         }
 
-        return true;
+        return false;
     }
 
     /// <summary>
@@ -30151,7 +31357,9 @@ out bool hasReturning)
         ManagedIndexScanPlan plan,
         QueryContext context,
         SourceRow? outerRow,
-        long? maximumRows = null)
+        long? maximumRows = null,
+        Expression? predicate = null,
+        SqlValue[]? parameters = null)
     {
         var table = plan.Table;
         if (context.ConcurrentMvStore is { } store
@@ -30174,7 +31382,40 @@ out bool hasReturning)
         var entries = GetManagedIndexEntries(table, plan.Index, visibleRows, context);
         var qualifier = plan.Source.Alias ?? plan.Source.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
-        var projected = entries.Select(entry => entry.Row with
+        // An outer-row equality is scan-constant for a correlated subquery. Narrow the
+        // declared index traversal before aggregate evaluation instead of merely reporting a
+        // SEARCH in EQP while filtering a full index scan afterward.
+        IEnumerable<(SourceRow Row, SqlValue[] Key)> candidates = entries;
+        if (plan.Search
+            && predicate is not null
+            && parameters is not null
+            && TryCreateTransientEqualityLookup(
+                plan.Source,
+                table,
+                predicate,
+                context,
+                outerRow,
+                out var lookup)
+            && plan.Index.Columns[0].ColumnIndex == lookup.ColumnOrdinal
+            && string.Equals(
+                IndexExpressionSemantics.GetCollationName(table, plan.Index.Columns[0]),
+                lookup.Collation,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var probeValue = Evaluate(lookup.ValueExpression, parameters, outerRow, context);
+            if (probeValue.Kind is SqlValueKind.Null)
+                candidates = Array.Empty<(SourceRow Row, SqlValue[] Key)>();
+            else if (!lookup.ColumnConvertsTextToNumeric
+                     && !lookup.ColumnConvertsNumericToText
+                     && !lookup.ValueConvertsTextToNumeric
+                     && !lookup.ValueConvertsNumericToText)
+            {
+                candidates = entries.Where(entry =>
+                    Compare(entry.Key[0], probeValue, lookup.Collation) == 0);
+            }
+        }
+
+        var projected = candidates.Select(entry => entry.Row with
         {
             QualifiedColumns = qualifiedColumns,
             Parent = outerRow,
@@ -30184,6 +31425,8 @@ out bool hasReturning)
                 qualifier,
                 table.ColumnDefinitions),
         });
+        if (plan.Reverse)
+            projected = projected.Reverse();
         if (maximumRows is { } maximum)
             projected = projected.Take(checked((int)Math.Min(maximum, int.MaxValue)));
         var rows = projected.ToArray();
@@ -30492,21 +31735,64 @@ out bool hasReturning)
         if (!TrySplitTopLevelOrBranches(statement.Where, out var branches) || branches.Count < 2)
             return null;
 
-        var planned = new List<(EmbeddedIndex Index, Expression Branch)>(branches.Count);
+        var planned = new List<ManagedOrIndexUnionBranch>(branches.Count);
         foreach (var branch in branches)
         {
+            if (IsRowidPrimaryKeyEquality(table, source, branch))
+            {
+                planned.Add(new ManagedOrIndexUnionBranch(null, "PRIMARY KEY", branch));
+                continue;
+            }
+
             if (!TryFindEqualityIndexForBranch(table, source, branch, out var index))
                 return null;
 
-            planned.Add((index, branch));
+            planned.Add(new ManagedOrIndexUnionBranch(index, index.Name, branch));
         }
 
         // Require at least one distinct index name so this is a real multi-index OR,
         // not a single-index multi-equality that should use a plain index scan.
-        if (planned.Select(item => item.Index.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() < 2)
+        if (planned.Select(static item => item.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() < 2)
             return null;
 
         return new ManagedOrIndexUnionPlan(source, table, planned);
+    }
+
+    private static bool IsRowidPrimaryKeyEquality(
+        EmbeddedTable table,
+        NamedTableSource source,
+        Expression branch)
+    {
+        if (!table.HasRowid
+            || branch is not BinaryExpression
+            {
+                Operator: BinaryOperator.Equal or BinaryOperator.Is,
+            } equality)
+        {
+            return false;
+        }
+
+        return IsRowidPrimaryKeyColumn(equality.Left) || IsRowidPrimaryKeyColumn(equality.Right);
+
+        bool IsRowidPrimaryKeyColumn(Expression expression)
+        {
+            if (expression is not ColumnExpression column
+                || (column.Qualifier is not null
+                    && !string.Equals(column.Qualifier, source.Name, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(column.Qualifier, source.Alias, StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            var name = column.UnqualifiedName ?? column.Name;
+            return EmbeddedTable.IsRowidAliasName(name)
+                    && !table.TryGetColumnIndex(name, out _)
+                || table.RowidAliasColumnIndex >= 0
+                    && string.Equals(
+                        table.Columns[table.RowidAliasColumnIndex],
+                        name,
+                        StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private static bool TrySplitTopLevelOrBranches(
@@ -30608,15 +31894,16 @@ out bool hasReturning)
             {
                 context.CheckInterrupt();
                 var rowId = table.HasRowid ? row.RowId : null;
-                foreach (var (index, branch) in plan.Branches)
+                foreach (var branch in plan.Branches)
                 {
-                    if (!IndexExpressionSemantics.Qualifies(
-                            index,
-                            table,
-                            row.Values,
-                            rowId,
-                            EvaluateIndexExpression)
-                        || !IsTrue(Evaluate(branch, parameters, row, context)))
+                    if ((branch.Index is { } index
+                            && !IndexExpressionSemantics.Qualifies(
+                                index,
+                                table,
+                                row.Values,
+                                rowId,
+                                EvaluateIndexExpression))
+                        || !IsTrue(Evaluate(branch.Predicate, parameters, row, context)))
                     {
                         continue;
                     }
@@ -30644,8 +31931,8 @@ out bool hasReturning)
         var tableName = plan.Source.Alias ?? plan.Source.Name;
         var indexes = string.Join(
             ", ",
-            plan.Branches.Select(branch => branch.Index.Name));
-        return $"MULTI-INDEX OR {tableName} USING INDEXES {indexes}";
+            plan.Branches.Select(static branch => branch.Name));
+        return $"MULTI-INDEX OR {tableName} ({indexes})";
     }
 
     private int CompareManagedIndexEntries(
@@ -30894,7 +32181,13 @@ out bool hasReturning)
                 context,
                 outerRow)
             : indexPlan is not null
-            ? GetManagedIndexRows(indexPlan, context, outerRow, sourceLimit)
+            ? GetManagedIndexRows(
+                indexPlan,
+                context,
+                outerRow,
+                sourceLimit,
+                statement.Where,
+                parameters)
             : orUnionPlan is not null
                 ? GetManagedOrIndexUnionRows(orUnionPlan, parameters, context, outerRow)
             : TryGetTransientLookupRows(
@@ -31619,6 +32912,56 @@ out bool hasReturning)
                             join.Right,
                             column with { Index = column.Index - leftWidth },
                             context);
+                }
+            case DerivedTableSource { Query: SelectStatement query, Alias: { } alias }:
+                {
+                    if (!string.Equals(column.Qualifier, alias, StringComparison.OrdinalIgnoreCase)
+                        || column.Index < 0
+                        || column.Index >= query.Projections.Count)
+                    {
+                        return null;
+                    }
+
+                    var projection = query.Projections[column.Index].Expression;
+                    var explicitCollation = projection is CollationExpression collation
+                        ? collation.Name
+                        : null;
+                    var projectedColumn = UnwrapCollation(projection) as ColumnExpression;
+                    if (projectedColumn is null)
+                        return explicitCollation is null
+                            ? null
+                            : new EmbeddedColumn(
+                                column.Name,
+                                null,
+                                false,
+                                false,
+                                false,
+                                null,
+                                Collation: explicitCollation);
+
+                    var sourceColumn = GetOutputColumns(query.Source, context).FirstOrDefault(candidate =>
+                        string.Equals(
+                            candidate.Name,
+                            projectedColumn.UnqualifiedName ?? projectedColumn.Name,
+                            StringComparison.OrdinalIgnoreCase)
+                        && (projectedColumn.Qualifier is null
+                            || string.Equals(
+                                candidate.Qualifier,
+                                projectedColumn.Qualifier,
+                                StringComparison.OrdinalIgnoreCase)));
+                    var definition = sourceColumn is null
+                        ? null
+                        : GetOutputColumnDefinition(query.Source, sourceColumn, context);
+                    return definition is null
+                        ? null
+                        : new EmbeddedColumn(
+                            column.Name,
+                            definition.DeclaredType,
+                            false,
+                            false,
+                            false,
+                            null,
+                            Collation: explicitCollation ?? definition.Collation);
                 }
             default:
                 return null;
@@ -35252,6 +36595,154 @@ out bool hasReturning)
         return new SourceData(table.Columns, rows);
     }
 
+    // Uses a real declared index for the narrow equality shape the semi/anti rewrite creates.
+    // Keep this deliberately stricter than the transient lookup: an index key compares its
+    // stored values directly, so a probe that needs SQLite affinity conversion must retain the
+    // hash path until the durable seeker can apply those conversions itself.
+    private SourceData? TryGetDeclaredIndexLookupRows(
+        TableSource? source,
+        Expression? predicate,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        if (source is not NamedTableSource named
+            || predicate is null
+            || context.ConcurrentMvStore is not null
+            || IsSchemaTable(named.Name)
+            || IsCommonTableExpression(named, context)
+            || context.Views?.ContainsKey(named.Name) == true
+            || !context.Tables.TryGetValue(named.Name, out var table)
+            || !TryCreateTransientEqualityLookup(named, table, predicate, context, outerRow, out var lookup)
+            || TryPlanDeclaredIndexLookup(named, predicate, context) is not { } plan
+            || plan.Index.Columns[0].ColumnIndex != lookup.ColumnOrdinal
+            || !string.Equals(
+                IndexExpressionSemantics.GetCollationName(table, plan.Index.Columns[0]),
+                lookup.Collation,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var probeValue = Evaluate(lookup.ValueExpression, parameters, outerRow, context);
+        if (probeValue.Kind is SqlValueKind.Null)
+            return new SourceData(table.Columns, []);
+
+        var visibleRows = GetNamedTableRows(
+            named,
+            context,
+            maximumRows: null,
+            outerRow).Rows;
+        var entries = GetManagedIndexEntries(table, plan.Index, visibleRows, context);
+        var qualifier = named.Alias ?? named.Name;
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
+        var qualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
+            qualifier,
+            table.ColumnDefinitions);
+        var conversionFree = !lookup.ColumnConvertsTextToNumeric
+            && !lookup.ColumnConvertsNumericToText
+            && !lookup.ValueConvertsTextToNumeric
+            && !lookup.ValueConvertsNumericToText;
+        var candidates = conversionFree
+            ? entries.Where(entry => Compare(entry.Key[0], probeValue, lookup.Collation) == 0)
+            : entries;
+        var rows = candidates
+            .Select(entry => entry.Row with
+            {
+                QualifiedColumns = qualifiedColumns,
+                Parent = outerRow,
+                RowIdQualifier = qualifier,
+                ColumnDefinitions = table.ColumnDefinitions,
+                QualifiedColumnDefinitions = qualifiedColumnDefinitions,
+            })
+            .ToArray();
+
+        return new SourceData(table.Columns, rows);
+    }
+
+    private ManagedIndexScanPlan? TryPlanDeclaredIndexLookup(
+        NamedTableSource source,
+        Expression? predicate,
+        QueryContext context)
+    {
+        if (predicate is null
+            || context.ConcurrentMvStore is not null
+            || IsSchemaTable(source.Name)
+            || IsCommonTableExpression(source, context)
+            || context.Views?.ContainsKey(source.Name) == true
+            || !context.Tables.TryGetValue(source.Name, out var table)
+            || !TryGetSemiAntiInnerEqualityColumn(predicate, source, table, out var columnOrdinal))
+        {
+            return null;
+        }
+
+        var index = table.Indexes.FirstOrDefault(candidate =>
+            !candidate.IsPartial
+            && !candidate.IsMethodIndex
+            && candidate.Columns.Count > 0
+            && !candidate.Columns[0].IsExpression
+            && candidate.Columns[0].ColumnIndex == columnOrdinal
+            && !IndexUsesRegisteredFunctions(candidate)
+            && IsCustomCollationIndexPlanReady(table, candidate));
+        return index is null
+            ? null
+            : new ManagedIndexScanPlan(
+                source,
+                table,
+                index,
+                Search: true,
+                SearchConstraint: $"{index.Columns[0].Name}=?",
+                Reverse: false);
+    }
+
+    private static bool TryGetSemiAntiInnerEqualityColumn(
+        Expression predicate,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out int columnOrdinal)
+    {
+        columnOrdinal = -1;
+        foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(predicate))
+        {
+            if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+                continue;
+
+            if (TryGetSemiAntiInnerColumnOrdinal(
+                    equality.Left,
+                    equality.Right,
+                    source,
+                    table,
+                    out var leftOrdinal)
+                || TryGetSemiAntiInnerColumnOrdinal(
+                    equality.Right,
+                    equality.Left,
+                    source,
+                    table,
+                    out leftOrdinal))
+            {
+                columnOrdinal = leftOrdinal;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetSemiAntiInnerColumnOrdinal(
+        Expression innerCandidate,
+        Expression outerCandidate,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out int columnOrdinal)
+    {
+        columnOrdinal = -1;
+        return innerCandidate is ColumnExpression { BooleanKeyword: null, Qualifier: { } qualifier } column
+            && (string.Equals(qualifier, source.Name, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(qualifier, source.Alias, StringComparison.OrdinalIgnoreCase))
+            && outerCandidate is ColumnExpression { BooleanKeyword: null }
+            && table.TryGetColumnIndex(column.UnqualifiedName ?? column.Name, out columnOrdinal);
+    }
+
     private sealed record TransientEqualityLookup(
         int ColumnOrdinal,
         string Collation,
@@ -35583,25 +37074,424 @@ out bool hasReturning)
         SourceRow? outerRow,
         IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
-        var rows = sidePredicate is not null && side is JoinTableSource nestedJoin
-            ? GetJoinRowsWithPredicatePushdown(
-                nestedJoin,
-                sidePredicate,
-                parameters,
-                context,
-                maximumRows: null,
-                outerRow,
-                sourceOrderBy)
-            : GetSourceRowsWithTransientIndex(
-                side,
-                sidePredicate,
-                parameters,
-                context,
-                maximumRows: null,
-                outerRow,
-                sourceOrderBy);
+        var rows = sidePredicate is not null && side is NamedTableSource named
+            ? TryGetManagedJoinSideIndexRows(
+                    named,
+                    sidePredicate,
+                    context,
+                    outerRow,
+                    sourceOrderBy)
+                ?? GetSourceRowsWithTransientIndex(
+                    side,
+                    sidePredicate,
+                    parameters,
+                    context,
+                    maximumRows: null,
+                    outerRow,
+                    sourceOrderBy)
+            : sidePredicate is not null && side is JoinTableSource nestedJoin
+                ? GetJoinRowsWithPredicatePushdown(
+                    nestedJoin,
+                    sidePredicate,
+                    parameters,
+                    context,
+                    maximumRows: null,
+                    outerRow,
+                    sourceOrderBy)
+                : GetSourceRowsWithTransientIndex(
+                    side,
+                    sidePredicate,
+                    parameters,
+                    context,
+                    maximumRows: null,
+                    outerRow,
+                    sourceOrderBy);
 
         return sidePredicate is null ? rows : FilterSourceRows(rows, sidePredicate, parameters, context);
+    }
+
+    private SourceData? TryGetManagedJoinSideIndexRows(
+        NamedTableSource source,
+        Expression predicate,
+        QueryContext context,
+        SourceRow? outerRow,
+        IReadOnlyList<OrderByTerm>? sourceOrderBy)
+    {
+        var select = new SelectStatement(
+            Distinct: false,
+            Projections: [],
+            Source: source,
+            Where: predicate,
+            GroupBy: [],
+            Having: null,
+            NamedWindows: [],
+            OrderBy: sourceOrderBy ?? [],
+            Limit: null,
+            Offset: null);
+        return TryPlanManagedIndexScan(select, context) is { } plan
+            ? GetManagedIndexRows(plan, context, outerRow)
+            : null;
+    }
+
+    // A narrow executor for a two-branch OR in an INNER join condition. The physical route scans
+    // the edge-side declared index once, then probes the node primary-key index for each branch.
+    // It remains deliberately evaluator-owned: the final ON and WHERE predicates run unchanged
+    // after candidate generation, which keeps affinity, collation, and error semantics exact.
+    private ManagedJoinLocalOrPlan? TryPlanManagedJoinLocalOr(
+        JoinTableSource source,
+        QueryContext context)
+    {
+        if (source is not
+            {
+                Kind: JoinKind.Inner,
+                Left: NamedTableSource nodeSource,
+                Right: NamedTableSource edgeSource,
+                Condition: BinaryExpression { Operator: BinaryOperator.Or } condition,
+            }
+            || nodeSource.IndexDirective is not null
+            || edgeSource.IndexDirective is not null
+            || !context.Tables.TryGetValue(nodeSource.Name, out var nodeTable)
+            || !context.Tables.TryGetValue(edgeSource.Name, out var edgeTable))
+        {
+            return null;
+        }
+
+        var branches = new List<Expression>();
+        CollectOrLeaves(condition, branches);
+        if (branches.Count != 2)
+            return null;
+
+        Expression? edgeIndexPredicate = null;
+        var plannedBranches = new List<ManagedJoinLocalOrBranch>(branches.Count);
+        foreach (var branch in branches)
+        {
+            var nodeKeyColumn = -1;
+            var edgeKeyColumn = -1;
+            Expression? branchEdgeIndexPredicate = null;
+            foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(branch))
+            {
+                if (conjunct is not BinaryExpression
+                    {
+                        Operator: BinaryOperator.Equal or BinaryOperator.Is,
+                    } equality)
+                {
+                    continue;
+                }
+
+                if (TryGetJoinLocalOrColumnPair(
+                        equality,
+                        nodeSource,
+                        nodeTable,
+                        edgeSource,
+                        edgeTable,
+                        out var nodeColumn,
+                        out var edgeColumn))
+                {
+                    nodeKeyColumn = nodeColumn;
+                    edgeKeyColumn = edgeColumn;
+                    continue;
+                }
+
+                if (TryGetSourceLiteralEquality(
+                        equality,
+                        edgeSource,
+                        edgeTable,
+                        out _,
+                        out _))
+                {
+                    branchEdgeIndexPredicate = conjunct;
+                }
+            }
+
+            if (nodeKeyColumn < 0 || edgeKeyColumn < 0 || branchEdgeIndexPredicate is null)
+                return null;
+
+            // The two OR arms must share the same edge-side literal restriction. The selected
+            // declared index is then a true common prefilter; each arm's remaining predicates
+            // stay in the final ON evaluation below.
+            if (edgeIndexPredicate is null)
+            {
+                edgeIndexPredicate = branchEdgeIndexPredicate;
+            }
+            else if (!IndexExpressionSemantics.ExpressionsEqual(
+                         edgeIndexPredicate,
+                         branchEdgeIndexPredicate))
+            {
+                return null;
+            }
+
+            plannedBranches.Add(new ManagedJoinLocalOrBranch(nodeKeyColumn, edgeKeyColumn));
+        }
+
+        if (edgeIndexPredicate is null)
+            return null;
+
+        var edgeSelect = new SelectStatement(
+            Distinct: false,
+            Projections: [],
+            Source: edgeSource,
+            Where: edgeIndexPredicate,
+            GroupBy: [],
+            Having: null,
+            NamedWindows: [],
+            OrderBy: [],
+            Limit: null,
+            Offset: null);
+        var edgeScan = TryPlanManagedIndexScan(edgeSelect, context);
+        if (edgeScan is not { Search: true })
+            return null;
+
+        var nodePrimaryKeyIndex = nodeTable.Indexes.FirstOrDefault(index =>
+            !index.IsPartial
+            && !index.IsMethodIndex
+            && index.Columns.Count == 1
+            && index.Columns[0].ColumnIndex == plannedBranches[0].NodeKeyColumn);
+        if (nodePrimaryKeyIndex is null
+            || plannedBranches.Any(branch =>
+                branch.NodeKeyColumn != nodePrimaryKeyIndex.Columns[0].ColumnIndex))
+        {
+            return null;
+        }
+
+        return new ManagedJoinLocalOrPlan(
+            nodeSource,
+            nodeTable,
+            nodePrimaryKeyIndex,
+            edgeSource,
+            edgeScan,
+            edgeIndexPredicate,
+            plannedBranches);
+
+        static void CollectOrLeaves(Expression expression, List<Expression> leaves)
+        {
+            if (expression is BinaryExpression { Operator: BinaryOperator.Or } or)
+            {
+                CollectOrLeaves(or.Left, leaves);
+                CollectOrLeaves(or.Right, leaves);
+                return;
+            }
+
+            leaves.Add(expression);
+        }
+    }
+
+    private static bool TryGetJoinLocalOrColumnPair(
+        BinaryExpression equality,
+        NamedTableSource nodeSource,
+        EmbeddedTable nodeTable,
+        NamedTableSource edgeSource,
+        EmbeddedTable edgeTable,
+        out int nodeColumn,
+        out int edgeColumn)
+    {
+        nodeColumn = -1;
+        edgeColumn = -1;
+        if (equality.Left is not ColumnExpression left || equality.Right is not ColumnExpression right)
+            return false;
+
+        if (TryResolveSourceColumn(left, nodeSource, nodeTable, out nodeColumn)
+            && TryResolveSourceColumn(right, edgeSource, edgeTable, out edgeColumn)
+            || TryResolveSourceColumn(right, nodeSource, nodeTable, out nodeColumn)
+            && TryResolveSourceColumn(left, edgeSource, edgeTable, out edgeColumn))
+        {
+            var nodeDefinition = nodeTable.ColumnDefinitions[nodeColumn];
+            var edgeDefinition = edgeTable.ColumnDefinitions[edgeColumn];
+            return string.Equals(nodeDefinition.Collation ?? "BINARY", "BINARY", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(edgeDefinition.Collation ?? "BINARY", "BINARY", StringComparison.OrdinalIgnoreCase)
+                && GetJoinKeyAffinity(nodeDefinition) == GetJoinKeyAffinity(edgeDefinition);
+        }
+
+        nodeColumn = -1;
+        edgeColumn = -1;
+        return false;
+    }
+
+    private static bool TryGetSourceLiteralEquality(
+        BinaryExpression equality,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out int column,
+        out Expression value)
+    {
+        column = -1;
+        value = null!;
+        if (equality.Left is ColumnExpression left
+            && TryResolveSourceColumn(left, source, table, out column)
+            && equality.Right is LiteralExpression)
+        {
+            value = equality.Right;
+            return true;
+        }
+
+        if (equality.Right is ColumnExpression right
+            && TryResolveSourceColumn(right, source, table, out column)
+            && equality.Left is LiteralExpression)
+        {
+            value = equality.Left;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryResolveSourceColumn(
+        ColumnExpression column,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out int ordinal)
+    {
+        ordinal = -1;
+        if (column.BooleanKeyword is not null
+            || column.Qualifier is not null
+                && !string.Equals(column.Qualifier, source.Name, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(column.Qualifier, source.Alias, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return table.TryGetColumnIndex(column.UnqualifiedName ?? column.Name, out ordinal);
+    }
+
+    private SourceData GetManagedJoinLocalOrRows(
+        JoinTableSource source,
+        ManagedJoinLocalOrPlan plan,
+        Expression leftPredicate,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        var nodeQualifier = plan.NodeSource.Alias ?? plan.NodeSource.Name;
+        var nodeColumns = plan.NodeTable.Columns;
+        var edgeColumns = context.Tables[plan.EdgeSource.Name].Columns;
+        var nodeQualifiedColumns = BuildQualifiedColumns(nodeQualifier, nodeColumns);
+        var edgeQualifiedColumns = BuildQualifiedColumns(
+            plan.EdgeSource.Alias ?? plan.EdgeSource.Name,
+            edgeColumns);
+        var nodeQualifiedDefinitions = BuildQualifiedColumnDefinitions(
+            nodeQualifier,
+            plan.NodeTable.ColumnDefinitions);
+        var edgeTable = context.Tables[plan.EdgeSource.Name];
+        var columns = nodeColumns.Concat(edgeColumns).ToArray();
+        var outputColumns = GetOutputColumns(source, context);
+        var qualifiedColumns = CombineQualifiedColumns(
+            nodeQualifiedColumns,
+            edgeQualifiedColumns,
+            nodeColumns.Length);
+        var qualifiedDefinitions = GetSourceQualifiedColumnDefinitions(source, context);
+        var columnDefinitions = plan.NodeTable.ColumnDefinitions
+            .Cast<EmbeddedColumn?>()
+            .Concat(edgeTable.ColumnDefinitions.Cast<EmbeddedColumn?>())
+            .ToArray();
+        var ambiguousQualifiedColumns = GetAmbiguousQualifiedColumns(source, context);
+
+        SourceRow DecorateNode(SourceRow row) => row with
+        {
+            QualifiedColumns = nodeQualifiedColumns,
+            Parent = outerRow,
+            RowIdQualifier = nodeQualifier,
+            ColumnDefinitions = plan.NodeTable.ColumnDefinitions,
+            QualifiedColumnDefinitions = nodeQualifiedDefinitions,
+        };
+        SourceRow Join(SourceRow node, SourceRow edge) => new(
+            columns,
+            node.Values.Concat(edge.Values).ToArray(),
+            qualifiedColumns,
+            outerRow,
+            outputColumns,
+            QualifiedRowIds: CombineQualifiedRowIds(
+                GetQualifiedRowIds(node),
+                GetQualifiedRowIds(edge)),
+            ColumnDefinitions: columnDefinitions,
+            QualifiedColumnDefinitions: qualifiedDefinitions,
+            AmbiguousQualifiedColumns: ambiguousQualifiedColumns);
+
+        var visibleNodes = GetNamedTableRows(
+            plan.NodeSource,
+            context,
+            maximumRows: null,
+            outerRow).Rows;
+        var nodeEntries = GetManagedIndexEntries(
+            plan.NodeTable,
+            plan.NodePrimaryKeyIndex,
+            visibleNodes,
+            context);
+        var edgeRows = GetManagedIndexRows(
+            plan.EdgeScan,
+            context,
+            outerRow,
+            predicate: plan.EdgePredicate,
+            parameters: parameters).Rows;
+        var rows = new List<SourceRow>();
+
+        foreach (var edge in edgeRows)
+        {
+            context.CheckInterrupt();
+            var emittedNodeEntries = new HashSet<int>();
+            foreach (var branch in plan.Branches)
+            {
+                var probe = edge.Values[branch.EdgeKeyColumn];
+                if (probe.Kind == SqlValueKind.Null)
+                    continue;
+
+                var first = FindFirstNodeEntry(nodeEntries, probe);
+                for (var index = first; index < nodeEntries.Count; index++)
+                {
+                    if (Compare(
+                            nodeEntries[index].Key[0],
+                            probe,
+                            IndexExpressionSemantics.GetCollationName(
+                                plan.NodeTable,
+                                plan.NodePrimaryKeyIndex.Columns[0])) != 0)
+                    {
+                        break;
+                    }
+
+                    if (!emittedNodeEntries.Add(index))
+                        continue;
+
+                    var node = DecorateNode(nodeEntries[index].Row);
+                    if (!IsTrue(Evaluate(leftPredicate, parameters, node, context)))
+                        continue;
+
+                    var joined = Join(node, edge);
+                    if (source.Condition is null
+                        || JoinConditionMatches(
+                            source,
+                            BuildJoinPairs(source, context),
+                            joined,
+                            node,
+                            edge,
+                            parameters,
+                            context))
+                    {
+                        rows.Add(joined);
+                    }
+                }
+            }
+        }
+
+        return new SourceData(columns, rows);
+
+        int FindFirstNodeEntry(
+            IReadOnlyList<(SourceRow Row, SqlValue[] Key)> entries,
+            SqlValue probe)
+        {
+            var low = 0;
+            var high = entries.Count;
+            var collation = IndexExpressionSemantics.GetCollationName(
+                plan.NodeTable,
+                plan.NodePrimaryKeyIndex.Columns[0]);
+            while (low < high)
+            {
+                var middle = low + ((high - low) / 2);
+                if (Compare(entries[middle].Key[0], probe, collation) < 0)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+
+            return low;
+        }
     }
 
     private SourceData GetJoinRows(
@@ -35625,6 +37515,18 @@ out bool hasReturning)
                 outerRow,
                 leftPredicate,
                 sourceOrderBy);
+        }
+        if (leftPredicate is not null
+            && rightPredicate is null
+            && TryPlanManagedJoinLocalOr(source, context) is { } joinLocalOrPlan)
+        {
+            return GetManagedJoinLocalOrRows(
+                source,
+                joinLocalOrPlan,
+                leftPredicate,
+                parameters,
+                context,
+                outerRow);
         }
         if (source.Kind == JoinKind.Inner
             && source.Condition is not null
@@ -35677,8 +37579,21 @@ out bool hasReturning)
                 sourceOrderBy ?? [],
                 context);
         var rightIsCorrelatedSource = rightIsCorrelatedTableFunction || rightIsCorrelatedVirtualTable;
+        // The evaluator's declared-index probe rebuilds its right-side entries on each call.
+        // Materialize once and hash the right side when multiple left rows would probe it.
+        var rightDeclaredLookup = !rightIsCorrelatedSource
+            && rightPredicate is null
+            && source.Kind is JoinKind.Inner or JoinKind.Left
+            && left.Rows.Count <= 1
+            && source.Left is NamedTableSource
+            && source.Right is NamedTableSource rightNamedSource
+            && TryPlanDeclaredIndexLookup(rightNamedSource, source.Condition, context) is { } declaredLookup
+            ? declaredLookup
+            : null;
         var right = rightIsCorrelatedSource
             ? new SourceData(GetSourceColumns(source.Right, context), [])
+            : rightDeclaredLookup is not null
+                ? new SourceData(GetSourceColumns(source.Right, context), [])
             : GetSideSourceRows(
                 source.Right,
                 rightPredicate,
@@ -35701,8 +37616,11 @@ out bool hasReturning)
         var joinPairs = BuildJoinPairs(source, context);
         var joinHashIndex = rightIsCorrelatedSource
             ? null
-            : TryBuildJoinHashIndex(source, right, parameters, context);
+            : rightDeclaredLookup is null
+                ? TryBuildJoinHashIndex(source, right, parameters, context)
+                : null;
         IEnumerable<int>? allRightIndices = null;
+        SourceData? rightLookupFallback = null;
 
         var rows = new List<SourceRow>();
         List<Expression>? omittedPredicates = null;
@@ -35803,12 +37721,26 @@ out bool hasReturning)
                     context,
                     leftRow,
                     sourceOrderBy)
+                : rightDeclaredLookup is not null
+                    ? TryGetDeclaredIndexLookupRows(
+                        source.Right,
+                        source.Condition,
+                        parameters,
+                        context,
+                        leftRow with { Parent = outerRow })
+                        ?? (rightLookupFallback ??= GetSideSourceRows(
+                            source.Right,
+                            rightPredicate,
+                            parameters,
+                            context,
+                            outerRow,
+                            sourceOrderBy))
                 : right;
             AddOmittedPredicates(rowsForLeft.OmittedVirtualTablePredicates);
             var matched = false;
             var candidateIndices = joinHashIndex is not null
                 ? joinHashIndex.Probe(leftRow)
-                : rightIsCorrelatedSource
+                : rightIsCorrelatedSource || rightDeclaredLookup is not null
                     ? Enumerable.Range(0, rowsForLeft.Rows.Count)
                     : allRightIndices ??= Enumerable.Range(0, rowsForLeft.Rows.Count);
             foreach (var rightIndex in candidateIndices)
@@ -35829,7 +37761,7 @@ out bool hasReturning)
                 }
 
                 matched = true;
-                if (!rightIsCorrelatedSource)
+                if (!rightIsCorrelatedSource && source.Kind is JoinKind.Right or JoinKind.Full)
                     rightMatched[rightIndex] = true;
                 rows.Add(row);
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
@@ -35953,11 +37885,9 @@ out bool hasReturning)
         // declared collation it resolved before the rewrite.
         var innerContext = EnterCollationSource(context, source.Right);
 
-        // The un-rewritten correlated subquery reached its inner table through
-        // TryGetTransientLookupRows, which turns an `inner.col = <outer expression>` conjunct
-        // into a statement-cached hash probe. Keep using it here so the rewrite never trades a
-        // probe for a scan; the materialized row set is only built when no probe applies, and
-        // then only once for the whole join instead of once per outer row.
+        // The un-rewritten correlated subquery reached its inner table through a cached
+        // transient hash probe. A matching declared index now takes precedence for the narrow
+        // conversion-free equality shape above; all other rewrites retain the hash probe.
         SourceData? materializedRight = null;
 
         var keepOnMatch = source.Kind == JoinKind.Semi;
@@ -35967,7 +37897,18 @@ out bool hasReturning)
             context.CheckInterrupt();
             var probed = source.Condition is null
                 ? null
-                : TryGetTransientLookupRows(source.Right, source.Condition, parameters, innerContext, leftRow);
+                : TryGetDeclaredIndexLookupRows(
+                        source.Right,
+                        source.Condition,
+                        parameters,
+                        innerContext,
+                        leftRow)
+                    ?? TryGetTransientLookupRows(
+                        source.Right,
+                        source.Condition,
+                        parameters,
+                        innerContext,
+                        leftRow);
             IReadOnlyList<SourceRow> candidates;
             bool reparent;
             if (probed is not null)
@@ -58287,7 +60228,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                 rewritten => new ExplainQueryPlanStatement(
                     rewritten,
                     explainQueryPlan.Format,
-                    explainQueryPlan.InnerSql)),
+                    explainQueryPlan.InnerSql,
+                    explainQueryPlan.Sql)),
             _ when ContainsSchemaQualification(statement)
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
@@ -58347,10 +60289,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                 IsAttached: true);
         }
 
-        // `ANALYZE sqlite_schema` re-analyzes the main schema (the schema-table name is
-        // not an ordinary table target).
+        // `ANALYZE sqlite_schema` reloads the manually editable planner-statistics tables; it
+        // does not regenerate their contents. Preserve the target so ExecuteAnalyze can perform
+        // that no-op reload over the catalog-backed statistics.
         if (EmbeddedDatabase.IsSchemaTable(statement.Target))
-            return new RoutedStatement(_database, statement with { Target = null }, IsAttached: false);
+            return new RoutedStatement(_database, statement, IsAttached: false);
 
         return new RoutedStatement(_database, statement, IsAttached: false);
     }

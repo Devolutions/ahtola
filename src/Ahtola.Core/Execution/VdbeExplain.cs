@@ -28,7 +28,10 @@ public static class VdbeExplain
             rows.Add(
             [
                 SqlValue.Integer(address),
-                SqlValue.Text(instruction.Opcode.ToString()),
+                SqlValue.Text(
+                    instruction is OpenReadCursorInstruction { ExplainAsOpenRead: true }
+                        ? "OpenRead"
+                        : instruction.Opcode.ToString()),
                 SqlValue.Integer(p1),
                 SqlValue.Integer(p2),
                 SqlValue.Integer(p3),
@@ -52,6 +55,12 @@ public static class VdbeExplain
                 0,
                 FormatValue(load.Value),
                 $"r[{load.Destination.Index}]={FormatValue(load.Value)}"),
+            IntegerInstruction integer => (
+                integer.Value,
+                integer.Destination.Index,
+                0,
+                null,
+                $"r[{integer.Destination.Index}]={integer.Value}"),
             LoadParameterInstruction loadParameter => (
                 loadParameter.Destination.Index,
                 loadParameter.Slot.Index,
@@ -104,7 +113,11 @@ public static class VdbeExplain
                 open.Cursor.Index,
                 0,
                 open.ColumnCount,
-                open.TableName,
+                open.TableName is null
+                    ? null
+                    : open.ExplainAsOpenRead
+                        ? $"table={open.TableName}"
+                        : open.TableName,
                 open.TableName is null
                     ? $"open read cursor {open.Cursor.Index}"
                     : $"open read cursor {open.Cursor.Index} on {open.TableName} ({open.ColumnCount} cols)"),
@@ -563,6 +576,12 @@ public static class VdbeExplain
                 seekKey.Key.Start.Index,
                 $"{seekKey.Operator}{(seekKey.EqOnly ? " eq_only" : string.Empty)} {FormatRange(seekKey.Key)}",
                 seekKey.Description),
+            IdxGTCheckInstruction indexRangeCheck => (
+                indexRangeCheck.Cursor.Index,
+                indexRangeCheck.PastEndTarget.Offset,
+                indexRangeCheck.Key.Start.Index,
+                FormatRange(indexRangeCheck.Key),
+                $"goto {indexRangeCheck.PastEndTarget.Offset} if c[{indexRangeCheck.Cursor.Index}] > {FormatRange(indexRangeCheck.Key)}"),
             IdxRowIdInstruction idxRowId => (
                 idxRowId.Cursor.Index,
                 idxRowId.Destination.Index,
@@ -841,6 +860,12 @@ public static class VdbeExplain
                 0,
                 aggFinalize.Aggregate.Name,
                 $"r[{aggFinalize.Destination.Index}]={aggFinalize.Aggregate.Name} finalize accumulator {aggFinalize.Accumulator.Index}"),
+            AggFinalInstruction aggFinal => (
+                aggFinal.Accumulator.Index,
+                aggFinal.Destination.Index,
+                0,
+                aggFinal.Aggregate.Name,
+                $"r[{aggFinal.Destination.Index}]={aggFinal.Aggregate.Name} finalize accumulator {aggFinal.Accumulator.Index}"),
             AggValueInstruction aggValue => (
                 aggValue.Accumulator.Index,
                 aggValue.Destination.Index,

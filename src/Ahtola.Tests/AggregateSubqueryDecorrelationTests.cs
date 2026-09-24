@@ -81,6 +81,37 @@ public sealed class AggregateSubqueryDecorrelationTests
         AssertRewrites(Setup, query, groupFirst: 1, joinFirst: 0, declines: 0);
     }
 
+    [Test]
+    public void GroupFirstDerivedAggregateProbesItsMaterializedGroupsByCorrelationKey()
+    {
+        const string query =
+            """
+            SELECT o.id, (SELECT avg(i.v) FROM inner_rows i WHERE i.k = o.k) AS agg
+            FROM outer_rows o
+            ORDER BY o.id;
+            """;
+
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, Setup);
+        database.ResetRewriteDiagnostics();
+        database.JoinIndexSeekMetrics.Reset();
+
+        var rows = Query(connection, query);
+
+        rows.Should().HaveCount(6);
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Real(200));
+        rows[1].Should().Equal(SqlValue.Integer(2), SqlValue.Real(200));
+        rows[2].Should().Equal(SqlValue.Integer(3), SqlValue.Real(7));
+        rows[3].Should().Equal(SqlValue.Integer(4), SqlValue.Null);
+        rows[4].Should().Equal(SqlValue.Integer(5), SqlValue.Null);
+        rows[5].Should().Equal(SqlValue.Integer(6), SqlValue.Real(7));
+        database.RewriteDiagnostics.AggregateGroupFirstRewrites.Should().Be(1);
+        database.JoinIndexSeekMetrics.PlansCreated.Should().Be(1);
+        database.JoinIndexSeekMetrics.SeeksAttempted.Should().Be(6);
+        database.JoinIndexSeekMetrics.CandidateRowsVisited.Should().Be(4);
+    }
+
     /// <summary>
     /// SQLite names an unaliased result column after the source text of the expression that
     /// produced it. Substituting the subquery with a joined column must not rename it.
@@ -130,6 +161,21 @@ public sealed class AggregateSubqueryDecorrelationTests
 
         AssertMatchesSqlite(Setup, query);
         AssertRewrites(Setup, query, groupFirst: 3, joinFirst: 0, declines: 0);
+    }
+
+    [Test]
+    public void GroupFirstReusesOneTableForIdenticalAggregateSubqueries()
+    {
+        const string query =
+            """
+            SELECT o.id
+            FROM outer_rows o
+            WHERE o.v < (SELECT avg(i.v) FROM inner_rows i WHERE i.k = o.k)
+              AND o.v > (SELECT avg(i.v) FROM inner_rows i WHERE i.k = o.k) - 100;
+            """;
+
+        AssertMatchesSqlite(Setup, query);
+        AssertRewrites(Setup, query, groupFirst: 1, joinFirst: 0, declines: 0);
     }
 
     /// <summary>
@@ -395,6 +441,26 @@ public sealed class AggregateSubqueryDecorrelationTests
 
         AssertMatchesSqliteUnordered(Setup, query);
         AssertRewrites(Setup, query, groupFirst: 0, joinFirst: 1, declines: 0);
+    }
+
+    [Test]
+    public void JoinFirstAllowsAnUncorrelatedInSubquery()
+    {
+        const string setup =
+            """
+            CREATE TABLE list_rows(k INTEGER);
+            INSERT INTO list_rows VALUES (1),(3);
+            """ + Setup;
+        const string query =
+            """
+            SELECT o.id
+            FROM outer_rows o
+            WHERE o.k IN (SELECT k FROM list_rows)
+              AND o.v > (SELECT sum(i.v) FROM inner_rows i WHERE i.k = o.k);
+            """;
+
+        AssertMatchesSqliteUnordered(setup, query);
+        AssertRewrites(setup, query, groupFirst: 0, joinFirst: 1, declines: 0);
     }
 
     /// <summary>

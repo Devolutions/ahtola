@@ -466,9 +466,9 @@ public class CompiledCompoundRecursiveDifferentialTests
 
         QueryPlanDetail(connection, callbackQuery).Should().Be("MANAGED EVALUATOR FALLBACK");
         calls.Should().Be(0);
-        QueryPlanDetail(connection, sorterQuery).Should().Be("MANAGED COMPILED VDBE");
+        QueryPlanDetail(connection, sorterQuery).Should().Be("SCAN items");
         QueryPlanDetail(connection, sorterQuery, cancellation.Token)
-            .Should().Be("MANAGED EVALUATOR FALLBACK");
+            .Should().Be("SCAN items");
 
         cancellation.Cancel();
         using var statement = connection.Prepare(sorterQuery);

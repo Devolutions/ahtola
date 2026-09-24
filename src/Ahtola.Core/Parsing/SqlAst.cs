@@ -483,7 +483,11 @@ internal sealed record ExplainQueryPlanStatement(
     ExplainQueryPlanFormat Format = ExplainQueryPlanFormat.Text,
     // The original statement text (without the EXPLAIN QUERY PLAN prefix), captured for
     // FORMAT=JSON's envelope "sql" field.
-    string? InnerSql = null) : ParsedStatement;
+    string? InnerSql = null,
+    // FORMAT=JSON must echo the statement exactly as it entered the parser, including its
+    // FORMAT clause, whitespace, and optional terminator. Reconstructing it from InnerSql loses
+    // that transport contract when a caller retains source formatting.
+    string? Sql = null) : ParsedStatement;
 
 internal sealed record SelectStatement(
     bool Distinct,
