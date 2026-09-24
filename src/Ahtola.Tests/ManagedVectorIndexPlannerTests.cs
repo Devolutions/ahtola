@@ -1,5 +1,6 @@
 using Ahtola.Core;
 using AwesomeAssertions;
+using System.Text.Json;
 using static Ahtola.Tests.ManagedVectorIndexTestHarness;
 
 namespace Ahtola.Tests;
@@ -45,6 +46,24 @@ public sealed class ManagedVectorIndexPlannerTests
         var before = EmbeddedDatabase.MethodIndexScansExecuted;
         QueryIntegers(connection, sql).Should().HaveCount(5);
         EmbeddedDatabase.MethodIndexScansExecuted.Should().Be(before + 1);
+    }
+
+    [Test]
+    public void JsonPlanNamesTheSelectedVectorIndexMethod()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = Seed(database);
+        var sql = $"SELECT id FROM docs ORDER BY vector_distance_l2(embedding, {Query}) LIMIT 5;";
+
+        var detail = ExplainDetail(connection, sql);
+        detail.Should().Contain("USING INDEX METHOD vector");
+        using var document = JsonDocument.Parse(
+            ManagedVectorIndexTestHarness.Query(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + sql)
+                .Single()[0].AsText());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(detail);
+        node.GetProperty("op").GetProperty("type").GetString().Should().Be("index_method");
+        node.GetProperty("op").GetProperty("method").GetString().Should().Be("vector");
     }
 
     [Test]

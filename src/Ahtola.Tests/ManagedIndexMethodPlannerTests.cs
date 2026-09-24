@@ -2,6 +2,7 @@ using Ahtola.Core;
 using Ahtola.Core.Indexing;
 using Ahtola.Core.Search;
 using AwesomeAssertions;
+using System.Text.Json;
 using static Ahtola.Tests.ManagedIndexMethodTestHarness;
 
 namespace Ahtola.Tests;
@@ -20,6 +21,40 @@ public sealed class ManagedIndexMethodPlannerTests
 
         detail.Should().StartWith("SEARCH docs USING INDEX METHOD fts INDEX docs_fts")
             .And.Contain("pattern=Match");
+    }
+
+    [Test]
+    public void JsonPlanIdentifiesTheSelectedIndexMethod()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        SeedLargeCorpus(connection);
+        const string sql = "SELECT id FROM docs WHERE fts_match(title, body, 'term7');";
+
+        var textDetail = ExplainDetail(connection, sql);
+        textDetail.Should().Contain("USING INDEX METHOD fts");
+        using var document = JsonDocument.Parse(
+            Query(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + sql).Single()[0].AsText());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(textDetail);
+        node.GetProperty("op").GetProperty("type").GetString().Should().Be("index_method");
+        node.GetProperty("op").GetProperty("method").GetString().Should().Be("fts");
+    }
+
+    [Test]
+    public void JsonPlanDoesNotClaimADeclinedIndexMethod()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        SeedLargeCorpus(connection);
+        const string sql = "SELECT id FROM docs WHERE id = 7;";
+
+        ExplainDetail(connection, sql).Should().NotContain("INDEX METHOD");
+        using var document = JsonDocument.Parse(
+            Query(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + sql).Single()[0].AsText());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.EnumerateArray().Select(static node => node.GetProperty("op").GetProperty("type").GetString())
+            .Should().NotContain("index_method");
     }
 
     [Test]

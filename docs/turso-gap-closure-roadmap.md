@@ -43,7 +43,7 @@ scope decision; it does not mean Ahtola implements every newer Turso feature.
 | 15 | `regexp-family` | Built-in regexp + operator without registration; corpus 19/19 | `core/regexp.rs`, `extensions/regexp`, `turso-sqltests/regexp.sqltest` | Done |
 | 16 | `time-family` | Full sqlean time_*/dur_* family; corpus 34/34 | `core/time/`, `turso-sqltests/time.sqltest` | Done |
 | 17 | `turso-sqltests-adoption` | regexp/sequence/time/vector/without_rowid vendored into turso/ | `turso-sqltests/` | Done |
-| 18 | `eqp-json-op-objects` | Structured per-node op objects not yet modeled | `core/translate/eqp.rs` | Open |
+| 18 | `eqp-json-op-objects` | Several op variants modeled, including virtual-table scans, chosen managed index methods, cost-selected multi-index AND/OR paths, join-local OR DISTINCT, and partial-index fallback scans. Unmodeled views no longer masquerade as base-table scans; other shapes remain `unmodeled`. DML RETURNING result columns and supported CTE materialization metadata use statement/plan data rather than TEXT-plan columns or post-hoc shape guesses. | `core/translate/eqp.rs` | Partial |
 
 The sqltest counts overlap by subsystem only in implementation, not in this
 classification: ranks 1-7 account for 133 distinct expected-failure entries.

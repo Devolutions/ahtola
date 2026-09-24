@@ -435,8 +435,12 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   option); the upstream conformance corpus pins the default-build rejection,
   which is recorded as an intentional expected-failure.
   `EXPLAIN QUERY PLAN FORMAT=JSON` emits one `plan_json` row with the
-  machine-readable envelope from `docs/eqp-json.md`; the structured per-node
-  `op` objects are not yet modeled. Built-in `get_byte`/`set_byte`
+  machine-readable envelope from Turso's `docs/eqp-json.md`. The inner
+  statement's result columns (including DML `RETURNING`) and several
+  structured per-node `op` variants are modeled, including virtual-table
+  scans and selected managed index methods; other plan shapes still carry
+  explicit `unmodeled` operations or no nodes when no access path is proven
+  (for example, an unmodeled view). Built-in `get_byte`/`set_byte`
   (PostgreSQL-compatible byte access) and `json_object(*)`/`jsonb_object(*)`
   (one label/value pair per FROM-row column) match the pinned Turso corpus.
 - **Native / Sync companions** — not shipped. Connection-string paths that need

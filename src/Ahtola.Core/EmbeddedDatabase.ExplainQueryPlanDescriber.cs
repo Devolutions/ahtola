@@ -770,6 +770,24 @@ internal sealed record EqpJsonScanOp(
     }
 }
 
+/// <summary>A scan through the selected virtual-table module, rather than a base b-tree.</summary>
+internal sealed record EqpJsonVirtualTableScanOp(string Table, string? Alias) : EqpJsonOp
+{
+    public override string ToJson()
+    {
+        var json = new System.Text.StringBuilder("{\"type\":\"scan\",");
+        AppendTableFields(json, Table, Alias, join: null);
+        return json.Append(",\"source\":\"virtual_table\"}").ToString();
+    }
+}
+
+/// <summary>A query delegated to the method the index planner selected.</summary>
+internal sealed record EqpJsonIndexMethodOp(string Method) : EqpJsonOp
+{
+    public override string ToJson() =>
+        $"{{\"type\":\"index_method\",\"method\":{EmbeddedDatabase.JsonEscape(Method)}}}";
+}
+
 /// <summary>A coroutine-style read of a FROM-clause derived subquery.</summary>
 internal sealed record EqpJsonSubqueryScanOp(int SubqueryId) : EqpJsonOp
 {
@@ -860,14 +878,20 @@ internal sealed record EqpJsonSearchOp(
     }
 }
 
-/// <summary>Mirrors <c>EqpDetail::MultiIndex</c>: an OR of independently-searched indexes.</summary>
-internal sealed record EqpJsonMultiIndexOp(string Table, IReadOnlyList<string> Indexes) : EqpJsonOp
+/// <summary>Mirrors <c>EqpDetail::MultiIndex</c>: union or intersection of index probes.</summary>
+internal sealed record EqpJsonMultiIndexOp(
+    string Table,
+    IReadOnlyList<string> Indexes,
+    bool Union = true,
+    string? Alias = null) : EqpJsonOp
 {
     public override string ToJson()
     {
-        var json = new System.Text.StringBuilder("{\"type\":\"multi_index\",\"table\":")
-            .Append(EmbeddedDatabase.JsonEscape(Table))
-            .Append(",\"set_op\":\"or\",\"indexes\":[")
+        var json = new System.Text.StringBuilder("{\"type\":\"multi_index\",");
+        AppendTableFields(json, Table, Alias, join: null);
+        json.Append(",\"set_op\":\"")
+            .Append(Union ? "or" : "and")
+            .Append("\",\"indexes\":[")
             .Append(string.Join(",", Indexes.Select(static name => EmbeddedDatabase.JsonEscape(name))))
             .Append(']');
         return json.Append('}').ToString();
@@ -886,6 +910,12 @@ internal sealed record EqpJsonHashJoinOp(string Table, string? Alias, string? Jo
         AppendTableFields(json, Table, Alias, Join);
         return json.Append('}').ToString();
     }
+}
+
+/// <summary>Mirrors <c>EqpDetail::Distinct</c> for hash-based result deduplication.</summary>
+internal sealed record EqpJsonDistinctOp : EqpJsonOp
+{
+    public override string ToJson() => "{\"type\":\"distinct\"}";
 }
 
 /// <summary>Mirrors <c>EqpDetail::OrderBy</c> with <c>method: "sorter"</c> ("USE SORTER FOR ORDER BY").</summary>
