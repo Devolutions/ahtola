@@ -31786,8 +31786,12 @@ out bool hasReturning)
 
             var name = column.UnqualifiedName ?? column.Name;
             return EmbeddedTable.IsRowidAliasName(name)
-                || table.RowidAliasColumnIndex is { } index
-                && string.Equals(table.Columns[index], name, StringComparison.OrdinalIgnoreCase);
+                    && !table.TryGetColumnIndex(name, out _)
+                || table.RowidAliasColumnIndex >= 0
+                    && string.Equals(
+                        table.Columns[table.RowidAliasColumnIndex],
+                        name,
+                        StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -37575,9 +37579,13 @@ out bool hasReturning)
                 sourceOrderBy ?? [],
                 context);
         var rightIsCorrelatedSource = rightIsCorrelatedTableFunction || rightIsCorrelatedVirtualTable;
+        // The evaluator's declared-index probe rebuilds its right-side entries on each call.
+        // Materialize once and hash the right side when multiple left rows would probe it.
         var rightDeclaredLookup = !rightIsCorrelatedSource
             && rightPredicate is null
             && source.Kind is JoinKind.Inner or JoinKind.Left
+            && left.Rows.Count <= 1
+            && source.Left is NamedTableSource
             && source.Right is NamedTableSource rightNamedSource
             && TryPlanDeclaredIndexLookup(rightNamedSource, source.Condition, context) is { } declaredLookup
             ? declaredLookup
@@ -37612,6 +37620,7 @@ out bool hasReturning)
                 ? TryBuildJoinHashIndex(source, right, parameters, context)
                 : null;
         IEnumerable<int>? allRightIndices = null;
+        SourceData? rightLookupFallback = null;
 
         var rows = new List<SourceRow>();
         List<Expression>? omittedPredicates = null;
@@ -37719,13 +37728,19 @@ out bool hasReturning)
                         parameters,
                         context,
                         leftRow with { Parent = outerRow })
-                        ?? right
+                        ?? (rightLookupFallback ??= GetSideSourceRows(
+                            source.Right,
+                            rightPredicate,
+                            parameters,
+                            context,
+                            outerRow,
+                            sourceOrderBy))
                 : right;
             AddOmittedPredicates(rowsForLeft.OmittedVirtualTablePredicates);
             var matched = false;
             var candidateIndices = joinHashIndex is not null
                 ? joinHashIndex.Probe(leftRow)
-                : rightIsCorrelatedSource
+                : rightIsCorrelatedSource || rightDeclaredLookup is not null
                     ? Enumerable.Range(0, rowsForLeft.Rows.Count)
                     : allRightIndices ??= Enumerable.Range(0, rowsForLeft.Rows.Count);
             foreach (var rightIndex in candidateIndices)
@@ -37746,7 +37761,7 @@ out bool hasReturning)
                 }
 
                 matched = true;
-                if (!rightIsCorrelatedSource)
+                if (!rightIsCorrelatedSource && source.Kind is JoinKind.Right or JoinKind.Full)
                     rightMatched[rightIndex] = true;
                 rows.Add(row);
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)

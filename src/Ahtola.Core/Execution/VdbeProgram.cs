@@ -616,8 +616,7 @@ public enum VdbeOpcode
     Integer = 179,
 
     /// <summary>
-    /// Checks whether the currently positioned index cursor has moved beyond an equality
-    /// prefix (Turso <c>IdxGT</c>).
+    /// Finalizes a grouped aggregate into its reusable result register (Turso <c>AggFinal</c>).
     /// </summary>
     AggFinal = 181,
 }

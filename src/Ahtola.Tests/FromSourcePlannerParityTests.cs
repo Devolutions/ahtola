@@ -529,7 +529,9 @@ public sealed class FromSourcePlannerParityTests
         using var statement = connection.Prepare(sql);
         statement.Step().Should().Be(StatementStepResult.Row);
         var detail = statement.GetValue(3).AsText();
-        statement.Step().Should().Be(StatementStepResult.Done);
+        while (statement.Step() == StatementStepResult.Row)
+        {
+        }
         return detail;
     }
 

@@ -10,7 +10,7 @@ namespace Ahtola.Tests;
 /// WindowBufferCompute / WindowBufferData / WindowBufferNext / CloseWindowBuffer opcode family that
 /// <c>BufferedWindowProgramBuilder</c> emits for every window shape the streaming running-frame program
 /// cannot model. Each routed case asserts both that the statement really lowered (EXPLAIN dumps the
-/// buffered opcodes, and EXPLAIN QUERY PLAN reports MANAGED COMPILED VDBE) and that its rows match a real
+/// buffered opcodes, and EXPLAIN QUERY PLAN reports the scan) and that its rows match a real
 /// SQLite build. Each fallback case asserts the opposite: the evaluator keeps ownership, raw EXPLAIN
 /// refuses to describe a program that was never built, and the evaluator still produces the right value
 /// or the right error.
@@ -787,8 +787,10 @@ public sealed class BufferedWindowVdbeRoutingTests
         var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
         opcodes.Should().Contain(opcode => opcode == "OpenWindowBuffer" || opcode == "AggStep", query)
             .And.Contain("ResultRow");
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + query)[0][3].AsText()
-            .Should().Be("MANAGED COMPILED VDBE", query);
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + query)
+            .Select(row => row[3].AsText())
+            .Should().Contain(detail => detail.StartsWith("SCAN ", StringComparison.Ordinal))
+            .And.Contain("USE SORTER FOR ORDER BY");
     }
 
     private static void AssertMatchesSqlite(

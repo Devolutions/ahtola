@@ -785,7 +785,7 @@ public class AggregateSqlRoutingTests
             .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
         ReadRows(connection, "EXPLAIN QUERY PLAN " + query)[0][3]
-            .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+            .Should().Be(SqlValue.Text("SCAN t"));
     }
 
     [Test]
@@ -838,7 +838,7 @@ public class AggregateSqlRoutingTests
 
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
         ReadRows(connection, "EXPLAIN QUERY PLAN " + query)[0][3]
-            .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+            .Should().Be(SqlValue.Text("SCAN t"));
     }
 
     [Test]
@@ -1076,7 +1076,7 @@ public class AggregateSqlRoutingTests
             .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
         ReadRows(connection, "EXPLAIN QUERY PLAN " + query)[0][3]
-            .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+            .Should().Be(SqlValue.Text("SCAN t"));
     }
 
     [Test]

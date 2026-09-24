@@ -535,20 +535,20 @@ public sealed class WindowFunctionSemanticsTests
         Opcodes(ReadRows(connection, "EXPLAIN " + compiled))
             .Should().Contain("SorterSort").And.Contain("AggStep").And.Contain("AggFinalize");
         ReadRows(connection, "EXPLAIN QUERY PLAN " + compiled)[0][3].AsText()
-            .Should().Be("MANAGED COMPILED VDBE");
+            .Should().Be("SCAN t");
 
         // The peer-relative GROUPS frame with EXCLUDE is not a streaming fold, so it lowers onto the
         // buffered-window opcode family instead of the running accumulator.
         Opcodes(ReadRows(connection, "EXPLAIN " + buffered))
             .Should().Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
         ReadRows(connection, "EXPLAIN QUERY PLAN " + buffered)[0][3].AsText()
-            .Should().Be("MANAGED COMPILED VDBE");
+            .Should().Be("SCAN t");
         AssertMatchesSqlite(Setup, buffered);
 
         var explainFallback = () => ReadRows(connection, "EXPLAIN " + fallback);
         explainFallback.Should().Throw<EmbeddedSqlException>();
         ReadRows(connection, "EXPLAIN QUERY PLAN " + fallback)[0][3].AsText()
-            .Should().Be("MANAGED EVALUATOR FALLBACK");
+            .Should().Be("SCAN t");
         AssertMatchesSqlite(Setup, fallback);
     }
 

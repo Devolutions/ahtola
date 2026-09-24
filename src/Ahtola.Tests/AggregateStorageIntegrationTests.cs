@@ -185,7 +185,7 @@ public sealed class AggregateStorageIntegrationTests
             SqlValue.Integer(1),
             SqlValue.Integer(6),
             SqlValue.Integer(payload.Length));
-        AssertCompiled(connection, grouped);
+        AssertCompiled(connection, grouped, scanPrefix: "SCAN wide");
     }
 
     // Group rows are emitted in ascending key order (the managed engine always aggregates
@@ -207,13 +207,19 @@ public sealed class AggregateStorageIntegrationTests
             SqlValue.Integer(10));
     }
 
-    private static void AssertCompiled(EmbeddedConnection connection, string sql)
+    private static void AssertCompiled(
+        EmbeddedConnection connection,
+        string sql,
+        string? scanPrefix = null)
     {
         ReadRows(connection, "EXPLAIN " + sql)
             .Select(row => row[1].AsText())
             .Should().Contain("GroupKey").And.Contain("AggFinalize");
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql)[0][3]
-            .Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+        var detail = ReadRows(connection, "EXPLAIN QUERY PLAN " + sql)[0][3].AsText();
+        if (scanPrefix is not null)
+            detail.Should().StartWith(scanPrefix);
+        else
+            detail.Should().Be("MANAGED COMPILED VDBE");
     }
 
     private static List<SqlValue[]> ReadRows(EmbeddedConnection connection, string sql)

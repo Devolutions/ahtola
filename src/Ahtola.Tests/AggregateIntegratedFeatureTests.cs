@@ -721,7 +721,7 @@ public sealed class AggregateIntegratedFeatureTests
             .Select(row => row[1].AsText())
             .Should().Contain("GroupKey").And.Contain("AggFinalize");
         ReadRows(connection, "EXPLAIN QUERY PLAN " + sql)[0][3]
-            .Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+            .AsText().Should().StartWith("SCAN ");
     }
 
     private static List<SqlValue[]> ReadRows(EmbeddedConnection connection, string sql)

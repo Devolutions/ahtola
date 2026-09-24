@@ -176,8 +176,10 @@ public sealed class VdbeSchemaRuntimeTests
         ((int)VdbeOpcode.BeginSubrtn).Should().Be(176);
         ((int)VdbeOpcode.Sequence).Should().Be(177);
         ((int)VdbeOpcode.SequenceTest).Should().Be(178);
+        ((int)VdbeOpcode.Integer).Should().Be(179);
+        ((int)VdbeOpcode.AggFinal).Should().Be(181);
 
-        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(178);
+        Enum.GetValues<VdbeOpcode>().Max(static opcode => (int)opcode).Should().Be(181);
     }
 
     [Test]
