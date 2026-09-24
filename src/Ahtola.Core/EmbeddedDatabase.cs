@@ -3601,10 +3601,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         string tableName,
         IReadOnlyList<Projection> returning,
         SchemaCatalog catalog)
+        => DescribeReturning(tableName, returning, catalog.Tables, catalog.VirtualTables);
+
+    private static string[] DescribeReturning(
+        string tableName,
+        IReadOnlyList<Projection> returning,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, VirtualTableDefinition> virtualTables)
     {
-        if (!catalog.Tables.TryGetValue(tableName, out var table))
+        if (!tables.TryGetValue(tableName, out var table))
         {
-            if (!catalog.VirtualTables.TryGetValue(tableName, out var virtualTable))
+            if (!virtualTables.TryGetValue(tableName, out var virtualTable))
                 throw new EmbeddedSqlException($"no such table: {tableName}");
 
             var visibleColumns = virtualTable.Table.Schema.VisibleColumns
@@ -28711,7 +28718,8 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context)
     {
-        var result = ExecuteExplainQueryPlanText(statement, parameters, context, out var ops);
+        var result = ExecuteExplainQueryPlanText(
+            statement, parameters, context, out var ops, out var cteMaterialization);
         if (statement.Format != ExplainQueryPlanFormat.Json)
             return result;
 
@@ -28724,34 +28732,25 @@ out bool hasReturning)
         // never a real Turso op name, so it can never be silently mistaken for the genuine
         // contract.
         var sql = statement.InnerSql ?? string.Empty;
-        var isWriteWithoutReturning = statement.Inner switch
-        {
-            InsertStatement { Returning: null } => true,
-            UpdateStatement { Returning: null } => true,
-            DeleteStatement { Returning: null } => true,
-            _ => false,
-        };
-        // The query's result columns come from the same auto-increment statement state the
-        // text path binds; when the inner statement is not a plain query, fall back to
-        // the plan row columns. INSERT/UPDATE/DELETE without RETURNING produce no output rows
-        // at all, so their result_columns is always empty rather than the internal EQP columns.
+        // Describe the inner statement, never the four-column TEXT plan result. In particular,
+        // DML RETURNING uses the same projection metadata as the statement it describes.
         string[] resultColumns;
-        if (isWriteWithoutReturning)
+        if (statement.Inner is QueryStatement query)
+        {
+            resultColumns = DescribeQuery(query, EnsureAutoIncrementStatementState(context));
+        }
+        else if (TryGetReturning(statement.Inner, out var tableName, out var returning))
+        {
+            resultColumns = DescribeReturning(
+                tableName, returning, context.Tables, context.VirtualTables ?? _virtualTables);
+        }
+        else if (statement.Inner is InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement)
         {
             resultColumns = [];
         }
         else
         {
-            try
-            {
-                resultColumns = statement.Inner is QueryStatement innerQuery
-                    ? DescribeQuery(innerQuery, EnsureAutoIncrementStatementState(context))
-                    : result.Columns;
-            }
-            catch (EmbeddedSqlException)
-            {
-                resultColumns = result.Columns;
-            }
+            resultColumns = result.Columns;
         }
 
         // A lone "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" row is the text path's
@@ -28767,7 +28766,7 @@ out bool hasReturning)
             && result.Rows[0][3].Kind == SqlValueKind.Text
             && result.Rows[0][3].AsText() is "MANAGED COMPILED VDBE" or "MANAGED EVALUATOR FALLBACK";
         (string Detail, EqpJsonOp Op)? placeholderNode = isPlaceholderOnly && statement.Inner is SelectStatement placeholderSelect
-            ? TryDescribeGenuinePlaceholderAccessPath(placeholderSelect)
+            ? TryDescribeGenuinePlaceholderAccessPath(placeholderSelect, context)
             : null;
 
         IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)> nodes;
@@ -28798,7 +28797,6 @@ out bool hasReturning)
             }).ToArray();
         }
 
-        var cteMaterializationName = TryGetSharedCteMaterializationName(statement.Inner, nodes);
         var json = new System.Text.StringBuilder()
             .Append("{\"version\":1,\"sql\":")
             .Append(JsonEscape(statement.Sql ?? "EXPLAIN QUERY PLAN " + sql))
@@ -28814,37 +28812,22 @@ out bool hasReturning)
                 return $"{{\"id\":{node.Id},\"parent\":{parentText},\"detail\":{JsonEscape(node.Detail)},\"op\":{op}}}";
             })))
             .Append(']');
-        if (cteMaterializationName is not null)
+        if (cteMaterialization is { } materialization)
         {
-            json.Append(",\"cte_materializations\":[{\"cte_id\":0,\"name\":")
-                .Append(JsonEscape(cteMaterializationName))
-                .Append(",\"nodes\":[2]}]");
+            if (!nodes.Any(node => node.Id == materialization.NodeId))
+                throw new InvalidOperationException("The CTE materialization has no corresponding plan node.");
+
+            json.Append(",\"cte_materializations\":[{\"cte_id\":")
+                .Append(materialization.CteId)
+                .Append(",\"name\":")
+                .Append(JsonEscape(materialization.Name))
+                .Append(",\"nodes\":[")
+                .Append(materialization.NodeId)
+                .Append("]}]");
         }
 
         json.Append('}');
         return new ExecutionResult(["plan_json"], [[SqlValue.Text(json.ToString())]], 0);
-    }
-
-    private static string? TryGetSharedCteMaterializationName(
-        ParsedStatement statement,
-        IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)> nodes)
-    {
-        if (statement is not WithSelectStatement
-            {
-                CommonTableExpressions: [{ Name: var cteName, Query: SelectStatement { GroupBy.Count: > 0 } }],
-                Query: SelectStatement { Source: var source },
-            }
-            || !TryGetNamedJoinLeaves(source, out var leaves)
-            || leaves.Count != 3
-            || !string.Equals(leaves[1].Name, cteName, StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(leaves[2].Name, cteName, StringComparison.OrdinalIgnoreCase)
-            || nodes.Count == 0
-            || nodes[0].Id != 2)
-        {
-            return null;
-        }
-
-        return cteName;
     }
 
     /// <summary>
@@ -28853,16 +28836,22 @@ out bool hasReturning)
     /// still genuinely executes some real access path for these two narrow, unambiguous shapes:
     /// a FROM-less SELECT (one synthesized row of literal/computed values) and a single plain
     /// base table with no join, no index chosen (an ordinary full table scan). Both are
-    /// determined purely from the statement's own FROM clause -- no guessing about which access
-    /// method the compiled/evaluator route happened to pick. A multi-table join's real per-leg
+    /// determined from the statement and its bound base-table catalog, never by treating a view
+    /// or other named row source as a table. A multi-table join's real per-leg
     /// access method (index seek vs. hash join vs. full scan) is not yet reconstructable this
     /// way and stays unmodeled.
     /// </summary>
-    private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(SelectStatement select)
+    private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(
+        SelectStatement select,
+        QueryContext context)
         => select.Source switch
         {
             null => ("SCAN CONSTANT ROW", new EqpJsonConstantRowOp()),
-            NamedTableSource { } source => (
+            NamedTableSource { IndexDirective: null } source
+                when context.Tables.ContainsKey(source.Name)
+                    && !context.CommonTableExpressions.ContainsKey(source.Name)
+                    && context.Views?.ContainsKey(source.Name) != true
+                    && context.VirtualTables?.ContainsKey(source.Name) != true => (
                 $"SCAN {source.Name}" + (source.Alias is null ? string.Empty : $" AS {source.Alias}"),
                 new EqpJsonScanOp(source.Name, source.Alias, IndexName: null, Covering: false)),
             _ => null,
@@ -28906,9 +28895,11 @@ out bool hasReturning)
         ExplainQueryPlanStatement statement,
         SqlValue[] parameters,
         QueryContext context,
-        out IReadOnlyList<EqpJsonOp?>? ops)
+        out IReadOnlyList<EqpJsonOp?>? ops,
+        out (int CteId, string Name, int NodeId)? cteMaterialization)
     {
         ops = null;
+        cteMaterialization = null;
         var compilationContext = EnsureAutoIncrementStatementState(context);
         if (statement.Inner is SelectStatement tableValuedSelect)
             statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
@@ -28936,6 +28927,7 @@ out bool hasReturning)
             virtualDetail += string.Create(
                 CultureInfo.InvariantCulture,
                 $" (rows~{virtualPlan.EstimatedRows} cost~{virtualPlan.EstimatedCost:0.###}{(virtualSelect.OrderBy.Count != 0 ? virtualPlan.OrderByConsumed && plannerInput.OrderBy.Count == virtualSelect.OrderBy.Count ? " order=consumed" : " order=sort" : string.Empty)})");
+            ops = [new EqpJsonVirtualTableScanOp(virtualTable.Name, virtualSource.Alias)];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [[SqlValue.Integer(2), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text(virtualDetail)]],
@@ -28944,6 +28936,8 @@ out bool hasReturning)
         if (statement.Inner is SelectStatement methodIndexSelect
             && TryPlanMethodIndexScanForSelect(methodIndexSelect, compilationContext, out var methodPlan))
         {
+            ops = [new EqpJsonIndexMethodOp(methodPlan.Index.Method
+                ?? throw new InvalidOperationException("The selected method index has no method name."))];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
@@ -28961,6 +28955,14 @@ out bool hasReturning)
                 intersectionSelect,
                 compilationContext) is { } intersectionPlan)
         {
+            ops =
+            [
+                new EqpJsonMultiIndexOp(
+                    intersectionPlan.Table.Name,
+                    intersectionPlan.Branches.Select(static branch => branch.Index.Name).ToArray(),
+                    Union: false,
+                    Alias: intersectionPlan.Source.Alias),
+            ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
@@ -29122,6 +29124,7 @@ out bool hasReturning)
         {
             var bodyDetail = FormatManagedIndexExplainDetail(cteBodyPlan, cteSelect);
             var bodyOp = BuildIndexScanOp(cteBodyPlan, cteSelect);
+            const int bodyNodeId = 2;
             var firstIndex = $"ephemeral_subquery_t3";
             var secondIndex = $"ephemeral_subquery_t5";
             var key = cteSelect.GroupBy[0] is ColumnExpression column
@@ -29138,10 +29141,11 @@ out bool hasReturning)
                 new EqpJsonCteReuseSearchOp(cteName, firstCteAlias, firstIndex, $"{key}=?"),
                 new EqpJsonCteReuseSearchOp(cteName, secondCteAlias, secondIndex, $"{key}=?"),
             ];
+            cteMaterialization = (0, cteName, bodyNodeId);
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
-                    [SqlValue.Integer(2), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text(bodyDetail)],
+                    [SqlValue.Integer(bodyNodeId), SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Text(bodyDetail)],
                     [
                         SqlValue.Integer(41),
                         SqlValue.Integer(0),
@@ -29241,7 +29245,8 @@ out bool hasReturning)
             [
                 new EqpJsonMultiIndexOp(
                     orUnionPlan.Table.Name,
-                    orUnionPlan.Branches.Select(static branch => branch.Name).ToArray()),
+                    orUnionPlan.Branches.Select(static branch => branch.Name).ToArray(),
+                    Alias: orUnionPlan.Source.Alias),
             ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -29258,6 +29263,11 @@ out bool hasReturning)
         if (statement.Inner is SelectStatement partialIndexSelect
             && TryGetPartialIndexScanSource(partialIndexSelect, compilationContext, out var partialIndexSource))
         {
+            ops = [new EqpJsonScanOp(
+                partialIndexSource.Name,
+                partialIndexSource.Alias,
+                IndexName: null,
+                Covering: false)];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
                 [
@@ -29265,7 +29275,7 @@ out bool hasReturning)
                         SqlValue.Integer(1),
                         SqlValue.Integer(0),
                         SqlValue.Integer(0),
-                        SqlValue.Text($"SCAN {partialIndexSource}"),
+                        SqlValue.Text($"SCAN {partialIndexSource.Alias ?? partialIndexSource.Name}"),
                     ],
                 ],
                 0);
@@ -29297,8 +29307,9 @@ out bool hasReturning)
                     [$"{edgeConstraint}"]),
                 new EqpJsonMultiIndexOp(
                     joinLocalOrPlan.NodeSource.Name,
-                    [nodeIndex, nodeIndex]),
-                null,
+                    [nodeIndex, nodeIndex],
+                    Alias: joinLocalOrPlan.NodeSource.Alias),
+                new EqpJsonDistinctOp(),
             ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -31185,9 +31196,9 @@ out bool hasReturning)
     private static bool TryGetPartialIndexScanSource(
         SelectStatement statement,
         QueryContext context,
-        out string sourceName)
+        out NamedTableSource matchedSource)
     {
-        sourceName = string.Empty;
+        matchedSource = null!;
         if (statement.Where is null
             || statement.Source is not NamedTableSource source
             || source.IndexDirective is not null
@@ -31200,7 +31211,7 @@ out bool hasReturning)
             return false;
         }
 
-        sourceName = source.Alias ?? source.Name;
+        matchedSource = source;
         return true;
     }
 

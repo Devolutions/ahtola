@@ -112,6 +112,29 @@ public class ExplainQueryPlanFormatJsonTests
         json[0].Should().Contain("\"parent\":");
     }
 
+    [TestCase("CREATE VIRTUAL TABLE boxes USING rtree(id,min,max);", "SELECT id FROM boxes AS b WHERE min >= 1;", "boxes", "b")]
+    [TestCase("CREATE VIRTUAL TABLE docs USING fts5(content);", "SELECT content FROM docs AS d;", "docs", "d")]
+    public void VirtualTablePlanIdentifiesItsRowSource(
+        string createTable,
+        string query,
+        string table,
+        string alias)
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection, createTable);
+
+        var textDetail = ReadValues(connection, "EXPLAIN QUERY PLAN " + query).Single()[3].AsText();
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(textDetail);
+        node.GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        node.GetProperty("op").GetProperty("table").GetString().Should().Be(table);
+        node.GetProperty("op").GetProperty("alias").GetString().Should().Be(alias);
+        node.GetProperty("op").GetProperty("source").GetString().Should().Be("virtual_table");
+    }
+
     [Test]
     public void CancellationSafeLeftJoinReportsItsExecutedIndexAccessPaths()
     {
@@ -179,6 +202,127 @@ public class ExplainQueryPlanFormatJsonTests
         var indexes = node.GetProperty("op").GetProperty("indexes");
         indexes.EnumerateArray().Select(static index => index.GetString())
             .Should().Equal("PRIMARY KEY", "idx_users_age");
+    }
+
+    [Test]
+    public void MultiIndexOrPreservesTheTableAlias()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE users(id INTEGER PRIMARY KEY, age INTEGER); " +
+            "CREATE INDEX idx_users_age ON users(age);");
+
+        using var document = JsonDocument.Parse(ReadAll(
+            connection,
+            "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM users AS u WHERE u.id = 5 OR u.age = 30;").Single());
+        var op = document.RootElement.GetProperty("nodes")[0].GetProperty("op");
+        op.GetProperty("type").GetString().Should().Be("multi_index");
+        op.GetProperty("table").GetString().Should().Be("users");
+        op.GetProperty("alias").GetString().Should().Be("u");
+        op.GetProperty("set_op").GetString().Should().Be("or");
+    }
+
+    [Test]
+    public void JoinLocalOrDistinctPlanModelsItsDeduplicationStep()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            """
+            CREATE TABLE nodes(id TEXT PRIMARY KEY);
+            CREATE TABLE edges(src TEXT, dst TEXT, tag INTEGER);
+            CREATE INDEX edges_tag ON edges(tag);
+            INSERT INTO nodes VALUES ('a'), ('b');
+            INSERT INTO edges VALUES ('a', 'a', 7), ('a', 'b', 7), ('b', 'a', 8);
+            """);
+
+        const string query = """
+            SELECT DISTINCT n.id
+            FROM nodes AS n JOIN edges AS e
+              ON (n.id = e.src AND e.tag = 7) OR (n.id = e.dst AND e.tag = 7)
+            WHERE n.id <> '';
+            """;
+        var textRows = ReadValues(connection, "EXPLAIN QUERY PLAN " + query);
+        textRows.Should().HaveCount(3);
+        textRows[0][3].AsText().Should().StartWith("SEARCH e USING INDEX edges_tag");
+        textRows[1][3].AsText().Should().StartWith("MULTI-INDEX OR n");
+        textRows[2][3].AsText().Should().Be("USE HASH TABLE FOR DISTINCT");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(3);
+        nodes[2].GetProperty("detail").GetString().Should().Be(textRows[2][3].AsText());
+        nodes[2].GetProperty("op").GetProperty("type").GetString().Should().Be("distinct");
+    }
+
+    [Test]
+    public void PartialIndexFallbackReportsTheActualBaseTableScan()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(
+            connection,
+            """
+            CREATE TABLE products(id INTEGER PRIMARY KEY, sku TEXT, status TEXT);
+            CREATE INDEX active_sku ON products(sku) WHERE status = 'active';
+            INSERT INTO products VALUES (1, 'X', 'active'), (2, 'X', 'inactive');
+            """);
+
+        const string query = "SELECT p.id FROM products AS p WHERE p.status = 'inactive' AND p.sku = 'X';";
+        ReadValues(connection, query).Single()[0].AsInteger().Should().Be(2);
+        var detail = ReadValues(connection, "EXPLAIN QUERY PLAN " + query).Single()[3].AsText();
+        detail.Should().Be("SCAN p");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(detail);
+        var op = node.GetProperty("op");
+        op.GetProperty("type").GetString().Should().Be("scan");
+        op.GetProperty("table").GetString().Should().Be("products");
+        op.GetProperty("alias").GetString().Should().Be("p");
+        op.GetProperty("source").GetString().Should().Be("table");
+        op.TryGetProperty("index", out _).Should().BeFalse();
+    }
+
+    [Test]
+    public void UnmodeledViewAccessDoesNotInventABaseTableScan()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER); CREATE VIEW v AS SELECT id FROM t;");
+
+        const string query = "SELECT id FROM v;";
+        ReadValues(connection, "EXPLAIN QUERY PLAN " + query).Single()[3].AsText()
+            .Should().StartWith("MANAGED ");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        document.RootElement.GetProperty("result_columns").EnumerateArray()
+            .Select(static column => column.GetString()).Should().Equal("id");
+        document.RootElement.GetProperty("nodes").GetArrayLength().Should().Be(0);
+    }
+
+    [Test]
+    public void PlainTableFallbackStillDescribesItsActualBaseScan()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER);");
+
+        const string query = "SELECT id FROM t AS base;";
+        ReadValues(connection, "EXPLAIN QUERY PLAN " + query).Single()[3].AsText()
+            .Should().StartWith("MANAGED ");
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        node.GetProperty("op").GetProperty("table").GetString().Should().Be("t");
+        node.GetProperty("op").GetProperty("alias").GetString().Should().Be("base");
     }
 
     [Test]
@@ -326,6 +470,70 @@ public class ExplainQueryPlanFormatJsonTests
         nodes[2].GetProperty("op").GetProperty("subquery").GetProperty("execution").GetString()
             .Should().Be("materialized_reuse");
         nodes[3].GetProperty("op").GetProperty("subquery").GetProperty("cte_id").GetInt32().Should().Be(0);
+    }
+
+    [TestCase("INSERT INTO items(id, value) VALUES (2, 'new') RETURNING id, value", "id", "value")]
+    [TestCase("UPDATE items SET value = 'changed' WHERE id = 1 RETURNING value AS result", "result", null)]
+    [TestCase("DELETE FROM items WHERE id = 1 RETURNING *", "id", "value")]
+    public void DmlReturningPlanReportsTheStatementResultColumnsWithoutExecutingIt(
+        string dml,
+        string firstColumn,
+        string? secondColumn)
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO items VALUES (1, 'original');");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, $"EXPLAIN QUERY PLAN FORMAT=JSON {dml};").Single());
+        document.RootElement.GetProperty("result_columns").EnumerateArray()
+            .Select(static value => value.GetString())
+            .Should().Equal(secondColumn is null ? [firstColumn] : [firstColumn, secondColumn]);
+        ReadValues(connection, "SELECT id, value FROM items").Single()
+            .Should().Equal(SqlValue.Integer(1), SqlValue.Text("original"));
+    }
+
+    [Test]
+    public void NonReturningDmlPlanHasNoResultColumns()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY);");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON INSERT INTO items VALUES (1);").Single());
+        document.RootElement.GetProperty("result_columns").GetArrayLength().Should().Be(0);
+        ReadValues(connection, "SELECT id FROM items").Should().BeEmpty();
+    }
+
+    [Test]
+    public void UnknownReturningTargetIsNotReportedAsTheTextPlanColumns()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+
+        Action explain = () => ReadAll(
+            connection, "EXPLAIN QUERY PLAN FORMAT=JSON INSERT INTO missing VALUES (1) RETURNING *;");
+        explain.Should().Throw<EmbeddedSqlException>().WithMessage("*no such table: missing*");
+    }
+
+    [Test]
+    public void CteMaterializationIsOmittedWithoutAPlannedReusableBody()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection, "CREATE TABLE source(id INTEGER PRIMARY KEY, value INTEGER);");
+
+        using var document = JsonDocument.Parse(ReadAll(
+            connection,
+            """
+            EXPLAIN QUERY PLAN FORMAT=JSON
+            WITH grouped AS (SELECT value, count(*) AS total FROM source GROUP BY value)
+            SELECT a.total FROM source s
+            JOIN grouped a ON a.value = s.value
+            JOIN grouped b ON b.value = s.id;
+            """).Single());
+        document.RootElement.TryGetProperty("cte_materializations", out _).Should().BeFalse();
     }
 
     [TestCase("a > 1", "a>?")]

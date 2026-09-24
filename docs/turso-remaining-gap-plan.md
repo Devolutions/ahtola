@@ -310,3 +310,30 @@ The frozen window-bounding checkpoint was also withheld after final review
 found allocate-before-reserve and exception-path accounting leaks. Existing
 window semantics remain integrated; a strict overall out-of-core evaluator
 bound is not claimed.
+
+### FORMAT=JSON result-metadata slice (2026-09-24)
+
+The JSON envelope now derives `result_columns` for DML `RETURNING` from the
+statement's projection and active catalog rather than copying the four TEXT
+plan-column names. Non-returning DML still reports no result columns; an
+unknown `RETURNING` target fails instead of producing a plausible-looking
+plan. For the supported shared-CTE plan shape, materialization metadata is
+emitted by the same plan branch that emits its body node, rather than inferred
+afterward from the AST and a presumed node ID. The remaining EQP work is to
+replace `unmodeled` operations and shape-specific descriptions with actual
+planner/program data; this slice does not claim general CTE or plan parity.
+Virtual-table scans now identify their `virtual_table` source and table/alias;
+selected `fts` and `vector` index-method plans report Turso's structured
+`index_method` operation with the selected method name. These fields come
+from the same planner branches as their TEXT plan rows, not from parsing
+those rows. Cost-selected multi-index AND intersections now emit `multi_index`
+with `set_op: "and"`, their ordered index names, and the table alias when
+present; the existing OR form retains `set_op: "or"` and now retains aliases.
+Other `unmodeled` operations remain open.
+The join-local OR plan's actual hash DISTINCT step emits a `distinct` op;
+partial-index fallback plans that decline the index describe the real base
+table scan and retain its alias. Generic placeholder plans no longer invent
+a base-table scan for a view: JSON leaves its nodes empty until the view's
+actual access path can be described. A standalone hash-build JSON op was
+not added because this managed planner does not currently emit a corresponding
+TEXT plan step; inventing one would misrepresent the executed plan.

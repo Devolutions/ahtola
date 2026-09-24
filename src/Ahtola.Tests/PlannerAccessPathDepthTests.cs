@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Storage;
+using System.Text.Json;
 
 namespace Ahtola.Tests;
 
@@ -43,6 +44,49 @@ public sealed class PlannerAccessPathDepthTests
     }
 
     [Test]
+    public void JsonPlanIdentifiesBothIndexesInTheSelectedAndIntersection()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, payload TEXT);");
+        Execute(connection, "CREATE INDEX items_a ON items(a);");
+        Execute(connection, "CREATE INDEX items_b ON items(b);");
+        Execute(
+            connection,
+            "INSERT INTO items VALUES "
+            + string.Join(
+                ", ",
+                Enumerable.Range(1, 1_000).Select(value =>
+                    $"({value}, {value % 100}, {value % 125}, 'p{value}')"))
+            + ";");
+        Execute(connection, "ANALYZE;");
+
+        foreach (var (sql, alias) in new[]
+                 {
+                     ("SELECT id, payload FROM items WHERE a = 7 AND b = 7;", (string?)null),
+                     ("SELECT i.id, i.payload FROM items AS i WHERE i.a = 7 AND i.b = 7;", "i"),
+                 })
+        {
+            var detail = PlanDetail(connection, sql);
+            detail.Should().StartWith("MULTI-INDEX AND");
+            using var document = JsonDocument.Parse(
+                ReadScalar(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + sql).AsText());
+            var node = document.RootElement.GetProperty("nodes")[0];
+            node.GetProperty("detail").GetString().Should().Be(detail);
+            var op = node.GetProperty("op");
+            op.GetProperty("type").GetString().Should().Be("multi_index");
+            op.GetProperty("table").GetString().Should().Be("items");
+            op.GetProperty("set_op").GetString().Should().Be("and");
+            op.GetProperty("indexes").EnumerateArray().Select(static index => index.GetString())
+                .Should().Equal("items_a", "items_b");
+            if (alias is null)
+                op.TryGetProperty("alias", out _).Should().BeFalse();
+            else
+                op.GetProperty("alias").GetString().Should().Be(alias);
+        }
+    }
+
+    [Test]
     public void IntersectionCostFallsBackForSmallInputsAndCompositePrefixes()
     {
         using var connection = new EmbeddedDatabase().Connect();
@@ -54,6 +98,14 @@ public sealed class PlannerAccessPathDepthTests
 
         PlanDetail(connection, "SELECT id FROM tiny WHERE a=1 AND b=1;")
             .Should().NotStartWith("MULTI-INDEX AND");
+        using (var plan = JsonDocument.Parse(ReadScalar(
+                   connection,
+                   "EXPLAIN QUERY PLAN FORMAT=JSON SELECT id FROM tiny WHERE a=1 AND b=1;").AsText()))
+        {
+            plan.RootElement.GetProperty("nodes").EnumerateArray()
+                .Select(static node => node.GetProperty("op").GetProperty("type").GetString())
+                .Should().NotContain("multi_index");
+        }
 
         Execute(connection, "CREATE INDEX tiny_ab ON tiny(a,b);");
         Execute(connection, "ANALYZE;");
