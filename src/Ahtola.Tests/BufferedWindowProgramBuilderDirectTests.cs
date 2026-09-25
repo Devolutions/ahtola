@@ -482,6 +482,45 @@ public class BufferedWindowProgramBuilderDirectTests
         budget.Should().BeLessThan(checked(rowBytes * 16));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void WindowEvaluatorScopeRestoresResourcesAfterComputeOrCancellation(bool cancel)
+    {
+        using var cancellation = new CancellationTokenSource();
+        var observer = new ScopedWindowEvaluator(cancellation, cancel);
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)], observer.Evaluate);
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(), sorterMemoryLimitBytes: 8192, metrics: metrics);
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options,
+            [new VdbeCursorSource(
+                [[SqlValue.Integer(1)], [SqlValue.Integer(2)]])]))
+        {
+            if (cancel)
+            {
+                Action step = () => statement.StepResumable(cancellation.Token);
+                step.Should().Throw<OperationCanceledException>();
+            }
+            else
+            {
+                statement.StepResumable(cancellation.Token).Should().Be(ResumableStatementStepResult.Row);
+                statement.CurrentRow![0].AsInteger().Should().Be(1);
+                Drain(statement).Should().ContainSingle().Subject[0].AsInteger().Should().Be(2);
+            }
+        }
+
+        observer.Entries.Should().Be(1);
+        observer.Exits.Should().Be(1);
+        observer.Active.Should().BeFalse();
+        observer.ObservedMemory!.LimitBytes.Should().Be(options.MemoryLimitBytes);
+        observer.ObservedOptions.Should().BeSameAs(options);
+        observer.ObservedToken.Should().Be(cancellation.Token);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+    }
+
     [Test]
     public void SpillIndexStaysOnDiskDuringRandomAccessAndCancellationCleansUp()
     {
@@ -1008,6 +1047,56 @@ public class BufferedWindowProgramBuilderDirectTests
         }
 
         public void DeleteFile(string path) => _inner.DeleteFile(path);
+    }
+
+    private sealed class ScopedWindowEvaluator(
+        CancellationTokenSource cancellation,
+        bool cancel) : IVdbeWindowEvaluationScope
+    {
+        public int Entries { get; private set; }
+
+        public int Exits { get; private set; }
+
+        public bool Active { get; private set; }
+
+        public VdbeExecutionMemory? ObservedMemory { get; private set; }
+
+        public VdbeExecutionOptions? ObservedOptions { get; private set; }
+
+        public CancellationToken ObservedToken { get; private set; }
+
+        public IDisposable Enter(
+            VdbeExecutionMemory memory,
+            VdbeExecutionOptions options,
+            CancellationToken cancellationToken)
+        {
+            Entries++;
+            Active = true;
+            ObservedMemory = memory;
+            ObservedOptions = options;
+            ObservedToken = cancellationToken;
+            return new Scope(this);
+        }
+
+        public IReadOnlyList<SqlValue[]> Evaluate(IReadOnlyList<SqlValue[]> rows)
+        {
+            Active.Should().BeTrue();
+            if (cancel)
+            {
+                cancellation.Cancel();
+                ObservedToken.ThrowIfCancellationRequested();
+            }
+            return RunningRowNumber(rows);
+        }
+
+        private sealed class Scope(ScopedWindowEvaluator owner) : IDisposable
+        {
+            public void Dispose()
+            {
+                owner.Active = false;
+                owner.Exits++;
+            }
+        }
     }
 
     private static int GetOpenRuntimeCount(ResumableStatement runtime, string fieldName)

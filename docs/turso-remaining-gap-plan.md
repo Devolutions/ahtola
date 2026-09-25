@@ -388,6 +388,10 @@ shape. Two-table non-indexed joins now describe actual named-table scans and
 the selected hash-probe operation from `OpenJoinCursor`; their JSON roots
 follow the pinned two-table plan without inventing a standalone materialized
 hash-build step that Ahtola's TEXT planner does not emit.
+For a proven three-table compiled plan that materializes a two-table
+named-table join prefix, JSON now nests the prefix's hash join and scan
+under the pinned `hash_build` parent. Derived and deeper/unsupported plan
+trees remain explicitly unmodeled rather than inventing scans.
 
 The WBOUND spill-index and output-drain slices now keep random-access row
 offsets on disk and avoid a second whole-partition output array for large
@@ -399,6 +403,9 @@ temporary computed results remain outside the retained-memory ledger;
 **full end-to-end window bounding remains open**. The output and spill-file
 failure paths release their reservations and clean up files rather than
 reporting a false finite peak.
+Buffered evaluators now also receive statement memory, spill options, and
+cancellation in a scoped binding restored on success or failure; this does
+not yet spill or account for `PrepareWindowFunctionInputs`' retained arrays.
 
 TYPE/DOMAIN adoption must keep SQLite's five physical storage classes: the
 pinned Turso engine persists named definitions as SQL, resolves base-type

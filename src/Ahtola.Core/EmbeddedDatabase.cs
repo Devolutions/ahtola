@@ -25250,14 +25250,47 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        var functions = windowFunctions.ToArray();
-        return bufferedRows => ComputeWindowFunctionValueRows(
-            functions,
-            new LazyWindowSourceRows(
-                bufferedRows,
-                row => CreateScanSourceRow(target, row, context, outerRow)),
-            parameters,
-            context);
+        var evaluator = new WindowEvaluatorAdapter(
+            this, target, windowFunctions.ToArray(), parameters, context, outerRow);
+        return evaluator.Evaluate;
+    }
+
+    private sealed class WindowEvaluatorAdapter(
+        EmbeddedDatabase database,
+        ScanTarget target,
+        FunctionExpression[] functions,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow) : IVdbeWindowEvaluationScope
+    {
+        private readonly AsyncLocal<VdbeWindowEvaluationResources?> _resources = new();
+
+        public IReadOnlyList<SqlValue[]> Evaluate(IReadOnlyList<SqlValue[]> bufferedRows) =>
+            database.ComputeWindowFunctionValueRows(
+                functions,
+                new LazyWindowSourceRows(
+                    bufferedRows,
+                    row => CreateScanSourceRow(target, row, context, outerRow)),
+                parameters,
+                context,
+                windowEvaluation: _resources.Value);
+
+        public IDisposable Enter(
+            VdbeExecutionMemory memory,
+            VdbeExecutionOptions options,
+            CancellationToken cancellationToken)
+        {
+            var previous = _resources.Value;
+            _resources.Value = new VdbeWindowEvaluationResources(memory, options, cancellationToken);
+            return new WindowEvaluationBinding(_resources, previous);
+        }
+
+        private sealed class WindowEvaluationBinding(
+            AsyncLocal<VdbeWindowEvaluationResources?> resources,
+            VdbeWindowEvaluationResources? previous) : IDisposable
+        {
+            public void Dispose() => resources.Value = previous;
+        }
     }
 
     private sealed class LazyWindowSourceRows : IReadOnlyList<SourceRow>
@@ -29442,11 +29475,68 @@ out bool hasReturning)
             0);
     }
 
+    private sealed record EqpJsonCompiledJoinHashBuildOp(string Table, string? Alias) : EqpJsonOp
+    {
+        public override string ToJson()
+        {
+            var json = new System.Text.StringBuilder("{\"type\":\"hash_build\",");
+            AppendTableFields(json, Table, Alias, join: null);
+            return json.Append('}').ToString();
+        }
+    }
+
     private static IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)>
         DescribeCompiledNamedJoinNonIndexedNodes(VdbeJoinPlanNode root, int nextId)
     {
+        // VdbeHashJoinRuntime enumerates the complete left prefix before probing the right
+        // when HashBuildRight is false. Model that materialization only for a proven two-table
+        // named-table hash prefix; upstream's HashBuild is likewise the parent of its
+        // materialization subtree (joins__hash-join-three-table.snap).
+        if (root is VdbeJoinOperatorPlan
+            {
+                Left: VdbeJoinOperatorPlan
+                {
+                    Left: VdbeJoinScanPlan,
+                    Right: VdbeJoinScanPlan,
+                    EquiProbe: not null,
+                } prefix,
+                Right: VdbeJoinScanPlan outerProbe,
+                EquiProbe: not null,
+                HashBuildRight: false,
+                Kind: VdbeJoinKind.Inner,
+            })
+        {
+            var prefixProbe = prefix.HashBuildRight ? prefix.Left : prefix.Right;
+            if (prefixProbe is not VdbeJoinScanPlan labeledProbe)
+                return [];
+            var prefixNodes = DescribeCompiledNamedJoinNonIndexedNodes(prefix, nextId + 1);
+            if (prefixNodes.Count != 2)
+                return [];
+
+            var parentId = nextId;
+            var detail = $"MATERIALIZE hash build input for {labeledProbe.TableName}"
+                + (labeledProbe.Alias is null ? string.Empty : $" AS {labeledProbe.Alias}");
+            var result = new List<(int Id, int Parent, string Detail, EqpJsonOp? Op)>
+            {
+                (parentId, 0, detail,
+                    new EqpJsonCompiledJoinHashBuildOp(labeledProbe.TableName, labeledProbe.Alias)),
+            };
+            result.AddRange(prefixNodes.Select(node => (
+                node.Id,
+                node.Parent == 0 ? parentId : node.Parent,
+                node.Detail,
+                node.Op)));
+            result.Add((
+                nextId + 1 + prefixNodes.Count,
+                0,
+                $"HASH JOIN {outerProbe.TableName}"
+                    + (outerProbe.Alias is null ? string.Empty : $" AS {outerProbe.Alias}"),
+                new EqpJsonHashJoinOp(outerProbe.TableName, outerProbe.Alias, "inner")));
+            return result;
+        }
+
         // A scan leaf in a compiled plan is a real named-table cursor. Do not expand a derived
-        // leaf or an N-way subtree: neither supplies a proven per-table access-path breakdown.
+        // leaf or an otherwise unmodeled N-way subtree.
         if (root is not VdbeJoinOperatorPlan { Left: VdbeJoinScanPlan left } join
             || join.Right is not VdbeJoinScanPlan
                 && (join.Right is not IVdbeJoinSeekPlan || join.Right.SearchMetadata is null))
@@ -50100,7 +50190,8 @@ out bool hasReturning)
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
         QueryContext context,
-        IReadOnlySet<int>? evaluationSourceIndexes = null)
+        IReadOnlySet<int>? evaluationSourceIndexes = null,
+        VdbeWindowEvaluationResources? windowEvaluation = null)
     {
         return ComputeWindowFunctionValueRows(
             windowFunctions,
@@ -50109,7 +50200,8 @@ out bool hasReturning)
             parameters,
             context,
             WindowEmissionOrder(windowFunctions),
-            evaluationSourceIndexes);
+            evaluationSourceIndexes,
+            windowEvaluation);
     }
 
     // The window pass reads every one of its inputs - arguments, FILTER, PARTITION BY and window
@@ -50123,7 +50215,8 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         IReadOnlyList<OrderByTerm>? emissionOrder = null,
-        IReadOnlySet<int>? evaluationSourceIndexes = null)
+        IReadOnlySet<int>? evaluationSourceIndexes = null,
+        VdbeWindowEvaluationResources? windowEvaluation = null)
     {
         var values = new SqlValue[rowCount][];
         for (var index = 0; index < rowCount; index++)
@@ -50132,7 +50225,8 @@ out bool hasReturning)
         if (windowFunctions.Count == 0)
             return values;
 
-        var inputs = PrepareWindowFunctionInputs(windowFunctions, rowCount, evaluate, context);
+        var inputs = PrepareWindowFunctionInputs(
+            windowFunctions, rowCount, evaluate, context, windowEvaluation);
         var groups = new List<List<int>>();
         foreach (var ordinal in Enumerable.Range(0, windowFunctions.Count))
         {
@@ -50173,7 +50267,8 @@ out bool hasReturning)
         IReadOnlyList<FunctionExpression> functions,
         int rowCount,
         WindowInputEvaluator evaluate,
-        QueryContext context)
+        QueryContext context,
+        VdbeWindowEvaluationResources? windowEvaluation)
     {
         var inputs = new Dictionary<FunctionExpression, WindowFunctionInput[]>();
         foreach (var function in functions)
@@ -50182,8 +50277,10 @@ out bool hasReturning)
         for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
             context.CheckInterrupt();
+            windowEvaluation?.CancellationToken.ThrowIfCancellationRequested();
             foreach (var function in functions)
             {
+                windowEvaluation?.CancellationToken.ThrowIfCancellationRequested();
                 var included = !IsAggregateWindowFunction(function)
                     || function.Filter is null
                     || IsTrue(evaluate(rowIndex, function.Filter));

@@ -207,6 +207,23 @@ internal sealed class VdbeExecutionMemory(long limitBytes, VdbeExecutionMetrics 
     }
 }
 
+/// <summary>
+/// Gives a buffered evaluator its statement-local resources for the duration of a compute pass.
+/// The legacy evaluator delegate does not carry an execution context.
+/// </summary>
+internal interface IVdbeWindowEvaluationScope
+{
+    IDisposable Enter(
+        VdbeExecutionMemory memory,
+        VdbeExecutionOptions options,
+        CancellationToken cancellationToken);
+}
+
+internal sealed record VdbeWindowEvaluationResources(
+    VdbeExecutionMemory Memory,
+    VdbeExecutionOptions Options,
+    CancellationToken CancellationToken);
+
 internal sealed class VdbeMemoryReservation : IDisposable
 {
     private readonly VdbeExecutionMemory _memory;

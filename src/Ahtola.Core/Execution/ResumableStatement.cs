@@ -6015,6 +6015,8 @@ public sealed class ResumableStatement : IDisposable
                 IReadOnlyList<SqlValue[]> input = _temporaryFile is null
                     ? _rows
                     : new SpilledWindowRowList(this, cancellationToken);
+                using var evaluationScope = (_evaluator.Target as IVdbeWindowEvaluationScope)?
+                    .Enter(_memory, _options, cancellationToken);
                 var computed = _evaluator(input)
                     ?? throw new InvalidOperationException("A window evaluator returned null.");
                 if (computed.Count != _count)

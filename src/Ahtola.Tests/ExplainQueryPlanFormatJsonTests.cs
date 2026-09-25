@@ -847,6 +847,95 @@ public class ExplainQueryPlanFormatJsonTests
     }
 
     [Test]
+    public void CompiledThreeTableHashBuildLeftNestsTheActualJoinedPrefix()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE small(id INTEGER PRIMARY KEY, label TEXT); " +
+            "CREATE TABLE seed(x INTEGER PRIMARY KEY); " +
+            "CREATE TABLE big(id INTEGER PRIMARY KEY, label TEXT); " +
+            "INSERT INTO small VALUES (1, 's1'), (2, 's2'), (3, 's3'); " +
+            "INSERT INTO seed VALUES (1), (2), (3); " +
+            "INSERT INTO big VALUES " +
+            string.Join(", ", Enumerable.Range(1, 40).Select(value => $"({value}, 'b{value}')")) +
+            "; ANALYZE;");
+
+        const string query = """
+            SELECT s.label, b.label
+            FROM small AS s NOT INDEXED JOIN seed AS e NOT INDEXED ON s.id = e.x
+                 JOIN big AS b NOT INDEXED ON s.id = b.id;
+            """;
+        ReadValues(connection, query).Should().HaveCount(3);
+        var compiled = ReadValues(connection, "EXPLAIN " + query)
+            .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText();
+        compiled.Should().Contain("hash-build left");
+        compiled.Should().Contain("scan order: s, e, b");
+        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
+            .Should().Equal("MANAGED COMPILED VDBE");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(4);
+        nodes.EnumerateArray().Select(static node => node.GetProperty("id").GetInt32())
+            .Should().Equal(1, 2, 3, 4);
+
+        nodes[0].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
+        nodes[0].GetProperty("detail").GetString().Should()
+            .Be("MATERIALIZE hash build input for small AS s");
+        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_build");
+        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("small");
+        nodes[0].GetProperty("op").GetProperty("alias").GetString().Should().Be("s");
+
+        nodes[1].GetProperty("parent").GetInt32().Should().Be(1);
+        nodes[1].GetProperty("detail").GetString().Should().Be("HASH JOIN small AS s");
+        nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_join");
+        nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("s");
+        nodes[1].GetProperty("op").TryGetProperty("join", out _).Should().BeFalse();
+
+        nodes[2].GetProperty("parent").GetInt32().Should().Be(1);
+        nodes[2].GetProperty("detail").GetString().Should().Be("SCAN seed AS e");
+        nodes[2].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        nodes[2].GetProperty("op").GetProperty("alias").GetString().Should().Be("e");
+        nodes[2].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+
+        nodes[3].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
+        nodes[3].GetProperty("detail").GetString().Should().Be("HASH JOIN big AS b");
+        nodes[3].GetProperty("op").GetProperty("table").GetString().Should().Be("big");
+        nodes[3].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+    }
+
+    [Test]
+    public void CompiledThreeTableHashBuildRightDoesNotInventPrefixMaterialization()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE first(k INTEGER); CREATE TABLE middle(k INTEGER); CREATE TABLE last(k INTEGER); " +
+            "INSERT INTO first VALUES (1), (2); " +
+            "INSERT INTO middle VALUES (1), (2); " +
+            "INSERT INTO last VALUES (1), (2);");
+
+        const string query = """
+            SELECT a.k, c.k
+            FROM first AS a NOT INDEXED JOIN middle AS b NOT INDEXED ON a.k = b.k
+                 JOIN last AS c NOT INDEXED ON a.k = c.k;
+            """;
+        ReadValues(connection, query).Should().HaveCount(2);
+        var compiled = ReadValues(connection, "EXPLAIN " + query)
+            .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText();
+        compiled.Should().Contain("hash-build right");
+        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
+            .Should().Equal("MANAGED COMPILED VDBE");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        document.RootElement.GetProperty("nodes").GetArrayLength().Should().Be(0);
+        document.RootElement.GetRawText().Should().NotContain("hash_build");
+    }
+
+    [Test]
     public void CompiledJoinAutomaticIndexIsAnEphemeralCoveringSearch()
     {
         using var embedded = new EmbeddedDatabase();
