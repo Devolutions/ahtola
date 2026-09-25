@@ -218,8 +218,9 @@ public sealed class AsyncBoundedWithoutRowidScanTests
             counted.Reset();
             var seekCache = new BoundedAsyncPageCache(counted, pager.UsableSpace, capacity: 8);
             var found = new List<SqlValue[]>();
-            await foreach (var row in AsyncBoundedWithoutRowidTableScanCursor.SeekIntegerPrimaryKeyAsync(
-                seekCache, entry.RootPage, entry.Table, encoding, [4, 149], limit: 1, offset: 0))
+            await foreach (var row in AsyncBoundedWithoutRowidTableScanCursor.SeekPrimaryKeyAsync(
+                seekCache, entry.RootPage, entry.Table, encoding,
+                [SqlValue.Integer(4), SqlValue.Integer(149)], limit: 1, offset: 0))
                 found.Add(row);
             found.Should().ContainSingle().Which[1].AsInteger().Should().Be(149);
             counted.ReadCount.Should().BeLessThan((int)counted.PageCount / 4);
@@ -292,6 +293,66 @@ public sealed class AsyncBoundedWithoutRowidScanTests
             await unsupported.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
                 .WithMessage("*WHERE*");
         }
+    }
+
+    [Test]
+    public async Task TextPrefixAndMixedTextIntegerKeyRespectBinaryOrdering()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        var accented = "caf\u00e9";
+        using (var database = EmbeddedDatabase.OpenFile(InMemoryPath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(tenant TEXT, seq INTEGER, payload TEXT, PRIMARY KEY(tenant, seq)) WITHOUT ROWID;");
+            Execute(connection, "CREATE TABLE labels(code TEXT, variant TEXT, label TEXT, PRIMARY KEY(code, variant)) WITHOUT ROWID;");
+            Execute(connection,
+                $"INSERT INTO items VALUES ('A', 1, 'upper'), ('a', 1, 'lower'), ('a', 2, 'second'), ('{accented}', 3, 'accented');");
+            Execute(connection, "INSERT INTO labels VALUES ('a', 'x', 'first'), ('a', 'y', 'second');");
+        }
+
+        await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false, InMemoryPath, pageBudget: 4, CancellationToken.None);
+        await using (var exact = await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE seq = 1 AND tenant = 'a'"))
+        {
+            (await exact.ReadAsync()).Should().BeTrue();
+            exact.GetValue(0).AsText().Should().Be("lower");
+            (await exact.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var prefix = await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE tenant = 'a' ORDER BY tenant DESC, seq DESC LIMIT 1 OFFSET 1"))
+        {
+            (await prefix.ReadAsync()).Should().BeTrue();
+            prefix.GetValue(0).AsText().Should().Be("lower");
+            (await prefix.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var unicode = await bounded.ExecuteBoundedScanAsync(
+            $"SELECT payload FROM items WHERE tenant = '{accented}' AND seq = 3"))
+        {
+            (await unicode.ReadAsync()).Should().BeTrue();
+            unicode.GetValue(0).AsText().Should().Be("accented");
+            (await unicode.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var missing = await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE tenant = 'a' AND seq = 4"))
+            (await missing.ReadAsync()).Should().BeFalse();
+
+        await using (var textTuple = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM labels WHERE variant = 'y' AND code = 'a'"))
+        {
+            (await textTuple.ReadAsync()).Should().BeTrue();
+            textTuple.GetValue(0).AsText().Should().Be("second");
+            (await textTuple.ReadAsync()).Should().BeFalse();
+        }
+
+        var wrongType = async () => await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE tenant = 1 AND seq = 1");
+        await wrongType.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+            .WithMessage("*WHERE*");
     }
 
     [Test]
@@ -444,6 +505,14 @@ public sealed class AsyncBoundedWithoutRowidScanTests
                 actual.Should().Equal(expected);
             }
 
+            await using (var exact = await bounded.ExecuteBoundedScanAsync(
+                $"SELECT payload FROM items WHERE code = '{expected[219].Code}'"))
+            {
+                (await exact.ReadAsync()).Should().BeTrue();
+                exact.GetValue(0).AsText().Should().Be(expected[219].Payload);
+                (await exact.ReadAsync()).Should().BeFalse();
+            }
+
             await using (var reader = await bounded.ExecuteBoundedScanAsync(
                 "SELECT tag, payload FROM items LIMIT 5 OFFSET 117"))
             {
@@ -588,7 +657,6 @@ public sealed class AsyncBoundedWithoutRowidScanTests
         {
             ("SELECT * FROM descending", "primary key"),
             ("SELECT * FROM collated", "primary key"),
-            ("SELECT * FROM ascending WHERE code = 'a'", "WHERE"),
             ("SELECT * FROM ascending WHERE code = 1", "WHERE"),
             ("SELECT * FROM ascending ORDER BY value", "ORDER BY"),
             ("SELECT * FROM ascending ORDER BY value DESC", "ORDER BY"),
@@ -603,6 +671,9 @@ public sealed class AsyncBoundedWithoutRowidScanTests
 
         await using var accepted = await bounded.ExecuteBoundedScanAsync("SELECT code FROM ascending LIMIT 0");
         (await accepted.ReadAsync()).Should().BeFalse();
+        await using var textKey = await bounded.ExecuteBoundedScanAsync(
+            "SELECT code FROM ascending WHERE code = 'a'");
+        (await textKey.ReadAsync()).Should().BeFalse();
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

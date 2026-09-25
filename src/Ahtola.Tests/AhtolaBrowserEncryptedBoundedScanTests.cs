@@ -43,7 +43,7 @@ public sealed class AhtolaBrowserEncryptedBoundedScanTests
     }
 
     [Test]
-    public async Task CompositeIntegerKeySeekReadsEncryptedWithoutRowidPages()
+    public async Task CompositeKeySeekReadsEncryptedWithoutRowidPages()
     {
         var storage = new InMemoryFileSystem();
         using (var options = AhtolaEncryptionOptions.FromHex(StorageCipher.Aes256Gcm, Key))
@@ -52,12 +52,14 @@ public sealed class AhtolaBrowserEncryptedBoundedScanTests
         using (var connection = database.Connect())
         {
             Execute(connection, "CREATE TABLE items(tenant INTEGER, seq INTEGER, label TEXT, PRIMARY KEY(tenant, seq)) WITHOUT ROWID;");
+            Execute(connection, "CREATE TABLE labels(tenant TEXT, seq INTEGER, label TEXT, PRIMARY KEY(tenant, seq)) WITHOUT ROWID;");
             Execute(connection, "BEGIN;");
             for (var tenant = 1; tenant <= 2; tenant++)
             {
                 for (var seq = 1; seq <= 80; seq++)
                     Execute(connection, $"INSERT INTO items VALUES ({tenant}, {seq}, 'item-{tenant}-{seq}');");
             }
+            Execute(connection, "INSERT INTO labels VALUES ('a', 1, 'encrypted-text');");
             Execute(connection, "COMMIT;");
         }
 
@@ -73,6 +75,12 @@ public sealed class AhtolaBrowserEncryptedBoundedScanTests
         await using var missing = await bounded.ExecuteBoundedScanAsync(
             "SELECT label FROM items WHERE tenant = 2 AND seq = 81");
         (await missing.ReadAsync()).Should().BeFalse();
+
+        await using var textKey = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM labels WHERE tenant = 'a' AND seq = 1");
+        (await textKey.ReadAsync()).Should().BeTrue();
+        textKey.GetValue(0).AsText().Should().Be("encrypted-text");
+        (await textKey.ReadAsync()).Should().BeFalse();
     }
 
     [Test]

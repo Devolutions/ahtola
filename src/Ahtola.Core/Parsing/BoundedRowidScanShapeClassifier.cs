@@ -19,8 +19,8 @@ internal sealed record BoundedRowidScanPlan(
     SqliteRowIdRange? RowIdRange,
     bool Descending,
     bool WithoutRowid,
-    long? FirstPrimaryKeyEquals,
-    IReadOnlyList<long>? FullPrimaryKeyEquals);
+    SqlValue? FirstPrimaryKeyEquals,
+    IReadOnlyList<SqlValue>? FullPrimaryKeyEquals);
 
 /// <summary>
 /// Classifies a parsed SQL statement against an <see cref="AsyncSchemaCatalog"/>, either
@@ -42,7 +42,7 @@ internal sealed record BoundedRowidScanPlan(
 /// No other <c>WHERE</c>, joins/subqueries, <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
 /// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references.
 /// <c>WITHOUT ROWID</c> tables additionally support ascending BINARY primary keys and
-/// first-key or complete all-INTEGER-key equality. A registered secondary index does not change a base-table
+/// first-key or complete INTEGER/TEXT-key equality. A registered secondary index does not change a base-table
 /// rowid scan or seek; other indexed access paths remain out of scope. Everything else is named follow-on
 /// work, not silently downgraded.
 /// </para>
@@ -158,8 +158,8 @@ internal static class BoundedRowidScanShapeClassifier
 
         long? equalRowId = null;
         SqliteRowIdRange? rowIdRange = null;
-        long? firstPrimaryKeyEquals = null;
-        IReadOnlyList<long>? fullPrimaryKeyEquals = null;
+        SqlValue? firstPrimaryKeyEquals = null;
+        IReadOnlyList<SqlValue>? fullPrimaryKeyEquals = null;
         if (select.Where is { } predicate)
         {
             if (withoutRowid)
@@ -168,7 +168,7 @@ internal static class BoundedRowidScanShapeClassifier
                         predicate, tableSource, entry.Table, out var keys))
                 {
                     rejectionReason =
-                        "WHERE on a bounded WITHOUT ROWID scan requires equality on the first INTEGER primary-key column or every INTEGER primary-key column.";
+                        "WHERE on a bounded WITHOUT ROWID scan requires equality on the first INTEGER/TEXT primary-key column or every INTEGER/TEXT primary-key column.";
                     return null;
                 }
 
@@ -290,10 +290,10 @@ internal static class BoundedRowidScanShapeClassifier
         Expression predicate,
         NamedTableSource source,
         EmbeddedTable table,
-        out long[] keys)
+        out SqlValue[] keys)
     {
         var terms = table.PrimaryKeySchema!.Terms;
-        var values = new long?[terms.Count];
+        var values = new SqlValue?[terms.Count];
         var matched = 0;
 
         bool Visit(Expression expression)
@@ -306,13 +306,11 @@ internal static class BoundedRowidScanShapeClassifier
             for (var index = 0; index < terms.Count; index++)
             {
                 var term = terms[index];
-                if (!string.Equals(
-                        table.ColumnDefinitions[term.ColumnIndex].DeclaredType,
-                        "INTEGER", StringComparison.OrdinalIgnoreCase)
-                    || values[index].HasValue)
+                if (values[index].HasValue)
                     continue;
-                if (!(TryMatchPrimaryKey(equality.Left, equality.Right, source, term, out var value)
-                    || TryMatchPrimaryKey(equality.Right, equality.Left, source, term, out value)))
+                var declaredType = table.ColumnDefinitions[term.ColumnIndex].DeclaredType;
+                if (!(TryMatchPrimaryKey(equality.Left, equality.Right, source, term, declaredType, out var value)
+                    || TryMatchPrimaryKey(equality.Right, equality.Left, source, term, declaredType, out value)))
                     continue;
                 values[index] = value;
                 matched++;
@@ -437,11 +435,25 @@ internal static class BoundedRowidScanShapeClassifier
         Expression valueExpression,
         NamedTableSource source,
         SqlitePrimaryKeyTerm term,
-        out long key)
+        string? declaredType,
+        out SqlValue key)
     {
-        key = 0;
-        return IsNamedColumn(columnExpression, source, term.ColumnName)
-            && TryGetIntegerLiteral(valueExpression, out key);
+        key = SqlValue.Null;
+        if (!IsNamedColumn(columnExpression, source, term.ColumnName))
+            return false;
+        if (string.Equals(declaredType, "INTEGER", StringComparison.OrdinalIgnoreCase)
+            && TryGetIntegerLiteral(valueExpression, out var integer))
+        {
+            key = SqlValue.Integer(integer);
+            return true;
+        }
+        if (string.Equals(declaredType, "TEXT", StringComparison.OrdinalIgnoreCase)
+            && valueExpression is LiteralExpression { Value.Kind: SqlValueKind.Text } literal)
+        {
+            key = literal.Value;
+            return true;
+        }
+        return false;
     }
 
     private static bool TryGetIntegerLiteral(Expression expression, out long value)
