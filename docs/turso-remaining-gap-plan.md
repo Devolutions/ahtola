@@ -414,10 +414,12 @@ Unfiltered window functions whose arguments are all literal values share
 one immutable input value (including the argument-free case) instead of
 allocating a row-count-wide array. Large row-dependent argument and FILTER
 input sets now use an indexed temporary file when their minimum row slots
-exceed half the remaining compiled-window memory budget. Cached spill reads
-reserve memory and the files are disposed on both success and evaluator
-failure. Smaller retained input arrays, partition metadata and computed
-result scratch still require the full spill-backed evaluator redesign;
+exceed half the remaining compiled-window memory budget. Smaller retained
+input arrays reserve their minimum slots before allocation. Cached spill
+reads reserve memory and the files are disposed on both success and evaluator
+failure. Retained argument payloads on the small-array path, partition
+metadata and computed result scratch still require the full spill-backed
+evaluator redesign;
 `WindowEvaluatorMemoryUnbounded` remains true.
 
 TYPE/DOMAIN adoption must keep SQLite's five physical storage classes: the

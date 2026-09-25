@@ -7,18 +7,18 @@ public sealed partial class EmbeddedDatabase
 {
     private sealed class WindowInputScope : IDisposable
     {
-        private readonly List<SpilledWindowInputList> _spills = [];
+        private readonly List<IDisposable> _owned = [];
 
-        public void Own(SpilledWindowInputList spill) => _spills.Add(spill);
+        public void Own(IDisposable resource) => _owned.Add(resource);
 
         public void Dispose()
         {
             Exception? failure = null;
-            foreach (var spill in _spills)
+            foreach (var resource in _owned)
             {
                 try
                 {
-                    spill.Dispose();
+                    resource.Dispose();
                 }
                 catch (Exception exception)
                 {

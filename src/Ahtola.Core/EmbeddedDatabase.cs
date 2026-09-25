@@ -50411,14 +50411,22 @@ out bool hasReturning)
                             .Select(static argument => ((LiteralExpression)argument).Value)
                             .ToArray())));
             }
-            else if (windowEvaluation is { } resources
-                && resources.Options.AllowTemporaryFileSpill
-                && VdbeManagedFootprint.EstimateWindowOutputMinimum(
-                    rowCount, function.Arguments.Count) > resources.Memory.AvailableBytes / 2)
+            else if (windowEvaluation is { } resources)
             {
-                var spill = new SpilledWindowInputList(rowCount, function.Arguments.Count, resources);
-                inputScope.Own(spill);
-                inputs.Add(function, spill);
+                var minimum = VdbeManagedFootprint.EstimateWindowOutputMinimum(
+                    rowCount, function.Arguments.Count);
+                if (resources.Options.AllowTemporaryFileSpill
+                    && minimum > resources.Memory.AvailableBytes / 2)
+                {
+                    var spill = new SpilledWindowInputList(rowCount, function.Arguments.Count, resources);
+                    inputScope.Own(spill);
+                    inputs.Add(function, spill);
+                }
+                else
+                {
+                    inputScope.Own(VdbeMemoryReservation.Create(resources.Memory, minimum));
+                    inputs.Add(function, new WindowFunctionInput[rowCount]);
+                }
             }
             else
             {
