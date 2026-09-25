@@ -362,9 +362,10 @@ public sealed class AsyncBoundedRowidScanTests
             .Should().BeNull();
         rangeReason.Should().Contain("WHERE");
 
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM indexed", catalog, out var indexedReason)
-            .Should().BeNull();
-        indexedReason.Should().Contain("index");
+        var indexedPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT * FROM indexed", catalog, out var indexedReason);
+        indexedPlan.Should().NotBeNull(indexedReason);
+        indexedPlan!.TableName.Should().Be("indexed");
 
         BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM wr", catalog, out var withoutRowidReason)
             .Should().BeNull();
@@ -381,7 +382,7 @@ public sealed class AsyncBoundedRowidScanTests
         // Classification never reads a page: the cache's resident count must stay exactly what
         // schema loading alone required, proving rejection happens before any scan I/O.
         var residentAfterClassification = pageCache.ResidentPageCount;
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM indexed", catalog, out _);
+        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM wr", catalog, out _);
         pageCache.ResidentPageCount.Should().Be(residentAfterClassification);
     }
 

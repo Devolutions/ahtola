@@ -38,7 +38,8 @@ internal sealed record BoundedRowidScanPlan(
 /// [ORDER BY integer-primary-key [ASC|DESC]] [LIMIT n [OFFSET m]]</c>.
 /// No other <c>WHERE</c>, joins/subqueries, <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
 /// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references, no
-/// <c>WITHOUT ROWID</c> or indexed tables. Everything else is named follow-on
+/// <c>WITHOUT ROWID</c> tables. A registered secondary index does not change a base-table
+/// rowid scan or seek; other indexed access paths remain out of scope. Everything else is named follow-on
 /// work, not silently downgraded.
 /// </para>
 /// </remarks>
@@ -116,13 +117,6 @@ internal static class BoundedRowidScanShapeClassifier
         {
             rejectionReason =
                 $"WITHOUT ROWID table '{tableSource.Name}' is not yet supported by a bounded scan connection.";
-            return null;
-        }
-
-        if (entry.HasAnyIndex)
-        {
-            rejectionReason =
-                $"Table '{tableSource.Name}' has a registered index; indexed tables are not yet supported by a bounded scan connection.";
             return null;
         }
 

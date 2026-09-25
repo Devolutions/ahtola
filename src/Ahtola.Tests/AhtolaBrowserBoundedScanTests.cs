@@ -56,6 +56,49 @@ public sealed class AhtolaBrowserBoundedScanTests
     }
 
     [Test]
+    public async Task IndexedRowidTableStillSupportsBaseScanAndPrimaryKeySeek()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT, score INTEGER);");
+            Execute(connection, "CREATE INDEX items_score ON items(score);");
+            Execute(connection, "INSERT INTO items VALUES (1, 'one', 9), (2, 'two', 7), (3, 'three', 5);");
+        }
+
+        await using var boundedConnection = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false,
+            DatabasePath,
+            pageBudget: 16,
+            CancellationToken.None);
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT label FROM items ORDER BY id"))
+        {
+            var labels = new List<string>();
+            while (await reader.ReadAsync())
+                labels.Add(reader.GetValue(0).AsText());
+            labels.Should().Equal("one", "two", "three");
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id >= 2 ORDER BY id DESC"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(3L, 2L);
+        }
+
+        var unsupported = async () => await boundedConnection.ExecuteBoundedScanAsync(
+            "SELECT id FROM items WHERE score = 7");
+        (await unsupported.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>())
+            .Which.Message.Should().Contain("WHERE");
+    }
+
+    [Test]
     public async Task LeavesAnOrdinarySynchronousReaderOfTheSameDatabaseUnaffected()
     {
         // Proves zero shared code path: a bounded scan connection touching this database does
