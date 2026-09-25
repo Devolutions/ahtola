@@ -275,6 +275,15 @@ public sealed class AhtolaBrowserBoundedScanTests
         }
 
         await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items ORDER BY id DESC NULLS FIRST LIMIT 2"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(199L, 198L);
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
                          "SELECT id FROM items WHERE id <= 0 ORDER BY id DESC"))
         {
             var ids = new List<long>();

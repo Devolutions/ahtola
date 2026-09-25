@@ -136,7 +136,6 @@ internal static class BoundedRowidScanShapeClassifier
         if (select.OrderBy.Count != 0
             && (entry.Table.RowidAliasColumnIndex < 0
                 || select.OrderBy is not [var order]
-                || order.NullPlacement != NullPlacement.Default
                 || !IsRowIdColumn(order.Expression, tableSource, entry.Table)))
         {
             rejectionReason = "ORDER BY supports only the INTEGER PRIMARY KEY column.";
