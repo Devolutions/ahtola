@@ -24,6 +24,8 @@ internal sealed class ManagedFtsIndexMethod : ManagedIndexMethod
     {
     }
 
+    public override IReadOnlyList<string> OwnedFunctionNames => ManagedFtsPlannerAdapter.Instance.OwnedFunctionNames;
+
     public override string Name => "fts";
 
     public override bool SupportsColumnParameters => true;
@@ -336,8 +338,12 @@ internal sealed class ManagedFtsIndexAttachment : ManagedIndexMethodAttachment
 
     public override IManagedIndexMethodPlannerAdapter Planner => ManagedFtsPlannerAdapter.Instance;
 
-    /// <summary>The live posting state. Only cursors mutate it.</summary>
-    internal ManagedFtsSearchIndex Index => _index;
+    /// <summary>
+    /// The live posting state. Reconciliation never mutates a published index in place: it forks,
+    /// applies, and publishes the result, so a statement already reading the previous state keeps a
+    /// consistent view. Only a writable cursor (on a statement's own working copy) mutates it.
+    /// </summary>
+    internal ManagedFtsSearchIndex Index => Volatile.Read(ref _index);
 
     public override ManagedIndexMethodCursor Open(IManagedIndexSource source)
     {
@@ -515,6 +521,23 @@ internal sealed class ManagedFtsIndexAttachment : ManagedIndexMethodAttachment
         return new ManagedFtsIndexAttachment(Configuration, Options);
     }
 
+    /// <summary>
+    /// Shares the immutable posting segments with the copy (see
+    /// <see cref="ManagedFtsSearchIndex.Fork"/>), so the working copy a write transaction commits
+    /// keeps the incrementally maintained index instead of rebuilding it from every base row.
+    /// </summary>
+    public override ManagedIndexMethodAttachment ForkWithState()
+    {
+        var fork = new ManagedFtsIndexAttachment(Configuration, Options);
+        if (!HasBeenBuilt)
+            return fork;
+
+        var index = _index.Fork();
+        index.ColumnIndexResolver = fork.ResolveColumnIndex;
+        fork.PublishIndex(index, _appliedRevision);
+        return fork;
+    }
+
     internal ManagedFtsSearchIndex CreateIndex()
         => new(
             Configuration.Columns.Count,
@@ -534,9 +557,19 @@ internal sealed class ManagedFtsIndexAttachment : ManagedIndexMethodAttachment
     internal void PublishIndex(ManagedFtsSearchIndex index, long revision)
     {
         ArgumentNullException.ThrowIfNull(index);
-        _index = index;
-        _appliedRevision = revision;
+
+        // Index first, revision second: a reader that observes the new revision is guaranteed to
+        // observe the index it describes.
+        Volatile.Write(ref _index, index);
+        Volatile.Write(ref _appliedRevision, revision);
     }
+
+    /// <summary>
+    /// Serializes reconciliation of this attachment. A published catalog's tables are shared by
+    /// every connection reading it, so two readers can find the same attachment stale at once; the
+    /// gate makes the second one find it current instead of repeating the work.
+    /// </summary>
+    internal object RefreshGate { get; } = new();
 
     /// <summary>Discards all derived state, forcing a rebuild on next use (DROP INDEX, Destroy).</summary>
     internal void ResetIndex()
@@ -545,9 +578,9 @@ internal sealed class ManagedFtsIndexAttachment : ManagedIndexMethodAttachment
         _appliedRevision = -1;
     }
 
-    internal long AppliedRevision => _appliedRevision;
+    internal long AppliedRevision => Volatile.Read(ref _appliedRevision);
 
-    internal void MarkApplied(long revision) => _appliedRevision = revision;
+    internal void MarkApplied(long revision) => Volatile.Write(ref _appliedRevision, revision);
 
     internal bool HasBeenBuilt => _appliedRevision >= 0;
 
@@ -853,18 +886,23 @@ internal sealed class ManagedFtsIndexCursor(ManagedFtsIndexAttachment attachment
         if (!force && source.Revision == attachment.AppliedRevision)
             return;
 
-        if (!force
-            && attachment.HasBeenBuilt
-            && source.TryGetDelta(attachment.AppliedRevision) is { } delta)
+        lock (attachment.RefreshGate)
         {
-            ApplyDelta(delta);
-            return;
-        }
+            if (!force && source.Revision == attachment.AppliedRevision)
+                return;
 
-        var rebuilt = attachment.CreateIndex();
-        BuildInto(rebuilt);
-        PublishRebuild(rebuilt);
-        CompactIfNeeded();
+            if (!force
+                && attachment.HasBeenBuilt
+                && source.TryGetDelta(attachment.AppliedRevision) is { } delta)
+            {
+                ApplyDelta(delta);
+                return;
+            }
+
+            var rebuilt = attachment.CreateIndex();
+            BuildInto(rebuilt);
+            PublishRebuild(rebuilt);
+        }
     }
 
     /// <summary>
@@ -882,7 +920,8 @@ internal sealed class ManagedFtsIndexCursor(ManagedFtsIndexAttachment attachment
 
     private void ApplyDelta(ManagedIndexSourceDelta delta)
     {
-        var index = attachment.Index;
+        // O(segments) fork; only the overlay and deleted sets this delta touches are copied.
+        var index = attachment.Index.Fork();
         var columnCount = attachment.Configuration.Columns.Count;
         foreach (var rowId in delta.ChangedRowIds)
         {
@@ -897,18 +936,21 @@ internal sealed class ManagedFtsIndexCursor(ManagedFtsIndexAttachment attachment
             }
         }
 
-        attachment.MarkApplied(delta.Revision);
-        CompactIfNeeded();
+        CompactIfNeeded(index);
+        attachment.PublishIndex(index, delta.Revision);
     }
 
     private void BuildInto(ManagedFtsSearchIndex index)
     {
         var columnCount = attachment.Configuration.Columns.Count;
+        index.BeginBulkLoad();
         for (var position = 0; position < source.RowCount; position++)
         {
             var row = source.GetRow(position);
             index.Upsert(source.GetRowId(position), row, ProjectColumns(row, columnCount));
         }
+
+        index.EndBulkLoad();
     }
 
     private SqlValue[] ProjectColumns(SqlValue[] row, int columnCount)
@@ -923,14 +965,16 @@ internal sealed class ManagedFtsIndexCursor(ManagedFtsIndexAttachment attachment
         return buffer;
     }
 
-    private void CompactIfNeeded()
+    private void CompactIfNeeded() => CompactIfNeeded(attachment.Index);
+
+    private static void CompactIfNeeded(ManagedFtsSearchIndex index)
     {
         // Compaction above the synchronous bound is deferred to an explicit optimize, mirroring
         // Turso's merge policy (fts.rs:73-91).
-        if (attachment.Index.NeedsCompaction
-            && attachment.Index.DocumentCount <= ManagedFtsSearchIndex.MaxSynchronousCompactionDocuments)
+        if (index.NeedsCompaction
+            && index.DocumentCount <= ManagedFtsSearchIndex.MaxSynchronousCompactionDocuments)
         {
-            attachment.Index.Compact();
+            index.Compact();
         }
     }
 

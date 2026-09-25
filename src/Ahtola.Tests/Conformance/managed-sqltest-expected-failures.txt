@@ -59,6 +59,11 @@ turso/analyze.sqltest::analyze-table-without-rowid-fails | policy candidate: int
 # its statement terminator; some operations/topology remain incomplete. Native-layout IDs
 # are not a reason to fabricate operations or hide a missing materialization relationship.
 turso/vector.sqltest::vector-insert-no-quotes | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is otherwise identical)
+turso/fts.sqltest::match-operator-non-fts-table-select-error | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is SQLite's and otherwise identical)
+turso/fts.sqltest::match-operator-non-fts-table-delete-error | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is SQLite's and otherwise identical)
+turso/fts.sqltest::match-operator-non-fts-table-update-error | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is SQLite's and otherwise identical)
+turso/fts.sqltest::not-match-operator-non-fts-table-error | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is SQLite's and otherwise identical)
+turso/fts.sqltest::match-operator-multi-table-join-wrong-table-error | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (engine message text is SQLite's and otherwise identical)
 turso/without_rowid.sqltest::without-rowid-secondary-unique-rejected | intentional extension: Ahtola supports secondary UNIQUE constraints on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-create-index-rejected | intentional extension: Ahtola supports secondary CREATE INDEX on WITHOUT ROWID tables where the pinned Turso corpus expects rejection
 turso/without_rowid.sqltest::without-rowid-update-rejected | intentional extension: Ahtola supports UPDATE on WITHOUT ROWID tables where the pinned Turso corpus expects rejection

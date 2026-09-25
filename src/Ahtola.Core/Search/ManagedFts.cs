@@ -42,39 +42,12 @@ internal static class ManagedFtsTokenizer
         return tokens;
     }
 
-    private static bool IsTokenRune(Rune rune)
-    {
-        var category = Rune.GetUnicodeCategory(rune);
-        return Rune.IsLetterOrDigit(rune)
-            || category is UnicodeCategory.LetterNumber or UnicodeCategory.OtherLetter;
-    }
+    private static bool IsTokenRune(Rune rune) => ManagedUnicode.IsUnicode61TokenChar(rune.Value);
 
-    private static bool IsCombiningMark(Rune rune)
-        => Rune.GetUnicodeCategory(rune) is UnicodeCategory.NonSpacingMark
-            or UnicodeCategory.SpacingCombiningMark
-            or UnicodeCategory.EnclosingMark;
+    private static bool IsCombiningMark(Rune rune) => ManagedUnicode.IsMark(rune.Value);
 
     private static ManagedFtsToken CreateToken(string source, int offset, int length, int position)
-        => new(Normalize(source.AsSpan(offset, length)), offset, length, position);
-
-    private static string Normalize(ReadOnlySpan<char> value)
-    {
-        var decomposed = value.ToString().Normalize(NormalizationForm.FormD);
-        var normalized = new StringBuilder(decomposed.Length);
-        foreach (var character in decomposed)
-        {
-            if (CharUnicodeInfo.GetUnicodeCategory(character) is UnicodeCategory.NonSpacingMark
-                or UnicodeCategory.SpacingCombiningMark
-                or UnicodeCategory.EnclosingMark)
-            {
-                continue;
-            }
-
-            normalized.Append(character);
-        }
-
-        return normalized.ToString().ToLowerInvariant();
-    }
+        => new(ManagedUnicode.Fold(source.AsSpan(offset, length)), offset, length, position);
 }
 
 /// <summary>

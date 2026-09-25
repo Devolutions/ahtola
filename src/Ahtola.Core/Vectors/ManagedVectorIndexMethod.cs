@@ -357,6 +357,8 @@ internal sealed class ManagedVectorIndexMethod : ManagedIndexMethod
     {
     }
 
+    public override IReadOnlyList<string> OwnedFunctionNames => ManagedVectorPlannerAdapter.AllOwnedFunctionNames;
+
     public override string Name => "vector";
 
     public override ManagedIndexMethodAttachment Attach(ManagedIndexMethodConfiguration configuration)

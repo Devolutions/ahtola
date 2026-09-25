@@ -12283,6 +12283,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             deletedRow = table.Rows[conflictIndex];
             table.Rows.RemoveAt(conflictIndex);
             table.RowIds.RemoveAt(conflictIndex);
+
+            // SQLite's REPLACE deletion reports no change of its own, but incremental method-index
+            // maintenance still has to learn which rowid this revision bump removed.
+            table.RecordMethodIndexMutation(conflictedRowId);
             if (table.HasRowid)
                 RecordBlobMutation(tableName, conflictedRowId);
             ValidateForeignKeysAfterDelete(context, tableName, table, originalRows, rows, [deletedRow]);
@@ -12767,7 +12771,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     table,
                     TriggerMutationKind.Update,
                     updatePlan);
+                var revisionBeforeSwap = table.Rows.Revision;
                 ApplyUpsertRows(table, updatedRows, updatedRowIds);
+
+                // The swap re-adds every row; only the conflicting row changed (under its old and,
+                // when DO UPDATE reassigns it, its new rowid).
+                table.RecordMethodIndexBulkMutation(
+                    [originalRowId, updatedRowIds[conflictPosition]],
+                    revisionBeforeSwap);
                 ReportUpdateChange(
                     updateContext,
                     statement.TableName,
@@ -15853,10 +15864,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // identity selected by the update before restoring clustered key order so
         // the MVCC mirror updates the row that was actually changed.
         var updatedRowIds = updatedPositions.Select(position => rowIds[position]).ToArray();
+        var revisionBeforeSwap = table.Rows.Revision;
         table.Rows.Clear();
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
         table.RowIds.AddRange(rowIds);
+
+        // The swap re-adds every row, but only the updated positions changed: tell incremental
+        // method-index maintenance exactly that (both the old and the new rowid when an UPDATE
+        // rewrites the rowid), before anything else can touch the rows.
+        table.RecordMethodIndexBulkMutation(originalRowIds.Concat(updatedRowIds), revisionBeforeSwap);
         SortWithoutRowid(table);
         ValidateForeignKeysAfterUpdate(
             context,
@@ -17689,10 +17706,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     originalRowIds,
                     deletedRows,
                     deletedRowIds));
+        var revisionBeforeSwap = table.Rows.Revision;
         table.Rows.Clear();
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
         table.RowIds.AddRange(rowIds);
+
+        // The swap re-adds every kept row; only the deleted rowids changed.
+        table.RecordMethodIndexBulkMutation(deletedRowIds, revisionBeforeSwap);
         if (rowsAffected > 0)
         {
             ValidateForeignKeysAfterDelete(
@@ -27595,10 +27616,12 @@ out bool hasReturning)
                     keptRowIds.Add(rowId);
                 }
 
+                var revisionBeforeSwap = table.Rows.Revision;
                 table.Rows.Clear();
                 table.Rows.AddRange(keptRows);
                 table.RowIds.Clear();
                 table.RowIds.AddRange(keptRowIds);
+                table.RecordMethodIndexBulkMutation(deletedRowIds, revisionBeforeSwap);
                 foreach (var deletedRowId in deletedRowIds)
                 {
                     context.ReportRowChange(
@@ -29105,6 +29128,40 @@ out bool hasReturning)
                     ],
                 ],
                 0);
+        }
+        if (statement.Inner is SelectStatement methodJoinSelect
+            && methodJoinSelect.Source is JoinTableSource methodJoin
+            && JoinReferencesMethodIndexedTable(methodJoin, compilationContext)
+            && TryDescribeMethodIndexJoinPlan(methodJoinSelect, compilationContext, out var methodJoinSteps))
+        {
+            var methodJoinRows = new List<SqlValue[]>(methodJoinSteps.Count + 1);
+            var methodJoinOps = new List<EqpJsonOp?>(methodJoinSteps.Count + 1);
+            foreach (var (stepDetail, stepOp) in methodJoinSteps)
+            {
+                methodJoinRows.Add(
+                [
+                    SqlValue.Integer(methodJoinRows.Count + 1),
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(0),
+                    SqlValue.Text(stepDetail),
+                ]);
+                methodJoinOps.Add(stepOp);
+            }
+
+            if (methodJoinSelect.OrderBy.Count != 0)
+            {
+                methodJoinRows.Add(
+                [
+                    SqlValue.Integer(methodJoinRows.Count + 1),
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(0),
+                    SqlValue.Text("USE SORTER FOR ORDER BY"),
+                ]);
+                methodJoinOps.Add(new EqpJsonOrderByOp());
+            }
+
+            ops = methodJoinOps;
+            return new ExecutionResult(ExplainQueryPlanColumns(), methodJoinRows, 0);
         }
         if (statement.Inner is SelectStatement intersectionSelect
             && TryPlanManagedAndIndexIntersection(
@@ -33372,7 +33429,9 @@ out bool hasReturning)
         foreach (var expression in statement.GroupBy)
             ValidateColumnReferences(expression, row);
         ValidateColumnReferences(statement.Having, row);
-        foreach (var orderBy in statement.OrderBy)
+
+        // ORDER BY may name a result alias or ordinal, exactly as on the non-empty path.
+        foreach (var orderBy in ResolveOrderBy(statement.OrderBy, statement.Projections))
             ValidateColumnReferences(orderBy.Expression, row);
     }
 
@@ -36571,7 +36630,11 @@ out bool hasReturning)
         SourceRow? outerRow,
         IReadOnlyList<OrderByTerm>? sourceOrderBy = null)
     {
-        var (leftPredicate, rightPredicate) = SplitJoinSidePredicates(where, source, context);
+        var (leftPredicate, rightPredicate) = SplitJoinSidePredicates(
+            where,
+            source,
+            context,
+            IsPushableMethodFunction);
 
         // Push a WHERE conjunct into a join side's scans only when that side is preserved by
         // the join: INNER (and CROSS, which parses as INNER) may push both sides, LEFT may
@@ -36602,7 +36665,8 @@ out bool hasReturning)
     private static (Expression? Left, Expression? Right) SplitJoinSidePredicates(
         Expression where,
         JoinTableSource join,
-        QueryContext context)
+        QueryContext context,
+        Func<FunctionExpression, bool>? isPushableFunction = null)
     {
         var leftColumns = GetJoinSidePredicateColumns(join.Left, context);
         var rightColumns = GetJoinSidePredicateColumns(join.Right, context);
@@ -36620,7 +36684,7 @@ out bool hasReturning)
                 continue;
             }
 
-            switch (ClassifyJoinSidePredicate(conjunct, leftColumns, rightColumns))
+            switch (ClassifyJoinSidePredicate(conjunct, leftColumns, rightColumns, isPushableFunction))
             {
                 case JoinSidePredicate.Left:
                     (leftConjuncts ??= []).Add(conjunct);
@@ -36654,7 +36718,8 @@ out bool hasReturning)
     private static JoinSidePredicate ClassifyJoinSidePredicate(
         Expression conjunct,
         IReadOnlyList<OutputColumn> leftColumns,
-        IReadOnlyList<OutputColumn> rightColumns)
+        IReadOnlyList<OutputColumn> rightColumns,
+        Func<FunctionExpression, bool>? isPushableFunction = null)
     {
         var sawLeft = false;
         var sawRight = false;
@@ -36729,6 +36794,12 @@ out bool hasReturning)
                     foreach (var argument in match.Arguments)
                         pending.Push(argument);
                     break;
+                case FunctionExpression function when isPushableFunction?.Invoke(function) == true:
+                    // A method-owned call (fts_match) is the constraint a join arm's method index
+                    // serves, exactly like MATCH reaching BestIndex.
+                    foreach (var argument in function.Arguments)
+                        pending.Push(argument);
+                    break;
                 default:
                     // MATCH is a virtual-table constraint that must reach BestIndex. Other
                     // functions, subqueries, CURRENT_* and anything else not on the
@@ -36743,6 +36814,20 @@ out bool hasReturning)
             return JoinSidePredicate.Left;
         return sawRight ? JoinSidePredicate.Right : JoinSidePredicate.None;
     }
+
+    /// <summary>
+    /// True for a call a join arm may push into its own scan so that arm's method index can serve it.
+    /// </summary>
+    /// <remarks>
+    /// Only calls owned by a registered index method qualify, only while no connection callback
+    /// shadows them, and only as plain scalar calls. The complete WHERE is re-applied to the join
+    /// output, so pushing one is at worst a duplicate evaluation of a deterministic built-in.
+    /// </remarks>
+    private bool IsPushableMethodFunction(FunctionExpression function)
+        => function is { Filter: null, Window: null, Distinct: false }
+            && Indexing.ManagedIndexMethodRegistry.OwnsFunction(function.Name)
+            && SqliteBuiltinFunctions.IsDeterministic(function.Name)
+            && !IsShadowedMethodFunction(function.Name);
 
     private static bool IsReverseCorrelatedTableFunctionJoin(
         JoinTableSource source,
@@ -67667,6 +67752,14 @@ internal sealed class EmbeddedTable
     public void RecordMethodIndexMutation(long rowId)
         => _methodIndexJournal?.Record(rowId, Rows.Revision);
 
+    /// <summary>
+    /// Records a whole-row-list rewrite whose exact change set is <paramref name="changedRowIds"/>;
+    /// see <see cref="Indexing.ManagedIndexMethodJournal.RecordBulk"/>. Call immediately after the
+    /// rewrite.
+    /// </summary>
+    public void RecordMethodIndexBulkMutation(IEnumerable<long> changedRowIds, long revisionBeforeRewrite)
+        => _methodIndexJournal?.RecordBulk(changedRowIds, revisionBeforeRewrite, Rows.Revision);
+
     /// <summary>The rowids touched since a revision, or null when the range cannot be proven complete.</summary>
     public Indexing.ManagedIndexSourceDelta? TryGetMethodIndexDelta(long sinceRevision)
         => _methodIndexJournal?.TryGetDelta(sinceRevision, Rows.Revision);
@@ -67717,9 +67810,15 @@ internal sealed class EmbeddedTable
 
     private void CopyMethodAttachmentsTo(EmbeddedTable clone)
     {
-        // Forked attachments carry no derived state and no journal: a snapshot that is later
-        // restored must rebuild from the rows it restored, never replay a delta recorded against
-        // rows that no longer exist.
+        // Derived state may follow the clone only when the clone provably holds the very rows it was
+        // derived from: the same row-store lineage at the same revision (EmbeddedTable.Clone's
+        // working copies). The clone then gets its own copy of the journal, so attachment, journal
+        // and rows stay one consistent triple on each side. Every other clone (a shallow backup
+        // whose rows were re-added, a rebuilt table) gets empty forks and a fresh journal, so it
+        // rebuilds from the rows it holds and never replays a delta recorded against other rows.
+        var carriesState = _methodIndexJournal is not null
+            && clone.Rows.LineageId == Rows.LineageId
+            && clone.Rows.Revision == Rows.Revision;
         foreach (var (name, entry) in _methodAttachments)
         {
             var forkedIndex = clone.Indexes.FirstOrDefault(
@@ -67727,11 +67826,17 @@ internal sealed class EmbeddedTable
             if (forkedIndex is null)
                 continue;
 
-            clone._methodAttachments[name] = new MethodAttachmentEntry(forkedIndex, entry.Attachment.Fork());
+            clone._methodAttachments[name] = new MethodAttachmentEntry(
+                forkedIndex,
+                carriesState ? entry.Attachment.ForkWithState() : entry.Attachment.Fork());
         }
 
         if (clone._methodAttachments.Count > 0)
-            clone._methodIndexJournal = new Indexing.ManagedIndexMethodJournal(clone.Rows.Revision);
+        {
+            clone._methodIndexJournal = carriesState
+                ? _methodIndexJournal!.Clone()
+                : new Indexing.ManagedIndexMethodJournal(clone.Rows.Revision);
+        }
     }
 
     public int GetColumnIndex(string name)

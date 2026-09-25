@@ -46,6 +46,15 @@ internal static class SqltestCorpus
     private static readonly HashSet<string> RunnableBackends =
         new(StringComparer.Ordinal) { "rust" };
 
+    /// <summary>
+    /// Files whose <c>@backend cli</c> cases were reviewed to contain only ordinary SQL (no
+    /// dot-commands, no CLI output modes). Upstream routes <c>turso/fts.sqltest</c> to the CLI
+    /// solely because the <c>fts</c> cargo feature is compiled into <c>tursodb</c> and not into
+    /// the Rust test backend, so the managed engine executes it.
+    /// </summary>
+    private static readonly HashSet<string> RunnableCliBackendFiles =
+        new(StringComparer.Ordinal) { "turso/fts.sqltest" };
+
     private static readonly Lazy<IReadOnlyList<SqltestDiscoveredCase>> LazyCases = new(Discover);
 
     private static readonly Lazy<IReadOnlyDictionary<string, string>> LazyExpectedFailures =
@@ -165,7 +174,9 @@ internal static class SqltestCorpus
                 return (SqltestCaseStatus.SkippedByCorpus, $"@requires {capability}");
         }
 
-        if (test.Backend is { } backend && !RunnableBackends.Contains(backend))
+        if (test.Backend is { } backend
+            && !RunnableBackends.Contains(backend)
+            && !(backend == "cli" && RunnableCliBackendFiles.Contains(file.RelativePath)))
             return (SqltestCaseStatus.SkippedByCorpus, $"@backend {backend}");
 
         return (SqltestCaseStatus.Runnable, null);

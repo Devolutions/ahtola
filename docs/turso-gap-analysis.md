@@ -1058,7 +1058,7 @@ than absent subsystems.
 | `func-array-postgres-family` | missing | s3-perf | L | 0 | 0 | Postgres-style ARRAY(...)/array_element/array_append/etc. scalar family, always compiled (not behind a cargo feature flag) but not part of stock SQLite semantics and not… |
 | `func-extension-format-btrim` | extension | s4-intentional | S | 0 | 0 | FORMAT (an alias for PRINTF, matching real SQLite's built-in but not present as a distinct entry in Turso's from_str dispatch table) and BTRIM (Postgres-style alias for T… |
 | `func-extension-uuid-family` | extension | s4-intentional | S | 0 | 0 | Ahtola registers a full UUID v4/v7 generation family (text and blob forms, plus gen_random_uuid() for Postgres compatibility) that has no counterpart anywhere in turso-sr… |
-| `func-fts-scalar-family` | partial | s3-perf | L | 0 | 0 | Reconciled 2026-08-29 with pinned v0.8.0-pre.7: method query grammar, pinned tokenizers, MATCH forms, NULL/TEXT-only behavior, varargs highlight, unordered column binding, boosts, seven declared plans, rowid-ordered matching, ranked top-k and OPTIMIZE are managed. Corpus-aware `fts_score` is schema-nondeterministic and rejected from indexes, generated columns, partial predicates, and CHECK constraints. Tantivy storage/exact score bits remain out of scope. |
+| `func-fts-scalar-family` | partial | s3-perf | L | 0 | 0 | Reconciled 2026-08-29 with pinned v0.8.0-pre.7: method query grammar, pinned tokenizers, MATCH forms, NULL/TEXT-only behavior, varargs highlight, unordered column binding, boosts, seven declared plans, rowid-ordered matching, ranked top-k and OPTIMIZE are managed. Corpus-aware `fts_score` is schema-nondeterministic and rejected from indexes, generated columns, partial predicates, and CHECK constraints. 2026-09-25: upstream `turso/fts.sqltest` executes and the upstream FTS integration/fuzz tests are ported; tokenizers are Tantivy-exact over a pinned Unicode 16.0 table; FTS serves join arms; postings are segmented with state-sharing forks, so writes no longer force rebuilds. Tantivy storage/exact score bits remain out of scope. |
 | `func-gcd-lcm-missing` | missing | s3-perf | S | 0 | 0 | gcd()/lcm() (Turso/SQLite-3.41+-style math helpers) have no hits anywhere in src/Ahtola.Core or Ahtola.Core/EmbeddedDatabase.MathFunctions.cs. Not covered by the vendored… |
 | `func-numeric-boolean-ip-helpers-missing` | missing | s4-intentional | M | 0 | 0 | Internal-flavored helper functions supporting Turso's typed BOOLEAN/NUMERIC column extensions and validated IP address type; no SQLite equivalent and no corpus coverage.… |
 | `func-octet-length-missing` | missing | s1-correctness | S | 0 | 0 | octet_length is absent from SqliteBuiltinFunctions.Names and from EmbeddedDatabase.StringFunctions.cs / EmbeddedDatabase.cs (no case-insensitive hit for 'octet' anywhere… |
@@ -1554,6 +1554,45 @@ defects, all now closed with regression coverage in
   Ahtola intentionally retains one correctness boundary: corpus-aware `fts_score`
   is rejected in CHECK constraints while the checked statement could mutate the
   same corpus.
+
+**FTS completeness follow-up (2026-09-25).**
+
+- *Conformance actually runs.* `turso/fts.sqltest` was skipped wholesale as
+  `@backend cli` (upstream routes it to `tursodb` only because the `fts` cargo
+  feature is compiled into the CLI). Its cases are plain SQL, so the corpus now
+  executes them; all pass except five `MATCH`-context errors that lack the CLI's
+  `Parse error:` prefix, recorded like the existing vector marker. Every FTS test in
+  upstream `tests/integration/index_method/mod.rs` and `tests/fuzz/fts.rs` is ported
+  as `ManagedFtsUpstreamIntegrationTests` (48 tests; Tantivy-internal counters such as
+  segment and writer-cache statistics are dropped with a comment at each site).
+- *Tokenization is Tantivy-exact and host independent.* `default`/`simple` split on
+  Rust `char::is_alphanumeric` (previously .NET `IsLetterOrDigit`, which broke Indic,
+  Thai and Arabic words at vowel signs and dropped `²`, `½`, `Ⓐ`), the remove-long
+  limit is measured on the source span before lowercasing, lowercasing is Rust's full
+  per-character mapping, and `whitespace` splits on ASCII whitespace only. All
+  character data comes from a generated Unicode 16.0 table
+  (`scripts/unicode/Update-ManagedUnicodeData.ps1`): `string.Normalize` silently
+  returned its input under `InvariantGlobalization`, which had disabled `unicode61`
+  accent folding in typical Blazor builds.
+- *Joins.* A method-owned `fts_match` conjunct on one join arm is pushed into that
+  arm, so its FTS index serves the join in either table order (upstream
+  `test_fts_join_order_optimization`), and EXPLAIN QUERY PLAN reports the arm's
+  method search instead of `MANAGED EVALUATOR FALLBACK`.
+- *Writes no longer rebuild the index.* Every write transaction and statement backup
+  clones the table, and the clone's attachment started empty, so the next query
+  after any explicit transaction, any file-backed write, and any UPDATE or DELETE
+  rebuilt the whole index (0.5–1.4 s at 20–50k documents). Postings are now
+  log-structured segments shared by state-carrying forks, and whole-row-list
+  rewrites report exact change sets; ten committed write shapes cause zero rebuilds
+  (`ManagedFtsIncrementalMaintenanceTests`). At 50k documents the index needs about
+  40 MiB instead of about 190 MiB, and a cold rebuild takes about 0.3 s instead of 1.3 s.
+- *Browser.* The pinned Turso compiles FTS out of every WebAssembly build; the Chromium
+  package lane now proves Ahtola's FTS over OPFS, including reopen.
+- *Also fixed:* `ORDER BY <result alias> LIMIT 0` raised `no such column`.
+- *Recorded divergence:* an unfiltered `ORDER BY fts_score(…) DESC LIMIT n` keeps
+  non-matching rows at `0.0` (SQL semantics on every plan); upstream's `Score`
+  cursor returns only ranked hits. The `WHERE fts_match(…)` form returns the
+  upstream result.
 
 **Current residual (honest, not scoreboard).** Inventory is **216 closed · 0 open**,
 and the live conformance expected-failures file contains two intentional
