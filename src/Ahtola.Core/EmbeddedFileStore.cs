@@ -1528,15 +1528,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 continue;
             }
 
-            if (typeDefinitions.Count != 0
-                && !entry.Name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase))
-            {
-                var definition = SqlParser.Parse(entry.Sql!, SqlParameterMap.Parse(entry.Sql!));
-                if (definition is CreateTableStatement create)
-                    ManagedTypeRegistry.RejectTypedColumns(create, typeDefinitions);
-            }
-
-            var table = ManagedSchemaRowParser.ParseTable(entry);
+            var table = ManagedSchemaRowParser.ParseTable(entry, typeDefinitions);
             // The lazy re-walk's seed must be captured BEFORE this table's own eager pass below
             // mutates occupiedBtreePages with its own interior/leaf child pages — otherwise the
             // seed would already contain this table's own pages, and the later, independent lazy

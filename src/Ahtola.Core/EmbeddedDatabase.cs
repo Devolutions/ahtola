@@ -5908,7 +5908,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 continue;
 
             var primaryKeyPosition = table.PrimaryKeyPosition(index);
-            var notNull = column.NotNull || (table.WithoutRowid && primaryKeyPosition > 0);
+            var notNull = column.NotNull || column.Domain?.NotNull == true
+                || (table.WithoutRowid && primaryKeyPosition > 0);
 
             // table_info renumbers cid over the columns it reports, so hiding a generated
             // column closes the gap it would otherwise leave; table_xinfo reports every
@@ -8030,6 +8031,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         };
         RejectInternalTypeTableMutation(tableName);
         var typeDefinitions = catalog.TypeDefinitions;
+        if (catalog.Tables.TryGetValue(tableName, out var existingTable)
+            && ManagedTypeRegistry.ContainsDomain(existingTable))
+            throw new EmbeddedSqlException($"ALTER TABLE of domain-typed table '{tableName}' is not yet supported.");
         if (statement is AlterTableAddColumnStatement { Column: var added })
             ManagedTypeRegistry.RejectTypedColumn(added, typeDefinitions);
         if (statement is AlterTableAlterColumnStatement { Column: var altered })
@@ -14455,7 +14459,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             var column = table.ColumnDefinitions[columnIndex];
             var conflictAlgorithm = statementAlgorithm ?? column.NotNullConflictAlgorithm;
-            if (!column.NotNull
+            if (!(column.NotNull || column.Domain?.NotNull == true)
                 || row[columnIndex].Kind != SqlValueKind.Null
                 || conflictAlgorithm != InsertConflictAlgorithm.Replace
                 || !column.HasDefault)
@@ -14466,7 +14470,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             row[columnIndex] = column.DefaultExpression is { } expression
                 ? Evaluate(expression, EmptyParameters, row: null, context)
                 : column.DefaultValue
-                    ?? throw new InvalidOperationException("Default metadata is incomplete.");
+                    ?? (column.Domain?.Default is { } domainDefault
+                        ? Evaluate(domainDefault, EmptyParameters, row: null, context)
+                        : throw new InvalidOperationException("Default metadata is incomplete."));
             changed = true;
         }
 
@@ -15657,9 +15663,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!table.HasCheckConstraints)
             return;
 
-        // PRAGMA ignore_check_constraints suppresses CHECK enforcement for the connection
-        // (Turso emitter::emit_check_constraints returns early when the flag is set).
-        if (context.IgnoreCheckConstraints)
+        // Ordinary CHECK constraints honor the pragma; a domain CHECK remains part of
+        // the typed value's validation contract even when ordinary checks are disabled.
+        if (context.IgnoreCheckConstraints && !ManagedTypeRegistry.ContainsDomain(table))
             return;
 
         // On UPDATE, SQLite only re-evaluates CHECK constraints that reference at least
@@ -15676,18 +15682,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ColumnDefinitions: table.ColumnDefinitions);
         foreach (var column in table.ColumnDefinitions)
         {
-            foreach (var check in column.CheckConstraints)
+            if (!context.IgnoreCheckConstraints)
+            {
+                foreach (var check in column.CheckConstraints)
+                {
+                    if (changedColumns is not null && !ReferencesAnyChangedColumn(check.Expression, changedColumns))
+                        continue;
+                    Validate(check);
+                }
+            }
+            if (column.Domain is { } domain
+                && (changedColumns is null || changedColumns.Contains(column.Name)))
+            {
+                for (var index = 0; index < domain.Checks.Count; index++)
+                {
+                    var check = domain.Checks[index];
+                    var value = Evaluate(
+                        ManagedTypeRegistry.RewriteDomainCheck(check.Expression, column.Name),
+                        EmptyParameters,
+                        source,
+                        context);
+                    if (value.Kind != SqlValueKind.Null && !IsTrue(value))
+                        throw new EmbeddedSqlException(
+                            $"value for domain {domain.Name} violates check constraint \"{check.Name ?? $"{domain.Name}_{index}"}\"",
+                            InsertConflictAlgorithm.Abort);
+                }
+            }
+        }
+        if (!context.IgnoreCheckConstraints)
+        {
+            foreach (var check in table.CheckConstraints)
             {
                 if (changedColumns is not null && !ReferencesAnyChangedColumn(check.Expression, changedColumns))
                     continue;
                 Validate(check);
             }
-        }
-        foreach (var check in table.CheckConstraints)
-        {
-            if (changedColumns is not null && !ReferencesAnyChangedColumn(check.Expression, changedColumns))
-                continue;
-            Validate(check);
         }
 
         void Validate(CheckConstraint check)
@@ -16500,7 +16529,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private SqlValue EvaluateForeignKeyDefault(EmbeddedColumn column, QueryContext context)
         => column.DefaultExpression is { } expression
             ? Evaluate(expression, EmptyParameters, row: null, context)
-            : column.DefaultValue ?? SqlValue.Null;
+            : column.DefaultValue
+                ?? (column.Domain?.Default is { } domainDefault
+                    ? Evaluate(domainDefault, EmptyParameters, row: null, context)
+                    : SqlValue.Null);
 
     private static QueryContext EnterForeignKeyAction(QueryContext context)
     {
@@ -17555,7 +17587,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // (self-referential cascades use CanCompileForeignKeyCascadeDelete instead).
     private bool CanCompileDml(QueryContext context)
         => !context.CancellationToken.CanBeCanceled
-            && !HasOpenBlobHandles;
+            && !HasOpenBlobHandles
+            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsDomain);
 
     private bool CanCompilePlainDelete(QueryContext context)
         => CanCompileDml(context) && !context.ForeignKeysEnabled;
@@ -17563,7 +17596,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private bool CanCompileForeignKeyCascadeDelete(QueryContext context)
         => !context.CancellationToken.CanBeCanceled
             && context.ForeignKeysEnabled
-            && !HasOpenBlobHandles;
+            && !HasOpenBlobHandles
+            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsDomain);
 
     private bool CanRouteInsertThroughCompiler(InsertStatement statement, QueryContext context)
         => CanCompileDml(context)
@@ -18479,6 +18513,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName))
+            return false;
         var isVirtualTableScan = select.Source is TableValuedFunctionSource
             || select.Source is NamedTableSource named
                 && TryGetVirtualTable(context, named, out _);
@@ -18511,6 +18547,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? outerRow,
         out CompiledSelect compiled)
     {
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName))
+        {
+            compiled = null!;
+            return false;
+        }
         select = ConsumeTursoFullOuterDuplicateEquijoinWhere(select);
         select = ResolveNamedWindows(select);
         context = EnterCollationSource(context, select.Source);
@@ -19983,7 +20024,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         compiled = null!;
 
-        if (context.CancellationToken.CanBeCanceled
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            || context.CancellationToken.CanBeCanceled
             || statement.Operators.Count == 0
             || statement.OrderBy.Count != 0)
         {
@@ -38626,7 +38668,7 @@ out bool hasReturning)
     private static ColumnAffinity? GetJoinKeyAffinity(EmbeddedColumn? definition)
         => definition is null || definition.StrictAny
             ? null
-            : EmbeddedTable.GetAffinity(definition.DeclaredType);
+            : EmbeddedTable.GetDeclaredColumnAffinity(definition);
 
     private static bool IsHashableJoinKeyCollation(string collation)
         => string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase)
@@ -39726,7 +39768,7 @@ out bool hasReturning)
             {
                 definition += FormatConstraintName(column.NullConstraintName) + " NULL";
             }
-            if (column.HasDefault)
+            if (column.DefaultValue.HasValue || column.DefaultExpression is not null)
             {
                 definition += FormatConstraintName(column.DefaultConstraintName)
                     + " DEFAULT "
@@ -41043,7 +41085,7 @@ out bool hasReturning)
                     return new QueryAffinityColumn(
                         null,
                         column,
-                        definition is not null ? EmbeddedTable.GetAffinity(definition.DeclaredType) : ColumnAffinity.Blob,
+                        definition is not null ? EmbeddedTable.GetDeclaredColumnAffinity(definition) : ColumnAffinity.Blob,
                         definition?.DeclaredType,
                         HasAffinity: definition is not null);
                 })
@@ -42390,7 +42432,17 @@ out bool hasReturning)
         SqlValue[] parameters,
         SourceRow? row,
         QueryContext context)
-        => CastValue(Evaluate(expression.Expression, parameters, row, context), expression.TypeName);
+    {
+        RejectTypedCast(expression.TypeName, context);
+        return CastValue(Evaluate(expression.Expression, parameters, row, context), expression.TypeName);
+    }
+
+    private static void RejectTypedCast(string typeName, QueryContext context)
+    {
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            && ManagedTypeRegistry.Load(context.Tables).ContainsKey(typeName))
+            throw new EmbeddedSqlException($"CAST to custom type '{typeName}' is not yet supported.");
+    }
 
     private SqlValue EvaluateCase(
         CaseExpression expression,
@@ -43852,6 +43904,17 @@ out bool hasReturning)
         };
     }
 
+    private SqlValue EvaluateAggregateCast(
+        CastExpression cast,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? representative)
+    {
+        RejectTypedCast(cast.TypeName, context);
+        return CastValue(EvaluateAggregate(cast.Expression, rows, parameters, context, representative), cast.TypeName);
+    }
+
     private SqlValue EvaluateAggregate(
         Expression expression,
         IReadOnlyList<SourceRow> rows,
@@ -43895,9 +43958,7 @@ out bool hasReturning)
                 GetComparisonCollation(binary.Left, binary.Right, context)),
             CollationExpression collation
                 => EvaluateAggregate(collation.Expression, rows, parameters, context, representative),
-            CastExpression cast => CastValue(
-                EvaluateAggregate(cast.Expression, rows, parameters, context, representative),
-                cast.TypeName),
+            CastExpression cast => EvaluateAggregateCast(cast, rows, parameters, context, representative),
             CaseExpression @case => EvaluateAggregateCase(@case, rows, parameters, context, representative),
             LikeExpression like => EvaluateLikeValues(
                 EvaluateAggregate(like.Value, rows, parameters, context, representative),
@@ -48926,7 +48987,7 @@ out bool hasReturning)
         {
             return definition.StrictAny
                 ? null
-                : EmbeddedTable.GetAffinity(definition.DeclaredType);
+                : EmbeddedTable.GetDeclaredColumnAffinity(definition);
         }
 
         // rowid/_rowid_/oid resolve to the hidden rowid even without a column definition;
@@ -57172,8 +57233,8 @@ public sealed partial class EmbeddedConnection : IDisposable
     private bool _queryOnly;
 
     /// <summary>
-    /// Opts this connection into experimental TYPE/DOMAIN declarations. Typed table columns remain
-    /// unsupported and are rejected until their read and write paths are fully implemented.
+    /// Opts this connection into experimental TYPE/DOMAIN declarations. INTEGER domain columns
+    /// are supported in STRICT tables; custom TYPE columns remain unsupported.
     /// </summary>
     public bool ExperimentalCustomTypesEnabled { get; set; }
 
@@ -67428,7 +67489,7 @@ internal sealed class EmbeddedTable
     }
 
     public bool HasCheckConstraints => CheckConstraints.Count > 0
-        || ColumnDefinitions.Any(column => column.CheckConstraints.Count > 0);
+        || ColumnDefinitions.Any(column => column.CheckConstraints.Count > 0 || column.Domain?.Checks.Count > 0);
 
     public bool HasNonDefaultConflictAlgorithms => TablePrimaryKeyConflictAlgorithm is not null
         || TableUniqueConstraints.Any(constraint => constraint.ConflictAlgorithm is not null)
@@ -67478,7 +67539,9 @@ internal sealed class EmbeddedTable
     }
 
     public ColumnAffinity GetColumnAffinity(EmbeddedColumn column)
-        => Strict
+        => column.Domain is not null
+            ? ColumnAffinity.Integer
+            : Strict
             && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase)
                 ? ColumnAffinity.Blob
                 : GetAffinity(column.DeclaredType);
@@ -68624,7 +68687,10 @@ internal sealed class EmbeddedTable
                 ? SqlValue.Null
                 : column.DefaultExpression is { } expression
                     ? evaluate(expression)
-                    : column.DefaultValue ?? SqlValue.Null;
+                    : column.DefaultValue
+                        ?? (column.Domain?.Default is { } domainDefault
+                            ? evaluate(domainDefault)
+                            : SqlValue.Null);
             row[index] = CoerceColumnAffinity(column, value);
         }
 
@@ -68990,7 +69056,7 @@ internal sealed class EmbeddedTable
                 continue;
 
             var column = ColumnDefinitions[columnIndex];
-            if ((column.NotNull || (Strict && IsPrimaryKeyColumn(columnIndex)))
+            if ((column.NotNull || column.Domain?.NotNull == true || (Strict && IsPrimaryKeyColumn(columnIndex)))
                 && rows.Any(row => row[columnIndex].Kind == SqlValueKind.Null))
             {
                 throw new EmbeddedSqlException(
@@ -69026,6 +69092,8 @@ internal sealed class EmbeddedTable
 
     private static SqlValue ApplyAffinity(EmbeddedColumn column, SqlValue value, bool strict)
     {
+        if (column.Domain is not null)
+            return ApplyAffinity(ColumnAffinity.Integer, value);
         if (strict
             && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase))
         {
@@ -69036,7 +69104,7 @@ internal sealed class EmbeddedTable
     }
 
     internal static ColumnAffinity GetDeclaredColumnAffinity(EmbeddedColumn column)
-        => GetAffinity(column.DeclaredType);
+        => column.Domain is not null ? ColumnAffinity.Integer : GetAffinity(column.DeclaredType);
 
     internal static SqlValue ApplyColumnAffinity(ColumnAffinity affinity, SqlValue value)
         => ApplyAffinity(affinity, value);
@@ -69072,7 +69140,8 @@ internal sealed class EmbeddedTable
                 throw new EmbeddedSqlException($"missing datatype for {Name}.{column.Name}");
 
             var declaredType = column.DeclaredType.Trim();
-            if (declaredType.Equals("INT", StringComparison.OrdinalIgnoreCase)
+            if (column.Domain is not null
+                || declaredType.Equals("INT", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("REAL", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("TEXT", StringComparison.OrdinalIgnoreCase)
@@ -69092,7 +69161,9 @@ internal sealed class EmbeddedTable
         if (!Strict || value.Kind == SqlValueKind.Null)
             return;
 
-        var declaredType = column.DeclaredType!.Trim().ToUpperInvariant();
+        var declaredType = column.Domain is not null
+            ? "INTEGER"
+            : column.DeclaredType!.Trim().ToUpperInvariant();
         var valid = declaredType switch
         {
             "INT" or "INTEGER" => value.Kind == SqlValueKind.Integer,
@@ -69123,7 +69194,9 @@ internal sealed class EmbeddedTable
     // exempt and must be handled by the caller.
     private static bool StrictValueMatchesDeclaredType(EmbeddedColumn column, SqlValue value)
     {
-        var declaredType = column.DeclaredType!.Trim().ToUpperInvariant();
+        var declaredType = column.Domain is not null
+            ? "INTEGER"
+            : column.DeclaredType!.Trim().ToUpperInvariant();
         return declaredType switch
         {
             "INT" or "INTEGER" => value.Kind == SqlValueKind.Integer,

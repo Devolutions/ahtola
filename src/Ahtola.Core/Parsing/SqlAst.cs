@@ -796,6 +796,8 @@ internal sealed record EmbeddedColumn(
     bool StrictAny = false,
     bool GenerationVirtualSpelled = false)
 {
+    public CreateDomainStatement? Domain { get; init; }
+
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
     // the value may be persisted (STORED) or must be recomputed (VIRTUAL).
@@ -811,7 +813,7 @@ internal sealed record EmbeddedColumn(
                 : new[] { ForeignKey }.Concat(AdditionalForeignKeys ?? []))
             .ToArray());
 
-    public bool HasDefault => DefaultValue.HasValue || DefaultExpression is not null;
+    public bool HasDefault => DefaultValue.HasValue || DefaultExpression is not null || Domain?.Default is not null;
 
     /// <summary>
     /// Rebuilds the column with different constraint clauses. <see cref="CheckConstraints"/> and

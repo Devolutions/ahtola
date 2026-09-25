@@ -29,14 +29,15 @@ internal static class SqltestManagedRunner
     public static SqltestOutcome Run(
         SqltestFile file,
         SqltestCase test,
-        SqltestIntegrityCheck? integrityCheck = null)
+        SqltestIntegrityCheck? integrityCheck = null,
+        bool enableCustomTypes = false)
     {
         integrityCheck ??= RunManagedIntegrityCheck;
         var failures = new List<string>();
         for (var databaseIndex = 0; databaseIndex < file.Databases.Count; databaseIndex++)
         {
             var database = file.Databases[databaseIndex];
-            var outcome = RunVariant(file, test, database, integrityCheck);
+            var outcome = RunVariant(file, test, database, integrityCheck, enableCustomTypes);
             if (!outcome.Matched)
             {
                 failures.Add(
@@ -54,7 +55,8 @@ internal static class SqltestManagedRunner
         SqltestFile file,
         SqltestCase test,
         SqltestDatabase database,
-        SqltestIntegrityCheck integrityCheck)
+        SqltestIntegrityCheck integrityCheck,
+        bool enableCustomTypes)
     {
         var writableDefault = database.Kind is SqltestDatabaseKind.Default
                 or SqltestDatabaseKind.DefaultNoRowidAlias
@@ -106,6 +108,7 @@ internal static class SqltestManagedRunner
                 0,
                 static _ => SqlValue.Integer(Interlocked.Increment(ref _testNondeterministicCounter) - 1));
             using var connection = embedded.Connect();
+            connection.ExperimentalCustomTypesEnabled = enableCustomTypes;
             using var timeout = new CancellationTokenSource(CaseTimeout);
 
             foreach (var setupName in test.Setups)

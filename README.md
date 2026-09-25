@@ -425,16 +425,25 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   raw pages explicitly and reject zstd responses because no approved
   pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), zstd-compressed replica page sets, and typed-value column semantics.
+  is null), zstd-compressed replica page sets, and general typed-value semantics.
   The core-only `EmbeddedConnection.ExperimentalCustomTypesEnabled` opt-in
   allows `CREATE TYPE name BASE INTEGER` (identity types) and
   `CREATE DOMAIN name AS INTEGER` with DEFAULT, NOT NULL and CHECK clauses to
   persist definitions in `__turso_internal_types`. Definitions survive reopen,
   participate in transactions and advance the schema cookie. **Columns
-  declared with these types are rejected**, including in STRICT tables and
-  ALTER TABLE, until affinity, defaults, checks, reads and writes are implemented;
-  other TYPE bodies, non-INTEGER bases, DROP TYPE/DOMAIN and typed casts are not
-  supported. The opt-in is not exposed through the ADO.NET connection string.
+  declared with an INTEGER-based DOMAIN are supported only in STRICT tables:
+  writes apply INTEGER affinity, inherited DEFAULT/NOT NULL/CHECK constraints,
+  and reads use the primitive INTEGER storage class. Such columns retain their
+  domain metadata through reopen, transactions, and savepoints; compiled DML
+  falls back to the validating evaluator whenever a domain table is present.
+  Domain CHECK remains enforced even when `ignore_check_constraints` disables
+  ordinary table CHECKs.
+  Non-STRICT domain columns, custom TYPE columns, generated/domain-primary-key
+  columns, and ALTER TABLE on domain tables fail closed. Domain DEFAULT is
+  limited to constant INTEGER expressions and CHECK to literal/value unary
+  and binary expressions; unsupported expressions are rejected at declaration.
+  Other TYPE bodies, non-INTEGER bases, DROP TYPE/DOMAIN and typed casts are
+  not supported. The opt-in is not exposed through the ADO.NET connection string.
   The bounded asynchronous catalog scan fails closed for databases containing
   type definitions until that reader can resolve their metadata.
   `CREATE SEQUENCE` / `DROP SEQUENCE` and the `nextval` / `currval` / `setval`

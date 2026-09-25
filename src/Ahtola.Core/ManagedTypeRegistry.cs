@@ -54,6 +54,8 @@ internal static class ManagedTypeRegistry
 
             var sql = row[1].AsText();
             var parsed = SqlParser.Parse(sql, SqlParameterMap.Parse(sql));
+            if (parsed is CreateDomainStatement domainDefinition)
+                ValidateDomain(domainDefinition);
             var name = parsed switch
             {
                 CreateTypeStatement type => type.Name,
@@ -78,28 +80,96 @@ internal static class ManagedTypeRegistry
         return types;
     }
 
-    internal static void RejectTypedColumns(
+    internal static IReadOnlyList<EmbeddedColumn> ResolveColumns(
         CreateTableStatement statement,
         IReadOnlyDictionary<string, ParsedStatement> types)
     {
-        foreach (var column in statement.Columns)
-            RejectTypedColumn(column, types);
+        var columns = new EmbeddedColumn[statement.Columns.Count];
+        for (var index = 0; index < columns.Length; index++)
+        {
+            var column = statement.Columns[index];
+            var definition = FindDefinition(column, types);
+            if (definition is null)
+            {
+                columns[index] = column;
+                continue;
+            }
+
+            if (definition is not CreateDomainStatement domain)
+                throw new EmbeddedSqlException($"Columns of custom type '{column.DeclaredType}' are not yet supported by the managed engine.");
+            if (!statement.Strict)
+                throw new EmbeddedSqlException($"domain type columns require STRICT tables: {statement.Name}.{column.Name}");
+            if (column.IsGenerated || column.PrimaryKey || column.ExplicitNull)
+                throw new EmbeddedSqlException($"Domain column {statement.Name}.{column.Name} cannot be generated, a primary key, or explicitly NULL.");
+            columns[index] = column with { Domain = domain };
+        }
+        return columns;
     }
+
+    internal static bool ContainsDomain(EmbeddedTable table)
+        => table.ColumnDefinitions.Any(static column => column.Domain is not null);
 
     internal static void RejectTypedColumn(
         EmbeddedColumn column,
         IReadOnlyDictionary<string, ParsedStatement> types)
     {
-        if (column.DeclaredType is not { } declaredType)
-            return;
-
-        var token = new SqlLexer(declaredType).Current;
-        if (token.Kind == TokenKind.Identifier && types.ContainsKey(token.Text))
+        if (FindDefinition(column, types) is not null)
         {
             throw new EmbeddedSqlException(
-                $"Columns of custom type '{declaredType}' are not yet supported by the managed engine.");
+                $"Columns of custom type '{column.DeclaredType}' are not yet supported by the managed engine.");
         }
     }
+
+    private static ParsedStatement? FindDefinition(
+        EmbeddedColumn column,
+        IReadOnlyDictionary<string, ParsedStatement> types)
+    {
+        if (column.DeclaredType is not { } declaredType)
+            return null;
+        var lexer = new SqlLexer(declaredType);
+        if (lexer.Current.Kind != TokenKind.Identifier
+            || !types.TryGetValue(lexer.Current.Text, out var definition))
+            return null;
+        lexer.Next();
+        if (lexer.Current.Kind != TokenKind.End)
+            throw new EmbeddedSqlException($"Parameterized custom type '{declaredType}' is not supported.");
+        return definition;
+    }
+
+    internal static Expression RewriteDomainCheck(Expression expression, string columnName)
+        => expression switch
+        {
+            ColumnExpression { Qualifier: null, Name: var name }
+                when name.Equals("value", StringComparison.OrdinalIgnoreCase)
+                => new ColumnExpression(columnName),
+            LiteralExpression literal => literal,
+            UnaryExpression unary => unary with
+            {
+                Operand = RewriteDomainCheck(unary.Operand, columnName),
+            },
+            BinaryExpression binary => binary with
+            {
+                Left = RewriteDomainCheck(binary.Left, columnName),
+                Right = RewriteDomainCheck(binary.Right, columnName),
+            },
+            _ => throw new EmbeddedSqlException("Unsupported expression in domain CHECK constraint."),
+        };
+
+    internal static void ValidateDomain(CreateDomainStatement domain)
+    {
+        foreach (var check in domain.Checks)
+            _ = RewriteDomainCheck(check.Expression, "value");
+        if (domain.Default is not null && !IsConstantDefault(domain.Default))
+            throw new EmbeddedSqlException("Only constant INTEGER domain DEFAULT expressions are supported.");
+    }
+
+    private static bool IsConstantDefault(Expression expression)
+        => expression switch
+        {
+            LiteralExpression { Value.Kind: SqlValueKind.Integer } => true,
+            UnaryExpression { Operand: var operand } => IsConstantDefault(operand),
+            _ => false,
+        };
 
     internal static EmbeddedTable CreateBackingTable()
         => new(

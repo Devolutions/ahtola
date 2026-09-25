@@ -65,7 +65,9 @@ internal static class ManagedSchemaRowParser
     /// Rebuilds the table a <c>table</c> row declares. The returned table carries no rows; the caller
     /// supplies them from storage (reopen) or from the table it is replacing (reparse).
     /// </summary>
-    public static EmbeddedTable ParseTable(ManagedSchemaRow row)
+    public static EmbeddedTable ParseTable(
+        ManagedSchemaRow row,
+        IReadOnlyDictionary<string, ParsedStatement>? typeDefinitions = null)
     {
         ArgumentNullException.ThrowIfNull(row);
         RequireType(row, ManagedSchemaRow.TableType);
@@ -81,7 +83,9 @@ internal static class ManagedSchemaRowParser
 
         var table = new EmbeddedTable(
             row.Name,
-            create.Columns,
+            ManagedTypeRegistry.ResolveColumns(
+                create,
+                typeDefinitions ?? new Dictionary<string, ParsedStatement>(StringComparer.OrdinalIgnoreCase)),
             create.WithoutRowid,
             create.PrimaryKeyColumns,
             create.UniqueConstraints,

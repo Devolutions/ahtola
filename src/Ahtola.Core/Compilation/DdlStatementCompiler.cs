@@ -306,7 +306,7 @@ internal static class DdlStatementCompiler
 {
     /// <summary>
     /// Persists the supported definitions using Turso's <c>persist_type_definition</c>
-    /// backing-table shape; typed columns are rejected until their write paths exist.
+    /// backing-table shape; domain columns resolve to primitive storage at table creation.
     /// </summary>
     public static CompiledSchemaProgram CompileCreateTypeDefinition(
         ParsedStatement statement,
@@ -325,6 +325,8 @@ internal static class DdlStatementCompiler
             throw new EmbeddedSqlException("Only primitive INTEGER-based type definitions are supported.");
         if (SqlParameterMap.Parse(sql).Count != 0)
             throw new EmbeddedSqlException("Bind parameters are not allowed in type definitions.");
+        if (statement is CreateDomainStatement domainDefinition)
+            ManagedTypeRegistry.ValidateDomain(domainDefinition);
 
         var catalog = context.Catalog;
         if (catalog.TypeDefinitions.ContainsKey(normalizedName))
@@ -427,7 +429,7 @@ internal static class DdlStatementCompiler
         if (EmbeddedDatabase.TryFindIndex(catalog.Tables, statement.Name, out _, out _))
             throw new EmbeddedSqlException($"there is already an index named {statement.Name}");
 
-        ManagedTypeRegistry.RejectTypedColumns(statement, catalog.TypeDefinitions);
+        var resolvedColumns = ManagedTypeRegistry.ResolveColumns(statement, catalog.TypeDefinitions);
 
         // A WITHOUT ROWID table has no hidden rowid to fall back on, so SQLite requires a
         // PRIMARY KEY; reject the table before it is registered when none is declared.
@@ -448,7 +450,7 @@ internal static class DdlStatementCompiler
         var isCreateTableAsSelect = statement.InitialRows is not null;
         var table = new EmbeddedTable(
             statement.Name,
-            statement.Columns,
+            resolvedColumns,
             statement.WithoutRowid,
             statement.PrimaryKeyColumns,
             statement.UniqueConstraints,
