@@ -496,16 +496,38 @@
             await ExecuteFeatureAsync(
                 connection,
                 "CREATE TABLE probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);"
-                + "INSERT INTO probe VALUES (1, 5), (2, 7);",
+                + "INSERT INTO probe VALUES (1, 5), (2, 7);"
+                + "CREATE TABLE keys(name TEXT, seq INTEGER, value INTEGER, PRIMARY KEY(name, seq)) WITHOUT ROWID;"
+                + "INSERT INTO keys VALUES ('b', 3, 11);",
                 "encrypted bounded setup");
         }
 
         await using var source = new AhtolaBrowserDataSource(options);
         await using var bounded = await source.OpenBoundedScanConnectionAsync();
-        await using var reader = await bounded.ExecuteBoundedScanAsync("SELECT value FROM probe ORDER BY id");
         var total = 0L;
-        while (await reader.ReadAsync())
-            total += reader.GetValue(0).AsInteger();
+        await using (var reader = await bounded.ExecuteBoundedScanAsync("SELECT value FROM probe ORDER BY id"))
+        {
+            while (await reader.ReadAsync())
+                total += reader.GetValue(0).AsInteger();
+        }
+        await using (var hidden = await bounded.ExecuteBoundedScanAsync(
+            "SELECT rowid FROM probe WHERE id = 2"))
+        {
+            if (!await hidden.ReadAsync())
+                throw new InvalidOperationException("Encrypted bounded rowid projection returned no row.");
+            total += hidden.GetValue(0).AsInteger();
+            if (await hidden.ReadAsync())
+                throw new InvalidOperationException("Encrypted bounded rowid projection returned extra rows.");
+        }
+        await using (var composite = await bounded.ExecuteBoundedScanAsync(
+            "SELECT value FROM keys WHERE name = 'b' AND seq = 3"))
+        {
+            if (!await composite.ReadAsync())
+                throw new InvalidOperationException("Encrypted bounded composite lookup returned no row.");
+            total += composite.GetValue(0).AsInteger();
+            if (await composite.ReadAsync())
+                throw new InvalidOperationException("Encrypted bounded composite lookup returned extra rows.");
+        }
         return total;
     }
 
