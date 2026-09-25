@@ -337,3 +337,36 @@ a base-table scan for a view: JSON leaves its nodes empty until the view's
 actual access path can be described. A standalone hash-build JSON op was
 not added because this managed planner does not currently emit a corresponding
 TEXT plan step; inventing one would misrepresent the executed plan.
+
+## Current closure order (2026-09-24, `1d074fa` baseline)
+
+The tracked expected-failures file now has **73 case-level differences**, not
+73 missing features. They group as 18 eager corruption-open differences,
+19 ALTER schema-text/CLI differences, 4 other schema-text differences,
+21 SQL extension, journal-mode, or CLI-policy differences, and 11 MVCC
+allocation/DDL/storage-policy differences. The harness-exclusion file is empty.
+Do not erase these markers by weakening fail-closed corruption checks,
+SQLite-style persisted schema SQL, or intentional managed extensions.
+
+Snapshot isolation for a table first touched after a peer commit is **already
+covered**: classic transactions hydrate their cloned catalog under the file
+write gate before opening a pager pin; MVCC hydrates its shared baseline before
+concurrent readers begin and whenever a catalog is published. The relevant
+`PageBackedLazyRowLoadTests` regressions cover both. The older
+`EmbeddedFileStore.Load()` comment describing this as an open isolation gap was
+stale, not a new implementation task.
+
+| Order | Work | Completion criterion |
+| --- | --- | --- |
+| 1 | Extend the browser's opt-in bounded read profile in small, explicitly classified shapes | **First slice implemented here:** an `INTEGER PRIMARY KEY = integer literal` predicate uses a page-bounded rowid seek; `LIMIT` applies to the matched result; all other WHERE expressions still reject before scan I/O. Expand to typed predicates, joins, and indexed/`WITHOUT ROWID` reads only with separate bounds and snapshot tests. |
+| 2 | Bound the entire buffered-window evaluator, not only its input | Charge partition keys, frame positions, function inputs, results, and spill indexes *before* allocation; compute/drain partitions incrementally; release reservations even on exceptions. Demonstrate a finite `cache_size` peak with large partitions, both spill modes and evaluator/compiled routes; do not treat output-only spilling as closure. |
+| 3 | Complete physical working-set and query-plan depth | Avoid mandatory whole-b-tree validation/first-touch whole-table hydration where safe while retaining explicit corruption detection; make each JSON EQP operation come from the executed access path, including view/CTE materialization, rather than fabricate missing nodes. |
+| 4 | Adopt Turso-specific SQL families as distinct product projects | The remaining 28 unadopted pinned `turso-sqltests` files cover TYPE/DOMAIN/typed values (23) and incremental materialized views (5). Specify durable type encoding, planner/runtime behavior, transaction maintenance and recovery before enabling their `@requires` capabilities; keep the corpus byte-faithful. |
+| 5 | Deepen sync and platform compatibility | Reusable multi-generation sync-prefix history must decode existing durable recovery formats, preserve publication leases, and survive crash/reopen tests. Expand portable locale tailoring and browser encryption only when deterministic persisted ordering and bounded async page codecs can be guaranteed. Native loadable extensions/raw sqlite3 handles and the PostgreSQL server are separate product-scope decisions, not hidden SQLite failures. |
+
+For each slice: compare the pinned Rust implementation, add focused regression
+coverage, run the affected managed suite and cross-framework/package gates,
+and remove an expected-failure entry only when its exact case passes. A
+conformance count unchanged by an architectural improvement does not mean
+the improvement was not delivered; conversely, a deliberately accepted
+difference should remain documented.

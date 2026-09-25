@@ -3,7 +3,7 @@ using Ahtola.Core;
 namespace Ahtola.Core.Parsing;
 
 /// <summary>
-/// A classified, fully resolved plan for a bounded ascending rowid-table scan: the exact shape
+/// A classified, fully resolved plan for a bounded rowid-table scan or exact rowid lookup: the shape
 /// <see cref="BoundedRowidScanShapeClassifier"/> currently accepts.
 /// </summary>
 internal sealed record BoundedRowidScanPlan(
@@ -12,7 +12,8 @@ internal sealed record BoundedRowidScanPlan(
     EmbeddedTable Table,
     IReadOnlyList<int> ProjectedColumnIndexes,
     IReadOnlyList<string> ColumnNames,
-    long? Limit);
+    long? Limit,
+    long? EqualRowId);
 
 /// <summary>
 /// Classifies a parsed SQL statement against an <see cref="AsyncSchemaCatalog"/>, either
@@ -26,8 +27,9 @@ internal sealed record BoundedRowidScanPlan(
 /// throws before any I/O happens for anything this classifier rejects — see
 /// <c>AhtolaBrowserBoundedConnection.ExecuteBoundedScanAsync</c>.
 /// <para>
-/// v1 supported shape: <c>SELECT column-list|* FROM one-ordinary-rowid-base-table [LIMIT n]</c>.
-/// No <c>WHERE</c>, no joins/subqueries, no <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
+/// Supported shape: <c>SELECT column-list|* FROM one-ordinary-rowid-base-table
+/// [WHERE integer-primary-key = integer-literal] [LIMIT n]</c>.
+/// No other <c>WHERE</c>, joins/subqueries, <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
 /// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references, no
 /// <c>WITHOUT ROWID</c> or indexed tables, no <c>OFFSET</c>. Everything else is named follow-on
 /// work, not silently downgraded.
@@ -63,12 +65,6 @@ internal static class BoundedRowidScanShapeClassifier
         if (select.Distinct)
         {
             rejectionReason = "DISTINCT is not supported by a bounded scan connection.";
-            return null;
-        }
-
-        if (select.Where is not null)
-        {
-            rejectionReason = "WHERE clauses are not yet supported by a bounded scan connection.";
             return null;
         }
 
@@ -142,6 +138,22 @@ internal static class BoundedRowidScanShapeClassifier
             return null;
         }
 
+        long? equalRowId = null;
+        if (select.Where is { } predicate)
+        {
+            if (entry.Table.RowidAliasColumnIndex < 0
+                || predicate is not BinaryExpression { Operator: BinaryOperator.Equal } equality
+                || !(TryMatchRowId(equality.Left, equality.Right, tableSource, entry.Table, out var rowId)
+                    || TryMatchRowId(equality.Right, equality.Left, tableSource, entry.Table, out rowId)))
+            {
+                rejectionReason =
+                    "WHERE supports only equality between an INTEGER PRIMARY KEY column and an integer literal.";
+                return null;
+            }
+
+            equalRowId = rowId;
+        }
+
         var columnIndexes = new List<int>();
         var columnNames = new List<string>();
         foreach (var projection in select.Projections)
@@ -205,6 +217,46 @@ internal static class BoundedRowidScanShapeClassifier
             entry.Table,
             columnIndexes,
             columnNames,
-            limit);
+            limit,
+            equalRowId);
+    }
+
+    private static bool TryMatchRowId(
+        Expression columnExpression,
+        Expression valueExpression,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out long rowId)
+    {
+        rowId = 0;
+        if (columnExpression is not ColumnExpression { Schema: null } column
+            || !string.Equals(
+                column.UnqualifiedName ?? column.Name,
+                table.Columns[table.RowidAliasColumnIndex],
+                StringComparison.OrdinalIgnoreCase)
+            || column.Qualifier is { } qualifier
+                && !string.Equals(
+                    qualifier,
+                    source.Alias ?? source.Name,
+                    StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        switch (valueExpression)
+        {
+            case LiteralExpression { Value.Kind: SqlValueKind.Integer } literal:
+                rowId = literal.Value.AsInteger();
+                return true;
+            case UnaryExpression
+            {
+                Operator: UnaryOperator.Negate,
+                Operand: LiteralExpression { Value.Kind: SqlValueKind.Integer } literal
+            } when literal.Value.AsInteger() != long.MinValue:
+                rowId = -literal.Value.AsInteger();
+                return true;
+            default:
+                return false;
+        }
     }
 }

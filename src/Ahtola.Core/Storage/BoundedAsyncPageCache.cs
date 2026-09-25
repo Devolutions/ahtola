@@ -9,12 +9,9 @@ namespace Ahtola.Core.Storage;
 /// silently exceeding the cap or corrupting the in-progress traversal.
 /// </summary>
 /// <remarks>
-/// Within one single-table ascending full scan (the only shape this cache currently serves),
-/// pages are visited in strictly increasing rowid order and each page is read at most once, so
-/// this cache mostly avoids growth rather than eviction. Its real value is amortizing repeated
-/// scans on the same connection (every scan revisits the same root and near-root interior
-/// pages), and it is also where the "resident pages never exceed a configured budget" contract
-/// is mechanically enforced, rather than merely true by construction of the traversal.
+/// An ascending full scan visits pages in rowid order; an exact rowid lookup retains only its
+/// search path and any overflow pages. Both paths use this cache to enforce the resident-page
+/// budget rather than relying on a presumed bound from their traversal shape.
 /// </remarks>
 internal sealed class BoundedAsyncPageCache : IAsyncSqliteBtreePageIo
 {

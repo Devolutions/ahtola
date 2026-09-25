@@ -111,6 +111,24 @@ public sealed class AsyncBoundedRowidScanTests
         }
 
         ids.Should().Equal(0L, 1L, 2L);
+
+        var pointPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT id FROM items WHERE id = 1999 LIMIT 1", catalog, out var pointReason);
+        pointPlan.Should().NotBeNull(pointReason);
+        var found = new List<long>();
+        await foreach (var row in AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
+            pageCache,
+            pointPlan!.RootPage,
+            pointPlan.Table,
+            textEncoding,
+            pointPlan.Limit,
+            equalRowId: pointPlan.EqualRowId))
+        {
+            found.Add(row[pointPlan.ProjectedColumnIndexes[0]].AsInteger());
+        }
+
+        found.Should().Equal(1999L);
+        pageCache.ResidentPageCount.Should().BeLessThanOrEqualTo(pageCache.Capacity);
     }
 
     [Test]
@@ -326,9 +344,18 @@ public sealed class AsyncBoundedRowidScanTests
         var textEncoding = await ReadTextEncodingAsync(pageCache);
         var catalog = await AsyncSchemaCatalogLoader.LoadAsync(pageCache, textEncoding);
 
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE id = 1", catalog, out var whereReason)
+        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE value = 'a'", catalog, out var whereReason)
             .Should().BeNull();
         whereReason.Should().Contain("WHERE");
+
+        var pointPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT value FROM plain WHERE id = 1 LIMIT 1", catalog, out var pointReason);
+        pointPlan.Should().NotBeNull(pointReason);
+        pointPlan!.EqualRowId.Should().Be(1);
+
+        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE id > 0", catalog, out var rangeReason)
+            .Should().BeNull();
+        rangeReason.Should().Contain("WHERE");
 
         BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM indexed", catalog, out var indexedReason)
             .Should().BeNull();

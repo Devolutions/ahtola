@@ -4,7 +4,7 @@ using Ahtola.Core;
 namespace Ahtola.Core.Storage;
 
 /// <summary>
-/// A genuinely asynchronous, page-bounded ascending full-table-scan cursor for an ordinary
+/// A genuinely asynchronous, page-bounded ascending scan or exact-rowid seek for an ordinary
 /// (indexless, has-rowid) SQLite table b-tree.
 /// </summary>
 /// <remarks>
@@ -47,10 +47,28 @@ internal static class AsyncBoundedRowidTableScanCursor
         EmbeddedTable table,
         SqliteTextEncoding textEncoding,
         long? limit,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        long? equalRowId = null)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
         ArgumentNullException.ThrowIfNull(table);
+
+        if (equalRowId is { } soughtRowId)
+        {
+            if (limit != 0
+                && await TrySeekRowIdAsync(
+                    pageCache,
+                    rootPage,
+                    table,
+                    textEncoding,
+                    soughtRowId,
+                    cancellationToken).ConfigureAwait(false) is { } found)
+            {
+                yield return found;
+            }
+
+            yield break;
+        }
 
         var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
         // Each frame is one still-open ancestor interior page: the page number (for
@@ -166,6 +184,65 @@ internal static class AsyncBoundedRowidTableScanCursor
         {
             foreach (var frame in stack)
                 pageCache.Unpin(frame.PageNumber);
+        }
+    }
+
+    private static async ValueTask<SqlValue[]?> TrySeekRowIdAsync(
+        BoundedAsyncPageCache pageCache,
+        uint rootPage,
+        EmbeddedTable table,
+        SqliteTextEncoding textEncoding,
+        long rowId,
+        CancellationToken cancellationToken)
+    {
+        var pinnedPages = new List<uint>();
+        var pageNumber = rootPage;
+        try
+        {
+            for (var depth = 0; depth < MaximumDepth; depth++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var isFirstPage = pageNumber == 1;
+                var image = await pageCache.ReadPageAsync(pageNumber, cancellationToken).ConfigureAwait(false);
+                switch (SqliteBtreePageHeader.Parse(image, isFirstPage, pageCache.UsableSpace).PageType)
+                {
+                    case SqliteBtreePageType.TableInterior:
+                        var interior = SqliteTableInteriorPageView.Parse(image, pageCache.UsableSpace, isFirstPage);
+                        pageCache.Pin(pageNumber);
+                        pinnedPages.Add(pageNumber);
+                        pageNumber = interior.SearchChild(rowId).ChildPage;
+                        break;
+
+                    case SqliteBtreePageType.TableLeaf:
+                        var leaf = SqliteTableLeafPageView.Parse(image, pageCache.UsableSpace, isFirstPage);
+                        var search = leaf.Search(rowId);
+                        if (!search.IsExact)
+                            return null;
+
+                        pageCache.Pin(pageNumber);
+                        pinnedPages.Add(pageNumber);
+                        var record = await new AsyncSqliteOverflowChainReader(pageCache)
+                            .ReadPayloadAsync(leaf.Cells[search.Index].Cell, cancellationToken)
+                            .ConfigureAwait(false);
+                        var values = EmbeddedFileStore.RestoreRowidTableRecord(
+                            table,
+                            SqliteRecordCodec.Decode(record, textEncoding));
+                        values[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
+                        return values;
+
+                    default:
+                        throw new InvalidDataException(
+                            $"SQLite page {pageNumber} is not part of a rowid-table b-tree.");
+                }
+            }
+
+            throw new InvalidDataException(
+                $"SQLite table b-tree rooted at page {rootPage} is deeper than {MaximumDepth} levels.");
+        }
+        finally
+        {
+            foreach (var pinnedPage in pinnedPages)
+                pageCache.Unpin(pinnedPage);
         }
     }
 

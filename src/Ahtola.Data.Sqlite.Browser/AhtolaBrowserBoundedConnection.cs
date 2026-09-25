@@ -171,7 +171,8 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
                 plan.Table,
                 _textEncoding,
                 plan.Limit,
-                cancellationToken);
+                cancellationToken,
+                equalRowId: plan.EqualRowId);
             return new AhtolaBrowserBoundedReader(
                 rows,
                 plan.ProjectedColumnIndexes,

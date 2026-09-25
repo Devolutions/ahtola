@@ -4170,9 +4170,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// concurrent commit — silently promoting the reader's view past its own pinned snapshot.
     /// Establishing the baseline once here, before any concurrent transaction can begin relying
     /// on it, is far cheaper than making every page-backed table ineligible for lazy
-    /// materialization, and MVCC-mode connections are the only ones that need it: an ordinary
-    /// (non-MVCC) reader's isolation is a separate, already-tracked gap — see the "NOTE ON A
-    /// REJECTED DESIGN" comment in EmbeddedFileStore.
+    /// materialization, and MVCC-mode connections are the only ones that need it: classic
+    /// transactions hydrate their own catalog before pinning it in
+    /// <see cref="CreateTransactionSnapshotWithPin"/>.
     /// </remarks>
     private void EstablishHeapBaselineForMvccLocked()
     {
@@ -5158,9 +5158,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // BEGIN CONCURRENT reader has not yet touched, can be after a peer's concurrent commit —
         // silently promoting the reader's view past its own pinned snapshot. Establishing the
         // baseline here, on every publish, for as long as this connection has MVCC active, is
-        // the single chokepoint that catches every one of those reload paths; an ordinary
-        // (non-MVCC) reader's isolation remains a separate, already-tracked gap — see the "NOTE
-        // ON A REJECTED DESIGN" comment in EmbeddedFileStore.
+        // the single chokepoint that catches every one of those reload paths; classic
+        // transactions instead hydrate their own cloned catalog before opening the pager pin
+        // in CreateTransactionSnapshotWithPin.
         if (_mvStore is not null)
         {
             foreach (var table in catalog.Tables.Values)

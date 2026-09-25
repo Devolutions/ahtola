@@ -323,15 +323,13 @@ internal sealed class EmbeddedFileStore : IDisposable
     // exclusive-lock upgrade against a "reader" that was really just this store's own bookkeeping
     // — a regression confirmed by broad test failures across ManagedMaintenanceStatementTests,
     // MvccCheckpointStateMachineTests, and ManagedVacuumStorageTests. Every lazy row loader below
-    // therefore reads through the store's live pager (ReadPageForLoad et al. below), exactly like
-    // the eager path always has. This reopens a narrower, explicitly tracked gap instead: a
-    // transaction that begins before touching a still-pending table, and only touches it after a
-    // peer commits new data to that specific table, can observe the peer's write instead of its
-    // own pinned snapshot for that one table. Closing this correctly requires routing the lazy
-    // loader through the *active transaction's own* existing pinned snapshot
-    // (EmbeddedFileReadSnapshot / the transactionPinnedSnapshot plumbing already used by classic
-    // transactions and BEGIN CONCURRENT) instead of a new, separate, store-level pin — tracked as
-    // follow-up work, not resolved here.
+    // therefore reads through the store's live pager (ReadPageForLoad et al. below). Classic
+    // transactions hydrate their cloned catalog while the file write gate is held, before
+    // opening their pinned snapshot (CreateTransactionSnapshotWithPin). MVCC establishes a
+    // stable heap baseline before concurrent readers begin and on every catalog publication
+    // (EstablishHeapBaselineForMvccLocked / PublishCatalog). Those transaction paths cannot
+    // first invoke this live loader after a peer commit; do not add a separate store-level
+    // reader lease to solve an isolation gap they already prevent.
     private byte[] ReadPageForLoad(uint pageNumber, object? pinnedTransaction = null)
         => _pager.ReadCommittedPage(pageNumber);
 
