@@ -1,9 +1,15 @@
 # Turso gap closure roadmap
 
-> Current execution plan: [Remaining Turso gap closure plan](turso-remaining-gap-plan.md).
+> Current execution plan and live TODOs:
+> [Remaining Turso gap closure plan](turso-remaining-gap-plan.md#live-todos-not-all-represented-by-expected-failure-cases).
 > The 2026-09-06 baseline at `83bb892` has 100 expected-failure entries:
 > 82 parity candidates, 17 deliberate extensions, and one CLI-only diagnostic.
-> Counts and completed waves below are historical, not a current zero-gap claim.
+> **At PR #71 head `6765675` (2026-09-25), the ledger has 73 case-level
+> differences, not 73 missing features.** The historical workstream checkboxes
+> and intermediate counts below are not a current zero-gap claim. General
+> typed encode/decode, transactional incremental materialized views, fully
+> bounded window evaluation, and complete planner/browser/locale parity remain
+> open in the linked plan.
 
 ## Baseline
 
@@ -167,8 +173,10 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
 - 2026-08-29: closed `grouped-aggregation-parity` (30 markers).
 - 2026-08-29: closed `window-group-pipeline` (9 observed cases; one newly
   exposed case was not in the 135-entry baseline).
-- Current expected-failure count: 2, both intentional STORED-generated-column
-  differences. There are no actionable sqltest failures in the baseline.
+- At this 2026-08-29 checkpoint the expected-failure count was 2, both
+  intentional STORED-generated-column differences. Later corpus adoption
+  exposed additional cases; the current ledger count is 73 (see the live
+  plan), not 2.
 - 2026-09-01: removed the final in-process harness exclusion. Cancellable
   evaluator joins now poll every nested candidate loop, and deterministic
   numeric arithmetic equalities can use sound expression hash probes without
@@ -290,7 +298,11 @@ classification: ranks 1-7 account for 133 distinct expected-failure entries.
   long-poll in between. See the detailed TODOs below for what remains blocked
   on the parallel MVCC branch.
 
-## Detailed TODOs
+## Historical detailed TODOs
+
+The checked items below describe the original workstreams, not the current
+Turso feature backlog; use the [live TODOs](turso-remaining-gap-plan.md#live-todos-not-all-represented-by-expected-failure-cases)
+for unfinished work.
 
 ### 1. Scalar expression parity
 

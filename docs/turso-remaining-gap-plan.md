@@ -5,6 +5,13 @@
 Prepared 2026-09-06 against Ahtola `83bb892` and the read-only Turso
 `v0.8.0-pre.7` pin, `277ddd050`.
 
+**Current status (2026-09-25, PR #71 head `6765675`).** The tracked
+expected-failures file has **73 case-level differences** (verified against the
+file), not 73 missing features; the detailed grouping and live TODOs are
+below. The older integration checkpoints and worker/first-wave instructions
+record how this branch was assembled, not work that should be restarted.
+This PR does **not** claim full Turso parity.
+
 At the baseline, the expected-failures file contained 100 entries: 82 engine, planner, or
 diagnostic parity candidates; 17 deliberate extensions (8 DML LIMIT, 2 STORED
 generated columns, 7 WITHOUT ROWID); and 1 Turso CLI error-prefix difference.
@@ -15,14 +22,16 @@ Baseline discovery reports 11,077 cases: 10,959 runnable, 85 skipped by the
 corpus/backend policy, and 33 unsupported by the harness. These are discovery
 counts, not evidence that every runnable case has passed in this execution.
 
-Implement the parity and architectural work below without removing the deliberate
-extensions. Native companions, loadable native extensions, and raw sqlite3 handles
-remain excluded. Typed values, TYPE/DOMAIN, and incremental materialized views
-remain separate product-adoption projects: do not silently enable them or call
-them implemented because a historical record says closed. Zstd rejection is not
-a missing feature relative to this pin; both engines reject it.
+Implement the remaining parity and architectural work without removing the
+deliberate extensions. Native companions, loadable native extensions, and raw
+sqlite3 handles remain excluded. Restricted experimental STRICT INTEGER
+DOMAIN and identity TYPE slices are delivered; general typed values and
+incremental materialized views remain separate product-adoption projects.
+Do not enable their full capabilities based on a historical closed record.
+Zstd rejection is not a missing feature relative to this pin; both engines
+reject it.
 
-## Worker and integration policy
+## Historical worker and integration policy
 
 - Every implementation worker uses Claude Sonnet 5 (`claude-sonnet-5`), high
   reasoning effort, and the long-context tier requested for 1M context.
@@ -222,8 +231,8 @@ behavior is integrated and evidenced; starting a worker is not closure.
 
 ## Integration checkpoint: `73af390` (2026-09-07)
 
-This is an in-progress checkpoint, not a claim of complete Turso parity. The
-expanded corpus currently records 112 differences. Coverage growth and explicit
+This was an in-progress checkpoint, not a claim of complete Turso parity. The
+expanded corpus then recorded 112 differences. Coverage growth and explicit
 intentional differences make that count incomparable with the original 100
 without considering which files and capabilities are now exercised.
 
@@ -253,13 +262,14 @@ output spilling alone is not the required bound on evaluator partitions.
 Planner/JSON completeness and the constrained locale implementation remain
 separate pending work.
 
-The browser workstream is implementing a narrower additive profile: an
-explicitly opt-in, read-only asynchronous scan surface over the existing async
+At this checkpoint the browser workstream was implementing a narrower additive
+profile: an explicitly opt-in, read-only asynchronous scan surface over the existing async
 pager. Unsupported statement/database shapes fail explicitly rather than
 falling back or replaying SQL. It must bound live pages, decoded records, schema
 and WAL metadata, and in-flight buffers, with real cancellation/disposal
-boundaries. The current WholeImage and ReadOnlyMirror profiles remain unchanged.
-This slice is not general asynchronous SQL execution or encrypted-page support.
+boundaries. The existing WholeImage and ReadOnlyMirror profiles remain unchanged.
+That checkpoint did not yet include encrypted-page support; the current
+bounded reader does, with authenticated AHTLA main/WAL reads and a metadata cap.
 
 ### Later checkpoint: `b383ae6`
 
@@ -338,7 +348,7 @@ actual access path can be described. A standalone hash-build JSON op was
 not added because this managed planner does not currently emit a corresponding
 TEXT plan step; inventing one would misrepresent the executed plan.
 
-## Current closure order (2026-09-24, `1d074fa` baseline)
+## Current closure order (updated 2026-09-25, `6765675`)
 
 The tracked expected-failures file now has **73 case-level differences**, not
 73 missing features. They group as 18 eager corruption-open differences,
@@ -361,8 +371,58 @@ stale, not a new implementation task.
 | 1 | Extend the browser's opt-in bounded read profile in small, explicitly classified shapes | **Current slices:** an `INTEGER PRIMARY KEY = integer literal` or unshadowed hidden `rowid`/`_rowid_`/`oid` predicate uses a page-bounded rowid point seek; integer-literal range comparisons and inclusive `BETWEEN` seek the starting bound and stop at the other, in ascending or descending rowid order. Explicit hidden-rowid projections retain SQLite's declared-column shadowing and `*` omission. Literal `OFFSET` skips matched rows before `LIMIT` counts emitted rows; unsupported predicates reject before scan I/O. Registered secondary indexes do not block base-table rowid scans or seeks. `WITHOUT ROWID` tables with ascending BINARY primary keys stream index interior/leaf records forward or backward under the same page budget, with logical column remapping and overflow checks; explicit uniformly ASC/DESC PK prefixes need no sort. INTEGER/TEXT first-key comparisons and BETWEEN seek the strongest starting bound, filter before LIMIT/OFFSET, and stop past the far bound; counted-page regressions guard against whole-tree scans for distant prefixes. Equality on every declared INTEGER/TEXT PK column with matching literal storage type uses direct B-tree page descent. Later-key ranges, implicit type conversions, other declared key types, joins, secondary-index access, and collated/mixed-direction ordering remain open. |
 | 2 | Bound the entire buffered-window evaluator, not only its input | Charge partition keys, frame positions, function inputs, results, and spill indexes *before* allocation; compute/drain partitions incrementally; release reservations even on exceptions. Demonstrate a finite `cache_size` peak with large partitions, both spill modes and evaluator/compiled routes; do not treat output-only spilling as closure. |
 | 3 | Complete physical working-set and query-plan depth | Avoid mandatory whole-b-tree validation/first-touch whole-table hydration where safe while retaining explicit corruption detection; make each JSON EQP operation come from the executed access path, including view/CTE materialization, rather than fabricate missing nodes. |
-| 4 | Adopt Turso-specific SQL families as distinct product projects | The 28 pinned Turso-specific files originally omitted cover TYPE/DOMAIN/typed values (23) and incremental materialized views (5). A gated, durable INTEGER TYPE/DOMAIN registry now supports restricted STRICT INTEGER-domain columns (inherited DEFAULT/NOT NULL/CHECK) and identity INTEGER TYPE columns through validated writes and reopen; general typed values and incremental materialized views remain unsupported. Expand encode/decode, planner/runtime behavior, transaction maintenance and recovery before enabling their full `@requires` capabilities; keep the corpus byte-faithful. |
+| 4 | Adopt Turso-specific SQL families as distinct product projects | The 28 pinned Turso-specific files originally omitted cover TYPE/DOMAIN/typed values (23) and incremental materialized views (5). A gated, durable INTEGER TYPE/DOMAIN registry now supports restricted STRICT INTEGER-domain columns (inherited DEFAULT/NOT NULL/CHECK) and identity INTEGER TYPE columns through validated writes/reopen; CAST to an identity type preserves its input value. General typed values and incremental materialized views remain unsupported. Expand encode/decode, planner/runtime behavior, transaction maintenance and recovery before enabling their full `@requires` capabilities; keep the corpus byte-faithful. |
 | 5 | Deepen sync and platform compatibility | A SHA-pinned, immutable sync-history root permits sparse original/committed revert segments across generations with v4/v5 compatibility, leases, and crash/reopen tests. The root still costs one full image; high-change generations fall back to full captures. AHTLA-encrypted bounded browser reads now authenticate main/WAL pages with a WAL-location metadata budget; further portable locale tailoring and browser SQL shapes still require deterministic persisted ordering and bounded async operation. Native loadable extensions/raw sqlite3 handles and the PostgreSQL server are separate product-scope decisions, not hidden SQLite failures. |
+
+### Live TODOs (not all represented by expected-failure cases)
+
+- [x] Integrate the bounded read, restricted TYPE/DOMAIN, reusable sync-history,
+  window input/output spill, and selected JSON EQP slices in **one** parent PR.
+  On head `6765675`, the bounded reader supports rowid predicates/projection,
+  INTEGER/TEXT BINARY `WITHOUT ROWID` full-key seeks and first-key ranges,
+  encrypted AHTLA/WAL snapshots, and an enforced page/WAL-location budget;
+  unsupported SQL fails closed.
+- [x] Keep the same head's opt-in STRICT INTEGER DOMAIN and identity INTEGER
+  TYPE metadata/writes/reopen/cast behavior behind the experimental switch.
+  Domain casts, non-identity encoding/decoding, and general typed values
+  remain unimplemented.
+- [ ] **WBOUND:** charge or spill partition keys, order entries, frame/peer
+  positions, small-array argument payloads, and computed result scratch
+  *before* allocation on compiled and evaluator routes. Compute/drain
+  incrementally; verify a finite peak for large partitions with spill on/off,
+  cancellation, exceptions, and temporary-file cleanup. Large argument/FILTER
+  input spill and minimum-slot reservations are only partial progress;
+  `WindowEvaluatorMemoryUnbounded` must remain true until the entire retained
+  working set is covered.
+- [ ] **IMV:** introduce view-owned persisted result **and** operator-state
+  roots, with catalog ownership in schema staging, loader, allocation-map,
+  pager and VACUUM paths. Route reads to that result, consume transaction-local
+  source-row deltas atomically on INSERT/UPDATE/DELETE, and cover rollback,
+  savepoints, reopen, concurrent snapshots, ALTER/DROP and recovery. The
+  existing view has a rootpage-0 SQL definition and evaluates its SELECT on
+  reads; `ReportRowChange` is not a materialized-view delta pipeline. Do not
+  substitute a writable backing table, CREATE-time refresh, or parser-only
+  acceptance.
+- [ ] **Typed values:** extend the gated registry beyond the current
+  primitive INTEGER identity/DOMAIN subset only with resolved base chains,
+  parameter/encode/decode semantics, constraint checks on all DML paths,
+  durable reload, and compatible index/FK behavior. Keep unsupported
+  STRUCT/UNION/parametric/non-INTEGER types, non-STRICT typed columns,
+  DROP TYPE/DOMAIN and domain casts fail-closed until their own contracts pass.
+  Then adopt exact upstream `@requires` cases, not the entire family at once.
+- [ ] **Planner/storage/platform:** eliminate remaining unmodeled JSON EQP
+  operations from executed plan data (especially view/derived joins and CTE
+  relationships); extend page-backed catalog/first-touch reads without
+  weakening corruption and snapshot guarantees; add other bounded browser
+  predicates/access paths and portable locale tailoring only with deterministic
+  persisted index ordering. Reassess the full-image sync-history root and
+  high-change fallback separately from the delivered sparse generations.
+- [ ] **Final parity audit:** re-run affected complete sqltest files and
+  cross-framework/package/browser gates after each change. Reconcile the
+  expected-failures ledger case by case, distinguishing intentional SQLite or
+  managed policies (including eager corruption-open rejection) from wrong
+  values. Do not turn the 73 entries into 73 feature TODOs or remove a
+  passing/intentional marker without proving its exact upstream case.
 
 For each slice: compare the pinned Rust implementation, add focused regression
 coverage, run the affected managed suite and cross-framework/package gates,
@@ -402,14 +462,13 @@ offsets on disk and avoid a second whole-partition output array for large
 results. Per-function result arrays now write directly into the final
 result rows, and partitions own their order entries without a second global
 order-key array. `WindowEvaluatorMemoryUnbounded` explicitly records that
-the evaluator's remaining partition entries, prepared function inputs, and
-temporary computed results remain outside the retained-memory ledger;
+the evaluator's remaining partition entries, small-array argument payloads,
+and temporary computed results remain outside the retained-memory ledger;
 **full end-to-end window bounding remains open**. The output and spill-file
 failure paths release their reservations and clean up files rather than
 reporting a false finite peak.
 Buffered evaluators now also receive statement memory, spill options, and
-cancellation in a scoped binding restored on success or failure; this does
-not yet spill or account for `PrepareWindowFunctionInputs`' retained arrays.
+cancellation in a scoped binding restored on success or failure.
 Unfiltered window functions whose arguments are all literal values share
 one immutable input value (including the argument-free case) instead of
 allocating a row-count-wide array. Large row-dependent argument and FILTER
