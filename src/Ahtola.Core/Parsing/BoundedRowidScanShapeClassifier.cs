@@ -18,7 +18,8 @@ internal sealed record BoundedRowidScanPlan(
     long? EqualRowId,
     SqliteRowIdRange? RowIdRange,
     bool Descending,
-    bool WithoutRowid);
+    bool WithoutRowid,
+    long? FirstPrimaryKeyEquals);
 
 /// <summary>
 /// Classifies a parsed SQL statement against an <see cref="AsyncSchemaCatalog"/>, either
@@ -156,30 +157,43 @@ internal static class BoundedRowidScanShapeClassifier
 
         long? equalRowId = null;
         SqliteRowIdRange? rowIdRange = null;
+        long? firstPrimaryKeyEquals = null;
         if (select.Where is { } predicate)
         {
             if (withoutRowid)
             {
-                rejectionReason = "WHERE is not supported for bounded WITHOUT ROWID scans.";
-                return null;
-            }
+                var first = entry.Table.PrimaryKeySchema!.Terms[0];
+                if (!string.Equals(
+                        entry.Table.ColumnDefinitions[first.ColumnIndex].DeclaredType,
+                        "INTEGER", StringComparison.OrdinalIgnoreCase)
+                    || predicate is not BinaryExpression { Operator: BinaryOperator.Equal } equality
+                    || !(TryMatchFirstPrimaryKey(
+                            equality.Left, equality.Right, tableSource, first, out var key)
+                        || TryMatchFirstPrimaryKey(
+                            equality.Right, equality.Left, tableSource, first, out key)))
+                {
+                    rejectionReason =
+                        "WHERE on a bounded WITHOUT ROWID scan requires equality on the first INTEGER primary-key column.";
+                    return null;
+                }
 
-            if (entry.Table.RowidAliasColumnIndex < 0
+                firstPrimaryKeyEquals = key;
+            }
+            else if (entry.Table.RowidAliasColumnIndex < 0
                 || !TryParseRowIdRange(predicate, tableSource, entry.Table, out var bounds))
             {
                 rejectionReason =
                     "WHERE supports only AND-combined comparisons between an INTEGER PRIMARY KEY column and integer literals.";
                 return null;
             }
-
-            if (bounds.Lower is { } exact
-                && bounds.Upper == exact
-                && bounds.IncludeLower
-                && bounds.IncludeUpper)
+            else if (bounds.Lower is { } exact
+                     && bounds.Upper == exact
+                     && bounds.IncludeLower
+                     && bounds.IncludeUpper)
             {
                 equalRowId = exact;
             }
-            else
+            else if (!withoutRowid)
             {
                 rowIdRange = bounds;
             }
@@ -270,7 +284,8 @@ internal static class BoundedRowidScanShapeClassifier
             equalRowId,
             rowIdRange,
             select.OrderBy.Count != 0 && select.OrderBy[0].Descending,
-            withoutRowid);
+            withoutRowid,
+            firstPrimaryKeyEquals);
     }
 
     private static bool TryParseRowIdRange(
@@ -369,20 +384,37 @@ internal static class BoundedRowidScanShapeClassifier
         rowId = 0;
         if (!IsRowIdColumn(columnExpression, source, table))
             return false;
+        return TryGetIntegerLiteral(valueExpression, out rowId);
+    }
 
-        switch (valueExpression)
+    private static bool TryMatchFirstPrimaryKey(
+        Expression columnExpression,
+        Expression valueExpression,
+        NamedTableSource source,
+        SqlitePrimaryKeyTerm first,
+        out long key)
+    {
+        key = 0;
+        return IsNamedColumn(columnExpression, source, first.ColumnName)
+            && TryGetIntegerLiteral(valueExpression, out key);
+    }
+
+    private static bool TryGetIntegerLiteral(Expression expression, out long value)
+    {
+        switch (expression)
         {
             case LiteralExpression { Value.Kind: SqlValueKind.Integer } literal:
-                rowId = literal.Value.AsInteger();
+                value = literal.Value.AsInteger();
                 return true;
             case UnaryExpression
             {
                 Operator: UnaryOperator.Negate,
                 Operand: LiteralExpression { Value.Kind: SqlValueKind.Integer } literal
             } when literal.Value.AsInteger() != long.MinValue:
-                rowId = -literal.Value.AsInteger();
+                value = -literal.Value.AsInteger();
                 return true;
             default:
+                value = 0;
                 return false;
         }
     }

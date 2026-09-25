@@ -76,6 +76,108 @@ public sealed class AsyncBoundedWithoutRowidScanTests
     }
 
     [Test]
+    public async Task IntegerPrimaryKeyPrefixEqualityFiltersBeforeOffsetAndLimit()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(InMemoryPath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(payload TEXT, tenant INTEGER, seq INTEGER, PRIMARY KEY(tenant, seq)) WITHOUT ROWID;");
+            Execute(connection, """
+                INSERT INTO items VALUES ('earlier', -1, 1);
+                INSERT INTO items VALUES ('first', 2, 1);
+                INSERT INTO items VALUES ('second', 2, 2);
+                INSERT INTO items VALUES ('third', 2, 3);
+                INSERT INTO items VALUES ('later', 3, 1);
+                """);
+        }
+
+        await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false, InMemoryPath, pageBudget: 8, CancellationToken.None);
+
+        await using (var reader = await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items AS i WHERE i.tenant = 2 ORDER BY i.tenant, i.seq LIMIT 1 OFFSET 1"))
+        {
+            (await reader.ReadAsync()).Should().BeTrue();
+            reader.GetValue(0).AsText().Should().Be("second");
+            (await reader.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var reader = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE 2 = tenant ORDER BY tenant DESC, seq DESC LIMIT 2"))
+        {
+            var sequences = new List<long>();
+            while (await reader.ReadAsync())
+                sequences.Add(reader.GetValue(0).AsInteger());
+            sequences.Should().Equal(3L, 2L);
+        }
+
+        await using (var missing = await bounded.ExecuteBoundedScanAsync(
+                         "SELECT payload FROM items WHERE tenant = 0"))
+            (await missing.ReadAsync()).Should().BeFalse();
+
+        var wrongColumn = async () => await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE seq = 1");
+        (await wrongColumn.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>())
+            .Which.Message.Should().Contain("WHERE");
+    }
+
+    [Test]
+    public async Task IntegerPrefixFilterTraversesInteriorRecordsInBothDirections()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(InMemoryPath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(tenant INTEGER, seq INTEGER, payload TEXT, PRIMARY KEY(tenant, seq)) WITHOUT ROWID;");
+            Execute(connection, "BEGIN;");
+            for (var tenant = 1; tenant <= 2; tenant++)
+            {
+                for (var seq = 1; seq <= 80; seq++)
+                    Execute(connection,
+                        $"INSERT INTO items VALUES ({tenant}, {seq}, '{new string('x', 120)}');");
+            }
+            Execute(connection, "COMMIT;");
+        }
+
+        await using (var pager = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem), InMemoryPath, InMemoryPath + "-wal", readOnly: true))
+        await using (var snapshot = await pager.BeginReadAsync())
+        {
+            var cache = new BoundedAsyncPageCache(snapshot, pager.UsableSpace, capacity: 16);
+            var page1 = await cache.ReadPageAsync(1);
+            var catalog = await AsyncSchemaCatalogLoader.LoadAsync(
+                cache, SqliteDatabaseHeader.Parse(page1).TextEncoding);
+            catalog.TryGetTable("items", out var entry).Should().BeTrue();
+            var root = await cache.ReadPageAsync(entry!.RootPage);
+            SqliteBtreePageHeader.Parse(root).PageType.Should().Be(SqliteBtreePageType.IndexInterior);
+        }
+
+        await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false, InMemoryPath, pageBudget: 16, CancellationToken.None);
+
+        await using (var reader = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE tenant = 2 ORDER BY tenant, seq LIMIT 3 OFFSET 15"))
+        {
+            var sequences = new List<long>();
+            while (await reader.ReadAsync())
+                sequences.Add(reader.GetValue(0).AsInteger());
+            sequences.Should().Equal(16L, 17L, 18L);
+        }
+
+        await using (var reader = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE tenant = 2 ORDER BY tenant DESC, seq DESC LIMIT 3 OFFSET 15"))
+        {
+            var sequences = new List<long>();
+            while (await reader.ReadAsync())
+                sequences.Add(reader.GetValue(0).AsInteger());
+            sequences.Should().Equal(65L, 64L, 63L);
+        }
+    }
+
+    [Test]
     public async Task ScansNativeMultiLevelIndexInteriorRecordsAndOverflowInPrimaryKeyOrder()
     {
         var path = Path.Combine(Path.GetTempPath(), $"ahtola-bounded-wr-{Guid.NewGuid():N}.db");
@@ -304,6 +406,7 @@ public sealed class AsyncBoundedWithoutRowidScanTests
             ("SELECT * FROM descending", "primary key"),
             ("SELECT * FROM collated", "primary key"),
             ("SELECT * FROM ascending WHERE code = 'a'", "WHERE"),
+            ("SELECT * FROM ascending WHERE code = 1", "WHERE"),
             ("SELECT * FROM ascending ORDER BY value", "ORDER BY"),
             ("SELECT * FROM ascending ORDER BY value DESC", "ORDER BY"),
             ("SELECT * FROM ascending INDEXED BY ascending_value", "INDEXED BY"),

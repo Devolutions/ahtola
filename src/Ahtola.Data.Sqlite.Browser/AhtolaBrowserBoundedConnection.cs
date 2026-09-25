@@ -168,9 +168,11 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
             var rows = plan.WithoutRowid
                 ? plan.Descending
                     ? AsyncBoundedWithoutRowidTableScanCursor.ScanDescendingAsync(
-                        pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, plan.Offset, cancellationToken)
+                        pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, plan.Offset,
+                        cancellationToken, plan.FirstPrimaryKeyEquals)
                     : AsyncBoundedWithoutRowidTableScanCursor.ScanAscendingAsync(
-                        pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, plan.Offset, cancellationToken)
+                        pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, plan.Offset,
+                        cancellationToken, plan.FirstPrimaryKeyEquals)
                 : plan.Descending
                 ? AsyncBoundedRowidTableScanCursor.ScanDescendingAsync(
                     pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, cancellationToken,

@@ -18,9 +18,11 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         SqliteTextEncoding textEncoding,
         long? limit,
         long offset,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        long? firstPrimaryKeyEquals = null)
         => ScanAscendingAsync(
             pageCache, rootPage, table, textEncoding, limit, offset, cancellationToken,
+            firstPrimaryKeyEquals,
             descending: true);
 
     public static async IAsyncEnumerable<SqlValue[]> ScanAscendingAsync(
@@ -31,6 +33,7 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         long? limit,
         long offset,
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        long? firstPrimaryKeyEquals = null,
         bool descending = false)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
@@ -42,6 +45,10 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
             textEncoding,
             primaryKey.Terms.Select(static term =>
                 new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+        var filterKey = firstPrimaryKeyEquals is { } target
+            ? new[] { SqlValue.Integer(target) }
+            : null;
+        var candidate = new SqlValue[1];
         var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
         var stack = new List<(uint PageNumber, SqliteIndexInteriorPageView View, int ChildIndex)>();
         var currentPage = rootPage;
@@ -101,14 +108,24 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
                         var key = ValidateAndExtractKey(
                             storedValues, table, primaryKey, comparer, previousKey, descending);
                         previousKey = key;
-                        var row = EmbeddedFileStore.RestoreWithoutRowidRecord(
-                            table.Name, table, primaryKey, storedValues);
+                        if (filterKey is not null)
+                        {
+                            candidate[0] = key[0];
+                            var comparison = comparer.Compare(candidate, filterKey);
+                            if (descending ? comparison < 0 : comparison > 0)
+                                yield break;
+                            if (comparison != 0)
+                                continue;
+                        }
+
                         if (skipped < offset)
                         {
                             skipped++;
                             continue;
                         }
 
+                        var row = EmbeddedFileStore.RestoreWithoutRowidRecord(
+                            table.Name, table, primaryKey, storedValues);
                         yield return row;
                         yielded++;
                     }
@@ -139,8 +156,15 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
                         var key = ValidateAndExtractKey(
                             storedValues, table, primaryKey, comparer, previousKey, descending);
                         previousKey = key;
-                        var row = EmbeddedFileStore.RestoreWithoutRowidRecord(
-                            table.Name, table, primaryKey, storedValues);
+                        var matches = true;
+                        if (filterKey is not null)
+                        {
+                            candidate[0] = key[0];
+                            var comparison = comparer.Compare(candidate, filterKey);
+                            if (descending ? comparison < 0 : comparison > 0)
+                                yield break;
+                            matches = comparison == 0;
+                        }
 
                         var nextChildIndex = frame.ChildIndex + (descending ? -1 : 1);
                         stack[frameIndex] = frame with { ChildIndex = nextChildIndex };
@@ -148,12 +172,17 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
                             ? frame.View.Header.RightMostChildPage
                             : frame.View.Cells[nextChildIndex].Cell.LeftChildPage;
 
-                        if (skipped < offset)
-                            skipped++;
-                        else
+                        if (matches)
                         {
-                            yield return row;
-                            yielded++;
+                            if (skipped < offset)
+                                skipped++;
+                            else
+                            {
+                                var row = EmbeddedFileStore.RestoreWithoutRowidRecord(
+                                    table.Name, table, primaryKey, storedValues);
+                                yield return row;
+                                yielded++;
+                            }
                         }
 
                         if (limit is { } separatorLimit && yielded >= separatorLimit)
