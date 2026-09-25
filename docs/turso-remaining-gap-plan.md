@@ -377,3 +377,14 @@ the full image, with hash-checked reconstruction on reopen. Its format-5
 metadata and the existing format-4 decoder both remain supported. The
 original-image segment is still full and no synced prefix is retained across
 generations; **reusable multi-generation history remains open**.
+
+TYPE/DOMAIN adoption must keep SQLite's five physical storage classes: the
+pinned Turso engine persists named definitions as SQL, resolves base-type
+chains, and encodes/decodes values at column boundaries. A metadata-only
+`CREATE TYPE` parser is not acceptance; persisted definitions must reload,
+and scalar/domain validation must agree across INSERT, SELECT, UPDATE,
+indexes, and foreign keys before enabling the corresponding corpus capability.
+Similarly, a materialized view populated once at CREATE time is not Turso's
+incremental feature: the pinned engine maintains both a result b-tree and
+operator state from transaction-local source deltas. Creation, DML, rollback,
+reopen, and VACUUM must preserve both before declaring that gap closed.
