@@ -39,6 +39,7 @@
             var persistentBackup = await RunPersistentBackupAsync();
             var persistentInboundBackup = await RunPersistentInboundBackupAsync();
             var persistentEncrypted = await RunPersistentEncryptedAsync();
+            var encryptedBounded = await RunPersistentEncryptedBoundedAsync();
             var encryptedMaintenance = await RunEncryptedMaintenanceAsync();
             var persistentEncryptedRawKey = await RunPersistentEncryptedRawKeyAsync();
             var encryptedWrongKeyRejected = await RunEncryptedWrongKeyAsync();
@@ -59,6 +60,7 @@
                 + $"persistent-backup={persistentBackup};"
                 + $"persistent-inbound-backup={persistentInboundBackup};"
                 + $"persistent-encrypted={persistentEncrypted};"
+                + $"encrypted-bounded={encryptedBounded};"
                 + $"encrypted-maintenance={encryptedMaintenance};"
                 + $"persistent-encrypted-raw-key={persistentEncryptedRawKey};"
                 + $"encrypted-wrong-key-rejected={encryptedWrongKeyRejected};"
@@ -480,6 +482,31 @@
                 await command.ExecuteScalarAsync(),
                 CultureInfo.InvariantCulture);
         }
+    }
+
+    private static async Task<long> RunPersistentEncryptedBoundedAsync()
+    {
+        const string path = "packed-consumer-encrypted-bounded/main.db";
+        const string key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+        using var encryption = AhtolaBrowserEncryptionOptions.FromHex(AhtolaEncryptionCipher.Aes256Gcm, key);
+        using var options = new AhtolaBrowserOptions(path, encryption: encryption);
+        await using (var writer = new AhtolaBrowserDataSource(options))
+        {
+            await using var connection = await writer.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);"
+                + "INSERT INTO probe VALUES (1, 5), (2, 7);",
+                "encrypted bounded setup");
+        }
+
+        await using var source = new AhtolaBrowserDataSource(options);
+        await using var bounded = await source.OpenBoundedScanConnectionAsync();
+        await using var reader = await bounded.ExecuteBoundedScanAsync("SELECT value FROM probe ORDER BY id");
+        var total = 0L;
+        while (await reader.ReadAsync())
+            total += reader.GetValue(0).AsInteger();
+        return total;
     }
 
     private static async Task<long> RunEncryptedMaintenanceAsync()

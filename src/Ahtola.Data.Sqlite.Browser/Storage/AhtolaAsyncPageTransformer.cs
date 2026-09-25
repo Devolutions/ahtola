@@ -176,6 +176,7 @@ internal sealed class AhtolaAsyncPageTransformer(IAhtolaAsyncPageCipher cipher) 
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (payload.Length != regions.PayloadLength)
                 throw AhtolaEncryptedPageFormat.CreateAuthenticationFailure(pageNumber, inner: null);
 

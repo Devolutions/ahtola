@@ -2,7 +2,7 @@ namespace Ahtola.Core.Storage;
 
 /// <summary>
 /// A capacity-capped, LRU-evicting page cache wrapping an
-/// <see cref="AsyncSqlitePagerReadTransaction"/>, used by bounded asynchronous b-tree
+/// <see cref="IAsyncBoundedReadSnapshot"/>, used by bounded asynchronous b-tree
 /// traversals. Never grows past its configured capacity: a page still pinned on a live
 /// traversal's ancestor stack can never be evicted, so a genuinely full cache with nothing
 /// evictable throws <see cref="SqliteBoundedPageBudgetExceededException"/> instead of either
@@ -15,7 +15,7 @@ namespace Ahtola.Core.Storage;
 /// </remarks>
 internal sealed class BoundedAsyncPageCache : IAsyncSqliteBtreePageIo
 {
-    private readonly AsyncSqlitePagerReadTransaction _transaction;
+    private readonly IAsyncBoundedReadSnapshot _transaction;
     private readonly int _capacity;
     private readonly LinkedList<uint> _lruOrder = new();
     private readonly Dictionary<uint, LinkedListNode<uint>> _nodesByPage = [];
@@ -23,7 +23,7 @@ internal sealed class BoundedAsyncPageCache : IAsyncSqliteBtreePageIo
     private readonly HashSet<uint> _pinned = [];
 
     public BoundedAsyncPageCache(
-        AsyncSqlitePagerReadTransaction transaction,
+        IAsyncBoundedReadSnapshot transaction,
         int usableSpace,
         int capacity)
     {

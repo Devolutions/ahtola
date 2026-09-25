@@ -315,6 +315,13 @@ does not share any code path with the `WholeImage` mirror or with
 `AhtolaBrowserSynchronousMode.ReadOnlyMirror` above, and opening one while the
 other already holds the directory's OPFS Web Lock fails closed the same way
 opening two ordinary data sources over one directory already does.
+When the data source has AHTLA encryption options, this same opt-in method
+uses a separate read-only asynchronous page decoder: it authenticates the
+database header and each requested database page, validates WAL checksums and
+salts before decrypting requested frame bodies, and never loads the encrypted
+database into the whole-image mirror. AES-GCM uses Web Crypto's non-extractable
+key handle; AEGIS uses the managed cipher. The normal connection and its
+`WholeImage` behavior do not change.
 
 ```csharp
 await using var dataSource = new AhtolaBrowserDataSource("inventory/main.db");
@@ -342,8 +349,16 @@ decides whether to retry the same statement against an ordinary
 | An ordinary rowid table with secondary indexes | Supported for base-table scans and rowid predicates; secondary indexes are not traversed or used to satisfy other predicates/orderings |
 | `SELECT column-list \| * FROM one-WITHOUT-ROWID-base-table [WHERE first-INTEGER-PK-column = integer-literal] [ORDER BY primary-key-prefix [ASC \| DESC]] [LIMIT n [OFFSET m]]` | Supported for ascending BINARY primary keys only. Traverses the table's index b-tree forward or backward in primary-key order, including interior and overflowing records; remaps the physical PK-first record to logical column order. A one-column INTEGER PK equality uses direct page-bounded B-tree descent, including interior separator records; a composite first-key equality filters the bounded stream and stops when keys pass the target. An explicit uniformly ascending or descending PK prefix needs no extra sort. Other declared PK collation/direction, non-key predicates/orderings, and `INDEXED BY` reject before scanning. No rowid is exposed. |
 | Any DDL, DML (`INSERT`/`UPDATE`/`DELETE`), `PRAGMA`, `ATTACH`, transactions | `AhtolaBrowserBoundedQueryException` — this connection is read-only by construction; there is no writer path, so there is no side-effect-duplication risk |
-| Encrypted (AHTLA page format) databases | `PlatformNotSupportedException` at `OpenBoundedScanConnectionAsync` — Web Crypto page decryption is asynchronous, and the pager's page-codec hook is currently synchronous-only; a `IAsyncPageCodec` hook is named future work |
+| Encrypted (AHTLA page format) databases | Supported with matching browser encryption options. Wrong keys, cipher IDs, authentication tags, malformed WAL frames, nonempty rollback journals, and unsupported journal modes fail closed; there is no plaintext or whole-image fallback. |
 | A cursor whose actual required interior-page stack depth exceeds `PageBudget` | `AhtolaBrowserBoundedQueryException` at the exact `ReadAsync` call that would have exceeded it — the budget is an enforced ceiling, not an advisory default |
+
+The page budget caps decoded pages retained by the cursor. Encrypted reads
+add a transient encrypted page and AEAD buffers per in-flight fetch. WAL
+recovery retains page-number/frame-number locations, **not page images**;
+that metadata scales with the number of distinct changed WAL pages. A
+requested WAL page is checked against the on-disk checksum chain again before
+decryption. A clean, authoritative WAL-mode main database can open without a
+WAL; if its header requires WAL recovery and the WAL is missing, open fails.
 
 ## EF Core
 

@@ -44,6 +44,24 @@ flowchart LR
 - `BrowserEncryptedPersistence` performs the actual AHTLA transform
   asynchronously while the mirror replays its pending mutations to OPFS.
 
+The opt-in `OpenBoundedScanConnectionAsync` read-only profile is separate from
+this mirror. It opens the encrypted file directly through OPFS's Web Lock,
+authenticates AHTLA page 1 to establish the SQLite header, and decrypts only
+pages requested by its bounded asynchronous scan cursor. For WAL databases,
+the shared SQLite WAL parser first validates the header, salts, and rolling
+checksums on **encrypted** frame bodies. Recovery retains only committed page
+locations (page number to frame number), not a WAL page-image overlay; a
+requested frame is checksum-validated again before its page is decrypted.
+Transient encrypted page and AEAD buffers are bounded per fetch, while WAL
+location metadata can grow with the number of distinct changed pages.
+
+This profile neither writes nor repairs storage. An incomplete or corrupt WAL
+tail, a nonempty rollback journal, an unsupported MVCC mode, a stale
+non-authoritative database with no committed WAL, or an unauthenticated page
+fails closed. It does not silently switch to the whole-image mirror. The
+existing `OpenConnectionAsync`/`WholeImage` write and recovery path remains
+unchanged.
+
 ## Cipher selection in the browser
 
 SubtleCrypto implements AES-GCM only. `AhtolaBrowserPageCipherFactory` therefore

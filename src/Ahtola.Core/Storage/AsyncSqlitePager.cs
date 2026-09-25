@@ -1961,7 +1961,7 @@ public sealed class AsyncSqlitePager : IAsyncDisposable
 }
 
 /// <summary>A stable committed snapshot owned by an <see cref="AsyncSqlitePager"/>.</summary>
-public sealed class AsyncSqlitePagerReadTransaction : IAsyncDisposable
+public sealed class AsyncSqlitePagerReadTransaction : IAsyncBoundedReadSnapshot
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly AsyncSqlitePager _pager;
