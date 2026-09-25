@@ -148,11 +148,10 @@ internal static class BoundedRowidScanShapeClassifier
         }
 
         if (!withoutRowid && select.OrderBy.Count != 0
-            && (entry.Table.RowidAliasColumnIndex < 0
-                || select.OrderBy is not [var order]
+            && (select.OrderBy is not [var order]
                 || !IsRowIdColumn(order.Expression, tableSource, entry.Table)))
         {
-            rejectionReason = "ORDER BY supports only the INTEGER PRIMARY KEY column.";
+            rejectionReason = "ORDER BY supports only the rowid or INTEGER PRIMARY KEY column.";
             return null;
         }
 
@@ -176,11 +175,10 @@ internal static class BoundedRowidScanShapeClassifier
                 if (keys.Length == entry.Table.PrimaryKeySchema!.Terms.Count)
                     fullPrimaryKeyEquals = keys;
             }
-            else if (entry.Table.RowidAliasColumnIndex < 0
-                || !TryParseRowIdRange(predicate, tableSource, entry.Table, out var bounds))
+            else if (!TryParseRowIdRange(predicate, tableSource, entry.Table, out var bounds))
             {
                 rejectionReason =
-                    "WHERE supports only AND-combined comparisons between an INTEGER PRIMARY KEY column and integer literals.";
+                    "WHERE supports only AND-combined comparisons between rowid (or its INTEGER PRIMARY KEY alias) and integer literals.";
                 return null;
             }
             else if (bounds.Lower is { } exact
@@ -495,7 +493,18 @@ internal static class BoundedRowidScanShapeClassifier
     }
 
     private static bool IsRowIdColumn(Expression expression, NamedTableSource source, EmbeddedTable table)
-        => IsNamedColumn(expression, source, table.Columns[table.RowidAliasColumnIndex]);
+    {
+        if (table.RowidAliasColumnIndex >= 0
+            && IsNamedColumn(expression, source, table.Columns[table.RowidAliasColumnIndex]))
+            return true;
+        foreach (var name in new[] { "rowid", "_rowid_", "oid" })
+        {
+            if (IsNamedColumn(expression, source, name)
+                && !table.Columns.Any(column => string.Equals(column, name, StringComparison.OrdinalIgnoreCase)))
+                return true;
+        }
+        return false;
+    }
 
     private static bool IsNamedColumn(Expression expression, NamedTableSource source, string name)
         => expression is ColumnExpression { Schema: null } column

@@ -224,6 +224,64 @@ public sealed class AhtolaBrowserBoundedScanTests
     }
 
     [Test]
+    public async Task HiddenRowidNamesSeekAndOrderWithoutAnIntegerPrimaryKeyAlias()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(label TEXT);");
+            Execute(connection, "INSERT INTO items(rowid, label) VALUES (-7, 'negative'), (2, 'second'), (3, 'third'), (4, 'fourth');");
+            Execute(connection, "CREATE TABLE shadowed(rowid TEXT, label TEXT);");
+            Execute(connection, "INSERT INTO shadowed VALUES ('text-rowid', 'shadowed');");
+        }
+
+        await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false, DatabasePath, pageBudget: 8, CancellationToken.None);
+        await using (var point = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items AS i WHERE -7 = i._rowid_"))
+        {
+            (await point.ReadAsync()).Should().BeTrue();
+            point.GetValue(0).AsText().Should().Be("negative");
+            (await point.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var range = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items WHERE oid BETWEEN 2 AND 4 ORDER BY oid DESC LIMIT 2 OFFSET 1"))
+        {
+            (await range.ReadAsync()).Should().BeTrue();
+            range.GetValue(0).AsText().Should().Be("third");
+            (await range.ReadAsync()).Should().BeTrue();
+            range.GetValue(0).AsText().Should().Be("second");
+            (await range.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var alternate = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM shadowed WHERE _rowid_ = 1"))
+        {
+            (await alternate.ReadAsync()).Should().BeTrue();
+            alternate.GetValue(0).AsText().Should().Be("shadowed");
+            (await alternate.ReadAsync()).Should().BeFalse();
+        }
+
+        var shadowed = async () => await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM shadowed WHERE rowid = 1");
+        await shadowed.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+            .WithMessage("*WHERE*");
+
+        var shadowedOrder = async () => await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM shadowed ORDER BY rowid");
+        await shadowedOrder.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+            .WithMessage("*ORDER BY*");
+
+        var noHiddenProjection = async () => await bounded.ExecuteBoundedScanAsync(
+            "SELECT rowid FROM items");
+        await noHiddenProjection.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+            .WithMessage("*does not exist*");
+    }
+
+    [Test]
     public async Task RowidRangesSeekTheirLowerBoundAndApplyLimitAfterFiltering()
     {
         var fileSystem = new InMemoryFileSystem();

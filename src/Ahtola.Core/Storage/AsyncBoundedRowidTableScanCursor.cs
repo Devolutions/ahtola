@@ -298,7 +298,8 @@ internal static class AsyncBoundedRowidTableScanCursor
                         var values = EmbeddedFileStore.RestoreRowidTableRecord(
                             table,
                             SqliteRecordCodec.Decode(record, textEncoding));
-                        values[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
+                        if (table.RowidAliasColumnIndex >= 0)
+                            values[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
                         return values;
 
                     default:
