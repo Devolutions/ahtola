@@ -124,6 +124,11 @@ public sealed class AhtolaBrowserBoundedScanTests
             "SELECT id FROM items ORDER BY label");
         var orderAssertion = await unsupportedOrder.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>();
         orderAssertion.Which.Message.Should().Contain("ORDER BY");
+
+        var unsupportedOffset = async () => await boundedConnection.ExecuteBoundedScanAsync(
+            "SELECT id FROM items LIMIT 2 OFFSET ?");
+        var offsetAssertion = await unsupportedOffset.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>();
+        offsetAssertion.Which.Message.Should().Contain("OFFSET");
     }
 
     [Test]
@@ -168,6 +173,10 @@ public sealed class AhtolaBrowserBoundedScanTests
 
         await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
                          "SELECT id FROM items WHERE id = 999"))
+            (await reader.ReadAsync()).Should().BeFalse();
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id = 120 LIMIT 1 OFFSET 1"))
             (await reader.ReadAsync()).Should().BeFalse();
     }
 
@@ -248,12 +257,21 @@ public sealed class AhtolaBrowserBoundedScanTests
         }
 
         await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
-                         "SELECT id FROM items ORDER BY id DESC LIMIT 2"))
+                         "SELECT id FROM items WHERE id >= 119 AND id < 125 ORDER BY id DESC LIMIT 2 OFFSET 1"))
         {
             var ids = new List<long>();
             while (await reader.ReadAsync())
                 ids.Add(reader.GetValue(0).AsInteger());
-            ids.Should().Equal(199L, 198L);
+            ids.Should().Equal(123L, 122L);
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items ORDER BY id DESC LIMIT 2 OFFSET 3"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(196L, 195L);
         }
 
         await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(

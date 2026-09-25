@@ -14,6 +14,7 @@ internal sealed record BoundedRowidScanPlan(
     IReadOnlyList<int> ProjectedColumnIndexes,
     IReadOnlyList<string> ColumnNames,
     long? Limit,
+    long Offset,
     long? EqualRowId,
     SqliteRowIdRange? RowIdRange,
     bool Descending);
@@ -34,10 +35,10 @@ internal sealed record BoundedRowidScanPlan(
 /// [WHERE integer-primary-key integer-comparison integer-literal
 /// [AND integer-primary-key integer-comparison integer-literal ...]]
 /// (or an inclusive integer-literal BETWEEN range)
-/// [ORDER BY integer-primary-key [ASC|DESC]] [LIMIT n]</c>.
+/// [ORDER BY integer-primary-key [ASC|DESC]] [LIMIT n [OFFSET m]]</c>.
 /// No other <c>WHERE</c>, joins/subqueries, <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
 /// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references, no
-/// <c>WITHOUT ROWID</c> or indexed tables, no <c>OFFSET</c>. Everything else is named follow-on
+/// <c>WITHOUT ROWID</c> or indexed tables. Everything else is named follow-on
 /// work, not silently downgraded.
 /// </para>
 /// </remarks>
@@ -83,12 +84,6 @@ internal static class BoundedRowidScanShapeClassifier
         if (select.NamedWindows.Count != 0)
         {
             rejectionReason = "Window definitions are not supported by a bounded scan connection.";
-            return null;
-        }
-
-        if (select.Offset is not null)
-        {
-            rejectionReason = "OFFSET is not supported by a bounded scan connection.";
             return null;
         }
 
@@ -229,6 +224,23 @@ internal static class BoundedRowidScanShapeClassifier
             limit = rawLimit;
         }
 
+        var offset = 0L;
+        if (select.Offset is not null)
+        {
+            if (limit is null || select.Offset is not LiteralExpression { Value.Kind: SqlValueKind.Integer } literal)
+            {
+                rejectionReason = "OFFSET requires LIMIT and a plain non-negative integer literal.";
+                return null;
+            }
+
+            offset = literal.Value.AsInteger();
+            if (offset < 0)
+            {
+                rejectionReason = "OFFSET must be non-negative.";
+                return null;
+            }
+        }
+
         rejectionReason = "";
         return new BoundedRowidScanPlan(
             tableSource.Name,
@@ -237,6 +249,7 @@ internal static class BoundedRowidScanShapeClassifier
             columnIndexes,
             columnNames,
             limit,
+            offset,
             equalRowId,
             rowIdRange,
             select.OrderBy.Count != 0 && select.OrderBy[0].Descending);

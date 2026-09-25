@@ -65,9 +65,10 @@ internal static class AsyncBoundedRowidTableScanCursor
         long? limit,
         CancellationToken cancellationToken = default,
         long? equalRowId = null,
-        SqliteRowIdRange? rowIdRange = null)
+        SqliteRowIdRange? rowIdRange = null,
+        long offset = 0)
         => ScanAscendingAsync(
-            pageCache, rootPage, table, textEncoding, limit, cancellationToken, equalRowId, rowIdRange,
+            pageCache, rootPage, table, textEncoding, limit, cancellationToken, equalRowId, rowIdRange, offset,
             descending: true);
 
     public static async IAsyncEnumerable<SqlValue[]> ScanAscendingAsync(
@@ -79,14 +80,16 @@ internal static class AsyncBoundedRowidTableScanCursor
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
         long? equalRowId = null,
         SqliteRowIdRange? rowIdRange = null,
+        long offset = 0,
         bool descending = false)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
         ArgumentNullException.ThrowIfNull(table);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
 
         if (equalRowId is { } soughtRowId)
         {
-            if (limit != 0
+            if (limit != 0 && offset == 0
                 && await TrySeekRowIdAsync(
                     pageCache,
                     rootPage,
@@ -111,6 +114,7 @@ internal static class AsyncBoundedRowidTableScanCursor
         var stack = new List<(uint PageNumber, SqliteTableInteriorPageView View, int NextChildIndex)>();
         var currentPage = rootPage;
         var yielded = 0L;
+        var skipped = 0L;
 
         try
         {
@@ -193,6 +197,12 @@ internal static class AsyncBoundedRowidTableScanCursor
                                 if (bounds.IsAboveUpper(cell.Cell.RowId))
                                     yield break;
                             }
+                        }
+
+                        if (skipped < offset)
+                        {
+                            skipped++;
+                            continue;
                         }
 
                         var record = await overflowReader
