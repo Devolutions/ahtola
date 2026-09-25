@@ -75,6 +75,9 @@ public sealed class VdbeExecutionMetrics
     /// <summary>Buffered-window result blocks moved to a temporary sequential output file.</summary>
     public long WindowOutputsSpilled { get; private set; }
 
+    /// <summary>Row-dependent or filtered window inputs moved to indexed temporary files.</summary>
+    public long WindowInputsSpilled { get; private set; }
+
     /// <summary>
     /// Buffered-window evaluation and draining can allocate outside the execution memory
     /// ledger. PeakRetainedBytes is not a bound on the window's total working set.
@@ -157,6 +160,9 @@ public sealed class VdbeExecutionMetrics
 
     internal void WindowOutputSpilled() =>
         WindowOutputsSpilled = checked(WindowOutputsSpilled + 1);
+
+    internal void WindowInputSpilled() =>
+        WindowInputsSpilled = checked(WindowInputsSpilled + 1);
 
     internal void WindowEvaluatorStarted() => WindowEvaluatorMemoryUnbounded = true;
 

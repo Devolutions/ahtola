@@ -1,6 +1,8 @@
 using AwesomeAssertions;
 using MsData = Microsoft.Data.Sqlite;
 using Ahtola.Core;
+using Ahtola.Core.Execution;
+using Ahtola.Core.Parsing;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
@@ -687,6 +689,70 @@ public sealed class WindowFunctionSemanticsTests
             .Should().Contain("WindowBufferCompute");
         AssertMatchesSqlite(Setup, buffered);
         AssertMatchesSqlite(Setup, evaluator);
+    }
+
+    [Test]
+    public void RowDependentWindowInputsSpillAndReleaseTheirIndexedFiles()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(value INTEGER);");
+        for (var value = 1; value <= 400; value++)
+            Execute(connection, $"INSERT INTO items VALUES ({value});");
+
+        const string sql =
+            """
+            SELECT value, sum(value) OVER (
+                ORDER BY value ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+                EXCLUDE CURRENT ROW),
+                   sum(value) FILTER (WHERE value > 200) OVER (
+                       ORDER BY value ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+                       EXCLUDE CURRENT ROW)
+            FROM items ORDER BY value;
+            """;
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 32 * 1024,
+            temporaryDirectory: "window-input-spill-tests",
+            metrics: metrics);
+        var result = database.Execute(
+            SqlParser.Parse(sql, SqlParameterMap.Parse(sql)),
+            [],
+            vdbeExecutionOptions: options);
+
+        result.Rows.Should().HaveCount(400);
+        result.Rows[0][1].AsInteger().Should().Be(2);
+        result.Rows[^1][1].AsInteger().Should().Be(399);
+        result.Rows[0][2].Kind.Should().Be(SqlValueKind.Null);
+        result.Rows[^1][2].AsInteger().Should().Be(399);
+        metrics.WindowInputsSpilled.Should().Be(2);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(options.SorterMemoryLimitBytes);
+
+        const string invalid =
+            """
+            SELECT ntile(0) OVER (ORDER BY value
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW),
+                   sum(value) OVER (ORDER BY value
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW)
+            FROM items;
+            """;
+        var failureMetrics = new VdbeExecutionMetrics();
+        var failureOptions = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 32 * 1024,
+            temporaryDirectory: "window-input-failure-tests",
+            metrics: failureMetrics);
+        Action fail = () => database.Execute(
+            SqlParser.Parse(invalid, SqlParameterMap.Parse(invalid)),
+            [],
+            vdbeExecutionOptions: failureOptions);
+        fail.Should().Throw<EmbeddedSqlException>().WithMessage("*ntile*");
+        failureMetrics.WindowInputsSpilled.Should().BeGreaterThan(0);
+        failureMetrics.ActiveSpillFiles.Should().Be(0);
+        failureMetrics.CurrentRetainedBytes.Should().Be(0);
     }
 
     [Test]

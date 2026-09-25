@@ -329,9 +329,10 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   materializes both sides as the query result by design, so it is not a spill
   candidate (an architectural property of the evaluator, not a missing spill
   path); an aggregate's own accumulator is a single bounded value per group.
-  Buffered-window input, its offset index, and its drained output can spill,
-  but the window evaluator's partition metadata, function inputs, and
-  computed result scratch are not yet fully bounded by the execution ledger;
+  Buffered-window input, its offset index, large row-dependent function inputs,
+  and its drained output can spill, but the window evaluator's partition
+  metadata, smaller retained function inputs, and computed result scratch are
+  not yet fully bounded by the execution ledger;
   `WindowEvaluatorMemoryUnbounded` makes that limitation explicit.
   Prefer modest databases
   and explicit transactions for writes (managed writes are slower than native

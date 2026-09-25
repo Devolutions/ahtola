@@ -50349,8 +50349,9 @@ out bool hasReturning)
         if (windowFunctions.Count == 0)
             return values;
 
+        using var inputScope = new WindowInputScope();
         var inputs = PrepareWindowFunctionInputs(
-            windowFunctions, rowCount, evaluate, context, windowEvaluation);
+            windowFunctions, rowCount, evaluate, context, windowEvaluation, inputScope);
         var groups = new List<List<int>>();
         foreach (var ordinal in Enumerable.Range(0, windowFunctions.Count))
         {
@@ -50392,24 +50393,37 @@ out bool hasReturning)
         int rowCount,
         WindowInputEvaluator evaluate,
         QueryContext context,
-        VdbeWindowEvaluationResources? windowEvaluation)
+        VdbeWindowEvaluationResources? windowEvaluation,
+        WindowInputScope inputScope)
     {
         var inputs = new Dictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>>();
         foreach (var function in functions)
         {
             var constant = function.Filter is null
                 && function.Arguments.All(static argument => argument is LiteralExpression);
-            inputs.Add(
-                function,
-                constant
-                    ? new ConstantWindowInputList(
-                        rowCount,
-                        new WindowFunctionInput(
-                            true,
-                            function.Arguments
-                                .Select(static argument => ((LiteralExpression)argument).Value)
-                                .ToArray()))
-                    : new WindowFunctionInput[rowCount]);
+            if (constant)
+            {
+                inputs.Add(function, new ConstantWindowInputList(
+                    rowCount,
+                    new WindowFunctionInput(
+                        true,
+                        function.Arguments
+                            .Select(static argument => ((LiteralExpression)argument).Value)
+                            .ToArray())));
+            }
+            else if (windowEvaluation is { } resources
+                && resources.Options.AllowTemporaryFileSpill
+                && VdbeManagedFootprint.EstimateWindowOutputMinimum(
+                    rowCount, function.Arguments.Count) > resources.Memory.AvailableBytes / 2)
+            {
+                var spill = new SpilledWindowInputList(rowCount, function.Arguments.Count, resources);
+                inputScope.Own(spill);
+                inputs.Add(function, spill);
+            }
+            else
+            {
+                inputs.Add(function, new WindowFunctionInput[rowCount]);
+            }
         }
 
         for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
@@ -50419,7 +50433,7 @@ out bool hasReturning)
             foreach (var function in functions)
             {
                 windowEvaluation?.CancellationToken.ThrowIfCancellationRequested();
-                if (inputs[function] is not WindowFunctionInput[] prepared)
+                if (inputs[function] is ConstantWindowInputList)
                     continue;
                 var included = !IsAggregateWindowFunction(function)
                     || function.Filter is null
@@ -50429,7 +50443,11 @@ out bool hasReturning)
                         .Select(argument => evaluate(rowIndex, argument))
                         .ToArray()
                     : [];
-                prepared[rowIndex] = new WindowFunctionInput(included, arguments);
+                var input = new WindowFunctionInput(included, arguments);
+                if (inputs[function] is WindowFunctionInput[] prepared)
+                    prepared[rowIndex] = input;
+                else
+                    ((SpilledWindowInputList)inputs[function]).Append(input);
             }
         }
 

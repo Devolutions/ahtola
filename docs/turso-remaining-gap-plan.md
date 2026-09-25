@@ -412,8 +412,13 @@ cancellation in a scoped binding restored on success or failure; this does
 not yet spill or account for `PrepareWindowFunctionInputs`' retained arrays.
 Unfiltered window functions whose arguments are all literal values share
 one immutable input value (including the argument-free case) instead of
-allocating a row-count-wide array. Row-dependent arguments and FILTER still
-require the broader spill-backed input redesign.
+allocating a row-count-wide array. Large row-dependent argument and FILTER
+input sets now use an indexed temporary file when their minimum row slots
+exceed half the remaining compiled-window memory budget. Cached spill reads
+reserve memory and the files are disposed on both success and evaluator
+failure. Smaller retained input arrays, partition metadata and computed
+result scratch still require the full spill-backed evaluator redesign;
+`WindowEvaluatorMemoryUnbounded` remains true.
 
 TYPE/DOMAIN adoption must keep SQLite's five physical storage classes: the
 pinned Turso engine persists named definitions as SQL, resolves base-type
