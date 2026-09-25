@@ -87,6 +87,9 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         var skipped = 0L;
         var yielded = 0L;
         SqlValue[]? previousKey = null;
+        var startingBound = FindStartingBound(
+            firstPrimaryKeyEquals, firstPrimaryKeyBounds, comparer, descending);
+        var seekingStart = startingBound is not null;
 
         try
         {
@@ -107,9 +110,14 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
                     var interior = SqliteIndexInteriorPageView.Parse(
                         image, pageCache.UsableSpace, textEncoding, currentPage == 1,
                         recordComparer: comparer);
-                    var childIndex = descending ? interior.Cells.Count : 0;
                     pageCache.Pin(currentPage);
-                    stack.Add((currentPage, interior, childIndex));
+                    stack.Add((currentPage, interior, 0));
+                    var childIndex = seekingStart && startingBound is { } bound
+                        ? await FindStartingChildAsync(
+                            interior, bound, descending, table, primaryKey,
+                            comparer, textEncoding, overflowReader, cancellationToken).ConfigureAwait(false)
+                        : descending ? interior.Cells.Count : 0;
+                    stack[^1] = (currentPage, interior, childIndex);
                     currentPage = childIndex == interior.Cells.Count
                         ? interior.Header.RightMostChildPage
                         : interior.Cells[childIndex].Cell.LeftChildPage;
@@ -122,6 +130,7 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
                 var leaf = SqliteIndexLeafPageView.Parse(
                     image, pageCache.UsableSpace, textEncoding, currentPage == 1,
                     recordComparer: comparer);
+                seekingStart = false;
                 pageCache.Pin(currentPage);
                 try
                 {
@@ -257,6 +266,64 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
             foreach (var frame in stack)
                 pageCache.Unpin(frame.PageNumber);
         }
+    }
+
+    private static SqlitePrimaryKeyConstraint? FindStartingBound(
+        SqlValue? firstPrimaryKeyEquals,
+        IReadOnlyList<SqlitePrimaryKeyConstraint>? bounds,
+        SqliteIndexRecordComparer comparer,
+        bool descending)
+    {
+        if (firstPrimaryKeyEquals is { } exact)
+            return new SqlitePrimaryKeyConstraint(exact, Lower: !descending, Inclusive: true);
+        SqlitePrimaryKeyConstraint? strongest = null;
+        if (bounds is null)
+            return null;
+        foreach (var bound in bounds)
+        {
+            if (bound.Lower == descending)
+                continue;
+            if (strongest is { } current)
+            {
+                var comparison = comparer.Compare([bound.Value], [current.Value]);
+                if (descending ? comparison > 0 : comparison < 0)
+                    continue;
+                if (comparison == 0 && (bound.Inclusive || !current.Inclusive))
+                    continue;
+            }
+            strongest = bound;
+        }
+        return strongest;
+    }
+
+    private static async ValueTask<int> FindStartingChildAsync(
+        SqliteIndexInteriorPageView interior,
+        SqlitePrimaryKeyConstraint bound,
+        bool descending,
+        EmbeddedTable table,
+        SqlitePrimaryKeySchema primaryKey,
+        SqliteIndexRecordComparer comparer,
+        SqliteTextEncoding textEncoding,
+        AsyncSqliteOverflowChainReader overflowReader,
+        CancellationToken cancellationToken)
+    {
+        var candidate = new SqlValue[1];
+        var target = new[] { bound.Value };
+        var includeEqual = descending ? !bound.Inclusive : bound.Inclusive;
+        for (var index = 0; index < interior.Cells.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var record = await overflowReader.ReadPayloadAsync(
+                interior.Cells[index].Cell.Key, cancellationToken).ConfigureAwait(false);
+            var storedValues = SqliteRecordCodec.Decode(record, textEncoding);
+            var key = ValidateAndExtractKey(
+                storedValues, table, primaryKey, comparer, previousKey: null, descending: false);
+            candidate[0] = key[0];
+            var comparison = comparer.Compare(candidate, target);
+            if (comparison > 0 || comparison == 0 && includeEqual)
+                return index;
+        }
+        return interior.Cells.Count;
     }
 
     private static (bool Matches, bool Beyond) CheckFirstKeyBounds(

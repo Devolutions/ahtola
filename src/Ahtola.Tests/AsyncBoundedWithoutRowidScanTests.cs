@@ -256,6 +256,35 @@ public sealed class AsyncBoundedWithoutRowidScanTests
                 found.Add(row);
             found.Should().ContainSingle().Which[1].AsInteger().Should().Be(149);
             counted.ReadCount.Should().BeLessThan((int)counted.PageCount / 4);
+
+            counted.Reset();
+            var prefixCache = new BoundedAsyncPageCache(counted, pager.UsableSpace, capacity: 8);
+            var prefixRows = 0;
+            await foreach (var row in AsyncBoundedWithoutRowidTableScanCursor.ScanAscendingAsync(
+                prefixCache, entry.RootPage, entry.Table, encoding, limit: 1, offset: 0,
+                firstPrimaryKeyEquals: SqlValue.Integer(4)))
+            {
+                row[1].AsInteger().Should().Be(1);
+                prefixRows++;
+            }
+            prefixRows.Should().Be(1);
+            counted.ReadCount.Should().BeLessThan((int)counted.PageCount / 4);
+
+            counted.Reset();
+            var reverseCache = new BoundedAsyncPageCache(counted, pager.UsableSpace, capacity: 8);
+            var reverseRows = 0;
+            await foreach (var row in AsyncBoundedWithoutRowidTableScanCursor.ScanDescendingAsync(
+                reverseCache, entry.RootPage, entry.Table, encoding, limit: 1, offset: 0,
+                firstPrimaryKeyBounds:
+                [
+                    new SqlitePrimaryKeyConstraint(SqlValue.Integer(1), Lower: false, Inclusive: true),
+                ]))
+            {
+                row[1].AsInteger().Should().Be(150);
+                reverseRows++;
+            }
+            reverseRows.Should().Be(1);
+            counted.ReadCount.Should().BeLessThan((int)counted.PageCount / 4);
         }
 
         await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
