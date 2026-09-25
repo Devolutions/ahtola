@@ -95,19 +95,26 @@ internal static class ManagedTypeRegistry
                 continue;
             }
 
-            if (definition is not CreateDomainStatement domain)
-                throw new EmbeddedSqlException($"Columns of custom type '{column.DeclaredType}' are not yet supported by the managed engine.");
             if (!statement.Strict)
-                throw new EmbeddedSqlException($"domain type columns require STRICT tables: {statement.Name}.{column.Name}");
+                throw new EmbeddedSqlException($"custom type columns require STRICT tables: {statement.Name}.{column.Name}");
             if (column.IsGenerated || column.PrimaryKey || column.ExplicitNull)
-                throw new EmbeddedSqlException($"Domain column {statement.Name}.{column.Name} cannot be generated, a primary key, or explicitly NULL.");
-            columns[index] = column with { Domain = domain };
+                throw new EmbeddedSqlException($"Custom type column {statement.Name}.{column.Name} cannot be generated, a primary key, or explicitly NULL.");
+            columns[index] = definition switch
+            {
+                CreateDomainStatement domain => column with { Domain = domain },
+                CreateTypeStatement identity => column with { IdentityType = identity },
+                _ => throw new EmbeddedSqlException($"Unsupported custom type '{column.DeclaredType}'."),
+            };
         }
         return columns;
     }
 
     internal static bool ContainsDomain(EmbeddedTable table)
         => table.ColumnDefinitions.Any(static column => column.Domain is not null);
+
+    internal static bool ContainsCustomType(EmbeddedTable table)
+        => table.ColumnDefinitions.Any(static column =>
+            column.Domain is not null || column.IdentityType is not null);
 
     internal static void RejectTypedColumn(
         EmbeddedColumn column,

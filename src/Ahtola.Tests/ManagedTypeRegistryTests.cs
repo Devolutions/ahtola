@@ -32,8 +32,9 @@ public sealed class ManagedTypeRegistryTests
         Execute(connection, "CREATE TABLE strict_entries(value positive) STRICT");
         Action quoted = () => Execute(connection, "CREATE TABLE quoted_entries(value \"positive\")");
         quoted.Should().Throw<EmbeddedSqlException>().WithMessage("*require STRICT tables*");
-        Action identity = () => Execute(connection, "CREATE TABLE counters(value counter) STRICT");
-        identity.Should().Throw<EmbeddedSqlException>().WithMessage("*not yet supported*");
+        Execute(connection, "CREATE TABLE counters(value counter) STRICT");
+        Execute(connection, "INSERT INTO counters VALUES ('8')");
+        Scalar(connection, "SELECT value FROM counters").Should().Be(8);
         Execute(connection, "CREATE TABLE ordinary(value INTEGER)");
         Action altered = () => Execute(connection, "ALTER TABLE ordinary ADD COLUMN typed \"positive\"");
         altered.Should().Throw<EmbeddedSqlException>().WithMessage("*not yet supported*");
@@ -43,6 +44,56 @@ public sealed class ManagedTypeRegistryTests
         Action directDrop = () => Execute(connection, "DROP TABLE __turso_internal_types");
         directDrop.Should().Throw<EmbeddedSqlException>().WithMessage("*cannot be modified directly*");
         Scalar(connection, "SELECT count(*) FROM __turso_internal_types").Should().Be(2);
+    }
+
+    [Test]
+    public void StrictIdentityIntegerTypeValidatesWritesTransactionsAndReopen()
+    {
+        var path = Path.Combine(TestContext.CurrentContext.WorkDirectory, $"{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                connection.ExperimentalCustomTypesEnabled = true;
+                Execute(connection, "CREATE TYPE counter BASE INTEGER");
+                Action nonStrict = () => Execute(connection, "CREATE TABLE loose(value counter)");
+                nonStrict.Should().Throw<EmbeddedSqlException>().WithMessage("*require STRICT tables*");
+                Action typedKey = () => Execute(connection, "CREATE TABLE keyed(value counter PRIMARY KEY) STRICT");
+                typedKey.Should().Throw<EmbeddedSqlException>().WithMessage("*cannot be generated, a primary key*");
+                Execute(connection, "CREATE TABLE entries(value counter NOT NULL UNIQUE) STRICT");
+                Execute(connection, "INSERT INTO entries VALUES ('9')");
+                Scalar(connection, "SELECT value FROM entries").Should().Be(9);
+                Action duplicate = () => Execute(connection, "INSERT INTO entries VALUES (9)");
+                duplicate.Should().Throw<EmbeddedSqlException>().WithMessage("*UNIQUE constraint failed*");
+                Action invalid = () => Execute(connection, "INSERT INTO entries VALUES (x'01')");
+                invalid.Should().Throw<EmbeddedSqlException>().WithMessage("*cannot store BLOB*INTEGER column*");
+                Scalar(connection, "SELECT count(*) FROM entries").Should().Be(1);
+
+                Execute(connection, "BEGIN");
+                Execute(connection, "SAVEPOINT before_update");
+                Execute(connection, "UPDATE entries SET value = 10");
+                Execute(connection, "ROLLBACK TO before_update");
+                Scalar(connection, "SELECT value FROM entries").Should().Be(9);
+                Execute(connection, "COMMIT");
+            }
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                connection.ExperimentalCustomTypesEnabled = true;
+                Scalar(connection, "SELECT value FROM entries").Should().Be(9);
+                Execute(connection, "UPDATE entries SET value = '11'");
+                Scalar(connection, "SELECT value FROM entries").Should().Be(11);
+                Action altered = () => Execute(connection, "ALTER TABLE entries ADD COLUMN another INTEGER");
+                altered.Should().Throw<EmbeddedSqlException>().WithMessage("*not yet supported*");
+                Scalar(connection, "SELECT value FROM entries").Should().Be(11);
+            }
+        }
+        finally
+        {
+            DeleteDatabaseFiles(path);
+        }
     }
 
     [Test]

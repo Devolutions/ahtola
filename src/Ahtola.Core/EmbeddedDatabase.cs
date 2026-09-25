@@ -8032,8 +8032,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         RejectInternalTypeTableMutation(tableName);
         var typeDefinitions = catalog.TypeDefinitions;
         if (catalog.Tables.TryGetValue(tableName, out var existingTable)
-            && ManagedTypeRegistry.ContainsDomain(existingTable))
-            throw new EmbeddedSqlException($"ALTER TABLE of domain-typed table '{tableName}' is not yet supported.");
+            && ManagedTypeRegistry.ContainsCustomType(existingTable))
+            throw new EmbeddedSqlException($"ALTER TABLE of custom-typed table '{tableName}' is not yet supported.");
         if (statement is AlterTableAddColumnStatement { Column: var added })
             ManagedTypeRegistry.RejectTypedColumn(added, typeDefinitions);
         if (statement is AlterTableAlterColumnStatement { Column: var altered })
@@ -17596,7 +17596,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         => !context.CancellationToken.CanBeCanceled
             && !HasOpenBlobHandles
             && !context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
-            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsDomain);
+            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsCustomType);
 
     private bool CanCompilePlainDelete(QueryContext context)
         => CanCompileDml(context) && !context.ForeignKeysEnabled;
@@ -17606,7 +17606,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             && context.ForeignKeysEnabled
             && !HasOpenBlobHandles
             && !context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
-            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsDomain);
+            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsCustomType);
 
     private bool CanRouteInsertThroughCompiler(InsertStatement statement, QueryContext context)
         => CanCompileDml(context)
@@ -67581,7 +67581,7 @@ internal sealed class EmbeddedTable
     }
 
     public ColumnAffinity GetColumnAffinity(EmbeddedColumn column)
-        => column.Domain is not null
+        => column.Domain is not null || column.IdentityType is not null
             ? ColumnAffinity.Integer
             : Strict
             && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase)
@@ -69134,7 +69134,7 @@ internal sealed class EmbeddedTable
 
     private static SqlValue ApplyAffinity(EmbeddedColumn column, SqlValue value, bool strict)
     {
-        if (column.Domain is not null)
+        if (column.Domain is not null || column.IdentityType is not null)
             return ApplyAffinity(ColumnAffinity.Integer, value);
         if (strict
             && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase))
@@ -69146,7 +69146,9 @@ internal sealed class EmbeddedTable
     }
 
     internal static ColumnAffinity GetDeclaredColumnAffinity(EmbeddedColumn column)
-        => column.Domain is not null ? ColumnAffinity.Integer : GetAffinity(column.DeclaredType);
+        => column.Domain is not null || column.IdentityType is not null
+            ? ColumnAffinity.Integer
+            : GetAffinity(column.DeclaredType);
 
     internal static SqlValue ApplyColumnAffinity(ColumnAffinity affinity, SqlValue value)
         => ApplyAffinity(affinity, value);
@@ -69182,7 +69184,7 @@ internal sealed class EmbeddedTable
                 throw new EmbeddedSqlException($"missing datatype for {Name}.{column.Name}");
 
             var declaredType = column.DeclaredType.Trim();
-            if (column.Domain is not null
+            if (column.Domain is not null || column.IdentityType is not null
                 || declaredType.Equals("INT", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("REAL", StringComparison.OrdinalIgnoreCase)
@@ -69203,7 +69205,7 @@ internal sealed class EmbeddedTable
         if (!Strict || value.Kind == SqlValueKind.Null)
             return;
 
-        var declaredType = column.Domain is not null
+        var declaredType = column.Domain is not null || column.IdentityType is not null
             ? "INTEGER"
             : column.DeclaredType!.Trim().ToUpperInvariant();
         var valid = declaredType switch
@@ -69236,7 +69238,7 @@ internal sealed class EmbeddedTable
     // exempt and must be handled by the caller.
     private static bool StrictValueMatchesDeclaredType(EmbeddedColumn column, SqlValue value)
     {
-        var declaredType = column.Domain is not null
+        var declaredType = column.Domain is not null || column.IdentityType is not null
             ? "INTEGER"
             : column.DeclaredType!.Trim().ToUpperInvariant();
         return declaredType switch

@@ -798,6 +798,8 @@ internal sealed record EmbeddedColumn(
 {
     public CreateDomainStatement? Domain { get; init; }
 
+    public CreateTypeStatement? IdentityType { get; init; }
+
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
     // the value may be persisted (STORED) or must be recomputed (VIRTUAL).
@@ -859,7 +861,11 @@ internal sealed record EmbeddedColumn(
             PrimaryKeyDeclarationOrder,
             UniqueDeclarationOrder,
             StrictAny,
-            GenerationVirtualSpelled);
+            GenerationVirtualSpelled)
+        {
+            Domain = Domain,
+            IdentityType = IdentityType,
+        };
 }
 
 // A column participating in a table-level PRIMARY KEY(...) clause, preserving the

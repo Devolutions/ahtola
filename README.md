@@ -432,18 +432,20 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   `CREATE DOMAIN name AS INTEGER` with DEFAULT, NOT NULL and CHECK clauses to
   persist definitions in `__turso_internal_types`. Definitions survive reopen,
   participate in transactions and advance the schema cookie. **INTEGER-based
-  DOMAIN columns** are supported only in STRICT tables:
-  writes apply INTEGER affinity, inherited DEFAULT/NOT NULL/CHECK constraints,
-  and reads use the primitive INTEGER storage class. Such columns retain their
-  domain metadata through reopen, transactions, and savepoints; compiled DML
-  falls back to the validating evaluator whenever a domain table is present.
+  DOMAIN columns** and identity `TYPE name BASE INTEGER` columns are supported
+  only in STRICT tables. Domain writes apply INTEGER affinity and inherited
+  DEFAULT/NOT NULL/CHECK constraints; identity TYPE columns use INTEGER
+  affinity and declared column constraints without an encode/decode expression.
+  Reads use the primitive INTEGER storage class. Both retain their type
+  metadata through reopen, transactions, and savepoints; compiled DML
+  falls back to the validating evaluator while the type registry is present.
   Domain CHECK remains enforced even when `ignore_check_constraints` disables
   ordinary table CHECKs.
-  Non-STRICT domain columns, custom TYPE columns, generated/domain-primary-key
-  columns, and ALTER TABLE on domain tables fail closed. Domain DEFAULT is
+  Non-STRICT custom columns, generated/custom-primary-key columns, and
+  ALTER TABLE on typed tables fail closed. Domain DEFAULT is
   limited to constant INTEGER expressions and CHECK to literal/value unary
   and binary expressions; unsupported expressions are rejected at declaration.
-  Other TYPE bodies, non-INTEGER bases, DROP TYPE/DOMAIN and typed casts are
+  Non-identity TYPE bodies, non-INTEGER bases, DROP TYPE/DOMAIN and typed casts are
   not supported. The opt-in is not exposed through the ADO.NET connection string.
   The bounded asynchronous catalog scan fails closed for databases containing
   type definitions until that reader can resolve their metadata.
