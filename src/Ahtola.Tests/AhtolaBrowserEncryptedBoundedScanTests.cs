@@ -43,6 +43,39 @@ public sealed class AhtolaBrowserEncryptedBoundedScanTests
     }
 
     [Test]
+    public async Task CompositeIntegerKeySeekReadsEncryptedWithoutRowidPages()
+    {
+        var storage = new InMemoryFileSystem();
+        using (var options = AhtolaEncryptionOptions.FromHex(StorageCipher.Aes256Gcm, Key))
+        using (var encrypted = new AhtolaEncryptionFileSystem(storage, options))
+        using (var database = EmbeddedDatabase.OpenFile(Path, encrypted))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(tenant INTEGER, seq INTEGER, label TEXT, PRIMARY KEY(tenant, seq)) WITHOUT ROWID;");
+            Execute(connection, "BEGIN;");
+            for (var tenant = 1; tenant <= 2; tenant++)
+            {
+                for (var seq = 1; seq <= 80; seq++)
+                    Execute(connection, $"INSERT INTO items VALUES ({tenant}, {seq}, 'item-{tenant}-{seq}');");
+            }
+            Execute(connection, "COMMIT;");
+        }
+
+        await using var bounded = await OpenAsync(storage, pageBudget: 8);
+        await using (var reader = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items WHERE seq = 79 AND tenant = 2"))
+        {
+            (await reader.ReadAsync()).Should().BeTrue();
+            reader.GetValue(0).AsText().Should().Be("item-2-79");
+            (await reader.ReadAsync()).Should().BeFalse();
+        }
+
+        await using var missing = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items WHERE tenant = 2 AND seq = 81");
+        (await missing.ReadAsync()).Should().BeFalse();
+    }
+
+    [Test]
     public async Task ReadsChangedPageFromAuthenticatedWalRatherThanStaleMainFile()
     {
         var storage = CreateWalDatabase();

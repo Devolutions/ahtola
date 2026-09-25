@@ -16,19 +16,20 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         uint rootPage,
         EmbeddedTable table,
         SqliteTextEncoding textEncoding,
-        long key,
+        IReadOnlyList<long> keys,
         long? limit,
         long offset,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
         ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(keys);
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         if (limit == 0 || offset != 0)
             yield break;
 
         var found = await TrySeekIntegerPrimaryKeyAsync(
-            pageCache, rootPage, table, textEncoding, key, cancellationToken).ConfigureAwait(false);
+            pageCache, rootPage, table, textEncoding, keys, cancellationToken).ConfigureAwait(false);
         if (found is not null)
             yield return found;
     }
@@ -262,30 +263,31 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         uint rootPage,
         EmbeddedTable table,
         SqliteTextEncoding textEncoding,
-        long key,
+        IReadOnlyList<long> keys,
         CancellationToken cancellationToken)
     {
         var schema = table.PrimaryKeySchema
             ?? throw new InvalidDataException("WITHOUT ROWID table has no primary-key schema.");
-        if (schema.Terms.Count != 1)
-            throw new InvalidOperationException("A direct primary-key lookup requires one key column.");
-        var term = schema.Terms[0];
-        if (term.SortOrder != SqliteKeySortOrder.Ascending
-            || !term.Collation.IsBinary
-            || term.Collation.Comparison is not null
-            || !string.Equals(
-                table.ColumnDefinitions[term.ColumnIndex].DeclaredType,
-                "INTEGER",
-                StringComparison.OrdinalIgnoreCase))
+        if (keys.Count != schema.Terms.Count || keys.Count == 0)
+            throw new InvalidOperationException("A direct primary-key lookup requires every key column.");
+        if (schema.Terms.Any(term =>
+                term.SortOrder != SqliteKeySortOrder.Ascending
+                || !term.Collation.IsBinary
+                || term.Collation.Comparison is not null
+                || !string.Equals(
+                    table.ColumnDefinitions[term.ColumnIndex].DeclaredType,
+                    "INTEGER",
+                    StringComparison.OrdinalIgnoreCase)))
         {
             throw new NotSupportedException(
-                "A direct primary-key lookup requires an ascending BINARY INTEGER key.");
+                "A direct primary-key lookup requires ascending BINARY INTEGER keys.");
         }
 
         var comparer = new SqliteIndexRecordComparer(
             textEncoding,
-            [new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)]);
-        var target = new[] { SqlValue.Integer(key) };
+            schema.Terms.Select(static term =>
+                new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+        var target = keys.Select(SqlValue.Integer).ToArray();
         var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
         var pinnedPages = new List<uint>();
         var currentPage = rootPage;
@@ -293,9 +295,9 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         (SqlValue[] Values, int Comparison) DecodeAndCompare(byte[] record)
         {
             var values = SqliteRecordCodec.Decode(record, textEncoding);
-            if (values.Length == 0 || values[0].Kind == SqlValueKind.Null)
-                throw new InvalidDataException("WITHOUT ROWID table record is missing its primary key.");
-            return (values, comparer.Compare(new[] { values[0] }, target));
+            var recordKey = ValidateAndExtractKey(
+                values, table, schema, comparer, previousKey: null, descending: false);
+            return (values, comparer.Compare(recordKey, target));
         }
 
         try

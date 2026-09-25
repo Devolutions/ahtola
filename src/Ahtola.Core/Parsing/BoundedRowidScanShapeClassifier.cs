@@ -19,7 +19,8 @@ internal sealed record BoundedRowidScanPlan(
     SqliteRowIdRange? RowIdRange,
     bool Descending,
     bool WithoutRowid,
-    long? FirstPrimaryKeyEquals);
+    long? FirstPrimaryKeyEquals,
+    IReadOnlyList<long>? FullPrimaryKeyEquals);
 
 /// <summary>
 /// Classifies a parsed SQL statement against an <see cref="AsyncSchemaCatalog"/>, either
@@ -40,8 +41,8 @@ internal sealed record BoundedRowidScanPlan(
 /// [ORDER BY integer-primary-key [ASC|DESC]] [LIMIT n [OFFSET m]]</c>.
 /// No other <c>WHERE</c>, joins/subqueries, <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
 /// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references.
-/// <c>WITHOUT ROWID</c> tables additionally support only ascending BINARY primary keys and
-/// unfiltered, unordered base scans. A registered secondary index does not change a base-table
+/// <c>WITHOUT ROWID</c> tables additionally support ascending BINARY primary keys and
+/// first-key or complete all-INTEGER-key equality. A registered secondary index does not change a base-table
 /// rowid scan or seek; other indexed access paths remain out of scope. Everything else is named follow-on
 /// work, not silently downgraded.
 /// </para>
@@ -158,26 +159,22 @@ internal static class BoundedRowidScanShapeClassifier
         long? equalRowId = null;
         SqliteRowIdRange? rowIdRange = null;
         long? firstPrimaryKeyEquals = null;
+        IReadOnlyList<long>? fullPrimaryKeyEquals = null;
         if (select.Where is { } predicate)
         {
             if (withoutRowid)
             {
-                var first = entry.Table.PrimaryKeySchema!.Terms[0];
-                if (!string.Equals(
-                        entry.Table.ColumnDefinitions[first.ColumnIndex].DeclaredType,
-                        "INTEGER", StringComparison.OrdinalIgnoreCase)
-                    || predicate is not BinaryExpression { Operator: BinaryOperator.Equal } equality
-                    || !(TryMatchFirstPrimaryKey(
-                            equality.Left, equality.Right, tableSource, first, out var key)
-                        || TryMatchFirstPrimaryKey(
-                            equality.Right, equality.Left, tableSource, first, out key)))
+                if (!TryParseWithoutRowidKeyEquality(
+                        predicate, tableSource, entry.Table, out var keys))
                 {
                     rejectionReason =
-                        "WHERE on a bounded WITHOUT ROWID scan requires equality on the first INTEGER primary-key column.";
+                        "WHERE on a bounded WITHOUT ROWID scan requires equality on the first INTEGER primary-key column or every INTEGER primary-key column.";
                     return null;
                 }
 
-                firstPrimaryKeyEquals = key;
+                firstPrimaryKeyEquals = keys[0];
+                if (keys.Length == entry.Table.PrimaryKeySchema!.Terms.Count)
+                    fullPrimaryKeyEquals = keys;
             }
             else if (entry.Table.RowidAliasColumnIndex < 0
                 || !TryParseRowIdRange(predicate, tableSource, entry.Table, out var bounds))
@@ -285,7 +282,55 @@ internal static class BoundedRowidScanShapeClassifier
             rowIdRange,
             select.OrderBy.Count != 0 && select.OrderBy[0].Descending,
             withoutRowid,
-            firstPrimaryKeyEquals);
+            firstPrimaryKeyEquals,
+            fullPrimaryKeyEquals);
+    }
+
+    private static bool TryParseWithoutRowidKeyEquality(
+        Expression predicate,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out long[] keys)
+    {
+        var terms = table.PrimaryKeySchema!.Terms;
+        var values = new long?[terms.Count];
+        var matched = 0;
+
+        bool Visit(Expression expression)
+        {
+            if (expression is BinaryExpression { Operator: BinaryOperator.And } conjunction)
+                return Visit(conjunction.Left) && Visit(conjunction.Right);
+            if (expression is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+                return false;
+
+            for (var index = 0; index < terms.Count; index++)
+            {
+                var term = terms[index];
+                if (!string.Equals(
+                        table.ColumnDefinitions[term.ColumnIndex].DeclaredType,
+                        "INTEGER", StringComparison.OrdinalIgnoreCase)
+                    || values[index].HasValue)
+                    continue;
+                if (!(TryMatchPrimaryKey(equality.Left, equality.Right, source, term, out var value)
+                    || TryMatchPrimaryKey(equality.Right, equality.Left, source, term, out value)))
+                    continue;
+                values[index] = value;
+                matched++;
+                return true;
+            }
+            return false;
+        }
+
+        if (!Visit(predicate) || !values[0].HasValue || matched != 1 && matched != terms.Count)
+        {
+            keys = [];
+            return false;
+        }
+
+        keys = matched == 1
+            ? [values[0]!.Value]
+            : values.Select(static value => value!.Value).ToArray();
+        return true;
     }
 
     private static bool TryParseRowIdRange(
@@ -387,15 +432,15 @@ internal static class BoundedRowidScanShapeClassifier
         return TryGetIntegerLiteral(valueExpression, out rowId);
     }
 
-    private static bool TryMatchFirstPrimaryKey(
+    private static bool TryMatchPrimaryKey(
         Expression columnExpression,
         Expression valueExpression,
         NamedTableSource source,
-        SqlitePrimaryKeyTerm first,
+        SqlitePrimaryKeyTerm term,
         out long key)
     {
         key = 0;
-        return IsNamedColumn(columnExpression, source, first.ColumnName)
+        return IsNamedColumn(columnExpression, source, term.ColumnName)
             && TryGetIntegerLiteral(valueExpression, out key);
     }
 

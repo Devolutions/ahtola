@@ -178,6 +178,123 @@ public sealed class AsyncBoundedWithoutRowidScanTests
     }
 
     [Test]
+    public async Task CompleteCompositeIntegerKeyUsesDirectDescent()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(InMemoryPath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(tenant INTEGER, seq INTEGER, payload TEXT, PRIMARY KEY(tenant, seq)) WITHOUT ROWID;");
+            Execute(connection, "BEGIN;");
+            for (var tenant = 1; tenant <= 4; tenant++)
+            {
+                for (var seq = 1; seq <= 150; seq++)
+                    Execute(connection,
+                        $"INSERT INTO items VALUES ({tenant}, {seq}, '{new string('x', 180)}');");
+            }
+            Execute(connection, "COMMIT;");
+        }
+
+        long separatorTenant;
+        long separatorSeq;
+        await using (var pager = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem), InMemoryPath, InMemoryPath + "-wal", readOnly: true))
+        await using (var counted = new CountingSnapshot(await pager.BeginReadAsync()))
+        {
+            var cache = new BoundedAsyncPageCache(counted, pager.UsableSpace, capacity: 8);
+            var page1 = await cache.ReadPageAsync(1);
+            var encoding = SqliteDatabaseHeader.Parse(page1).TextEncoding;
+            var catalog = await AsyncSchemaCatalogLoader.LoadAsync(cache, encoding);
+            catalog.TryGetTable("items", out var entry).Should().BeTrue();
+            var root = await cache.ReadPageAsync(entry!.RootPage);
+            var interior = SqliteIndexInteriorPageView.Parse(root, pager.UsableSpace, encoding);
+            var record = await new AsyncSqliteOverflowChainReader(cache)
+                .ReadPayloadAsync(interior.Cells[0].Cell.Key);
+            var key = SqliteRecordCodec.Decode(record, encoding);
+            separatorTenant = key[0].AsInteger();
+            separatorSeq = key[1].AsInteger();
+
+            counted.PageCount.Should().BeGreaterThan(20);
+            counted.Reset();
+            var seekCache = new BoundedAsyncPageCache(counted, pager.UsableSpace, capacity: 8);
+            var found = new List<SqlValue[]>();
+            await foreach (var row in AsyncBoundedWithoutRowidTableScanCursor.SeekIntegerPrimaryKeyAsync(
+                seekCache, entry.RootPage, entry.Table, encoding, [4, 149], limit: 1, offset: 0))
+                found.Add(row);
+            found.Should().ContainSingle().Which[1].AsInteger().Should().Be(149);
+            counted.ReadCount.Should().BeLessThan((int)counted.PageCount / 4);
+        }
+
+        await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false, InMemoryPath, pageBudget: 8, CancellationToken.None);
+        await using (var separator = await bounded.ExecuteBoundedScanAsync(
+            $"SELECT seq FROM items WHERE seq = {separatorSeq} AND tenant = {separatorTenant}"))
+        {
+            (await separator.ReadAsync()).Should().BeTrue();
+            separator.GetValue(0).AsInteger().Should().Be(separatorSeq);
+            (await separator.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var missing = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE tenant = 4 AND seq = 151"))
+            (await missing.ReadAsync()).Should().BeFalse();
+
+        await using (var skipped = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE tenant = 4 AND seq = 149 LIMIT 1 OFFSET 1"))
+            (await skipped.ReadAsync()).Should().BeFalse();
+
+        foreach (var sql in new[]
+                 {
+                     "SELECT seq FROM items WHERE seq = 149",
+                     "SELECT seq FROM items WHERE tenant = 4 AND seq = 149 AND seq > 1",
+                 })
+        {
+            var unsupported = async () => await bounded.ExecuteBoundedScanAsync(sql);
+            await unsupported.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+                .WithMessage("*WHERE*");
+        }
+    }
+
+    [Test]
+    public async Task ThreeColumnIntegerKeyRequiresCompleteNonduplicatedEquality()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(InMemoryPath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(tenant INTEGER, region INTEGER, seq INTEGER, payload TEXT, PRIMARY KEY(tenant, region, seq)) WITHOUT ROWID;");
+            Execute(connection, "INSERT INTO items VALUES (-2, 0, 7, 'match'), (-2, 1, 7, 'other'), (1, 0, 7, 'later');");
+        }
+
+        await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false, InMemoryPath, pageBudget: 4, CancellationToken.None);
+        await using (var match = await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items AS i WHERE i.seq = 7 AND -2 = i.tenant AND i.region = 0"))
+        {
+            (await match.ReadAsync()).Should().BeTrue();
+            match.GetValue(0).AsText().Should().Be("match");
+            (await match.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var missing = await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE tenant = -2 AND region = 2 AND seq = 7"))
+            (await missing.ReadAsync()).Should().BeFalse();
+
+        foreach (var sql in new[]
+                 {
+                     "SELECT payload FROM items WHERE tenant = -2 AND region = 0",
+                     "SELECT payload FROM items WHERE tenant = -2 AND tenant = -2 AND region = 0 AND seq = 7",
+                 })
+        {
+            var unsupported = async () => await bounded.ExecuteBoundedScanAsync(sql);
+            await unsupported.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+                .WithMessage("*WHERE*");
+        }
+    }
+
+    [Test]
     public async Task SingleIntegerPrimaryKeyCanBeFoundInAnInteriorRecord()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -498,7 +615,27 @@ public sealed class AsyncBoundedWithoutRowidScanTests
                 {
                 }
             }
+
         }
+    }
+
+    private sealed class CountingSnapshot(IAsyncBoundedReadSnapshot snapshot) : IAsyncBoundedReadSnapshot
+    {
+        public uint PageCount => snapshot.PageCount;
+
+        public int ReadCount { get; private set; }
+
+        public ValueTask<byte[]> ReadPageAsync(
+            uint pageNumber,
+            CancellationToken cancellationToken = default)
+        {
+            ReadCount++;
+            return snapshot.ReadPageAsync(pageNumber, cancellationToken);
+        }
+
+        public void Reset() => ReadCount = 0;
+
+        public ValueTask DisposeAsync() => snapshot.DisposeAsync();
     }
 }
 
