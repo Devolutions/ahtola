@@ -4,7 +4,7 @@
 > [Remaining Turso gap closure plan](turso-remaining-gap-plan.md#live-todos-not-all-represented-by-expected-failure-cases).
 > The 2026-09-06 baseline at `83bb892` has 100 expected-failure entries:
 > 82 parity candidates, 17 deliberate extensions, and one CLI-only diagnostic.
-> **At PR #71 head `6765675` (2026-09-25), the ledger has 73 case-level
+> **At code commit `6765675` in PR #71 (2026-09-25), the ledger has 73 case-level
 > differences, not 73 missing features.** The historical workstream checkboxes
 > and intermediate counts below are not a current zero-gap claim. General
 > typed encode/decode, transactional incremental materialized views, fully

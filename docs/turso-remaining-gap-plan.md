@@ -5,7 +5,7 @@
 Prepared 2026-09-06 against Ahtola `83bb892` and the read-only Turso
 `v0.8.0-pre.7` pin, `277ddd050`.
 
-**Current status (2026-09-25, PR #71 head `6765675`).** The tracked
+**Current status (2026-09-25; code verified through `6765675` in PR #71).** The tracked
 expected-failures file has **73 case-level differences** (verified against the
 file), not 73 missing features; the detailed grouping and live TODOs are
 below. The older integration checkpoints and worker/first-wave instructions
@@ -378,7 +378,7 @@ stale, not a new implementation task.
 
 - [x] Integrate the bounded read, restricted TYPE/DOMAIN, reusable sync-history,
   window input/output spill, and selected JSON EQP slices in **one** parent PR.
-  On head `6765675`, the bounded reader supports rowid predicates/projection,
+  As of code commit `6765675`, the bounded reader supports rowid predicates/projection,
   INTEGER/TEXT BINARY `WITHOUT ROWID` full-key seeks and first-key ranges,
   encrypted AHTLA/WAL snapshots, and an enforced page/WAL-location budget;
   unsupported SQL fails closed.
