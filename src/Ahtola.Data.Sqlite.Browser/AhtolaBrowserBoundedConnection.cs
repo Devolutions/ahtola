@@ -197,6 +197,8 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
         {
             var usableSpace = _pager?.UsableSpace ?? _encryptedSnapshot!.UsableSpace;
             var pageCache = new BoundedAsyncPageCache(readTransaction, usableSpace, _pageBudget);
+            var includeHiddenRowId = !plan.WithoutRowid
+                && plan.ProjectedColumnIndexes.Contains(plan.Table.Columns.Length);
             var rows = plan.WithoutRowid && plan.FullPrimaryKeyEquals is { } exactKeys
                 ? AsyncBoundedWithoutRowidTableScanCursor.SeekPrimaryKeyAsync(
                     pageCache, plan.RootPage, plan.Table, _textEncoding, exactKeys,
@@ -212,10 +214,12 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
                 : plan.Descending
                 ? AsyncBoundedRowidTableScanCursor.ScanDescendingAsync(
                     pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, cancellationToken,
-                    equalRowId: plan.EqualRowId, rowIdRange: plan.RowIdRange, offset: plan.Offset)
+                    equalRowId: plan.EqualRowId, rowIdRange: plan.RowIdRange, offset: plan.Offset,
+                    includeHiddenRowId: includeHiddenRowId)
                 : AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
                     pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, cancellationToken,
-                    equalRowId: plan.EqualRowId, rowIdRange: plan.RowIdRange, offset: plan.Offset);
+                    equalRowId: plan.EqualRowId, rowIdRange: plan.RowIdRange, offset: plan.Offset,
+                    includeHiddenRowId: includeHiddenRowId);
             return new AhtolaBrowserBoundedReader(
                 rows,
                 plan.ProjectedColumnIndexes,

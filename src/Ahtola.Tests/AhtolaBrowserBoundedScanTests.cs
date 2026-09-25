@@ -221,6 +221,15 @@ public sealed class AhtolaBrowserBoundedScanTests
         await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
                          "SELECT id FROM items WHERE id = 120 LIMIT 1 OFFSET 1"))
             (await reader.ReadAsync()).Should().BeFalse();
+
+        await using (var alias = await boundedConnection.ExecuteBoundedScanAsync(
+            "SELECT rowid AS key FROM items WHERE id = 120"))
+        {
+            alias.GetName(0).Should().Be("key");
+            (await alias.ReadAsync()).Should().BeTrue();
+            alias.GetValue(0).AsInteger().Should().Be(120);
+            (await alias.ReadAsync()).Should().BeFalse();
+        }
     }
 
     [Test]
@@ -258,10 +267,12 @@ public sealed class AhtolaBrowserBoundedScanTests
         }
 
         await using (var alternate = await bounded.ExecuteBoundedScanAsync(
-            "SELECT label FROM shadowed WHERE _rowid_ = 1"))
+            "SELECT rowid, _rowid_, label FROM shadowed WHERE _rowid_ = 1"))
         {
             (await alternate.ReadAsync()).Should().BeTrue();
-            alternate.GetValue(0).AsText().Should().Be("shadowed");
+            alternate.GetValue(0).AsText().Should().Be("text-rowid");
+            alternate.GetValue(1).AsInteger().Should().Be(1);
+            alternate.GetValue(2).AsText().Should().Be("shadowed");
             (await alternate.ReadAsync()).Should().BeFalse();
         }
 
@@ -275,10 +286,21 @@ public sealed class AhtolaBrowserBoundedScanTests
         await shadowedOrder.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
             .WithMessage("*ORDER BY*");
 
-        var noHiddenProjection = async () => await bounded.ExecuteBoundedScanAsync(
-            "SELECT rowid FROM items");
-        await noHiddenProjection.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
-            .WithMessage("*does not exist*");
+        await using (var projection = await bounded.ExecuteBoundedScanAsync(
+            "SELECT rowid, label FROM items ORDER BY rowid DESC LIMIT 2"))
+        {
+            projection.FieldCount.Should().Be(2);
+            (await projection.ReadAsync()).Should().BeTrue();
+            projection.GetValue(0).AsInteger().Should().Be(4);
+            projection.GetValue(1).AsText().Should().Be("fourth");
+            (await projection.ReadAsync()).Should().BeTrue();
+            projection.GetValue(0).AsInteger().Should().Be(3);
+            projection.GetValue(1).AsText().Should().Be("third");
+            (await projection.ReadAsync()).Should().BeFalse();
+        }
+
+        await using var star = await bounded.ExecuteBoundedScanAsync("SELECT * FROM items LIMIT 1");
+        star.FieldCount.Should().Be(1);
     }
 
     [Test]

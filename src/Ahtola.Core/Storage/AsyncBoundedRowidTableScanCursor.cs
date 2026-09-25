@@ -66,10 +66,11 @@ internal static class AsyncBoundedRowidTableScanCursor
         CancellationToken cancellationToken = default,
         long? equalRowId = null,
         SqliteRowIdRange? rowIdRange = null,
-        long offset = 0)
+        long offset = 0,
+        bool includeHiddenRowId = false)
         => ScanAscendingAsync(
             pageCache, rootPage, table, textEncoding, limit, cancellationToken, equalRowId, rowIdRange, offset,
-            descending: true);
+            descending: true, includeHiddenRowId: includeHiddenRowId);
 
     public static async IAsyncEnumerable<SqlValue[]> ScanAscendingAsync(
         BoundedAsyncPageCache pageCache,
@@ -81,7 +82,8 @@ internal static class AsyncBoundedRowidTableScanCursor
         long? equalRowId = null,
         SqliteRowIdRange? rowIdRange = null,
         long offset = 0,
-        bool descending = false)
+        bool descending = false,
+        bool includeHiddenRowId = false)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
         ArgumentNullException.ThrowIfNull(table);
@@ -96,7 +98,8 @@ internal static class AsyncBoundedRowidTableScanCursor
                     table,
                     textEncoding,
                     soughtRowId,
-                    cancellationToken).ConfigureAwait(false) is { } found)
+                    cancellationToken,
+                    includeHiddenRowId).ConfigureAwait(false) is { } found)
             {
                 yield return found;
             }
@@ -217,7 +220,7 @@ internal static class AsyncBoundedRowidTableScanCursor
                         if (table.RowidAliasColumnIndex >= 0)
                             values[table.RowidAliasColumnIndex] = SqlValue.Integer(cell.Cell.RowId);
 
-                        yield return values;
+                        yield return WithHiddenRowId(values, cell.Cell.RowId, includeHiddenRowId);
                         yielded++;
                     }
                 }
@@ -264,7 +267,8 @@ internal static class AsyncBoundedRowidTableScanCursor
         EmbeddedTable table,
         SqliteTextEncoding textEncoding,
         long rowId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool includeHiddenRowId)
     {
         var pinnedPages = new List<uint>();
         var pageNumber = rootPage;
@@ -300,7 +304,7 @@ internal static class AsyncBoundedRowidTableScanCursor
                             SqliteRecordCodec.Decode(record, textEncoding));
                         if (table.RowidAliasColumnIndex >= 0)
                             values[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
-                        return values;
+                        return WithHiddenRowId(values, rowId, includeHiddenRowId);
 
                     default:
                         throw new InvalidDataException(
@@ -316,6 +320,16 @@ internal static class AsyncBoundedRowidTableScanCursor
             foreach (var pinnedPage in pinnedPages)
                 pageCache.Unpin(pinnedPage);
         }
+    }
+
+    private static SqlValue[] WithHiddenRowId(SqlValue[] values, long rowId, bool includeHiddenRowId)
+    {
+        if (!includeHiddenRowId)
+            return values;
+        var projected = new SqlValue[values.Length + 1];
+        values.CopyTo(projected, 0);
+        projected[^1] = SqlValue.Integer(rowId);
+        return projected;
     }
 
     private static uint ChildAt(SqliteTableInteriorPageView view, int childIndex)

@@ -215,9 +215,14 @@ internal static class BoundedRowidScanShapeClassifier
                         candidate => string.Equals(candidate, column.Name, StringComparison.OrdinalIgnoreCase));
                     if (columnIndex < 0)
                     {
-                        rejectionReason =
-                            $"Column '{column.Name}' does not exist on table '{tableSource.Name}'.";
-                        return null;
+                        if (!withoutRowid && IsRowIdColumn(column, tableSource, entry.Table))
+                            columnIndex = entry.Table.Columns.Length;
+                        else
+                        {
+                            rejectionReason =
+                                $"Column '{column.Name}' does not exist on table '{tableSource.Name}'.";
+                            return null;
+                        }
                     }
 
                     columnIndexes.Add(columnIndex);

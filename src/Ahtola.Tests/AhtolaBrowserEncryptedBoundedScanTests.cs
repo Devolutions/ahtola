@@ -39,6 +39,12 @@ public sealed class AhtolaBrowserEncryptedBoundedScanTests
             reader.GetValue(0).AsInteger().Should().Be(2);
             reader.GetValue(1).AsText().Should().Be("second");
             (await reader.ReadAsync()).Should().BeFalse();
+
+            await using var hiddenRowId = await bounded.ExecuteBoundedScanAsync(
+                "SELECT rowid FROM items WHERE id = 2");
+            (await hiddenRowId.ReadAsync()).Should().BeTrue();
+            hiddenRowId.GetValue(0).AsInteger().Should().Be(2);
+            (await hiddenRowId.ReadAsync()).Should().BeFalse();
         }
     }
 
