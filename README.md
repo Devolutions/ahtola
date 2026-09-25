@@ -430,8 +430,8 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   allows `CREATE TYPE name BASE INTEGER` (identity types) and
   `CREATE DOMAIN name AS INTEGER` with DEFAULT, NOT NULL and CHECK clauses to
   persist definitions in `__turso_internal_types`. Definitions survive reopen,
-  participate in transactions and advance the schema cookie. **Columns
-  declared with an INTEGER-based DOMAIN are supported only in STRICT tables:
+  participate in transactions and advance the schema cookie. **INTEGER-based
+  DOMAIN columns** are supported only in STRICT tables:
   writes apply INTEGER affinity, inherited DEFAULT/NOT NULL/CHECK constraints,
   and reads use the primitive INTEGER storage class. Such columns retain their
   domain metadata through reopen, transactions, and savepoints; compiled DML
