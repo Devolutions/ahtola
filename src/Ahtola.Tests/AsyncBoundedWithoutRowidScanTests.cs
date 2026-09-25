@@ -44,6 +44,22 @@ public sealed class AsyncBoundedWithoutRowidScanTests
         while (await reader.ReadAsync())
             rows.Add((reader.GetValue(0).AsInteger(), reader.GetValue(1).AsText(), reader.GetValue(2).AsText()));
         rows.Should().Equal((2L, "first", "a"), (5L, "middle", "a"), (9L, "last", "b"));
+
+        await reader.DisposeAsync();
+        await using var ordered = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items AS i ORDER BY i.tenant, i.seq LIMIT 2");
+        var labels = new List<string>();
+        while (await ordered.ReadAsync())
+            labels.Add(ordered.GetValue(0).AsText());
+        labels.Should().Equal("first", "middle");
+
+        await ordered.DisposeAsync();
+        await using var prefix = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items ORDER BY tenant LIMIT 2");
+        var sequence = new List<long>();
+        while (await prefix.ReadAsync())
+            sequence.Add(prefix.GetValue(0).AsInteger());
+        sequence.Should().Equal(2L, 5L);
     }
 
     [Test]
@@ -265,7 +281,8 @@ public sealed class AsyncBoundedWithoutRowidScanTests
             ("SELECT * FROM descending", "primary key"),
             ("SELECT * FROM collated", "primary key"),
             ("SELECT * FROM ascending WHERE code = 'a'", "WHERE"),
-            ("SELECT * FROM ascending ORDER BY code", "ORDER BY"),
+            ("SELECT * FROM ascending ORDER BY value", "ORDER BY"),
+            ("SELECT * FROM ascending ORDER BY code DESC", "ORDER BY"),
             ("SELECT * FROM ascending INDEXED BY ascending_value", "INDEXED BY"),
             ("SELECT rowid FROM ascending", "does not exist"),
         })

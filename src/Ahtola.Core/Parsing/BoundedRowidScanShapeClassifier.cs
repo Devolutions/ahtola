@@ -138,13 +138,14 @@ internal static class BoundedRowidScanShapeClassifier
             return null;
         }
 
-        if (withoutRowid && select.OrderBy.Count != 0)
+        if (withoutRowid && select.OrderBy.Count != 0
+            && !IsWithoutRowidPrimaryKeyOrder(select.OrderBy, tableSource, entry.Table))
         {
-            rejectionReason = "ORDER BY is not supported for bounded WITHOUT ROWID scans.";
+            rejectionReason = "ORDER BY on a bounded WITHOUT ROWID scan requires an ascending primary-key prefix.";
             return null;
         }
 
-        if (select.OrderBy.Count != 0
+        if (!withoutRowid && select.OrderBy.Count != 0
             && (entry.Table.RowidAliasColumnIndex < 0
                 || select.OrderBy is not [var order]
                 || !IsRowIdColumn(order.Expression, tableSource, entry.Table)))
@@ -386,11 +387,31 @@ internal static class BoundedRowidScanShapeClassifier
         }
     }
 
+    private static bool IsWithoutRowidPrimaryKeyOrder(
+        IReadOnlyList<OrderByTerm> order,
+        NamedTableSource source,
+        EmbeddedTable table)
+    {
+        var terms = table.PrimaryKeySchema!.Terms;
+        if (order.Count > terms.Count)
+            return false;
+        for (var index = 0; index < order.Count; index++)
+        {
+            if (order[index].Descending
+                || !IsNamedColumn(order[index].Expression, source, terms[index].ColumnName))
+                return false;
+        }
+        return true;
+    }
+
     private static bool IsRowIdColumn(Expression expression, NamedTableSource source, EmbeddedTable table)
+        => IsNamedColumn(expression, source, table.Columns[table.RowidAliasColumnIndex]);
+
+    private static bool IsNamedColumn(Expression expression, NamedTableSource source, string name)
         => expression is ColumnExpression { Schema: null } column
             && string.Equals(
                 column.UnqualifiedName ?? column.Name,
-                table.Columns[table.RowidAliasColumnIndex],
+                name,
                 StringComparison.OrdinalIgnoreCase)
             && (column.Qualifier is null
                 || string.Equals(
