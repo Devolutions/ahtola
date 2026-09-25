@@ -425,7 +425,8 @@ evaluator redesign;
 TYPE/DOMAIN adoption must keep SQLite's five physical storage classes: the
 pinned Turso engine persists named definitions as SQL, resolves base-type
 chains, and encodes/decodes values at column boundaries. Identity INTEGER TYPE
-columns now carry resolved metadata through STRICT-table writes and reopen;
+columns now carry resolved metadata through STRICT-table writes and reopen,
+and their CAST returns the unchanged stored representation;
 custom encode/decode expressions and general type chains are not implemented.
 Persisted definitions must reload, and scalar/domain validation must agree
 across INSERT, SELECT, UPDATE, indexes, and foreign keys before enabling the

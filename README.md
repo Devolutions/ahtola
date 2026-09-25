@@ -436,6 +436,7 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   only in STRICT tables. Domain writes apply INTEGER affinity and inherited
   DEFAULT/NOT NULL/CHECK constraints; identity TYPE columns use INTEGER
   affinity and declared column constraints without an encode/decode expression.
+  `CAST(value AS identity_type)` preserves the input storage value.
   Reads use the primitive INTEGER storage class. Both retain their type
   metadata through reopen, transactions, and savepoints; compiled DML
   falls back to the validating evaluator while the type registry is present.
@@ -445,8 +446,9 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   ALTER TABLE on typed tables fail closed. Domain DEFAULT is
   limited to constant INTEGER expressions and CHECK to literal/value unary
   and binary expressions; unsupported expressions are rejected at declaration.
-  Non-identity TYPE bodies, non-INTEGER bases, DROP TYPE/DOMAIN and typed casts are
-  not supported. The opt-in is not exposed through the ADO.NET connection string.
+  Non-identity TYPE bodies, non-INTEGER bases, DROP TYPE/DOMAIN and domain or
+  non-identity typed casts are not supported. The opt-in is not exposed through
+  the ADO.NET connection string.
   The bounded asynchronous catalog scan fails closed for databases containing
   type definitions until that reader can resolve their metadata.
   `CREATE SEQUENCE` / `DROP SEQUENCE` and the `nextval` / `currval` / `setval`

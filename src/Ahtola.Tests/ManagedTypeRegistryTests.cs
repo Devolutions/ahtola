@@ -489,6 +489,34 @@ public sealed class ManagedTypeRegistryTests
     }
 
     [Test]
+    public void IdentityTypeCastKeepsStoredValueAcrossSelectAggregateAndReturning()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        connection.ExperimentalCustomTypesEnabled = true;
+        Execute(connection, "CREATE TYPE counter BASE INTEGER");
+        Execute(connection, "CREATE TABLE ordinary(value INTEGER)");
+
+        Scalar(connection, "SELECT CAST(42 AS counter)").Should().Be(42);
+        using (var text = connection.Prepare("SELECT CAST('7' AS counter)"))
+        {
+            text.Step().Should().Be(StatementStepResult.Row);
+            text.GetValue(0).AsText().Should().Be("7");
+            text.Step().Should().Be(StatementStepResult.Done);
+        }
+
+        using (var insert = connection.Prepare(
+            "INSERT INTO ordinary VALUES (5) RETURNING CAST(value AS counter)"))
+        {
+            insert.Step().Should().Be(StatementStepResult.Row);
+            insert.GetValue(0).AsInteger().Should().Be(5);
+            insert.Step().Should().Be(StatementStepResult.Done);
+        }
+        Scalar(connection, "SELECT CAST(COUNT(*) AS counter) FROM ordinary").Should().Be(1);
+        Scalar(connection, "SELECT value FROM ordinary").Should().Be(5);
+    }
+
+    [Test]
     public void IntegerDomainParametersUsePrimitiveAffinityAndStillValidateWrites()
     {
         using var database = new EmbeddedDatabase();

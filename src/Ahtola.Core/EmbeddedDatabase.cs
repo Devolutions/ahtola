@@ -10498,7 +10498,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     groupByScope);
                 return;
             case CastExpression cast:
-                RejectTypedCast(cast.TypeName, context);
+                _ = IsIdentityTypedCast(cast.TypeName, context);
                 ValidateExpressionSchema(
                     cast.Expression,
                     row,
@@ -42442,15 +42442,21 @@ out bool hasReturning)
         SourceRow? row,
         QueryContext context)
     {
-        RejectTypedCast(expression.TypeName, context);
-        return CastValue(Evaluate(expression.Expression, parameters, row, context), expression.TypeName);
+        var identity = IsIdentityTypedCast(expression.TypeName, context);
+        var value = Evaluate(expression.Expression, parameters, row, context);
+        return identity ? value : CastValue(value, expression.TypeName);
     }
 
-    private static void RejectTypedCast(string typeName, QueryContext context)
+    private static bool IsIdentityTypedCast(string typeName, QueryContext context)
     {
         if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
-            && ManagedTypeRegistry.Load(context.Tables).ContainsKey(typeName))
+            && ManagedTypeRegistry.Load(context.Tables).TryGetValue(typeName, out var definition))
+        {
+            if (definition is CreateTypeStatement)
+                return true;
             throw new EmbeddedSqlException($"CAST to custom type '{typeName}' is not yet supported.");
+        }
+        return false;
     }
 
     private SqlValue EvaluateCase(
@@ -43920,8 +43926,9 @@ out bool hasReturning)
         QueryContext context,
         SourceRow? representative)
     {
-        RejectTypedCast(cast.TypeName, context);
-        return CastValue(EvaluateAggregate(cast.Expression, rows, parameters, context, representative), cast.TypeName);
+        var identity = IsIdentityTypedCast(cast.TypeName, context);
+        var value = EvaluateAggregate(cast.Expression, rows, parameters, context, representative);
+        return identity ? value : CastValue(value, cast.TypeName);
     }
 
     private SqlValue EvaluateAggregate(
