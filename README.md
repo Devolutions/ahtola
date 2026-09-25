@@ -419,7 +419,9 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   changes without closing sibling hosts, then applies one-shot staged changes
   under the publication and cross-process leases. Local journal advancement is
   rebased without another network pull; genuinely stale remote bases retry with
-  a bound. Page replacement retains crash-safe revert evidence. Pulls request
+  a bound. Page replacement retains crash-safe revert evidence; protected
+  snapshots can reuse a SHA-pinned full-image history root across generations
+  and store sparse original/committed revert segments. Pulls request
   raw pages explicitly and reject zstd responses because no approved
   pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
@@ -453,9 +455,9 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   machine-readable envelope from Turso's `docs/eqp-json.md`. The inner
   statement's result columns (including DML `RETURNING`) and several
   structured per-node `op` variants are modeled, including virtual-table
-  scans, selected managed index methods, and compiled two-table join scans/seeks;
-  other plan shapes still carry
-  explicit `unmodeled` operations or no nodes when no access path is proven
+  scans, selected managed index methods, compiled two-table join scans/seeks,
+  and proven materialized three-table hash prefixes. Other plan shapes still
+  carry explicit `unmodeled` operations or no nodes when no access path is proven
   (for example, an unmodeled view). Built-in `get_byte`/`set_byte`
   (PostgreSQL-compatible byte access) and `json_object(*)`/`jsonb_object(*)`
   (one label/value pair per FROM-row column) match the pinned Turso corpus.

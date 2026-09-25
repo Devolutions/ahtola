@@ -361,8 +361,8 @@ stale, not a new implementation task.
 | 1 | Extend the browser's opt-in bounded read profile in small, explicitly classified shapes | **Current slices:** an `INTEGER PRIMARY KEY = integer literal` predicate uses a page-bounded rowid point seek; integer-literal range comparisons and inclusive `BETWEEN` seek the starting bound and stop at the other, in ascending or descending rowid order. Literal `OFFSET` skips matched rows before `LIMIT` counts emitted rows; unsupported predicates reject before scan I/O. Registered secondary indexes no longer block base-table rowid scans or seeks (the secondary b-trees are not traversed). Expand to typed predicates, joins, secondary-index access and `WITHOUT ROWID` reads only with separate bounds and snapshot tests. |
 | 2 | Bound the entire buffered-window evaluator, not only its input | Charge partition keys, frame positions, function inputs, results, and spill indexes *before* allocation; compute/drain partitions incrementally; release reservations even on exceptions. Demonstrate a finite `cache_size` peak with large partitions, both spill modes and evaluator/compiled routes; do not treat output-only spilling as closure. |
 | 3 | Complete physical working-set and query-plan depth | Avoid mandatory whole-b-tree validation/first-touch whole-table hydration where safe while retaining explicit corruption detection; make each JSON EQP operation come from the executed access path, including view/CTE materialization, rather than fabricate missing nodes. |
-| 4 | Adopt Turso-specific SQL families as distinct product projects | The remaining 28 unadopted pinned `turso-sqltests` files cover TYPE/DOMAIN/typed values (23) and incremental materialized views (5). Specify durable type encoding, planner/runtime behavior, transaction maintenance and recovery before enabling their `@requires` capabilities; keep the corpus byte-faithful. |
-| 5 | Deepen sync and platform compatibility | Reusable multi-generation sync-prefix history must decode existing durable recovery formats, preserve publication leases, and survive crash/reopen tests. Expand portable locale tailoring and browser encryption only when deterministic persisted ordering and bounded async page codecs can be guaranteed. Native loadable extensions/raw sqlite3 handles and the PostgreSQL server are separate product-scope decisions, not hidden SQLite failures. |
+| 4 | Adopt Turso-specific SQL families as distinct product projects | The remaining 28 unadopted pinned `turso-sqltests` files cover TYPE/DOMAIN/typed values (23) and incremental materialized views (5). A gated, durable INTEGER TYPE/DOMAIN *definition registry* is now implemented; no typed column/value semantics or materialized views are claimed. Complete encode/decode, planner/runtime behavior, transaction maintenance and recovery before enabling their `@requires` capabilities; keep the corpus byte-faithful. |
+| 5 | Deepen sync and platform compatibility | A SHA-pinned, immutable sync-history root now permits sparse original/committed revert segments across generations with v4/v5 compatibility, leases, and crash/reopen tests. The root still costs one full image; high-change generations fall back to full captures. Expand portable locale tailoring and browser encryption only when deterministic persisted ordering and bounded async page codecs can be guaranteed. Native loadable extensions/raw sqlite3 handles and the PostgreSQL server are separate product-scope decisions, not hidden SQLite failures. |
 
 For each slice: compare the pinned Rust implementation, add focused regression
 coverage, run the affected managed suite and cross-framework/package gates,
@@ -373,10 +373,14 @@ difference should remain documented.
 
 The first SYNC format-depth slice stores a sparse committed-image revert
 segment for a protected snapshot when its changed-page set is smaller than
-the full image, with hash-checked reconstruction on reopen. Its format-5
-metadata and the existing format-4 decoder both remain supported. The
-original-image segment is still full and no synced prefix is retained across
-generations; **reusable multi-generation history remains open**.
+the full image, with hash-checked reconstruction on reopen. The follow-on
+format-6 revert state references an immutable full-image history root by
+SHA-256; metadata versions 9–12 retain that root while a protected recovery
+or ambiguous push can need it. Subsequent generations can store sparse
+original **and** committed segments. Format-4/5 recovery remains readable
+without a history root. This closes reusable protected-prefix capture for
+the supported cases; it is not a claim that every Turso sync-engine path,
+large delta, or compressed replica format is ported.
 
 Compiled named-table join seeks now attach typed JSON `search` operations
 from the selected program plan (actual table/alias, chosen durable or
