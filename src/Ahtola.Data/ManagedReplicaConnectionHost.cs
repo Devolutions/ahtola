@@ -1213,7 +1213,8 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             selectionMetadata.Revision,
             selectionMetadata.RevertState?.Phase,
             selectionMetadata.PushState,
-            _changeJournal.Generation);
+            _changeJournal.Generation,
+            selectionMetadata.HistorySha256);
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Pushing));
         using var client = replicaOptions.HttpPolicy.CreateHttpClient(replicaOptions.RemoteEncryption is not null);
@@ -1358,7 +1359,8 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         string Revision,
         ManagedReplicaBootstrapper.ManagedReplicaRevertPhase? RevertPhase,
         ManagedReplicaBootstrapper.ManagedReplicaPushState? PushState,
-        ReplicaJournalGeneration Journal);
+        ReplicaJournalGeneration Journal,
+        string? HistorySha256);
 
     /// <summary>
     /// Durably acknowledges a remote-confirmed push while holding the exclusive physical apply
@@ -1449,6 +1451,7 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         if (!string.Equals(current.Revision, generation.Revision, StringComparison.Ordinal)
             || current.RevertState?.Phase != generation.RevertPhase
             || current.PushState != generation.PushState
+            || !string.Equals(current.HistorySha256, generation.HistorySha256, StringComparison.Ordinal)
             || durable.Generation != generation.Journal)
         {
             throw new AhtolaException(

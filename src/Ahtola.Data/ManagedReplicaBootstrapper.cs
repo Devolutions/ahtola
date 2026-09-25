@@ -339,6 +339,7 @@ internal static class ManagedReplicaBootstrapper
             "6" => LoadV6Metadata(values),
             "7" => LoadV7Metadata(values),
             "8" => LoadV8Metadata(values),
+            "9" or "10" or "11" or "12" => LoadHistoryMetadata(values, version),
             _ => throw new InvalidDataException($"Managed embedded replica metadata has an unsupported version '{version}'."),
         };
     }
@@ -464,6 +465,40 @@ internal static class ManagedReplicaBootstrapper
             pushState,
             DecodeJournalBaseWatermark(values),
             DecodeRemoteBaseSha256(values));
+    }
+
+    private static ManagedReplicaMetadata LoadHistoryMetadata(
+        Dictionary<string, string> values,
+        string version)
+    {
+        if (!values.TryGetValue("history_sha256", out var historySha256)
+            || !IsSha256Hex(historySha256))
+            throw new InvalidDataException("Managed embedded replica history reference is invalid.");
+
+        ManagedReplicaRevertState? revertState =
+            version is "10" or "12" ? DecodeRevertStateField(values) : null;
+        ManagedReplicaPushState? pushState =
+            version is "11" or "12" ? DecodePushStateField(values) : null;
+        if (revertState is { Phase: ManagedReplicaRevertPhase.PushOutcomeUnknown } unknown
+            && (pushState is not { } push
+                || unknown.AttemptedFirstSequence != push.FirstSequence
+                || unknown.AttemptedWatermark != push.Watermark))
+            throw new InvalidDataException("Managed embedded replica history metadata contains inconsistent push recovery.");
+        return LoadCurrentMetadata(
+            values,
+            expectedFieldCount: version switch
+            {
+                "9" => 9,
+                "10" or "11" => 10,
+                _ => 11,
+            },
+            revertState,
+            pushState,
+            DecodeJournalBaseWatermark(values),
+            DecodeRemoteBaseSha256(values)) with
+        {
+            HistorySha256 = historySha256,
+        };
     }
 
     private static ManagedReplicaMetadata LoadCurrentMetadata(
@@ -691,6 +726,9 @@ internal static class ManagedReplicaBootstrapper
         writer.Write(Convert.FromHexString(state.OriginalDatabaseSha256));
         writer.Write(Convert.FromHexString(state.CommittedDatabaseSha256));
         writer.Write(Convert.FromHexString(state.RevertWalSha256));
+        if (state.FormatVersion == 6)
+            writer.Write(Convert.FromHexString(state.ParentSha256
+                ?? throw new InvalidDataException("Managed replica revert history reference is missing.")));
         writer.Flush();
         writer.Write(SHA256.HashData(buffer.GetBuffer().AsSpan(0, checked((int)buffer.Length))));
         return buffer.ToArray();
@@ -698,9 +736,11 @@ internal static class ManagedReplicaBootstrapper
 
     private static ManagedReplicaRevertState DecodeRevertState(byte[] bytes)
     {
-        const int payloadLength = 2 + (3 * sizeof(long)) + (10 * sizeof(uint)) + 96;
-        const int encodedLength = payloadLength + 32;
-        if (bytes.Length != encodedLength || bytes[0] is not (4 or 5))
+        const int basePayloadLength = 2 + (3 * sizeof(long)) + (10 * sizeof(uint)) + 96;
+        var payloadLength = basePayloadLength + (bytes.Length == basePayloadLength + 64 ? 32 : 0);
+        var encodedLength = payloadLength + 32;
+        if (bytes.Length != encodedLength || bytes[0] is not (4 or 5 or 6)
+            || (bytes[0] == 6) != (payloadLength != basePayloadLength))
             throw new InvalidDataException("Managed embedded replica revert state is malformed.");
         if (!CryptographicOperations.FixedTimeEquals(
                 SHA256.HashData(bytes.AsSpan(0, payloadLength)),
@@ -741,6 +781,8 @@ internal static class ManagedReplicaBootstrapper
         var committedDatabaseSha256 = Convert.ToHexString(bytes.AsSpan(offset, 32));
         offset += 32;
         var revertWalSha256 = Convert.ToHexString(bytes.AsSpan(offset, 32));
+        offset += 32;
+        var parentSha256 = bytes[0] == 6 ? Convert.ToHexString(bytes.AsSpan(offset, 32)) : null;
         var hasAttemptedBatch = attemptedFirstSequence > 0 && attemptedWatermark > attemptedFirstSequence;
         if (!Enum.IsDefined(phase)
             || phase == ManagedReplicaRevertPhase.None
@@ -751,11 +793,13 @@ internal static class ManagedReplicaBootstrapper
             || attemptedFirstSequence < 0
             || attemptedWatermark < 0
             || originalDatabaseSizeInPages == 0
-            || originalRevertWalFrameCount != originalDatabaseSizeInPages
+            || (bytes[0] != 6 && originalRevertWalFrameCount != originalDatabaseSizeInPages)
+            || (bytes[0] == 6 && (originalRevertWalFrameCount == 0
+                                  || originalRevertWalFrameCount > originalDatabaseSizeInPages))
             || originalRevertWalFrameCount > int.MaxValue
             || committedDatabaseSizeInPages == 0
             || (bytes[0] == 4 && committedRevertWalFrameCount != committedDatabaseSizeInPages)
-            || (bytes[0] == 5 && (committedRevertWalFrameCount == 0
+            || (bytes[0] is 5 or 6 && (committedRevertWalFrameCount == 0
                                   || committedRevertWalFrameCount > committedDatabaseSizeInPages))
             || committedRevertWalFrameCount > int.MaxValue)
         {
@@ -780,7 +824,8 @@ internal static class ManagedReplicaBootstrapper
             originalDatabaseSha256,
             committedDatabaseSha256,
             revertWalSha256,
-            bytes[0]);
+            bytes[0],
+            parentSha256);
     }
 
     private static byte[] EncodePushState(ManagedReplicaPushState state)
@@ -1215,6 +1260,7 @@ internal static class ManagedReplicaBootstrapper
                 && string.Equals(freshMetadata.DatabaseSha256, metadata.DatabaseSha256, StringComparison.Ordinal)
                 && freshMetadata.RevertState == metadata.RevertState
                 && freshMetadata.PushState == metadata.PushState
+                && string.Equals(freshMetadata.HistorySha256, metadata.HistorySha256, StringComparison.Ordinal)
                 && freshMetadata.JournalBaseWatermark == metadata.JournalBaseWatermark;
 
             if (!remoteFacingIdentityUnchanged || attempt >= MaxLocalJournalRebaseAttempts)
@@ -1590,6 +1636,10 @@ internal static class ManagedReplicaBootstrapper
                 StringComparison.Ordinal)
             && freshMetadata.RevertState == requestBaseMetadata.RevertState
             && freshMetadata.PushState == requestBaseMetadata.PushState
+            && string.Equals(
+                freshMetadata.HistorySha256,
+                requestBaseMetadata.HistorySha256,
+                StringComparison.Ordinal)
             && freshMetadata.JournalBaseWatermark == requestBaseMetadata.JournalBaseWatermark
             && HaveSamePendingLocalChangeSequence(requestBasePendingLocalChanges, freshPendingLocalChanges)
             && HaveSamePendingLocalChangeSequence(
@@ -1868,7 +1918,8 @@ internal static class ManagedReplicaBootstrapper
                         revertState: metadata.RevertState,
                         pushState: metadata.PushState,
                         journalBaseWatermark: journalBaseWatermark,
-                        remoteBaseSha256: remoteBaseSha256)
+                        remoteBaseSha256: remoteBaseSha256,
+                        historySha256: metadata.HistorySha256)
                     .ConfigureAwait(false);
             }
             finally
@@ -2286,7 +2337,8 @@ internal static class ManagedReplicaBootstrapper
                     revertState: null,
                     pushState: null,
                     journalBaseWatermark: metadata.JournalBaseWatermark,
-                    remoteBaseSha256: metadata.RemoteBaseSha256)
+                    remoteBaseSha256: metadata.RemoteBaseSha256,
+                    historySha256: metadata.HistorySha256)
                 .ConfigureAwait(false);
             var updated = metadata with
             {
@@ -2429,7 +2481,8 @@ internal static class ManagedReplicaBootstrapper
                     revertState: metadata.RevertState,
                     pushState: metadata.PushState,
                     journalBaseWatermark: metadata.JournalBaseWatermark,
-                    remoteBaseSha256: remoteBaseSha256)
+                    remoteBaseSha256: remoteBaseSha256,
+                    historySha256: metadata.HistorySha256)
                 .ConfigureAwait(false);
             ManagedReplicaFaultInjection.Hit(
                 ManagedReplicaDurableBoundary.PartialImageMetadataPublished);
@@ -2686,6 +2739,7 @@ internal static class ManagedReplicaBootstrapper
                 PushState = metadata.PushState,
                 JournalBaseWatermark = AdvanceJournalBaseWatermark(metadata, acknowledgedLocalChanges),
                 RemoteBaseSha256 = remoteBaseSha256,
+                HistorySha256 = metadata.HistorySha256,
             };
             ManagedReplicaReplacementState.Recover(options.Path);
             mainFileReplacementLock = ManagedReplicaApplyLock.AcquireMainFileReplacementLock(
@@ -2735,7 +2789,8 @@ internal static class ManagedReplicaBootstrapper
                     clientId: replacementMetadata.ClientId,
                     pushState: replacementMetadata.PushState,
                     journalBaseWatermark: replacementMetadata.JournalBaseWatermark,
-                    remoteBaseSha256: replacementMetadata.RemoteBaseSha256)
+                    remoteBaseSha256: replacementMetadata.RemoteBaseSha256,
+                    historySha256: replacementMetadata.HistorySha256)
                 .ConfigureAwait(false);
             metadataInstalled = true;
             CompleteRemoteBaseSnapshotPublication(options.Path);
@@ -3197,7 +3252,8 @@ internal static class ManagedReplicaBootstrapper
         ManagedReplicaRevertState? revertState = null,
         ManagedReplicaPushState? pushState = null,
         long journalBaseWatermark = 1,
-        string? remoteBaseSha256 = null)
+        string? remoteBaseSha256 = null,
+        string? historySha256 = null)
     {
         var metadata = CreateMetadataBytes(
             revision,
@@ -3208,7 +3264,8 @@ internal static class ManagedReplicaBootstrapper
             revertState,
             pushState,
             journalBaseWatermark,
-            remoteBaseSha256 ?? fingerprint);
+            remoteBaseSha256 ?? fingerprint,
+            historySha256);
         await using (var stream = new FileStream(
             stagingPath,
             FileMode.CreateNew,
@@ -3242,7 +3299,8 @@ internal static class ManagedReplicaBootstrapper
             || !string.Equals(current.DatabaseSha256, expected.DatabaseSha256, StringComparison.Ordinal)
             || !string.Equals(current.ClientId, expected.ClientId, StringComparison.Ordinal)
             || current.Protocol != expected.Protocol
-            || !string.Equals(current.RemoteBaseSha256, expected.RemoteBaseSha256, StringComparison.Ordinal))
+            || !string.Equals(current.RemoteBaseSha256, expected.RemoteBaseSha256, StringComparison.Ordinal)
+            || !string.Equals(current.HistorySha256, expected.HistorySha256, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 "Managed embedded replica metadata changed while page materialization was in flight; "
@@ -3264,7 +3322,8 @@ internal static class ManagedReplicaBootstrapper
             metadata.RevertState,
             metadata.PushState,
             metadata.JournalBaseWatermark,
-            metadata.RemoteBaseSha256);
+            metadata.RemoteBaseSha256,
+            metadata.HistorySha256);
         using (var stream = new FileStream(
                    stagingPath,
                    FileMode.CreateNew,
@@ -3294,7 +3353,8 @@ internal static class ManagedReplicaBootstrapper
             metadata.RevertState,
             metadata.PushState,
             metadata.JournalBaseWatermark,
-            metadata.RemoteBaseSha256)));
+            metadata.RemoteBaseSha256,
+            metadata.HistorySha256)));
 
     private static byte[] CreateMetadataBytes(
         string revision,
@@ -3305,7 +3365,8 @@ internal static class ManagedReplicaBootstrapper
         ManagedReplicaRevertState? revertState,
         ManagedReplicaPushState? pushState,
         long journalBaseWatermark,
-        string remoteBaseSha256)
+        string remoteBaseSha256,
+        string? historySha256)
     {
         var protocolText = protocol switch
         {
@@ -3321,6 +3382,12 @@ internal static class ManagedReplicaBootstrapper
             (false, true) => 7,
             (true, true) => 8,
         };
+        if (historySha256 is not null)
+        {
+            if (!IsSha256Hex(historySha256))
+                throw new InvalidDataException("Managed replica history reference is invalid.");
+            version += 4;
+        }
         var metadata = string.Concat(
             "version=", version.ToString(CultureInfo.InvariantCulture), "\n",
             "server_revision_base64=", Convert.ToBase64String(StrictUtf8.GetBytes(revision)), "\n",
@@ -3330,6 +3397,7 @@ internal static class ManagedReplicaBootstrapper
             "table_map_base64=", Convert.ToBase64String(EncodeTableMap(tableNamesByStableId)), "\n",
             "journal_base_watermark=", journalBaseWatermark.ToString(CultureInfo.InvariantCulture), "\n",
             "remote_base_sha256=", remoteBaseSha256, "\n",
+            historySha256 is not null ? string.Concat("history_sha256=", historySha256, "\n") : string.Empty,
             revertState is { } value
                 ? string.Concat("revert_state_base64=", Convert.ToBase64String(EncodeRevertState(value)), "\n")
                 : string.Empty,
@@ -4471,6 +4539,8 @@ internal static class ManagedReplicaBootstrapper
         internal long JournalBaseWatermark { get; init; } = 1;
 
         internal string RemoteBaseSha256 { get; init; } = string.Empty;
+
+        internal string? HistorySha256 { get; init; }
     }
 
     /// <summary>
@@ -4714,7 +4784,8 @@ internal static class ManagedReplicaBootstrapper
         string OriginalDatabaseSha256,
         string CommittedDatabaseSha256,
         string RevertWalSha256,
-        byte FormatVersion = 4);
+        byte FormatVersion = 4,
+        string? ParentSha256 = null);
 
     internal readonly record struct ManagedReplicaPushState(
         long SourcePullGeneration,

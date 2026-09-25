@@ -7,6 +7,7 @@ namespace Ahtola;
 internal static class ManagedReplicaRevertWal
 {
     internal const string Suffix = "-wal-revert";
+    internal const string HistorySuffix = "-wal-revert.history";
 
     internal static SqliteCheckpointResult CaptureAndCheckpoint(
         string databasePath,
@@ -25,7 +26,11 @@ internal static class ManagedReplicaRevertWal
                 capture =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var state = StageCapture(databasePath, stagingPath, capture);
+                    var reuseHistory = metadata.HistorySha256 is not null;
+                    var protectedMetadata = EnsureHistory(databasePath, metadata, databasePath);
+                    var state = StageCapture(
+                        databasePath, stagingPath, capture,
+                        reuseHistory ? protectedMetadata.HistorySha256 : null);
                     ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertWalStaged);
                     cancellationToken.ThrowIfCancellationRequested();
 
@@ -39,7 +44,7 @@ internal static class ManagedReplicaRevertWal
                         ManagedReplicaBootstrapper.WriteMetadata(
                             metadataStagingPath,
                             databasePath + ManagedReplicaBootstrapper.MetadataSuffix,
-                            metadata with { RevertState = state });
+                            protectedMetadata with { RevertState = state });
                     }
                     finally
                     {
@@ -83,12 +88,16 @@ internal static class ManagedReplicaRevertWal
         var stagingPath = CreateStagingPath(databasePath, "capture");
         try
         {
+            var reuseHistory = metadata.HistorySha256 is not null;
+            metadata = EnsureHistory(databasePath, metadata, originalDatabasePath);
             var state = StageFileCapture(
                 stagingPath,
                 originalDatabasePath,
                 committedDatabasePath,
                 knownOriginalFingerprint,
-                knownCommittedFingerprint);
+                knownCommittedFingerprint,
+                reuseHistory ? databasePath + HistorySuffix : null,
+                reuseHistory ? metadata.HistorySha256 : null);
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertWalStaged);
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -150,9 +159,12 @@ internal static class ManagedReplicaRevertWal
         if (metadata.RevertState is not { } state)
         {
             Retire(databasePath);
+            ValidateOrRetireHistory(databasePath, metadata);
             return metadata;
         }
 
+        ValidateOrRetireHistory(databasePath, metadata);
+        ValidateParent(state, metadata);
         var snapshots = ReadAndValidate(databasePath, state);
         switch (state.Phase)
         {
@@ -320,9 +332,12 @@ internal static class ManagedReplicaRevertWal
         if (metadata.RevertState is not { } state)
         {
             Retire(databasePath);
+            ValidateOrRetireHistory(databasePath, metadata);
             return;
         }
 
+        ValidateOrRetireHistory(databasePath, metadata);
+        ValidateParent(state, metadata);
         _ = ReadAndValidate(databasePath, state);
         throw new InvalidOperationException(
             "Managed embedded replica has a pending checkpoint recovery bundle that must be "
@@ -336,8 +351,13 @@ internal static class ManagedReplicaRevertWal
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
         EnsurePushRecoveryComplete(metadata);
         if (metadata.RevertState is not { } state)
+        {
+            ValidateOrRetireHistory(databasePath, metadata);
             return;
+        }
 
+        ValidateOrRetireHistory(databasePath, metadata);
+        ValidateParent(state, metadata);
         _ = ReadAndValidate(databasePath, state);
         throw new InvalidOperationException(
             "Managed embedded replica has a pending checkpoint recovery bundle that must be "
@@ -458,6 +478,8 @@ internal static class ManagedReplicaRevertWal
     internal static IReadOnlyList<string> GetArtifactPaths(string databasePath) =>
     [
         databasePath + Suffix,
+        databasePath + HistorySuffix,
+        databasePath + HistorySuffix + ".staging.tmp",
         CreateStagingPath(databasePath, "capture"),
         CreateStagingPath(databasePath, "metadata"),
         CreateStagingPath(databasePath, "restore"),
@@ -466,10 +488,73 @@ internal static class ManagedReplicaRevertWal
         CreateStagingPath(databasePath, "phase-metadata"),
     ];
 
+    private static ManagedReplicaBootstrapper.ManagedReplicaMetadata EnsureHistory(
+        string databasePath,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
+        string originalPath)
+    {
+        if (metadata.HistorySha256 is not null)
+        {
+            ValidateOrRetireHistory(databasePath, metadata);
+            return metadata;
+        }
+
+        var path = databasePath + HistorySuffix;
+        var stagingPath = path + ".staging.tmp";
+        var fingerprint = ComputeSha256(originalPath);
+        try
+        {
+            using (var source = OpenSnapshot(originalPath))
+            using (var destination = new FileStream(
+                       stagingPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                       bufferSize: 81920, FileOptions.WriteThrough))
+            {
+                source.CopyTo(destination);
+                destination.Flush(flushToDisk: true);
+            }
+            if (!string.Equals(ComputeSha256(stagingPath), fingerprint, StringComparison.Ordinal))
+                throw new InvalidDataException("Managed embedded replica history changed during capture.");
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertHistoryStaged);
+            File.Move(stagingPath, path, overwrite: false);
+            ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertHistoryPublished);
+            return metadata with { HistorySha256 = fingerprint };
+        }
+        finally
+        {
+            DeleteIfExists(stagingPath);
+        }
+    }
+
+    private static void ValidateOrRetireHistory(
+        string databasePath,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+    {
+        var path = databasePath + HistorySuffix;
+        if (metadata.HistorySha256 is null)
+        {
+            DeleteIfExists(path);
+            return;
+        }
+        if (!File.Exists(path)
+            || !string.Equals(ComputeSha256(path), metadata.HistorySha256, StringComparison.Ordinal))
+            throw new InvalidDataException("Managed embedded replica retained history is missing or corrupt.");
+        _ = GetDatabasePageCount(path, ReadDatabaseHeader(path).PageSize);
+    }
+
+    private static void ValidateParent(
+        ManagedReplicaBootstrapper.ManagedReplicaRevertState state,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+    {
+        if (state.FormatVersion == 6
+            && !string.Equals(state.ParentSha256, metadata.HistorySha256, StringComparison.Ordinal))
+            throw new InvalidDataException("Managed embedded replica revert parent does not match retained history.");
+    }
+
     private static ManagedReplicaBootstrapper.ManagedReplicaRevertState StageCapture(
         string databasePath,
         string stagingPath,
-        SqliteCheckpointRevertCapture capture)
+        SqliteCheckpointRevertCapture capture,
+        string? historySha256)
     {
         var expectedDatabaseLength = checked((long)capture.OriginalDatabaseSizeInPages * capture.PageSize);
         if (new FileInfo(databasePath).Length != expectedDatabaseLength)
@@ -479,6 +564,23 @@ internal static class ManagedReplicaRevertWal
         }
 
         var originalFileFingerprint = ComputeSha256(databasePath);
+        IReadOnlyList<uint>? originalChanges = null;
+        IReadOnlyList<uint>? committedChanges = null;
+        string? committedFingerprint = null;
+        if (historySha256 is not null)
+        {
+            var historyPath = databasePath + HistorySuffix;
+            using var history = OpenSnapshot(historyPath);
+            using var original = OpenSnapshot(databasePath);
+            originalChanges = FindChangedPages(
+                history, GetDatabasePageCount(historyPath, capture.PageSize),
+                original, capture.OriginalDatabaseSizeInPages,
+                capture.PageSize, originalFileFingerprint);
+            committedChanges = FindChangedCheckpointPages(capture, out committedFingerprint);
+        }
+        var reusable = originalChanges is not null && committedChanges is not null
+            && originalChanges.Count < capture.OriginalDatabaseSizeInPages
+            && committedChanges.Count < capture.CommittedDatabaseSizeInPages;
         Span<byte> saltBytes = stackalloc byte[8];
         RandomNumberGenerator.Fill(saltBytes);
         var revertHeader = SqliteWalHeader.Create(
@@ -490,11 +592,12 @@ internal static class ManagedReplicaRevertWal
             using var originalSource = new RevertFrameSource(
                 capture.OriginalDatabaseSizeInPages,
                 capture.ReadOriginalPage);
-            var originalLastFrame = wal.AppendFrames(
-                originalSource,
-                capture.OriginalDatabaseSizeInPages);
-            var originalFingerprint = originalSource.CompleteFingerprint();
-            if (originalLastFrame != originalSource.Count
+            ISqliteWalFrameSource originalFrames = reusable
+                ? new SparseRevertFrameSource(originalChanges!, capture.ReadOriginalPage)
+                : originalSource;
+            var originalLastFrame = wal.AppendFrames(originalFrames, capture.OriginalDatabaseSizeInPages);
+            var originalFingerprint = reusable ? originalFileFingerprint : originalSource.CompleteFingerprint();
+            if (originalLastFrame != originalFrames.Count
                 || !string.Equals(originalFingerprint, originalFileFingerprint, StringComparison.Ordinal))
             {
                 throw new InvalidDataException(
@@ -504,11 +607,13 @@ internal static class ManagedReplicaRevertWal
             using var committedSource = new RevertFrameSource(
                 capture.CommittedDatabaseSizeInPages,
                 capture.ReadCommittedPage);
+            ISqliteWalFrameSource committedFrames = reusable
+                ? new SparseRevertFrameSource(committedChanges!, capture.ReadCommittedPage)
+                : committedSource;
             var committedLastFrame = wal.AppendFrames(
-                committedSource,
-                capture.CommittedDatabaseSizeInPages);
-            var committedFingerprint = committedSource.CompleteFingerprint();
-            var expectedLastFrame = checked((long)originalSource.Count + committedSource.Count);
+                committedFrames, capture.CommittedDatabaseSizeInPages);
+            committedFingerprint = reusable ? committedFingerprint : committedSource.CompleteFingerprint();
+            var expectedLastFrame = checked((long)originalFrames.Count + committedFrames.Count);
             if (committedLastFrame != expectedLastFrame)
                 throw new InvalidDataException("Managed embedded replica revert WAL frame count is invalid.");
             wal.Flush();
@@ -526,13 +631,41 @@ internal static class ManagedReplicaRevertWal
                 capture.SourceWatermarkFrame.Checksum1,
                 capture.SourceWatermarkFrame.Checksum2,
                 capture.OriginalDatabaseSizeInPages,
-                checked((uint)originalSource.Count),
+                checked((uint)originalFrames.Count),
                 capture.CommittedDatabaseSizeInPages,
-                checked((uint)committedSource.Count),
+                checked((uint)committedFrames.Count),
                 originalFingerprint,
-                committedFingerprint,
-                revertFingerprint);
+                committedFingerprint!,
+                revertFingerprint,
+                FormatVersion: reusable ? (byte)6 : (byte)4,
+                ParentSha256: reusable ? historySha256 : null);
         }
+    }
+
+    private static IReadOnlyList<uint>? FindChangedCheckpointPages(
+        SqliteCheckpointRevertCapture capture,
+        out string fingerprint)
+    {
+        const int maxSparseChangedPages = 65_536;
+        List<uint>? changed = [];
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        for (uint pageNumber = 1; pageNumber <= capture.CommittedDatabaseSizeInPages; pageNumber++)
+        {
+            var page = capture.ReadCommittedPage(pageNumber);
+            hash.AppendData(page.Span);
+            if (changed is not null
+                && (pageNumber > capture.OriginalDatabaseSizeInPages
+                    || !page.Span.SequenceEqual(capture.ReadOriginalPage(pageNumber).Span)))
+            {
+                changed.Add(pageNumber);
+                if (changed.Count > maxSparseChangedPages)
+                    changed = null;
+            }
+        }
+        fingerprint = Convert.ToHexString(hash.GetHashAndReset());
+        if (changed is { Count: 0 })
+            changed.Add(1);
+        return changed;
     }
 
     /// <summary>
@@ -559,7 +692,9 @@ internal static class ManagedReplicaRevertWal
         string originalDatabasePath,
         string committedDatabasePath,
         string? knownOriginalFingerprint = null,
-        string? knownCommittedFingerprint = null)
+        string? knownCommittedFingerprint = null,
+        string? historyPath = null,
+        string? historySha256 = null)
     {
         var originalHeader = ReadDatabaseHeader(originalDatabasePath);
         var committedHeader = ReadDatabaseHeader(committedDatabasePath);
@@ -588,26 +723,37 @@ internal static class ManagedReplicaRevertWal
             BinaryPrimitives.ReadUInt32BigEndian(saltBytes[4..]));
         using (var originalStream = OpenSnapshot(originalDatabasePath))
         using (var committedStream = OpenSnapshot(committedDatabasePath))
+        using (var historyStream = historySha256 is null ? null : OpenSnapshot(historyPath!))
         using (var wal = SqliteWalFile.Create(PhysicalFileSystem.Instance, stagingPath, revertHeader))
         {
-            using var originalSource = new RevertFrameSource(
-                originalPageCount,
-                pageNumber => ReadPage(originalStream, pageNumber, pageSize));
-            var originalLastFrame = wal.AppendFrames(originalSource, originalPageCount);
-            if (originalLastFrame != originalSource.Count
-                || !string.Equals(
-                    originalSource.CompleteFingerprint(),
-                    originalFingerprint,
-                    StringComparison.Ordinal))
+            var changedPages = FindChangedPages(
+                originalStream, originalPageCount, committedStream, committedPageCount,
+                pageSize, committedFingerprint);
+            var sparse = changedPages is not null && changedPages.Count < committedPageCount;
+            var originalChanges = historyStream is null
+                ? null
+                : FindChangedPages(historyStream,
+                    GetDatabasePageCount(historyPath!, pageSize),
+                    originalStream, originalPageCount, pageSize, originalFingerprint);
+            var reusable = sparse && originalChanges is not null
+                && originalChanges.Count < originalPageCount;
+            using var originalSource = reusable
+                ? null
+                : new RevertFrameSource(
+                    originalPageCount, pageNumber => ReadPage(originalStream, pageNumber, pageSize));
+            ISqliteWalFrameSource originalFrames = reusable
+                ? new SparseRevertFrameSource(
+                    originalChanges!, pageNumber => ReadPage(originalStream, pageNumber, pageSize))
+                : originalSource!;
+            var originalLastFrame = wal.AppendFrames(originalFrames, originalPageCount);
+            if (originalLastFrame != originalFrames.Count
+                || originalSource is not null
+                && !string.Equals(originalSource.CompleteFingerprint(), originalFingerprint, StringComparison.Ordinal))
             {
                 throw new InvalidDataException(
                     "Managed embedded replica original protected snapshot changed during capture.");
             }
 
-            var changedPages = FindChangedPages(
-                originalStream, originalPageCount, committedStream, committedPageCount,
-                pageSize, committedFingerprint);
-            var sparse = changedPages is not null && changedPages.Count < committedPageCount;
             using var fullSource = sparse
                 ? null
                 : new RevertFrameSource(
@@ -617,7 +763,7 @@ internal static class ManagedReplicaRevertWal
                     changedPages!, pageNumber => ReadPage(committedStream, pageNumber, pageSize))
                 : fullSource!;
             var committedLastFrame = wal.AppendFrames(committedSource, committedPageCount);
-            if (committedLastFrame != checked((long)originalSource.Count + committedSource.Count)
+            if (committedLastFrame != checked((long)originalFrames.Count + committedSource.Count)
                 || fullSource is not null
                 && !string.Equals(fullSource.CompleteFingerprint(), committedFingerprint, StringComparison.Ordinal))
             {
@@ -638,13 +784,14 @@ internal static class ManagedReplicaRevertWal
                 0,
                 0,
                 originalPageCount,
-                originalPageCount,
+                checked((uint)originalFrames.Count),
                 committedPageCount,
                 checked((uint)committedSource.Count),
                 originalFingerprint,
                 committedFingerprint,
                 ComputeSha256(stagingPath),
-                FormatVersion: sparse ? (byte)5 : (byte)4);
+                FormatVersion: reusable && sparse ? (byte)6 : sparse ? (byte)5 : (byte)4,
+                ParentSha256: reusable && sparse ? historySha256 : null);
         }
     }
 
@@ -767,7 +914,9 @@ internal static class ManagedReplicaRevertWal
             }
 
             var originalPages = new List<SqliteCheckpointRevertPage>(
-                checked((int)state.OriginalRevertWalFrameCount));
+                state.FormatVersion == 6
+                    ? checked((int)state.OriginalDatabaseSizeInPages)
+                    : checked((int)state.OriginalRevertWalFrameCount));
             var committedPages = new List<SqliteCheckpointRevertPage>(
                 state.FormatVersion == 4
                     ? checked((int)state.CommittedRevertWalFrameCount)
@@ -807,7 +956,41 @@ internal static class ManagedReplicaRevertWal
                     committedPages.Add(page);
             }
 
-            if (state.FormatVersion == 5)
+            if (state.FormatVersion == 6)
+            {
+                if (state.ParentSha256 is null)
+                    throw new InvalidDataException("Managed embedded replica revert parent is missing.");
+                var historyPath = databasePath + HistorySuffix;
+                if (!File.Exists(historyPath)
+                    || !string.Equals(ComputeSha256(historyPath), state.ParentSha256, StringComparison.Ordinal))
+                    throw new InvalidDataException("Managed embedded replica revert parent is missing or corrupt.");
+                using var history = OpenSnapshot(historyPath);
+                if (ReadDatabaseHeader(historyPath).PageSize != wal.PageSize)
+                    throw new InvalidDataException("Managed embedded replica revert parent has a different page size.");
+                var historyCount = GetDatabasePageCount(historyPath, wal.PageSize);
+                var changes = originalPages.ToDictionary(page => page.PageNumber);
+                originalPages.Clear();
+                for (uint pageNumber = 1; pageNumber <= state.OriginalDatabaseSizeInPages; pageNumber++)
+                {
+                    if (changes.Remove(pageNumber, out var changed))
+                        originalPages.Add(changed);
+                    else if (pageNumber <= historyCount)
+                        originalPages.Add(new SqliteCheckpointRevertPage(
+                            pageNumber, ReadPage(history, pageNumber, wal.PageSize)));
+                    else
+                        throw new InvalidDataException("Managed embedded replica revert parent is missing an added page.");
+                }
+                if (changes.Count != 0)
+                    throw new InvalidDataException("Managed embedded replica revert parent has an invalid page range.");
+                using var originalHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                foreach (var page in originalPages)
+                    originalHash.AppendData(page.PageData.Span);
+                if (!string.Equals(Convert.ToHexString(originalHash.GetHashAndReset()),
+                        state.OriginalDatabaseSha256, StringComparison.Ordinal))
+                    throw new InvalidDataException("Managed embedded replica revert parent cannot reconstruct the original.");
+            }
+
+            if (state.FormatVersion is 5 or 6)
             {
                 var changedPages = committedPages.ToDictionary(page => page.PageNumber);
                 committedPages.Clear();
@@ -1059,8 +1242,12 @@ internal static class ManagedReplicaRevertWal
 
     private static void CleanupTemporaryArtifacts(string databasePath)
     {
-        foreach (var path in GetArtifactPaths(databasePath).Skip(1))
+        foreach (var path in GetArtifactPaths(databasePath).Skip(2))
+        {
+            if (path == databasePath + HistorySuffix)
+                continue;
             DeleteIfExists(path);
+        }
     }
 
     private static void DeleteIfExists(string path)
