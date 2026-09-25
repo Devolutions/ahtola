@@ -165,7 +165,12 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
         try
         {
             var pageCache = new BoundedAsyncPageCache(readTransaction, _pager.UsableSpace, _pageBudget);
-            var rows = plan.WithoutRowid
+            var rows = plan.WithoutRowid && plan.FirstPrimaryKeyEquals is { } exactKey
+                    && plan.Table.PrimaryKeySchema?.Terms.Count == 1
+                ? AsyncBoundedWithoutRowidTableScanCursor.SeekIntegerPrimaryKeyAsync(
+                    pageCache, plan.RootPage, plan.Table, _textEncoding, exactKey,
+                    plan.Limit, plan.Offset, cancellationToken)
+                : plan.WithoutRowid
                 ? plan.Descending
                     ? AsyncBoundedWithoutRowidTableScanCursor.ScanDescendingAsync(
                         pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, plan.Offset,

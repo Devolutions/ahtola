@@ -11,6 +11,28 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
 {
     private const int MaximumDepth = 64;
 
+    public static async IAsyncEnumerable<SqlValue[]> SeekIntegerPrimaryKeyAsync(
+        BoundedAsyncPageCache pageCache,
+        uint rootPage,
+        EmbeddedTable table,
+        SqliteTextEncoding textEncoding,
+        long key,
+        long? limit,
+        long offset,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(pageCache);
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        if (limit == 0 || offset != 0)
+            yield break;
+
+        var found = await TrySeekIntegerPrimaryKeyAsync(
+            pageCache, rootPage, table, textEncoding, key, cancellationToken).ConfigureAwait(false);
+        if (found is not null)
+            yield return found;
+    }
+
     public static IAsyncEnumerable<SqlValue[]> ScanDescendingAsync(
         BoundedAsyncPageCache pageCache,
         uint rootPage,
@@ -233,5 +255,115 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         }
 
         return key;
+    }
+
+    private static async ValueTask<SqlValue[]?> TrySeekIntegerPrimaryKeyAsync(
+        BoundedAsyncPageCache pageCache,
+        uint rootPage,
+        EmbeddedTable table,
+        SqliteTextEncoding textEncoding,
+        long key,
+        CancellationToken cancellationToken)
+    {
+        var schema = table.PrimaryKeySchema
+            ?? throw new InvalidDataException("WITHOUT ROWID table has no primary-key schema.");
+        if (schema.Terms.Count != 1)
+            throw new InvalidOperationException("A direct primary-key lookup requires one key column.");
+        var term = schema.Terms[0];
+        if (term.SortOrder != SqliteKeySortOrder.Ascending
+            || !term.Collation.IsBinary
+            || term.Collation.Comparison is not null
+            || !string.Equals(
+                table.ColumnDefinitions[term.ColumnIndex].DeclaredType,
+                "INTEGER",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                "A direct primary-key lookup requires an ascending BINARY INTEGER key.");
+        }
+
+        var comparer = new SqliteIndexRecordComparer(
+            textEncoding,
+            [new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)]);
+        var target = new[] { SqlValue.Integer(key) };
+        var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
+        var pinnedPages = new List<uint>();
+        var currentPage = rootPage;
+
+        (SqlValue[] Values, int Comparison) DecodeAndCompare(byte[] record)
+        {
+            var values = SqliteRecordCodec.Decode(record, textEncoding);
+            if (values.Length == 0 || values[0].Kind == SqlValueKind.Null)
+                throw new InvalidDataException("WITHOUT ROWID table record is missing its primary key.");
+            return (values, comparer.Compare(new[] { values[0] }, target));
+        }
+
+        try
+        {
+            for (var depth = 0; depth < MaximumDepth; depth++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var image = await pageCache.ReadPageAsync(currentPage, cancellationToken).ConfigureAwait(false);
+                var pageType = SqliteBtreePageHeader.Parse(
+                    image, currentPage == 1, pageCache.UsableSpace).PageType;
+                if (pageType == SqliteBtreePageType.IndexInterior)
+                {
+                    var interior = SqliteIndexInteriorPageView.Parse(
+                        image, pageCache.UsableSpace, textEncoding, currentPage == 1,
+                        recordComparer: comparer);
+                    pageCache.Pin(currentPage);
+                    pinnedPages.Add(currentPage);
+                    var childPage = interior.Header.RightMostChildPage;
+                    foreach (var separator in interior.Cells)
+                    {
+                        var record = await overflowReader.ReadPayloadAsync(
+                            separator.Cell.Key, cancellationToken).ConfigureAwait(false);
+                        var (values, comparison) = DecodeAndCompare(record);
+                        if (comparison == 0)
+                            return EmbeddedFileStore.RestoreWithoutRowidRecord(
+                                table.Name, table, schema, values);
+                        if (comparison > 0)
+                        {
+                            childPage = separator.Cell.LeftChildPage;
+                            break;
+                        }
+                    }
+                    currentPage = childPage;
+                    continue;
+                }
+
+                if (pageType != SqliteBtreePageType.IndexLeaf)
+                {
+                    throw new InvalidDataException(
+                        $"SQLite page {currentPage} is not part of a WITHOUT ROWID index b-tree.");
+                }
+
+                var leaf = SqliteIndexLeafPageView.Parse(
+                    image, pageCache.UsableSpace, textEncoding, currentPage == 1,
+                    recordComparer: comparer);
+                pageCache.Pin(currentPage);
+                pinnedPages.Add(currentPage);
+                foreach (var cell in leaf.Cells)
+                {
+                    var record = await overflowReader.ReadPayloadAsync(
+                        cell.Cell, cancellationToken).ConfigureAwait(false);
+                    var (values, comparison) = DecodeAndCompare(record);
+                    if (comparison == 0)
+                        return EmbeddedFileStore.RestoreWithoutRowidRecord(
+                            table.Name, table, schema, values);
+                    if (comparison > 0)
+                        return null;
+                }
+                return null;
+            }
+
+            throw new InvalidDataException(
+                $"SQLite index b-tree rooted at page {rootPage} is deeper than {MaximumDepth} levels or contains a cycle.");
+        }
+        finally
+        {
+            foreach (var pinnedPage in pinnedPages)
+                pageCache.Unpin(pinnedPage);
+        }
     }
 }

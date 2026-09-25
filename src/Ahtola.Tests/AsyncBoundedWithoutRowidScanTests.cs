@@ -178,6 +178,72 @@ public sealed class AsyncBoundedWithoutRowidScanTests
     }
 
     [Test]
+    public async Task SingleIntegerPrimaryKeyCanBeFoundInAnInteriorRecord()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(InMemoryPath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(code INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;");
+            Execute(connection, "BEGIN;");
+            for (var code = 1; code <= 160; code++)
+                Execute(connection, $"INSERT INTO items VALUES ({code}, '{new string('p', 6000)}');");
+            Execute(connection, "COMMIT;");
+        }
+
+        long separatorKey;
+        await using (var pager = await AsyncSqlitePager.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem), InMemoryPath, InMemoryPath + "-wal", readOnly: true))
+        await using (var snapshot = await pager.BeginReadAsync())
+        {
+            var cache = new BoundedAsyncPageCache(snapshot, pager.UsableSpace, capacity: 16);
+            var page1 = await cache.ReadPageAsync(1);
+            var encoding = SqliteDatabaseHeader.Parse(page1).TextEncoding;
+            var catalog = await AsyncSchemaCatalogLoader.LoadAsync(cache, encoding);
+            catalog.TryGetTable("items", out var entry).Should().BeTrue();
+            var root = await cache.ReadPageAsync(entry!.RootPage);
+            var interior = SqliteIndexInteriorPageView.Parse(root, pager.UsableSpace, encoding);
+            interior.Cells.Should().NotBeEmpty();
+            interior.Cells[0].Cell.Key.FirstOverflowPage.Should().NotBeNull();
+            var record = await new AsyncSqliteOverflowChainReader(cache)
+                .ReadPayloadAsync(interior.Cells[0].Cell.Key);
+            separatorKey = SqliteRecordCodec.Decode(
+                record, encoding)[0].AsInteger();
+            separatorKey.Should().BeGreaterThan(1);
+        }
+
+        await using (var tooSmall = await AhtolaBrowserBoundedConnection.OpenAsync(
+                         AsyncFileSystemAdapter.Create(fileSystem),
+                         ownsFileSystem: false, InMemoryPath, pageBudget: 1, CancellationToken.None))
+        await using (var reader = await tooSmall.ExecuteBoundedScanAsync(
+                         $"SELECT code FROM items WHERE code = {separatorKey}"))
+        {
+            var seek = async () => await reader.ReadAsync();
+            await seek.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+                .WithMessage("*budget*");
+        }
+
+        await using var bounded = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false, InMemoryPath, pageBudget: 16, CancellationToken.None);
+        await using (var reader = await bounded.ExecuteBoundedScanAsync(
+                         $"SELECT code FROM items WHERE code = {separatorKey}"))
+        {
+            (await reader.ReadAsync()).Should().BeTrue();
+            reader.GetValue(0).AsInteger().Should().Be(separatorKey);
+            (await reader.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var missing = await bounded.ExecuteBoundedScanAsync(
+                         "SELECT code FROM items WHERE code = 999"))
+            (await missing.ReadAsync()).Should().BeFalse();
+
+        await using (var skipped = await bounded.ExecuteBoundedScanAsync(
+                         $"SELECT code FROM items WHERE code = {separatorKey} LIMIT 1 OFFSET 1"))
+            (await skipped.ReadAsync()).Should().BeFalse();
+    }
+
+    [Test]
     public async Task ScansNativeMultiLevelIndexInteriorRecordsAndOverflowInPrimaryKeyOrder()
     {
         var path = Path.Combine(Path.GetTempPath(), $"ahtola-bounded-wr-{Guid.NewGuid():N}.db");
