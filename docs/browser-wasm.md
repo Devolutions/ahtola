@@ -327,10 +327,10 @@ while (await reader.ReadAsync())
     Console.WriteLine($"{reader.GetValue(0).AsInteger()} {reader.GetValue(1).AsText()}");
 ```
 
-### Supported shape (v1)
+### Supported shape (preview)
 
 Only a narrow, explicitly classified shape is supported; everything else
-throws `AhtolaBrowserBoundedQueryException` **before any page is read** —
+throws `AhtolaBrowserBoundedQueryException` **before any scan page is read** —
 this connection never silently falls back to a slower path. The caller
 decides whether to retry the same statement against an ordinary
 `OpenConnectionAsync`/`OpenSynchronousReadConnectionAsync` connection instead.
@@ -340,7 +340,7 @@ decides whether to retry the same statement against an ordinary
 | `SELECT column-list \| * FROM one-ordinary-rowid-base-table [WHERE integer-primary-key <comparison> integer-literal [AND ...] \| integer-primary-key BETWEEN integer-literal AND integer-literal] [ORDER BY integer-primary-key [ASC \| DESC] [NULLS FIRST \| LAST]] [LIMIT n [OFFSET m]]` | Supported comparisons: `=`, `<`, `<=`, `>`, `>=` (including literal-first forms); `BETWEEN` is inclusive. Equality performs a point seek; ranges seek their starting bound and stop at the opposite bound in the requested direction. Rowid is never NULL, so explicit NULL placement does not change its order. Non-negative literal `OFFSET` skips matching rows before `LIMIT` counts emitted rows; reads remain page-bounded and validate visited pages lazily. |
 | Other `WHERE`/`ORDER BY` forms, joins, subqueries, `GROUP BY`/`HAVING`, `DISTINCT`, window definitions, non-literal `OFFSET`, expressions beyond a plain column reference, generated columns | `AhtolaBrowserBoundedQueryException`, naming the exact unsupported construct — natural follow-on slices |
 | An ordinary rowid table with secondary indexes | Supported for base-table scans and rowid predicates; secondary indexes are not traversed or used to satisfy other predicates/orderings |
-| `WITHOUT ROWID` tables | `AhtolaBrowserBoundedQueryException` — these need an index-b-tree traversal, a distinct follow-on |
+| `SELECT column-list \| * FROM one-WITHOUT-ROWID-base-table [LIMIT n [OFFSET m]]` | Supported for ascending BINARY primary keys only. Traverses the table's index b-tree in declared primary-key order, including records stored in interior cells and overflowing records; remaps the physical PK-first record to logical column order. A secondary index does not change the base scan. Other PK collation/direction, `WHERE`, `ORDER BY`, and `INDEXED BY` shapes are rejected before scanning. No rowid is exposed. |
 | Any DDL, DML (`INSERT`/`UPDATE`/`DELETE`), `PRAGMA`, `ATTACH`, transactions | `AhtolaBrowserBoundedQueryException` — this connection is read-only by construction; there is no writer path, so there is no side-effect-duplication risk |
 | Encrypted (AHTLA page format) databases | `PlatformNotSupportedException` at `OpenBoundedScanConnectionAsync` — Web Crypto page decryption is asynchronous, and the pager's page-codec hook is currently synchronous-only; a `IAsyncPageCodec` hook is named future work |
 | A cursor whose actual required interior-page stack depth exceeds `PageBudget` | `AhtolaBrowserBoundedQueryException` at the exact `ReadAsync` call that would have exceeded it — the budget is an enforced ceiling, not an advisory default |

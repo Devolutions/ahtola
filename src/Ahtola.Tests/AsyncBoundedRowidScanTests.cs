@@ -367,9 +367,10 @@ public sealed class AsyncBoundedRowidScanTests
         indexedPlan.Should().NotBeNull(indexedReason);
         indexedPlan!.TableName.Should().Be("indexed");
 
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM wr", catalog, out var withoutRowidReason)
-            .Should().BeNull();
-        withoutRowidReason.Should().Contain("WITHOUT ROWID");
+        var withoutRowidPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT * FROM wr", catalog, out var withoutRowidReason);
+        withoutRowidPlan.Should().NotBeNull(withoutRowidReason);
+        withoutRowidPlan!.WithoutRowid.Should().BeTrue();
 
         BoundedRowidScanShapeClassifier.TryClassify("INSERT INTO plain VALUES (2, 'b')", catalog, out var writeReason)
             .Should().BeNull();

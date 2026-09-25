@@ -4,7 +4,7 @@ using Ahtola.Core.Storage;
 namespace Ahtola.Core.Parsing;
 
 /// <summary>
-/// A classified, fully resolved plan for a bounded rowid-table scan or exact rowid lookup: the shape
+/// A classified, fully resolved plan for a bounded base-table scan or exact rowid lookup: the shape
 /// <see cref="BoundedRowidScanShapeClassifier"/> currently accepts.
 /// </summary>
 internal sealed record BoundedRowidScanPlan(
@@ -17,7 +17,8 @@ internal sealed record BoundedRowidScanPlan(
     long Offset,
     long? EqualRowId,
     SqliteRowIdRange? RowIdRange,
-    bool Descending);
+    bool Descending,
+    bool WithoutRowid);
 
 /// <summary>
 /// Classifies a parsed SQL statement against an <see cref="AsyncSchemaCatalog"/>, either
@@ -37,8 +38,9 @@ internal sealed record BoundedRowidScanPlan(
 /// (or an inclusive integer-literal BETWEEN range)
 /// [ORDER BY integer-primary-key [ASC|DESC]] [LIMIT n [OFFSET m]]</c>.
 /// No other <c>WHERE</c>, joins/subqueries, <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
-/// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references, no
-/// <c>WITHOUT ROWID</c> tables. A registered secondary index does not change a base-table
+/// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references.
+/// <c>WITHOUT ROWID</c> tables additionally support only ascending BINARY primary keys and
+/// unfiltered, unordered base scans. A registered secondary index does not change a base-table
 /// rowid scan or seek; other indexed access paths remain out of scope. Everything else is named follow-on
 /// work, not silently downgraded.
 /// </para>
@@ -113,10 +115,19 @@ internal static class BoundedRowidScanShapeClassifier
             return null;
         }
 
-        if (!entry.Table.HasRowid)
+        var withoutRowid = !entry.Table.HasRowid;
+        if (withoutRowid && entry.Table.PrimaryKeySchema is not { Terms.Count: > 0 })
         {
             rejectionReason =
-                $"WITHOUT ROWID table '{tableSource.Name}' is not yet supported by a bounded scan connection.";
+                $"WITHOUT ROWID table '{tableSource.Name}' has no usable primary-key schema.";
+            return null;
+        }
+
+        if (withoutRowid && entry.Table.PrimaryKeySchema!.Terms.Any(static term =>
+                term.SortOrder != SqliteKeySortOrder.Ascending || !term.Collation.IsBinary
+                || term.Collation.Comparison is not null))
+        {
+            rejectionReason = "WITHOUT ROWID scans require an ascending BINARY primary key.";
             return null;
         }
 
@@ -124,6 +135,12 @@ internal static class BoundedRowidScanShapeClassifier
         {
             rejectionReason =
                 $"Table '{tableSource.Name}' has a generated column, which is not yet supported by a bounded scan connection.";
+            return null;
+        }
+
+        if (withoutRowid && select.OrderBy.Count != 0)
+        {
+            rejectionReason = "ORDER BY is not supported for bounded WITHOUT ROWID scans.";
             return null;
         }
 
@@ -140,6 +157,12 @@ internal static class BoundedRowidScanShapeClassifier
         SqliteRowIdRange? rowIdRange = null;
         if (select.Where is { } predicate)
         {
+            if (withoutRowid)
+            {
+                rejectionReason = "WHERE is not supported for bounded WITHOUT ROWID scans.";
+                return null;
+            }
+
             if (entry.Table.RowidAliasColumnIndex < 0
                 || !TryParseRowIdRange(predicate, tableSource, entry.Table, out var bounds))
             {
@@ -245,7 +268,8 @@ internal static class BoundedRowidScanShapeClassifier
             offset,
             equalRowId,
             rowIdRange,
-            select.OrderBy.Count != 0 && select.OrderBy[0].Descending);
+            select.OrderBy.Count != 0 && select.OrderBy[0].Descending,
+            withoutRowid);
     }
 
     private static bool TryParseRowIdRange(

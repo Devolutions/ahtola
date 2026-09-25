@@ -12386,7 +12386,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         return values;
     }
 
-    private static SqlValue[] RestoreWithoutRowidRecord(
+    internal static SqlValue[] RestoreWithoutRowidRecord(
         string tableName,
         EmbeddedTable table,
         SqlitePrimaryKeySchema primaryKeySchema,
