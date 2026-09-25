@@ -50397,10 +50397,18 @@ out bool hasReturning)
         var inputs = new Dictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>>();
         foreach (var function in functions)
         {
+            var constant = function.Filter is null
+                && function.Arguments.All(static argument => argument is LiteralExpression);
             inputs.Add(
                 function,
-                function.Arguments.Count == 0 && function.Filter is null
-                    ? new ConstantWindowInputList(rowCount)
+                constant
+                    ? new ConstantWindowInputList(
+                        rowCount,
+                        new WindowFunctionInput(
+                            true,
+                            function.Arguments
+                                .Select(static argument => ((LiteralExpression)argument).Value)
+                                .ToArray()))
                     : new WindowFunctionInput[rowCount]);
         }
 
@@ -50428,21 +50436,20 @@ out bool hasReturning)
         return inputs;
     }
 
-    private sealed class ConstantWindowInputList(int count) : IReadOnlyList<WindowFunctionInput>
+    private sealed class ConstantWindowInputList(int count, WindowFunctionInput input)
+        : IReadOnlyList<WindowFunctionInput>
     {
-        private static readonly WindowFunctionInput Input = new(true, []);
-
         public int Count => count;
 
         public WindowFunctionInput this[int index] =>
             (uint)index < (uint)count
-                ? Input
+                ? input
                 : throw new ArgumentOutOfRangeException(nameof(index));
 
         public IEnumerator<WindowFunctionInput> GetEnumerator()
         {
             for (var index = 0; index < count; index++)
-                yield return Input;
+                yield return input;
         }
 
         System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>

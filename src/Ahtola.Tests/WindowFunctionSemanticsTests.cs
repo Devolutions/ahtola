@@ -655,6 +655,41 @@ public sealed class WindowFunctionSemanticsTests
     }
 
     [Test]
+    public void LiteralWindowArgumentsMatchSqliteAcrossBufferedAndEvaluatorRoutes()
+    {
+        const string buffered =
+            """
+            SELECT id,
+                   sum(2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW),
+                   nth_value('fixed', 2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                   count('present') OVER (PARTITION BY grp)
+            FROM t ORDER BY id;
+            """;
+        const string evaluator =
+            """
+            SELECT DISTINCT id,
+                   sum(2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW),
+                   nth_value('fixed', 2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                   count('present') OVER (PARTITION BY grp)
+            FROM t ORDER BY id;
+            """;
+
+        using var connection = OpenManaged(Setup);
+        Opcodes(ReadRows(connection, "EXPLAIN " + buffered))
+            .Should().Contain("WindowBufferCompute");
+        AssertMatchesSqlite(Setup, buffered);
+        AssertMatchesSqlite(Setup, evaluator);
+    }
+
+    [Test]
     public void CancellationKeepsEvaluatorWindowStateReusable()
     {
         using var connection = OpenManaged(Setup);

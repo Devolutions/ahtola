@@ -410,9 +410,10 @@ reporting a false finite peak.
 Buffered evaluators now also receive statement memory, spill options, and
 cancellation in a scoped binding restored on success or failure; this does
 not yet spill or account for `PrepareWindowFunctionInputs`' retained arrays.
-No-argument, unfiltered window functions share one immutable input value
-instead of allocating a row-count-wide array; functions with arguments or
-FILTER still require the broader spill-backed input redesign.
+Unfiltered window functions whose arguments are all literal values share
+one immutable input value (including the argument-free case) instead of
+allocating a row-count-wide array. Row-dependent arguments and FILTER still
+require the broader spill-backed input redesign.
 
 TYPE/DOMAIN adoption must keep SQLite's five physical storage classes: the
 pinned Turso engine persists named definitions as SQL, resolves base-type
