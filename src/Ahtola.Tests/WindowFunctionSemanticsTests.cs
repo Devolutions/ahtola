@@ -552,6 +552,40 @@ public sealed class WindowFunctionSemanticsTests
         AssertMatchesSqlite(Setup, fallback);
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void SharedAndIndependentWindowSpecsPreserveMovingFramesAndPeerOrder(bool distinct)
+    {
+        var query =
+            $"""
+            SELECT {(distinct ? "DISTINCT" : "")} grp, id,
+                   sum(value) OVER moving,
+                   count(*) OVER moving,
+                   lag(value) OVER ordered,
+                   rank() OVER (PARTITION BY grp ORDER BY ord)
+            FROM t
+            WINDOW moving AS (
+                PARTITION BY grp ORDER BY id
+                ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+                   ordered AS (PARTITION BY grp ORDER BY id)
+            ORDER BY grp, id;
+            """;
+
+        using var connection = OpenManaged(Setup);
+        if (distinct)
+        {
+            Action explain = () => ReadRows(connection, "EXPLAIN " + query);
+            explain.Should().Throw<EmbeddedSqlException>();
+        }
+        else
+        {
+            Opcodes(ReadRows(connection, "EXPLAIN " + query))
+                .Should().Contain("WindowBufferCompute");
+        }
+
+        AssertMatchesSqlite(Setup, query);
+    }
+
     [Test]
     public void CancellationKeepsEvaluatorWindowStateReusable()
     {

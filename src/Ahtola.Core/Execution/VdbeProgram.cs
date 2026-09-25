@@ -1342,6 +1342,8 @@ public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
 
     public string TableName { get; }
 
+    internal string? Alias { get; init; }
+
     public VdbeCursorSource Source { get; }
 
     internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows) => Enumerate(maximumRows).ToList();

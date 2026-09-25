@@ -442,7 +442,7 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   machine-readable envelope from Turso's `docs/eqp-json.md`. The inner
   statement's result columns (including DML `RETURNING`) and several
   structured per-node `op` variants are modeled, including virtual-table
-  scans, selected managed index methods, and compiled named-table join seeks;
+  scans, selected managed index methods, and compiled two-table join scans/seeks;
   other plan shapes still carry
   explicit `unmodeled` operations or no nodes when no access path is proven
   (for example, an unmodeled view). Built-in `get_byte`/`set_byte`

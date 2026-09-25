@@ -22068,7 +22068,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return true;
         }
 
-        if (source is NamedTableSource)
+        if (source is NamedTableSource namedTable)
         {
             CompiledJoinIndexSelection? selectedSeek = null;
             if (indexSeekSelections is not null)
@@ -22129,7 +22129,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     target.Columns.Length,
                     selectedSeek is null
                         ? target.CreateCursorSource()
-                        : new VdbeCursorSource([])),
+                        : new VdbeCursorSource([]))
+                {
+                    Alias = namedTable.Alias,
+                },
                 target.TableName,
                 target.Columns,
                 BuildQualifiedColumns(target.Qualifier, target.Columns),
@@ -28731,7 +28734,7 @@ out bool hasReturning)
         QueryContext context)
     {
         var result = ExecuteExplainQueryPlanText(
-            statement, parameters, context, out var ops, out var cteMaterialization);
+            statement, parameters, context, out var ops, out var cteMaterialization, out var compiledJoinRoot);
         if (statement.Format != ExplainQueryPlanFormat.Json)
             return result;
 
@@ -28767,10 +28770,10 @@ out bool hasReturning)
 
         // A lone "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" row is the text path's
         // placeholder for "no per-step plan is modeled for this statement yet", not a real scan
-        // or search step -- but for a plain SELECT the query still genuinely executes some real
-        // access path (a FROM-less constant row, or an ordinary full table scan), and the JSON
-        // envelope can describe that faithfully even while the TEXT convention keeps reporting
-        // the placeholder (ExplainQueryPlanTests.cs pins that TEXT routing marker independently
+        // or search step -- but a FROM-less or plain-table SELECT still executes a real access
+        // path, and a compiled named-table join exposes its actual plan tree. JSON can describe
+        // those without changing the TEXT convention, which keeps reporting the placeholder
+        // (ExplainQueryPlanTests.cs pins that TEXT routing marker independently
         // of what FORMAT=JSON reports). A write statement with nothing to scan (a constant
         // INSERT ... VALUES) has no equivalent real access path, so it still reports no nodes.
         var isPlaceholderOnly = result.Rows.Count == 1
@@ -28807,6 +28810,15 @@ out bool hasReturning)
                 var op = ops is not null && index < ops.Count ? ops[index] : null;
                 return (nodeId, parent, detailText, op);
             }).ToArray();
+        }
+
+        if (compiledJoinRoot is not null)
+        {
+            var additionalNodes = DescribeCompiledNamedJoinNonIndexedNodes(
+                compiledJoinRoot,
+                nodes.Count == 0 ? 1 : nodes.Max(static node => node.Id) + 1);
+            if (additionalNodes.Count != 0)
+                nodes = [.. nodes, .. additionalNodes];
         }
 
         var json = new System.Text.StringBuilder()
@@ -28849,9 +28861,8 @@ out bool hasReturning)
     /// a FROM-less SELECT (one synthesized row of literal/computed values) and a single plain
     /// base table with no join, no index chosen (an ordinary full table scan). Both are
     /// determined from the statement and its bound base-table catalog, never by treating a view
-    /// or other named row source as a table. A multi-table join's real per-leg
-    /// access method (index seek vs. hash join vs. full scan) is not yet reconstructable this
-    /// way and stays unmodeled.
+    /// or other named row source as a table. Joins cannot be reconstructed from this syntax;
+    /// supported compiled joins instead use their actual OpenJoinCursor plan tree.
     /// </summary>
     private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(
         SelectStatement select,
@@ -28908,10 +28919,13 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         out IReadOnlyList<EqpJsonOp?>? ops,
-        out (int CteId, string Name, int NodeId)? cteMaterialization)
+        out (int CteId, string Name, int NodeId)? cteMaterialization,
+        out VdbeJoinPlanNode? compiledJoinRoot)
     {
         ops = null;
         cteMaterialization = null;
+        compiledJoinRoot = null;
+        VdbeJoinPlanNode? compiledJoinCandidate = null;
         var compilationContext = EnsureAutoIncrementStatementState(context);
         if (statement.Inner is SelectStatement tableValuedSelect)
             statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
@@ -29340,20 +29354,27 @@ out bool hasReturning)
                 parameters,
                 compilationContext,
                 outerRow: null,
-                out var compiledJoinProgram)
-            && GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program) is { Count: > 0 } searches)
+                out var compiledJoinProgram))
         {
-            ops = searches.Select(static search => search.Op).ToArray();
-            return new ExecutionResult(
-                ExplainQueryPlanColumns(),
-                searches.Select((search, index) => new[]
-                {
-                    SqlValue.Integer(index + 1),
-                    SqlValue.Integer(0),
-                    SqlValue.Integer(0),
-                    SqlValue.Text(search.Detail),
-                }).ToArray(),
-                0);
+            compiledJoinCandidate = compiledJoinProgram.Program.Instructions
+                .OfType<OpenJoinCursorInstruction>()
+                .FirstOrDefault()?.Plan.Root;
+            var searches = GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program);
+            if (searches.Count > 0)
+            {
+                compiledJoinRoot = compiledJoinCandidate;
+                ops = searches.Select(static search => search.Op).ToArray();
+                return new ExecutionResult(
+                    ExplainQueryPlanColumns(),
+                    searches.Select((search, index) => new[]
+                    {
+                        SqlValue.Integer(index + 1),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text(search.Detail),
+                    }).ToArray(),
+                    0);
+            }
         }
         if (statement.Inner is SelectStatement correlatedAggregateSelect
             && TryDescribeCorrelatedAggregateSubqueryPlan(
@@ -29369,9 +29390,10 @@ out bool hasReturning)
 
         var usesCompiledProgram = statement.Inner switch
         {
-            SelectStatement select => HasExplainSafeBounds(select)
-                && CanUseCompiledSelectRoute(select, compilationContext, outerRow: null)
-                && TryCompileSelect(select, parameters, compilationContext, outerRow: null, out _),
+            SelectStatement select => compiledJoinCandidate is not null
+                || HasExplainSafeBounds(select)
+                    && CanUseCompiledSelectRoute(select, compilationContext, outerRow: null)
+                    && TryCompileSelect(select, parameters, compilationContext, outerRow: null, out _),
             CompoundSelectStatement compound => !compilationContext.CancellationToken.CanBeCanceled
                 && TryCompileCompoundSelect(
                     compound,
@@ -29405,6 +29427,8 @@ out bool hasReturning)
         var detail = usesCompiledProgram
             ? "MANAGED COMPILED VDBE"
             : "MANAGED EVALUATOR FALLBACK";
+        if (usesCompiledProgram)
+            compiledJoinRoot = compiledJoinCandidate;
         return new ExecutionResult(
             ExplainQueryPlanColumns(),
             [
@@ -29417,6 +29441,69 @@ out bool hasReturning)
             ],
             0);
     }
+
+    private static IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)>
+        DescribeCompiledNamedJoinNonIndexedNodes(VdbeJoinPlanNode root, int nextId)
+    {
+        // A scan leaf in a compiled plan is a real named-table cursor. Do not expand a derived
+        // leaf or an N-way subtree: neither supplies a proven per-table access-path breakdown.
+        if (root is not VdbeJoinOperatorPlan { Left: VdbeJoinScanPlan left } join
+            || join.Right is not VdbeJoinScanPlan
+                && (join.Right is not IVdbeJoinSeekPlan || join.Right.SearchMetadata is null))
+        {
+            return [];
+        }
+
+        var nodes = new List<(int Id, int Parent, string Detail, EqpJsonOp? Op)>();
+        string? joinMarker = GetCompiledJoinMarker(join.Kind);
+
+        void AddScan(VdbeJoinScanPlan scan, string? marker)
+        {
+            var detail = $"SCAN {scan.TableName}"
+                + (scan.Alias is null ? string.Empty : $" AS {scan.Alias}");
+            nodes.Add((
+                nextId++,
+                0,
+                detail,
+                new EqpJsonScanOp(scan.TableName, scan.Alias, IndexName: null, Covering: false, marker)));
+        }
+
+        if (join.Right is not VdbeJoinScanPlan right)
+        {
+            AddScan(left, marker: null);
+            return nodes;
+        }
+
+        if (join.EquiProbe is null)
+        {
+            AddScan(left, marker: null);
+            AddScan(right, marker: joinMarker);
+            return nodes;
+        }
+
+        // A two-table hash join needs no separate materialized build-input subtree. Like
+        // Turso's two-table EQP, report HASH JOIN for the probe and SCAN for the build source;
+        // the multi-table HashBuild parent only exists when a join prefix is materialized.
+        var build = join.HashBuildRight ? right : left;
+        var probe = join.HashBuildRight ? left : right;
+        var hashJoinDetail = $"HASH JOIN {probe.TableName}"
+            + (probe.Alias is null ? string.Empty : $" AS {probe.Alias}");
+        nodes.Add((nextId++, 0, hashJoinDetail,
+            new EqpJsonHashJoinOp(probe.TableName, probe.Alias,
+                join.HashBuildRight ? null : joinMarker)));
+        AddScan(build, marker: join.HashBuildRight ? joinMarker : null);
+        return nodes;
+    }
+
+    private static string? GetCompiledJoinMarker(VdbeJoinKind kind) => kind switch
+    {
+        VdbeJoinKind.Inner => "inner",
+        VdbeJoinKind.Left => "left",
+        VdbeJoinKind.Full => "full",
+        VdbeJoinKind.Semi => "semi",
+        VdbeJoinKind.Anti => "anti",
+        _ => null,
+    };
 
     private static IReadOnlyList<(string Detail, EqpJsonOp? Op)> GetCompiledJoinIndexSearchDescriptions(VdbeProgram program)
     {
@@ -29460,16 +29547,7 @@ out bool hasReturning)
             Collect(
                 join.Right,
                 join.Kind == VdbeJoinKind.Left ? " LEFT-JOIN" : suffix,
-                join.Kind switch
-                {
-                    VdbeJoinKind.Inner => "inner",
-                    VdbeJoinKind.Left => "left",
-                    VdbeJoinKind.Right => null,
-                    VdbeJoinKind.Full => "full",
-                    VdbeJoinKind.Semi => "semi",
-                    VdbeJoinKind.Anti => "anti",
-                    _ => null,
-                });
+                GetCompiledJoinMarker(join.Kind));
         }
     }
 
@@ -50072,7 +50150,10 @@ out bool hasReturning)
         foreach (var group in groups)
         {
             var functions = group.Select(ordinal => windowFunctions[ordinal]).ToArray();
-            var computed = ComputeWindowFunctions(
+            var resultOrdinals = new Dictionary<FunctionExpression, int>(functions.Length);
+            for (var position = 0; position < functions.Length; position++)
+                resultOrdinals.Add(functions[position], group[position]);
+            ComputeWindowFunctions(
                 functions,
                 rowCount,
                 evaluate,
@@ -50080,13 +50161,9 @@ out bool hasReturning)
                 parameters,
                 context,
                 emissionOrder,
-                evaluationSourceIndexes);
-            for (var position = 0; position < functions.Length; position++)
-            {
-                var series = computed[functions[position]];
-                for (var index = 0; index < rowCount; index++)
-                    values[index][group[position]] = series[index];
-            }
+                evaluationSourceIndexes,
+                values,
+                resultOrdinals);
         }
 
         return values;
@@ -50198,7 +50275,7 @@ out bool hasReturning)
 
         public SqlValue[] Keys { get; }
 
-        public List<int> Members { get; } = [];
+        public List<WindowOrderEntry> Entries { get; } = [];
     }
 
     private sealed record WindowOrderEntry(
@@ -50506,7 +50583,7 @@ out bool hasReturning)
 
     private delegate SqlValue WindowInputEvaluator(int rowIndex, Expression expression);
 
-    private Dictionary<FunctionExpression, SqlValue[]> ComputeWindowFunctions(
+    private void ComputeWindowFunctions(
         IReadOnlyList<FunctionExpression> functions,
         int rowCount,
         WindowInputEvaluator evaluate,
@@ -50514,13 +50591,11 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         IReadOnlyList<OrderByTerm>? emissionOrder,
-        IReadOnlySet<int>? evaluationSourceIndexes)
+        IReadOnlySet<int>? evaluationSourceIndexes,
+        SqlValue[][] results,
+        IReadOnlyDictionary<FunctionExpression, int> resultOrdinals)
     {
         var spec = functions[0].Window!;
-        var results = new Dictionary<FunctionExpression, SqlValue[]>();
-        foreach (var function in functions)
-            results.Add(function, new SqlValue[rowCount]);
-
         var partitionCollations = spec.PartitionBy
             .Select(expression => GetEffectiveCollation(expression, context))
             .ToArray();
@@ -50535,7 +50610,6 @@ out bool hasReturning)
             : new Dictionary<SqlValue[], WindowPartition>(
                 new GroupKeyEqualityComparer(partitionEquality, partitionHasher));
         var partitions = new List<WindowPartition>();
-        var orderKeysBySource = new SqlValue[rowCount][];
         for (var index = 0; index < rowCount; index++)
         {
             context.CheckInterrupt();
@@ -50559,14 +50633,16 @@ out bool hasReturning)
                 partitionIndexByKey?.Add(keys, partition);
             }
 
-            partition.Members.Add(index);
-            orderKeysBySource[index] = spec.OrderBy
-                .Select(term => evaluate(index, term.Expression))
-                .ToArray();
+            partition.Entries.Add(new WindowOrderEntry(
+                index,
+                partition.Entries.Count,
+                spec.OrderBy
+                    .Select(term => evaluate(index, term.Expression))
+                    .ToArray()));
         }
 
         if (partitions.Count == 0)
-            return results;
+            return;
 
         var needsFrame = functions.Any(WindowFunctionUsesFrame);
         var frameRuntime = needsFrame
@@ -50593,15 +50669,7 @@ out bool hasReturning)
         foreach (var partition in partitions)
         {
             context.CheckInterrupt();
-            var entries = new List<WindowOrderEntry>(partition.Members.Count);
-            for (var ordinal = 0; ordinal < partition.Members.Count; ordinal++)
-            {
-                var sourceIndex = partition.Members[ordinal];
-                entries.Add(new WindowOrderEntry(
-                    sourceIndex,
-                    ordinal,
-                    orderKeysBySource[sourceIndex]));
-            }
+            var entries = partition.Entries;
 
             if (spec.OrderBy.Count > 0)
             {
@@ -50860,14 +50928,14 @@ out bool hasReturning)
                             cumulativeValues[function] = cumulative.GetValue();
                         }
 
-                        results[function][entries[position].SourceIndex] =
+                        results[entries[position].SourceIndex][resultOrdinals[function]] =
                             cumulativeValues[function];
                         continue;
                     }
 
                     if (slidingAggregates.TryGetValue(function, out var sliding))
                     {
-                        results[function][entries[position].SourceIndex] = sliding.GetValue();
+                        results[entries[position].SourceIndex][resultOrdinals[function]] = sliding.GetValue();
                         continue;
                     }
 
@@ -50887,11 +50955,11 @@ out bool hasReturning)
                                 context);
                         }
 
-                        results[function][entries[position].SourceIndex] = sharedAggregateValues![function];
+                        results[entries[position].SourceIndex][resultOrdinals[function]] = sharedAggregateValues![function];
                         continue;
                     }
 
-                    results[function][entries[position].SourceIndex] = EvaluateWindowFunctionAtPosition(
+                    results[entries[position].SourceIndex][resultOrdinals[function]] = EvaluateWindowFunctionAtPosition(
                         function,
                         entries,
                         peers,
@@ -50905,7 +50973,6 @@ out bool hasReturning)
             }
         }
 
-        return results;
     }
 
     private Dictionary<FunctionExpression, CumulativeWindowAggregate>

@@ -690,6 +690,160 @@ public class ExplainQueryPlanFormatJsonTests
         op.GetProperty("index").GetProperty("ephemeral").GetBoolean().Should().BeFalse();
         op.GetProperty("constraints").EnumerateArray().Select(static value => value.GetString())
             .Should().Equal("k=?");
+        var outerScan = document.RootElement.GetProperty("nodes")[1];
+        outerScan.GetProperty("detail").GetString().Should().Be("SCAN items AS a");
+        outerScan.GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        outerScan.GetProperty("op").GetProperty("alias").GetString().Should().Be("a");
+    }
+
+    [Test]
+    public void CompiledNonIndexedEquijoinOrdersHashProbeBeforeBuildScanAsTwoRoots()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE outer_items(k INTEGER, payload TEXT); " +
+            "CREATE TABLE inner_items(k INTEGER, payload TEXT); " +
+            "INSERT INTO outer_items VALUES (1, 'outer-1'), (2, 'outer-2'); " +
+            "INSERT INTO inner_items VALUES (1, 'inner-1'), (3, 'inner-3');");
+
+        const string query = """
+            SELECT o.payload, i.payload
+            FROM outer_items AS o JOIN inner_items AS i NOT INDEXED ON o.k = i.k
+            ORDER BY o.k;
+            """;
+        ReadValues(connection, query).Should().ContainSingle().Which
+            .Should().Equal(SqlValue.Text("outer-1"), SqlValue.Text("inner-1"));
+        var compiled = ReadValues(connection, "EXPLAIN " + query)
+            .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText();
+        compiled.Should().Contain("equijoin hash-build right");
+        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
+            .Should().Equal("MANAGED COMPILED VDBE");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(2);
+        nodes[0].GetProperty("id").GetInt32().Should().Be(1);
+        nodes[0].GetProperty("detail").GetString().Should().Be("HASH JOIN outer_items AS o");
+        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_join");
+        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("outer_items");
+        nodes[0].GetProperty("op").GetProperty("alias").GetString().Should().Be("o");
+        nodes[0].GetProperty("op").TryGetProperty("join", out _).Should().BeFalse();
+        nodes[0].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
+        nodes[1].GetProperty("id").GetInt32().Should().Be(2);
+        nodes[1].GetProperty("detail").GetString().Should().Be("SCAN inner_items AS i");
+        nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        nodes[1].GetProperty("op").GetProperty("table").GetString().Should().Be("inner_items");
+        nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("i");
+        nodes[1].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+        nodes[1].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
+        document.RootElement.GetRawText().Should().NotContain("hash_build");
+        document.RootElement.GetRawText().Should().NotContain("MATERIALIZE hash build input");
+    }
+
+    [Test]
+    public void CompiledNonEquiLeftJoinReportsTwoScansWithoutInventingHashWork()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE l(k INTEGER); CREATE TABLE r(k INTEGER); " +
+            "INSERT INTO l VALUES (1), (3); INSERT INTO r VALUES (2);");
+        const string query = """
+            SELECT a.k, b.k
+            FROM l AS a LEFT JOIN r AS b ON a.k < b.k
+            ORDER BY a.k;
+            """;
+        ReadValues(connection, query).Should().HaveCount(2);
+        ReadValues(connection, "EXPLAIN " + query)
+            .Should().Contain(row => row[1].AsText() == "OpenJoinCursor");
+        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
+            .Should().Equal("MANAGED COMPILED VDBE");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(2);
+        nodes[0].GetProperty("detail").GetString().Should().Be("SCAN l AS a");
+        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        nodes[1].GetProperty("detail").GetString().Should().Be("SCAN r AS b");
+        nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        nodes[1].GetProperty("op").GetProperty("join").GetString().Should().Be("left");
+    }
+
+    [Test]
+    public void CompiledSelfJoinWithoutIndexKeepsProbeAndBuildAliasesDistinct()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE items(k INTEGER, payload TEXT); " +
+            "INSERT INTO items VALUES (1, 'one'), (2, 'two');");
+
+        const string query = """
+            SELECT a.payload, b.payload
+            FROM items AS a NOT INDEXED JOIN items AS b NOT INDEXED ON a.k = b.k
+            ORDER BY a.k;
+            """;
+        ReadValues(connection, query).Should().HaveCount(2);
+        ReadValues(connection, "EXPLAIN " + query)
+            .Should().Contain(row => row[1].AsText() == "OpenJoinCursor");
+        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
+            .Should().Equal("MANAGED COMPILED VDBE");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(2);
+        nodes.EnumerateArray().Select(static node => node.GetProperty("op").GetProperty("alias").GetString())
+            .Should().BeEquivalentTo(["a", "b"]);
+        nodes.EnumerateArray()
+            .Select(static node => node.GetProperty("op").GetProperty("table").GetString())
+            .Should().OnlyContain(static table => table == "items");
+        nodes.EnumerateArray().Select(static node => node.GetProperty("op").GetProperty("type").GetString())
+            .Should().BeEquivalentTo(["hash_join", "scan"]);
+    }
+
+    [Test]
+    public void CompiledHashBuildLeftUsesTheChosenSmallTable()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE small(k INTEGER, label TEXT); " +
+            "CREATE TABLE big(k INTEGER, label TEXT); " +
+            "INSERT INTO small VALUES (1, 's1'), (2, 's2'), (3, 's3'); " +
+            "INSERT INTO big VALUES " +
+            string.Join(", ", Enumerable.Range(1, 40).Select(value => $"({value}, 'b{value}')")) +
+            "; ANALYZE;");
+
+        const string query = """
+            SELECT s.label, b.label
+            FROM small AS s JOIN big AS b NOT INDEXED ON s.k = b.k
+            ORDER BY s.k;
+            """;
+        ReadValues(connection, query).Should().HaveCount(3);
+        ReadValues(connection, "EXPLAIN " + query)
+            .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText()
+            .Should().Contain("hash-build left");
+        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
+            .Should().Equal("MANAGED COMPILED VDBE");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(2);
+        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_join");
+        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("big");
+        nodes[0].GetProperty("op").GetProperty("alias").GetString().Should().Be("b");
+        nodes[0].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+        nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        nodes[1].GetProperty("op").GetProperty("table").GetString().Should().Be("small");
+        nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("s");
+        nodes[1].GetProperty("op").TryGetProperty("join", out _).Should().BeFalse();
+        nodes.EnumerateArray().Should().OnlyContain(static node =>
+            node.GetProperty("parent").ValueKind == JsonValueKind.Null);
     }
 
     [Test]
@@ -796,7 +950,9 @@ public class ExplainQueryPlanFormatJsonTests
 
         using var document = JsonDocument.Parse(
             ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
-        var node = document.RootElement.GetProperty("nodes")[0];
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(1);
+        var node = nodes[0];
         node.GetProperty("detail").GetString().Should().Be(details[0]);
         node.GetProperty("op").GetProperty("type").GetString().Should().Be("unmodeled");
         node.GetProperty("op").GetProperty("detail").GetString().Should().Be(details[0]);
