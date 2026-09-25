@@ -60,6 +60,19 @@ public sealed class AsyncBoundedWithoutRowidScanTests
         while (await prefix.ReadAsync())
             sequence.Add(prefix.GetValue(0).AsInteger());
         sequence.Should().Equal(2L, 5L);
+
+        await prefix.DisposeAsync();
+        await using var reverse = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items ORDER BY tenant DESC, seq DESC LIMIT 2");
+        var reverseLabels = new List<string>();
+        while (await reverse.ReadAsync())
+            reverseLabels.Add(reverse.GetValue(0).AsText());
+        reverseLabels.Should().Equal("last", "middle");
+
+        var mixedOrder = async () => await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items ORDER BY tenant DESC, seq ASC");
+        (await mixedOrder.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>())
+            .Which.Message.Should().Contain("ORDER BY");
     }
 
     [Test]
@@ -155,6 +168,16 @@ public sealed class AsyncBoundedWithoutRowidScanTests
                 while (await reader.ReadAsync())
                     actual.Add((reader.GetValue(0).AsInteger(), reader.GetValue(1).AsText()));
                 actual.Should().Equal(expected.Skip(117).Take(5).Select(row => (row.Tag, row.Payload)));
+            }
+
+            await using (var reader = await bounded.ExecuteBoundedScanAsync(
+                "SELECT code, payload FROM items ORDER BY code DESC LIMIT 3 OFFSET 117"))
+            {
+                var actual = new List<(string Code, string Payload)>();
+                while (await reader.ReadAsync())
+                    actual.Add((reader.GetValue(0).AsText(), reader.GetValue(1).AsText()));
+                actual.Should().Equal(expected.AsEnumerable().Reverse().Skip(117).Take(3)
+                    .Select(row => (row.Code, row.Payload)));
             }
         }
         finally
@@ -282,7 +305,7 @@ public sealed class AsyncBoundedWithoutRowidScanTests
             ("SELECT * FROM collated", "primary key"),
             ("SELECT * FROM ascending WHERE code = 'a'", "WHERE"),
             ("SELECT * FROM ascending ORDER BY value", "ORDER BY"),
-            ("SELECT * FROM ascending ORDER BY code DESC", "ORDER BY"),
+            ("SELECT * FROM ascending ORDER BY value DESC", "ORDER BY"),
             ("SELECT * FROM ascending INDEXED BY ascending_value", "INDEXED BY"),
             ("SELECT rowid FROM ascending", "does not exist"),
         })

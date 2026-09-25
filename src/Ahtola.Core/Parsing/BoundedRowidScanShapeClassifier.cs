@@ -395,9 +395,10 @@ internal static class BoundedRowidScanShapeClassifier
         var terms = table.PrimaryKeySchema!.Terms;
         if (order.Count > terms.Count)
             return false;
+        var descending = order[0].Descending;
         for (var index = 0; index < order.Count; index++)
         {
-            if (order[index].Descending
+            if (order[index].Descending != descending
                 || !IsNamedColumn(order[index].Expression, source, terms[index].ColumnName))
                 return false;
         }
