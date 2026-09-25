@@ -1298,6 +1298,9 @@ public abstract class VdbeJoinPlanNode
 
     public int SourceCount { get; }
 
+    // Only named base-table seeks carry a modeled access path; derived seeks stay unmodeled.
+    internal VdbeJoinSearchMetadata? SearchMetadata { get; set; }
+
     internal abstract IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows);
 
     /// <summary>
@@ -1315,6 +1318,15 @@ public abstract class VdbeJoinPlanNode
         return Enumerate(maximumRows);
     }
 }
+
+/// <summary>Typed search fields corresponding to Turso's <c>EqpDetail::Search</c>.</summary>
+internal sealed record VdbeJoinSearchMetadata(
+    string TableName,
+    string? Alias,
+    string IndexName,
+    bool Covering,
+    bool Ephemeral,
+    IReadOnlyList<string> Constraints);
 
 /// <summary>A base-table leaf in a materializing join plan.</summary>
 public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode

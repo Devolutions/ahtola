@@ -378,6 +378,22 @@ metadata and the existing format-4 decoder both remain supported. The
 original-image segment is still full and no synced prefix is retained across
 generations; **reusable multi-generation history remains open**.
 
+Compiled named-table join seeks now attach typed JSON `search` operations
+from the selected program plan (actual table/alias, chosen durable or
+automatic index, covering status, constraints, and join kind). TEXT EQP
+remains unchanged. A derived join seek with no base-table metadata still
+reports `unmodeled`, and compiled joins with no indexed leg still need an
+executed access-path description.
+
+The WBOUND spill-index and output-drain slices now keep random-access row
+offsets on disk and avoid a second whole-partition output array for large
+results. `WindowEvaluatorMemoryUnbounded` explicitly records that the
+evaluator's partition keys, prepared function inputs, and temporary computed
+results remain outside the retained-memory ledger; **full end-to-end window
+bounding remains open**. The output and spill-file failure paths release
+their reservations and clean up files rather than reporting a false finite
+peak.
+
 TYPE/DOMAIN adoption must keep SQLite's five physical storage classes: the
 pinned Turso engine persists named definitions as SQL, resolves base-type
 chains, and encodes/decodes values at column boundaries. A metadata-only

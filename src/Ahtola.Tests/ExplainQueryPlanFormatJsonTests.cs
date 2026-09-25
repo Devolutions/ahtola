@@ -1,4 +1,5 @@
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 using AwesomeAssertions;
 using System.Text.Json;
 
@@ -654,6 +655,151 @@ public class ExplainQueryPlanFormatJsonTests
             "\"detail\":\"SEARCH o USING COVERING INDEX idx_semi_orders_user (user_id=?)\",\"op\":{\"type\":\"search\",\"table\":\"semi_orders\",\"alias\":\"o\",\"join\":\"semi\"");
         json[0].Should().Contain("\"index\":{\"name\":\"idx_semi_orders_user\",\"covering\":true,\"ephemeral\":false}");
         json[0].Should().NotContain("\"integer_primary_key\"");
+    }
+
+    [Test]
+    public void CompiledSelfJoinSearchRetainsItsChosenIndexAndRightAlias()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE items(k INTEGER, payload TEXT); " +
+            "CREATE INDEX items_k ON items(k); " +
+            "INSERT INTO items VALUES (1, 'one'), (2, 'two'); ANALYZE;");
+
+        const string query = """
+            SELECT a.payload, b.payload
+            FROM items AS a JOIN items AS b INDEXED BY items_k ON a.k = b.k;
+            """;
+        ReadValues(connection, query).Should().HaveCount(2);
+        var details = ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query);
+        details.Should().ContainSingle().Which.Should().Be("SEARCH items USING INDEX items_k (k=?)");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(details[0]);
+        var op = node.GetProperty("op");
+        op.GetProperty("type").GetString().Should().Be("search");
+        op.GetProperty("table").GetString().Should().Be("items");
+        op.GetProperty("alias").GetString().Should().Be("b");
+        op.GetProperty("join").GetString().Should().Be("inner");
+        op.GetProperty("search_kind").GetString().Should().Be("seek");
+        op.GetProperty("index").GetProperty("name").GetString().Should().Be("items_k");
+        op.GetProperty("index").GetProperty("covering").GetBoolean().Should().BeFalse();
+        op.GetProperty("index").GetProperty("ephemeral").GetBoolean().Should().BeFalse();
+        op.GetProperty("constraints").EnumerateArray().Select(static value => value.GetString())
+            .Should().Equal("k=?");
+    }
+
+    [Test]
+    public void CompiledJoinAutomaticIndexIsAnEphemeralCoveringSearch()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE outer_items(k INTEGER, payload TEXT); " +
+            "CREATE TABLE inner_items(k INTEGER, payload TEXT); " +
+            "INSERT INTO outer_items VALUES " +
+            string.Join(", ", Enumerable.Range(1, 100).Select(value => $"({value}, 'o{value}')")) + "; " +
+            "INSERT INTO inner_items VALUES " +
+            string.Join(", ", Enumerable.Range(1, 100).Select(value => $"({value}, 'i{value}')")) + "; ANALYZE;");
+
+        const string query = """
+            SELECT o.k, i.payload
+            FROM outer_items AS o JOIN inner_items AS i ON o.k = i.k
+            ORDER BY o.k;
+            """;
+        ReadValues(connection, query).Should().HaveCount(100);
+        var detail = ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query).Single();
+        detail.Should().Be("SEARCH inner_items USING AUTOMATIC COVERING INDEX (k=?)");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(detail);
+        var op = node.GetProperty("op");
+        op.GetProperty("type").GetString().Should().Be("search");
+        op.GetProperty("table").GetString().Should().Be("inner_items");
+        op.GetProperty("alias").GetString().Should().Be("i");
+        op.GetProperty("join").GetString().Should().Be("inner");
+        op.GetProperty("index").GetProperty("name").GetString().Should().Be("automatic_inner_items");
+        op.GetProperty("index").GetProperty("covering").GetBoolean().Should().BeTrue();
+        op.GetProperty("index").GetProperty("ephemeral").GetBoolean().Should().BeTrue();
+        op.GetProperty("constraints")[0].GetString().Should().Be("k=?");
+    }
+
+    [Test]
+    public void CompiledJoinPagerSeekReportsTheDurableIndexRatherThanAnAutomaticIndex()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var embedded = EmbeddedDatabase.OpenFile("eqp-join-index.db", fileSystem))
+        using (var connection = embedded.Connect())
+        {
+            Execute(connection,
+                "CREATE TABLE outer_items(k INTEGER); " +
+                "CREATE TABLE inner_items(k INTEGER, payload TEXT); " +
+                "CREATE INDEX inner_items_k ON inner_items(k); " +
+                "INSERT INTO outer_items VALUES (2), (40); " +
+                "INSERT INTO inner_items VALUES " +
+                string.Join(", ", Enumerable.Range(1, 100).Select(value => $"({value}, 'p{value}')")) +
+                "; ANALYZE;");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile("eqp-join-index.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        const string query = """
+            SELECT i.payload
+            FROM outer_items o JOIN inner_items i INDEXED BY inner_items_k
+                ON o.k = i.k
+            ORDER BY o.k;
+            """;
+        var detail = ReadPlanDetails(reopenedConnection, "EXPLAIN QUERY PLAN " + query).Single();
+        detail.Should().Be("SEARCH inner_items USING INDEX inner_items_k (k=?)");
+        using var document = JsonDocument.Parse(
+            ReadAll(reopenedConnection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(detail);
+        var op = node.GetProperty("op");
+        op.GetProperty("type").GetString().Should().Be("search");
+        op.GetProperty("table").GetString().Should().Be("inner_items");
+        op.GetProperty("alias").GetString().Should().Be("i");
+        op.GetProperty("index").GetProperty("name").GetString().Should().Be("inner_items_k");
+        op.GetProperty("index").GetProperty("ephemeral").GetBoolean().Should().BeFalse();
+        op.GetProperty("constraints")[0].GetString().Should().Be("k=?");
+
+        ReadValues(reopenedConnection, query).Select(static row => row[0].AsText())
+            .Should().Equal("p2", "p40");
+        reopened.JoinIndexSeekMetrics.DurableCursorPlans.Should().Be(1);
+    }
+
+    [Test]
+    public void CompiledDerivedJoinSeekRemainsUnmodeledWithoutBaseTableMetadata()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE outer_items(k INTEGER); " +
+            "CREATE TABLE inner_items(k INTEGER, value INTEGER); " +
+            "INSERT INTO outer_items VALUES (1), (2); " +
+            "INSERT INTO inner_items VALUES (1, 10), (2, 20);");
+
+        const string query = """
+            SELECT o.k, d.total
+            FROM outer_items o JOIN
+                (SELECT k, sum(value) AS total FROM inner_items GROUP BY k) d
+                ON o.k = d.k;
+            """;
+        ReadValues(connection, query).Should().HaveCount(2);
+        var details = ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query);
+        details.Should().ContainSingle().Which.Should().StartWith("SEARCH d USING INDEX derived_");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var node = document.RootElement.GetProperty("nodes")[0];
+        node.GetProperty("detail").GetString().Should().Be(details[0]);
+        node.GetProperty("op").GetProperty("type").GetString().Should().Be("unmodeled");
+        node.GetProperty("op").GetProperty("detail").GetString().Should().Be(details[0]);
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

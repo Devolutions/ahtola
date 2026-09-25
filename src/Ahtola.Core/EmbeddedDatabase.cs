@@ -22678,13 +22678,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return key;
         }
 
-        var prefix = string.Join(
-            ", ",
-            selection.Candidate.Columns
-                .Take(keys.Length)
-                .Select((column, position) => column.IndexExpression is not null
-                    ? $"{(index!.Columns[position].ExpressionSql ?? "expr")}=?"
-                    : $"{table.Columns[column.ColumnOrdinal]}=?"));
+        var constraints = selection.Candidate.Columns
+            .Take(keys.Length)
+            .Select((column, position) => column.IndexExpression is not null
+                ? $"{(index!.Columns[position].ExpressionSql ?? "expr")}=?"
+                : $"{table.Columns[column.ColumnOrdinal]}=?")
+            .ToArray();
+        var prefix = string.Join(", ", constraints);
+        var searchMetadata = new VdbeJoinSearchMetadata(
+            table.Name,
+            named.Alias,
+            indexName,
+            selection.Candidate.Covering,
+            selection.Candidate.Automatic,
+            constraints);
         var usingClause = selection.Candidate.Automatic
             ? "USING AUTOMATIC COVERING INDEX"
             : selection.Candidate.Covering
@@ -22701,6 +22708,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 BuildSeekKey,
                 CanonicalizeAutomaticKey,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"automatic-index-seek {table.Name} ({prefix})";
             return true;
         }
@@ -22737,6 +22745,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 concurrentMvccAccessor.Open,
                 concurrentMvccAccessor.Dispose,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
             return true;
         }
@@ -22773,6 +22782,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 transactionAccessor.Open,
                 transactionAccessor.Dispose,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
             return true;
         }
@@ -22810,6 +22820,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 accessor.Open,
                 accessor.Dispose,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
             return true;
         }
@@ -22823,6 +22834,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             BuildSeekKey,
             ComparePrefix,
             _joinIndexSeekMetrics);
+        plan.SearchMetadata = searchMetadata;
         description = $"materialized-index-seek {table.Name} {usingClause} ({prefix})";
         return true;
     }
@@ -29331,14 +29343,15 @@ out bool hasReturning)
                 out var compiledJoinProgram)
             && GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program) is { Count: > 0 } searches)
         {
+            ops = searches.Select(static search => search.Op).ToArray();
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
-                searches.Select((detail, index) => new[]
+                searches.Select((search, index) => new[]
                 {
                     SqlValue.Integer(index + 1),
                     SqlValue.Integer(0),
                     SqlValue.Integer(0),
-                    SqlValue.Text(detail),
+                    SqlValue.Text(search.Detail),
                 }).ToArray(),
                 0);
         }
@@ -29405,33 +29418,58 @@ out bool hasReturning)
             0);
     }
 
-    private static IReadOnlyList<string> GetCompiledJoinIndexSearchDescriptions(VdbeProgram program)
+    private static IReadOnlyList<(string Detail, EqpJsonOp? Op)> GetCompiledJoinIndexSearchDescriptions(VdbeProgram program)
     {
-        var searches = new List<string>();
+        var searches = new List<(string Detail, EqpJsonOp? Op)>();
         foreach (var instruction in program.Instructions)
         {
             if (instruction is OpenJoinCursorInstruction open)
-                Collect(open.Plan.Root, suffix: null);
+                Collect(open.Plan.Root, suffix: null, joinMarker: null);
         }
 
         return searches;
 
-        void Collect(VdbeJoinPlanNode node, string? suffix)
+        void Collect(VdbeJoinPlanNode node, string? suffix, string? joinMarker)
         {
             if (node is IVdbeJoinSeekPlan index)
             {
-                searches.Add(suffix is null ? index.SearchDescription : index.SearchDescription + suffix);
+                var metadata = node.SearchMetadata;
+                EqpJsonOp? op = metadata is null
+                    ? null
+                    : new EqpJsonSearchOp(
+                        metadata.TableName,
+                        metadata.Alias,
+                        metadata.IndexName,
+                        metadata.Covering,
+                        metadata.Constraints,
+                        joinMarker,
+                        metadata.Ephemeral);
+                searches.Add((
+                    suffix is null ? index.SearchDescription : index.SearchDescription + suffix,
+                    op));
                 return;
             }
 
             if (node is not VdbeJoinOperatorPlan join)
                 return;
-            Collect(join.Left, suffix);
+            Collect(join.Left, suffix, joinMarker);
             // Turso tags the preserved (right) side of a LEFT JOIN's access-method line with
             // " LEFT-JOIN" so EXPLAIN QUERY PLAN reads which side the outer join keeps NULL-padded
             // rows for (core/translate/eqp.rs). RIGHT/FULL have no equivalent fixture evidence yet,
             // so they are left exactly as before rather than guessed at.
-            Collect(join.Right, join.Kind == VdbeJoinKind.Left ? " LEFT-JOIN" : suffix);
+            Collect(
+                join.Right,
+                join.Kind == VdbeJoinKind.Left ? " LEFT-JOIN" : suffix,
+                join.Kind switch
+                {
+                    VdbeJoinKind.Inner => "inner",
+                    VdbeJoinKind.Left => "left",
+                    VdbeJoinKind.Right => null,
+                    VdbeJoinKind.Full => "full",
+                    VdbeJoinKind.Semi => "semi",
+                    VdbeJoinKind.Anti => "anti",
+                    _ => null,
+                });
         }
     }
 

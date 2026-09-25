@@ -329,6 +329,10 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   materializes both sides as the query result by design, so it is not a spill
   candidate (an architectural property of the evaluator, not a missing spill
   path); an aggregate's own accumulator is a single bounded value per group.
+  Buffered-window input, its offset index, and its drained output can spill,
+  but the window evaluator's partition metadata, function inputs, and
+  computed result scratch are not yet fully bounded by the execution ledger;
+  `WindowEvaluatorMemoryUnbounded` makes that limitation explicit.
   Prefer modest databases
   and explicit transactions for writes (managed writes are slower than native
   SQLite and the gap grows with table size).
@@ -438,7 +442,8 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   machine-readable envelope from Turso's `docs/eqp-json.md`. The inner
   statement's result columns (including DML `RETURNING`) and several
   structured per-node `op` variants are modeled, including virtual-table
-  scans and selected managed index methods; other plan shapes still carry
+  scans, selected managed index methods, and compiled named-table join seeks;
+  other plan shapes still carry
   explicit `unmodeled` operations or no nodes when no access path is proven
   (for example, an unmodeled view). Built-in `get_byte`/`set_byte`
   (PostgreSQL-compatible byte access) and `json_object(*)`/`jsonb_object(*)`
