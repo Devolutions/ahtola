@@ -52,6 +52,13 @@ internal static class AsyncSchemaCatalogLoader
         await WalkAsync(pageCache, SchemaRootPage, rows, textEncoding, cancellationToken)
             .ConfigureAwait(false);
 
+        if (rows.Any(static row =>
+                row.Name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new EmbeddedSqlException(
+                "Bounded asynchronous scans of databases with custom types are not yet supported.");
+        }
+
         var indexedTableNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var row in rows)
         {

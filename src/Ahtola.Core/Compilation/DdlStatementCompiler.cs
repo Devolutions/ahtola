@@ -305,6 +305,97 @@ internal sealed record CompiledSchemaProgram(
 internal static class DdlStatementCompiler
 {
     /// <summary>
+    /// Persists the supported definitions using Turso's <c>persist_type_definition</c>
+    /// backing-table shape; typed columns are rejected until their write paths exist.
+    /// </summary>
+    public static CompiledSchemaProgram CompileCreateTypeDefinition(
+        ParsedStatement statement,
+        DdlCompilationContext context)
+    {
+        var (name, baseType, sql, ifNotExists) = statement switch
+        {
+            CreateTypeStatement type => (type.Name, type.BaseType, type.Sql, type.IfNotExists),
+            CreateDomainStatement domain => (domain.Name, domain.BaseType, domain.Sql, domain.IfNotExists),
+            _ => throw new ArgumentException("Expected CREATE TYPE or CREATE DOMAIN.", nameof(statement)),
+        };
+        var normalizedName = name.ToLowerInvariant();
+        if (normalizedName is "int" or "integer" or "real" or "text" or "blob" or "any")
+            throw new EmbeddedSqlException($"cannot create type \"{name}\": name is a built-in type");
+        if (!baseType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException("Only primitive INTEGER-based type definitions are supported.");
+        if (SqlParameterMap.Parse(sql).Count != 0)
+            throw new EmbeddedSqlException("Bind parameters are not allowed in type definitions.");
+
+        var catalog = context.Catalog;
+        if (catalog.TypeDefinitions.ContainsKey(normalizedName))
+        {
+            if (ifNotExists)
+                return CompileNoOp(context);
+            throw new EmbeddedSqlException($"type {name} already exists");
+        }
+
+        var createBacking = !catalog.Tables.ContainsKey(ManagedTypeRegistry.TableName);
+        if (createBacking)
+        {
+            if (catalog.Views.ContainsKey(ManagedTypeRegistry.TableName)
+                || catalog.Triggers.ContainsKey(ManagedTypeRegistry.TableName)
+                || EmbeddedDatabase.TryFindIndex(catalog.Tables, ManagedTypeRegistry.TableName, out _, out _))
+            {
+                throw new EmbeddedSqlException("The internal type registry name is already in use.");
+            }
+            context.EnforceMaxPageCount(1 + ManagedTypeRegistry.CreateBackingTable().Indexes.Count);
+        }
+
+        var builder = new SchemaProgramBuilder(context.Database);
+        var schemaCursor = builder.AllocateCursor();
+        builder.Emit(new OpenWriteCursorInstruction(
+            schemaCursor,
+            ManagedSchemaProgramBindings.SchemaTableName,
+            ManagedSchemaProgramBindings.SchemaColumnCount));
+        if (createBacking)
+        {
+            var backing = ManagedTypeRegistry.CreateBackingTable();
+            var root = builder.EmitCreateBtree(VdbeCreateBtreeFlags.Table);
+            builder.EmitSchemaEntry(
+                schemaCursor,
+                ManagedSchemaRow.TableType,
+                ManagedTypeRegistry.TableName,
+                ManagedTypeRegistry.TableName,
+                root,
+                EmbeddedDatabase.BuildCreateTableSql(ManagedTypeRegistry.TableName, backing));
+            foreach (var index in backing.Indexes.Where(static index => index.Origin != EmbeddedIndexOrigin.Explicit))
+            {
+                var indexRoot = builder.EmitCreateBtree(VdbeCreateBtreeFlags.Index);
+                builder.EmitSchemaEntry(
+                    schemaCursor,
+                    ManagedSchemaRow.IndexType,
+                    index.Name,
+                    ManagedTypeRegistry.TableName,
+                    indexRoot,
+                    sql: null);
+            }
+            builder.Emit(ParseSchemaFor(context.Database, ManagedTypeRegistry.TableName));
+        }
+
+        var stagedSchemaVersion = NextSchemaVersion(context.SchemaVersion);
+        builder.Emit(new SetCookieInstruction(
+            context.Database,
+            VdbeSchemaCookie.SchemaVersion,
+            checked((int)stagedSchemaVersion)));
+        var row = new[] { SqlValue.Text(normalizedName), SqlValue.Text(sql) };
+        var populations = new[]
+        {
+            EmitPopulation(builder, ManagedTypeRegistry.TableName, [row], 2),
+        };
+        return new CompiledSchemaProgram(
+            builder.Build(),
+            schemaCursor,
+            populations,
+            stagedSchemaVersion,
+            IsNoOp: false);
+    }
+
+    /// <summary>
     /// Lowers <c>CREATE TABLE</c> and the materialized form of <c>CREATE TABLE AS SELECT</c>, following
     /// <c>translate_create_table</c> (schema.rs:1100).
     /// </summary>
@@ -335,6 +426,8 @@ internal static class DdlStatementCompiler
             throw new EmbeddedSqlException($"view {statement.Name} already exists");
         if (EmbeddedDatabase.TryFindIndex(catalog.Tables, statement.Name, out _, out _))
             throw new EmbeddedSqlException($"there is already an index named {statement.Name}");
+
+        ManagedTypeRegistry.RejectTypedColumns(statement, catalog.TypeDefinitions);
 
         // A WITHOUT ROWID table has no hidden rowid to fall back on, so SQLite requires a
         // PRIMARY KEY; reject the table before it is registered when none is declared.

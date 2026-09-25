@@ -875,8 +875,77 @@ internal sealed class SqlParser
         }
         if (ConsumeKeyword("SEQUENCE"))
             return ParseCreateSequence();
+        if (ConsumeKeyword("TYPE"))
+            return ParseCreateType();
+        if (ConsumeKeyword("DOMAIN"))
+            return ParseCreateDomain();
 
         return ParseCreateTable(temporary: false);
+    }
+
+    private ParsedStatement ParseCreateType()
+    {
+        var ifNotExists = ParseIfNotExists();
+        var name = ExpectIdentifier();
+        if (_lexer.Current.Kind == TokenKind.LeftParen || ConsumeKeyword("AS"))
+            throw Error("Parameterized, STRUCT, and UNION types are not supported.");
+        ExpectKeyword("BASE");
+        var baseType = ExpectIdentifier();
+        if (!baseType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase))
+            throw Error("Only identity INTEGER-based types are supported.");
+        return new CreateTypeStatement(name, baseType, ifNotExists, _sql.Trim().TrimEnd(';'));
+    }
+
+    private ParsedStatement ParseCreateDomain()
+    {
+        var ifNotExists = ParseIfNotExists();
+        var name = ExpectIdentifier();
+        ExpectKeyword("AS");
+        var baseType = ExpectIdentifier();
+        Expression? defaultValue = null;
+        var notNull = false;
+        var explicitNull = false;
+        var checks = new List<DomainCheck>();
+        while (_lexer.Current.Kind == TokenKind.Identifier)
+        {
+            if (ConsumeKeyword("DEFAULT"))
+            {
+                if (defaultValue is not null)
+                    throw Error("multiple DEFAULT clauses in domain definition");
+                defaultValue = _lexer.Current.Kind == TokenKind.LeftParen
+                    ? ParseExpression()
+                    : ParseSignedPrimary();
+                continue;
+            }
+            if (ConsumeKeyword("NOT"))
+            {
+                ExpectKeyword("NULL");
+                if (notNull || explicitNull)
+                    throw Error("duplicate or conflicting NULL clause in domain definition");
+                notNull = true;
+                continue;
+            }
+            if (ConsumeKeyword("NULL"))
+            {
+                if (notNull || explicitNull)
+                    throw Error("duplicate or conflicting NULL clause in domain definition");
+                explicitNull = true;
+                continue;
+            }
+            string? constraintName = null;
+            if (ConsumeKeyword("CONSTRAINT"))
+                constraintName = ExpectIdentifier();
+            if (constraintName is not null || CurrentIsKeyword("CHECK"))
+            {
+                ExpectKeyword("CHECK");
+                var (expression, sql) = ParseParenthesizedSchemaExpression("CHECK");
+                checks.Add(new DomainCheck(constraintName, expression, sql));
+                continue;
+            }
+            break;
+        }
+        return new CreateDomainStatement(name, baseType, ifNotExists, defaultValue, notNull, checks,
+            _sql.Trim().TrimEnd(';'));
     }
 
     /// <summary>

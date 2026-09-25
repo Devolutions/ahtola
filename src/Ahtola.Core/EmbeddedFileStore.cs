@@ -1512,8 +1512,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                 .Where(entry => entry.Type is "table" or "index" && entry.RootPage != 0)
                 .Select(entry => entry.RootPage));
 
-        // Materialize tables first so views and triggers can be parsed afterwards.
-        foreach (var entry in schemaEntries)
+        // Materialize type definitions first so a typed table cannot be admitted under
+        // ordinary SQLite affinity before its declared type has been resolved.
+        IReadOnlyDictionary<string, ParsedStatement> typeDefinitions =
+            new Dictionary<string, ParsedStatement>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in schemaEntries.OrderBy(static entry =>
+                     entry.Name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase) ? 0 : 1))
         {
             if (!string.Equals(entry.Type, "table", StringComparison.Ordinal))
                 continue;
@@ -1522,6 +1526,14 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 virtualTables.Add(entry.Name, ManagedSchemaRowParser.ParseVirtualTable(entry));
                 continue;
+            }
+
+            if (typeDefinitions.Count != 0
+                && !entry.Name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase))
+            {
+                var definition = SqlParser.Parse(entry.Sql!, SqlParameterMap.Parse(entry.Sql!));
+                if (definition is CreateTableStatement create)
+                    ManagedTypeRegistry.RejectTypedColumns(create, typeDefinitions);
             }
 
             var table = ManagedSchemaRowParser.ParseTable(entry);
@@ -1572,6 +1584,11 @@ internal sealed class EmbeddedFileStore : IDisposable
                         materializeRows: true));
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
+            if (entry.Name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase))
+            {
+                _ = table.Rows;
+                typeDefinitions = ManagedTypeRegistry.Load(tables);
+            }
         }
 
         foreach (var entry in schemaEntries)
@@ -3431,8 +3448,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             ValidateTableRepresentable(name, table, previousTables);
         EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateSchemaDefinitions(tables, views, triggers, virtualTables);
+        _ = ManagedTypeRegistry.Load(tables);
+        var typeMetadataChanged = _committedTables is null
+            ? tables.ContainsKey(ManagedTypeRegistry.TableName)
+            : !ManagedTypeRegistry.MetadataMatches(tables, _committedTables);
 
-        if (!forceFullRewrite
+        if (!typeMetadataChanged
+            && !forceFullRewrite
             && !reclaimTrailingPages
             && pragmaHeader is null)
         {
@@ -3591,7 +3613,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             _usableSpace);
 
         var signature = ComputeSchemaSignature(schemaEntries);
-        var schemaChanged = !string.Equals(signature, _lastSchemaSignature, StringComparison.Ordinal);
+        var schemaChanged = typeMetadataChanged
+            || !string.Equals(signature, _lastSchemaSignature, StringComparison.Ordinal);
 
         var newChangeCounter = currentHeader.ChangeCounter + 1;
         var newHeader = currentHeader with

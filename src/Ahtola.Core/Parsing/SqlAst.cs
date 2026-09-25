@@ -6,6 +6,23 @@ internal abstract record ParsedStatement;
 
 internal abstract record QueryStatement : ParsedStatement;
 
+internal sealed record CreateTypeStatement(
+    string Name,
+    string BaseType,
+    bool IfNotExists,
+    string Sql) : ParsedStatement;
+
+internal sealed record CreateDomainStatement(
+    string Name,
+    string BaseType,
+    bool IfNotExists,
+    Expression? Default,
+    bool NotNull,
+    IReadOnlyList<DomainCheck> Checks,
+    string Sql) : ParsedStatement;
+
+internal sealed record DomainCheck(string? Name, Expression Expression, string Sql);
+
 internal sealed record CreateTableStatement(
     string Name,
     IReadOnlyList<EmbeddedColumn> Columns,

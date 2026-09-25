@@ -1357,6 +1357,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public Dictionary<string, VirtualTableDefinition> VirtualTables { get; }
 
+        public IReadOnlyDictionary<string, ParsedStatement> TypeDefinitions
+            => ManagedTypeRegistry.Load(Tables);
+
         public SchemaCatalog Clone()
         {
             var virtualTables = new Dictionary<string, VirtualTableDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -2784,6 +2787,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
             or DropTableStatement or CreateIndexStatement or DropIndexStatement
             or CreateSequenceStatement or DropSequenceStatement
+            or CreateTypeStatement or CreateDomainStatement
             or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
             or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
             or AlterTableAlterColumnStatement or AlterTableDropColumnStatement
@@ -2991,6 +2995,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
         or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateSequenceStatement or DropSequenceStatement
+        or CreateTypeStatement or CreateDomainStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableAlterColumnStatement or AlterTableDropColumnStatement;
@@ -5622,6 +5627,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var result = statement switch
             {
                 CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
+                CreateTypeStatement or CreateDomainStatement => ExecuteCreateTypeDefinition(
+                    statement,
+                    catalog,
+                    cancellationToken),
                 CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(
                     createVirtual,
                     catalog,
@@ -6493,6 +6502,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new ExecutionResult([], [], 0, true);
     }
 
+    private ExecutionResult ExecuteCreateTypeDefinition(
+        ParsedStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
+    {
+        var compiled = DdlStatementCompiler.CompileCreateTypeDefinition(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
+
+        RunSchemaProgram(compiled, catalog, cancellationToken);
+        _ = catalog.TypeDefinitions;
+        return new ExecutionResult([], [], 0, true);
+    }
+
     /// <summary>
     /// The connection-dependent facts and checks a DDL compilation needs.
     /// </summary>
@@ -6761,6 +6786,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.Name);
         var compiled = DdlStatementCompiler.CompileDropTable(
             statement,
             CreateDdlCompilationContext(catalog));
@@ -6997,6 +7023,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         CancellationToken cancellationToken)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         var compiled = DdlStatementCompiler.CompileCreateIndex(
             statement,
             CreateDdlCompilationContext(catalog));
@@ -7992,6 +8019,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        var tableName = statement switch
+        {
+            AlterTableAddColumnStatement add => add.TableName,
+            AlterTableAlterColumnStatement alter => alter.TableName,
+            AlterTableDropColumnStatement drop => drop.TableName,
+            AlterTableRenameStatement rename => rename.TableName,
+            AlterTableRenameColumnStatement renameColumn => renameColumn.TableName,
+            _ => throw new ArgumentException("Expected ALTER TABLE statement.", nameof(statement)),
+        };
+        RejectInternalTypeTableMutation(tableName);
+        var typeDefinitions = catalog.TypeDefinitions;
+        if (statement is AlterTableAddColumnStatement { Column: var added })
+            ManagedTypeRegistry.RejectTypedColumn(added, typeDefinitions);
+        if (statement is AlterTableAlterColumnStatement { Column: var altered })
+            ManagedTypeRegistry.RejectTypedColumn(altered, typeDefinitions);
+
         if (statement is AlterTableRenameStatement virtualRename
             && catalog.VirtualTables.TryGetValue(virtualRename.TableName, out var virtualTable))
         {
@@ -11180,6 +11223,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         if (context.InsideTrigger && context.TriggerConflictAlgorithm is { } triggerConflictAlgorithm)
             statement = statement with { ConflictAlgorithm = triggerConflictAlgorithm };
         else if (context.InsideTrigger
@@ -14870,6 +14914,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
             return ExecuteVirtualTableUpdate(statement, virtualTable, parameters, context);
 
@@ -17443,6 +17488,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
             return ExecuteVirtualTableDelete(statement, virtualTable, parameters, context);
 
@@ -39136,12 +39182,20 @@ out bool hasReturning)
         return backing;
     }
 
-    // SQLite rejects any user-created object whose name begins with "sqlite_" (case
-    // insensitive); those names are reserved for the internal schema.
+    // SQLite reserves "sqlite_" and the managed type registry owns its backing-table name.
     internal static bool IsReservedObjectName(string name)
         => name.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase)
+            || name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase)
             || IsAutoIncrementSequenceBackingTable(name)
             || Indexing.ManagedIndexMethodNames.IsReserved(name);
+
+    private static void RejectInternalTypeTableMutation(string name)
+    {
+        if (ManagedSchemaName.TrySplit(name, out _, out var localName))
+            name = localName;
+        if (name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException("The internal type registry cannot be modified directly.");
+    }
 
     private static SourceData GetNamedTableRows(
         NamedTableSource source,
@@ -57089,6 +57143,12 @@ public sealed partial class EmbeddedConnection : IDisposable
     private bool _queryOnly;
 
     /// <summary>
+    /// Opts this connection into experimental TYPE/DOMAIN declarations. Typed table columns remain
+    /// unsupported and are rejected until their read and write paths are fully implemented.
+    /// </summary>
+    public bool ExperimentalCustomTypesEnabled { get; set; }
+
+    /// <summary>
     /// <c>PRAGMA count_changes</c>: when enabled, each INSERT/UPDATE/DELETE returns one row
     /// carrying the number of changed rows (SQLite's deprecated count_changes behavior,
     /// pinned by pragma-count-changes.sqltest).
@@ -58360,6 +58420,8 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfInsideHookCallback();
         var parameterMap = SqlParameterMap.Parse(sql);
         var statement = SqlParser.Parse(sql, parameterMap, IsKnownTableOrViewName);
+        if (statement is CreateTypeStatement or CreateDomainStatement && !ExperimentalCustomTypesEnabled)
+            throw new EmbeddedSqlException("Custom types are experimental and are not enabled for this connection.");
         if (_hooks.Authorizer is not null)
             statement = Authorize(statement);
 
@@ -59029,6 +59091,8 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         ThrowIfInsideHookCallback();
+        if (statement is CreateTypeStatement or CreateDomainStatement && !ExperimentalCustomTypesEnabled)
+            throw new EmbeddedSqlException("Custom types are experimental and are not enabled for this connection.");
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfRequireWhereViolated(statement);
         if (_transactionMutationDatabase is not null && StatementMayMutate(_database, statement))
