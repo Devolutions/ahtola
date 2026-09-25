@@ -312,6 +312,12 @@ internal abstract class ManagedIndexMethod
     /// <summary>Whether this method accepts field-local <c>WITH</c> options.</summary>
     public virtual bool SupportsColumnParameters => false;
 
+    /// <summary>
+    /// SQL function names this method's planner owns, independent of any attachment. Must agree with
+    /// every attachment's <see cref="IManagedIndexMethodPlannerAdapter.OwnedFunctionNames"/>.
+    /// </summary>
+    public virtual IReadOnlyList<string> OwnedFunctionNames => [];
+
     /// <summary>Validates the configuration and produces the immutable attachment for one index.</summary>
     public abstract ManagedIndexMethodAttachment Attach(ManagedIndexMethodConfiguration configuration);
 }
@@ -367,6 +373,15 @@ internal abstract class ManagedIndexMethodAttachment
     /// cannot leave method state behind.
     /// </summary>
     public abstract ManagedIndexMethodAttachment Fork();
+
+    /// <summary>
+    /// Like <see cref="Fork"/>, but the copy may keep this attachment's derived state, because the
+    /// caller proved the copy's base rows are identical to this attachment's source rows at the
+    /// same revision and handed it a copy of the same mutation journal. The copy must still share
+    /// no mutable state: a later write on either side is invisible to the other. The default keeps
+    /// nothing, which is always correct.
+    /// </summary>
+    public virtual ManagedIndexMethodAttachment ForkWithState() => Fork();
 
     /// <summary>
     /// True when either attachment may answer the same scalar/prefilter call without changing its
@@ -608,6 +623,25 @@ internal static class ManagedIndexMethodRegistry
         => TryResolve(name, out var method)
             ? method
             : throw new EmbeddedSqlException($"no such index method: {name}");
+
+    /// <summary>True when some registered method's planner owns the SQL function <paramref name="name"/>.</summary>
+    public static bool OwnsFunction(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        lock (Gate)
+        {
+            foreach (var method in Methods.Values)
+            {
+                foreach (var owned in method.OwnedFunctionNames)
+                {
+                    if (string.Equals(owned, name, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>Registered method names, for diagnostics and tests.</summary>
     public static IReadOnlyCollection<string> Names

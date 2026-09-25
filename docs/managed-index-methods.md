@@ -160,17 +160,38 @@ parsed and then ignored:
 
 ### Tokenization and offsets
 
-The pinned tokenizer behavior is distinct:
+The pinned tokenizers reproduce Tantivy 0.26's analyzers as the pinned Turso registers them
+(`turso-src/core/index_method/fts.rs:2215-2240`), character for character:
 
-- `default`: Unicode alphanumeric runs, lowercase, and Tantivy's remove-long filter (only terms
-  shorter than 40 UTF-8 bytes survive);
+- `default`: `SimpleTokenizer` runs of Rust `char::is_alphanumeric` (the Unicode *Alphabetic*
+  property or an Nd/Nl/No number, so Devanagari, Thai and Arabic vowel signs stay inside a word and
+  `x²`, `½`, `Ⓐ` are tokens), then `RemoveLongFilter` (the **source** span must be shorter than
+  40 UTF-8 bytes — measured before lowercasing), then `LowerCaser` (Rust's full, context-free
+  per-character `char::to_lowercase`, so `İ` becomes `i̇` and a final `Σ` becomes `σ`);
 - `raw`: one exact, case-sensitive whole-field token;
-- `simple`: split Unicode punctuation/whitespace and preserve case;
-- `whitespace`: split only whitespace and preserve punctuation/case;
+- `simple`: the same `is_alphanumeric` runs with case preserved;
+- `whitespace`: split only on Rust ASCII whitespace (space, tab, LF, FF, CR) — a no-break space,
+  an em space or a vertical tab stays inside the token — with punctuation and case preserved;
 - `ngram`: lowercase 2- and 3-character sliding grams by default.
 
-The explicitly named `unicode61`, `ascii`, and `trigram` extensions retain their previous managed
-behavior. Offset-bearing tokenization keeps highlight/snippet source spans exact.
+The explicitly named `unicode61`, `ascii`, and `trigram` extensions keep their managed behavior:
+`unicode61` folds each character to its canonical decomposition with combining marks removed, then
+lowercases. Offset-bearing tokenization keeps highlight/snippet source spans exact.
+
+**Tokenization never depends on the host.** Character classes, case mapping and canonical
+decomposition come from `ManagedUnicodeData.g.cs`, a generated table pinned to Unicode 16.0 — the
+version of Rust 1.88, which the pinned Turso release builds Tantivy with — instead of
+`Rune.IsLetterOrDigit`, `ToLowerInvariant` and `string.Normalize`. Those follow whichever Unicode
+version the runtime or loaded ICU carries, and `Normalize` silently returns its input in
+globalization-invariant mode (the usual Blazor WebAssembly setting), which used to turn `unicode61`
+accent folding off in exactly the browser builds that most need it. The same document therefore
+tokenizes identically on Windows, Linux, macOS, .NET 8/9/10 and in the browser.
+`scripts/unicode/Update-ManagedUnicodeData.ps1` regenerates the table (Node's ICU supplies the
+Alphabetic property and decompositions; a .NET 10 generator in invariant mode restricts them to the
+Unicode 16.0 repertoire and cross-checks every simple case mapping against CoreLib), and
+`ManagedFtsUnicodePinningTests` proves the tables match their fingerprint, agree with the host ICU
+wherever the host decomposes a character, and that no tokenization source calls a host-dependent
+Unicode API.
 
 Query text goes through the tokenizer of each searched field. For heterogeneous field tokenizers,
 an unqualified operand is analyzed once per field and ORs those field-specific queries, just as
@@ -229,6 +250,30 @@ frequencies, positions, column masks, generation-stamped tombstones) is reconstr
 rows and kept in the catalog snapshot that the engine already isolates per connection, transaction
 and savepoint. That is why atomicity is *inherited* rather than reimplemented: rolling a statement,
 transaction or savepoint back restores the rows, and the derived state reconciles against them.
+
+### Posting storage
+
+The postings are log structured, like Tantivy's segments
+(`src/Ahtola.Core/Search/ManagedFtsSearchIndex.Storage.cs`):
+
+- **Immutable segments** store postings column-wise — per term a contiguous run of (document
+  ordinal, frequency, column mask), with positions and per-column frequencies packed into one shared
+  array each — about 20 bytes plus 8 per position for each posting. A 50,000-document,
+  1.5-million-posting corpus holds its index in roughly 40 MiB.
+- **A small mutable overlay** takes recent writes and is frozen into a new segment once it reaches
+  `OverlayFreezePostings` (16,384) entries. Deleting or superseding a document that lives in a
+  segment records its rowid in that index's private deleted set for the segment.
+- **Tiered merging** combines segments once four share a size tier and rewrites a segment whose
+  deletions reach half its postings, so each posting is rewritten O(log n) times over the life of an
+  index rather than on every write. `OPTIMIZE INDEX` (and the synchronous compaction threshold)
+  merges everything into one segment.
+- **A rebuild is one pass.** `REINDEX`, a cold open and every other full build stream the base rows
+  into flat arrays and order them with one counting sort, producing a single segment without
+  building the overlay's per-term dictionaries; reopening the corpus above rebuilds in about 0.3 s.
+- **Forks are O(segments).** `ManagedFtsSearchIndex.Fork` shares every immutable segment; the
+  overlay and each deleted set are copy-on-write, so the first write on either side copies only
+  what it touches and neither side ever observes the other's later writes. Reads never mutate
+  shared state (prefix expansion skips stale terms instead of compacting them).
 State version 2 records field-local analyzers. A version-1 declaration is accepted only when its
 stored global tokenizer still agrees with the explicit/current declaration; an old implicit
 `unicode61` default is not silently reinterpreted as the new pinned `default`.
@@ -248,9 +293,21 @@ Reconciliation is **revision aware**, not a walk of the base rows on every use:
   every revision bump in its range was recorded. A gap (a mutation that reached the row store without
   reaching the journal) poisons it until the next full rebuild, and a trailing unrecorded bump makes
   the journal refuse. The fallback is always a correct full rebuild, never a stale answer.
-- Catalog snapshots do **not** copy the journal, and forked attachments start empty. A restored
-  snapshot therefore rebuilds from the rows it restored; a delta recorded before a rollback can never
-  be replayed against post-rollback state.
+- Every write transaction and statement backup clones the tables it touches. A clone that provably
+  holds the same rows — the same row-store lineage at the same revision, which is what
+  `EmbeddedTable.Clone`'s working copies are — receives `ForkWithState()` attachments that share
+  the immutable segments plus its own `Clone()` of the journal, so rows, journal and derived state
+  stay one consistent triple on each side and the working copy a transaction commits keeps the
+  incrementally maintained index. Any other clone (a shallow backup whose rows were re-added, a
+  rebuilt table) gets empty forks and a fresh journal; a restored snapshot therefore rebuilds from
+  the rows it restored, and a delta recorded before a rollback can never be replayed against
+  post-rollback state.
+- Statements that swap in a complete post-statement row list (`UPDATE`, `DELETE`, `UPSERT … DO
+  UPDATE` and the compiled `DELETE`) bump the revision once per row they re-add. Each reports its
+  exact change set immediately after the swap through `RecordBulk`, which vouches only for the swap's
+  own bumps: an unreported mutation before it still poisons the journal. `REPLACE` records the rowid
+  its conflict deletion removed. `ManagedFtsIncrementalMaintenanceTests` pins that ten committed
+  write shapes, in memory and on file, cause **zero** state rebuilds.
 - `CommitTransaction` runs each published method's `PreCommit` hook inside the same pager/WAL
   transaction that writes the catalog, so nothing method-visible is left pending across a commit.
 
@@ -305,8 +362,19 @@ comment: it is the user's SQL text, not method state.
 ## Planning and execution
 
 The planner mirrors Turso's optimizer stage that matches a single-table source against a method's
-declared patterns, most specific first (`turso-src/core/translate/optimizer/mod.rs:236-413`), and
-restricts candidates to single-table access paths (`mod.rs:2368`).
+declared patterns, most specific first (`turso-src/core/translate/optimizer/mod.rs:236-413`).
+
+**Join arms.** Upstream also collects index-method candidates for the arms of a join
+(`collect_index_method_candidates`). The evaluator materializes each join arm once after pushing each
+preserved side's own WHERE conjuncts into it, and a conjunct that is a method-owned call
+(`ManagedIndexMethodRegistry.OwnsFunction`, never shadowed by a connection callback) now qualifies,
+so `… FROM articles a JOIN authors u ON … WHERE fts_match(a.title, a.body, ?)` serves the `articles`
+arm from its FTS index in either table order, through nested joins, and on the preserved side of a
+LEFT JOIN (never the null-supplying side). The full WHERE still runs on the join output. Such a join
+stays on the evaluator, and EXPLAIN QUERY PLAN reports the arm's
+`SEARCH … USING INDEX METHOD fts INDEX …` row in evaluation order; a shape the describer cannot prove
+(a view, CTE, virtual table, subquery, transient equality probe or ordinary index on the arm) keeps
+the generic placeholder instead.
 
 **The core planner contains no method-specific SQL knowledge.** It hands each candidate index a
 `ManagedIndexMethodPlannerContext` (source qualifier, index columns, predicate, `ORDER BY`, literal
@@ -381,6 +449,41 @@ Five rules keep "the plan cannot change the answer" true:
    the same resolved set make the method plan decline. Equivalent duplicates use a lexical-name
    final tie-break rather than catalog insertion order.
 
+### Performance
+
+Two execution details keep the method path proportional to its hits rather than to the table:
+
+- Hits are mapped back to base rows through the table's cached rowid lookup, and only a
+  ranking-only plan that must append unranked rows builds the sorted list of every rowid. A
+  selective query on a 50,000-row table therefore costs tens of microseconds, not a
+  table-sized map per statement.
+- The full WHERE clause still runs on every row a method scan produced ("the plan cannot change
+  the answer"), but a residual `fts_match` whose bound index and query equal those of an unlimited
+  filtering pattern the statement already executed answers from that result set by rowid instead
+  of re-tokenizing the row. Every other scalar `fts_match` keeps its row-local evaluation.
+
+Indicative figures from `TursoFtsWorkloadBenchmarks`-style workloads (Zipf corpus of 50,000
+documents with 46 tokens each, file-backed, .NET 10, one shared developer workstation; SQLite is
+FTS5 through `Microsoft.Data.Sqlite` with trigger-maintained external content):
+
+| Operation | Ahtola | SQLite FTS5 |
+| --- | --- | --- |
+| mid-frequency term (661 hits) | 0.9 ms | 2.4 ms |
+| rare term / `AND` / phrase | 0.03–1.2 ms | 0.02–0.4 ms |
+| `OR` (1,299 hits) / 111-term prefix (4,147 hits) | 1.6 / 5.3 ms | 4.4 / 12 ms |
+| ranked top-10 (mid / common term) | 0.7 / 47 ms | 0.4 / 44 ms |
+| `count(*)` of a term in every document | 59 ms | 1.2 ms |
+| FTS arm of a two-table join | 3.4 ms | 2.6 ms |
+| build the index over existing rows | 1.8 s | 0.5 s |
+| first search after reopening (postings rebuilt) | 0.6 s | 2 ms |
+| managed heap for the index | ~52 MiB | (native) |
+
+Search latency is competitive. Write latency is not an FTS cost: a single-row `INSERT`,
+`UPDATE` or `DELETE` on the same 50,000-row table costs 63 / 178 / 37 ms **without** any FTS index
+(SQLite: 0.03–0.05 ms), because the engine validates and snapshots whole tables per statement;
+the FTS index adds under 20 ms including the follow-up search. Load large corpora with multi-row
+`INSERT … VALUES` or `INSERT … SELECT` inside one transaction rather than one statement per row.
+
 ### Cost model
 
 `EstimateCost` is expressed in the same row-read unit the join cost model uses: a method scan costs
@@ -447,7 +550,7 @@ Maintenance values use Turso's layout: index columns in declaration order, rowid
 | `MaxStateEncodedChars` | base64 bound checked before the decode allocates |
 | `default` term limit | terms must be shorter than 40 UTF-8 bytes (Tantivy remove-long behavior) |
 | `unicode61` / `ascii` extension term limit | 256 UTF-16 code units (longer terms are truncated) |
-| `MaxPrefixTerms` | 4096 **live** terms per prefix wildcard (stale terms are purged before the limit is enforced) |
+| `MaxPrefixTerms` | 4096 **live** terms per prefix wildcard (terms carried only by deleted documents are skipped, not counted) |
 | `MaxQueryTerms` | 256 |
 | `MaxQueryDepth` | 64 |
 | `MaxPositionsPerDocument` | 1,000,000 |
@@ -461,9 +564,10 @@ result, but `LIMIT 1` cannot fail merely because more than one million rows matc
 
 Merge policy constants are ported from `turso-src/core/index_method/fts.rs:73-91`:
 `DeletedDocumentsCompactionThreshold = 0.30`, `MaxSynchronousCompactionDocuments = 64_000`.
-Deletes are generation-stamped tombstones, invisible to readers immediately; compaction reclaims
-their space, and above the synchronous bound it is deferred to `REINDEX`. Prefix expansion purges
-stale terms first so the limit counts live terms only.
+Deletes are invisible to readers immediately (generation-stamped overlay tombstones or a segment's
+deleted set); tiered merges reclaim most of their space as a side effect, full compaction above the
+synchronous bound is deferred to `OPTIMIZE INDEX`/`REINDEX`, and prefix expansion counts live terms
+only.
 
 ## MVCC
 
@@ -481,8 +585,13 @@ so answering from that state would be stale. The scalar `fts_match`/`fts_score` 
 returns the same rows.
 
 Lifetime: `ManagedIndexMethod` singletons are immutable and thread safe; attachments are per-catalog
-and forked (never shared) by every catalog snapshot; cursors are per statement, single threaded and
-disposed at statement finalize/reset. There is no cross-connection cache — Turso's `CachedFtsStates`
+and forked by every catalog snapshot — an FTS fork shares only immutable segments, and its mutable
+overlay and deleted sets are copy-on-write, so no mutable state is ever shared; index mutations and
+forks are serialized by a per-index lock. Lazy reconciliation of a published attachment (which every
+connection reading that catalog shares) never mutates the published index: behind a per-attachment
+gate it forks the index, applies the delta and publishes the result, so a statement still reading the
+previous state keeps a consistent view and two readers never repeat the same work. Cursors are per
+statement, single threaded and disposed at statement finalize/reset. There is no cross-connection cache — Turso's `CachedFtsStates`
 (`fts.rs:1489-1580`) is a Tantivy artifact and is deliberately **not** ported; the pager snapshot is
 the cache.
 
@@ -504,6 +613,17 @@ the cache.
 7. **`fts_score` is schema-nondeterministic.** Its runtime value can observe the covering index's
    corpus and configuration, so Ahtola rejects it in expression indexes, partial-index predicates,
    generated columns, and CHECK constraints rather than persisting the unbound `0.0` fallback.
+8. **A score ordering without a filter keeps every row.** Upstream's `Score` pattern
+   (`SELECT …, fts_score(…) AS s FROM t ORDER BY s DESC LIMIT n`) returns only the ranked hits,
+   because the method cursor replaces the scan; without the index the same statement returns every
+   row. Ahtola keeps the SQL meaning on every plan — hits first by score, then non-matches at `0.0`
+   — and the upstream result is what `WHERE fts_match(…)` returns. `ManagedFtsUpstreamIntegrationTests`
+   pins both forms.
+9. **FTS works in the browser.** The pinned Turso compiles its Tantivy-backed FTS out of every
+   WebAssembly build (`#[cfg(all(feature = "fts", not(target_family = "wasm")))]` on the index
+   method, the `fts_*` functions and `MATCH`). Ahtola's index is pure managed code and runs unchanged
+   in `Devolutions.Ahtola.Data.Sqlite.Browser`; the Chromium package lane exercises it over OPFS,
+   including reopen.
 
 ## The vector index method
 
@@ -540,7 +660,9 @@ prices the rows a query actually reads rather than the pruning it hopes for.
 | Catalog validation, attachment publication, revision-aware base-row adapter | `src/Ahtola.Core/Indexing/ManagedIndexMethodSemantics.cs` |
 | Tokenizers, offset-preserving folding, gram slicing | `src/Ahtola.Core/Search/ManagedFtsTokenization.cs` |
 | Extended query grammar and limits | `src/Ahtola.Core/Search/ManagedFtsQueryLanguage.cs` |
-| Postings, generations, BM25, compaction | `src/Ahtola.Core/Search/ManagedFtsSearchIndex.cs` |
+| Query evaluation, generations, BM25 | `src/Ahtola.Core/Search/ManagedFtsSearchIndex.cs` |
+| Segments, overlay, forks, merges, bulk build | `src/Ahtola.Core/Search/ManagedFtsSearchIndex.Storage.cs` |
+| Pinned Unicode properties (and the generated Unicode 16.0 table) | `src/Ahtola.Core/Search/ManagedUnicode.cs`, `ManagedUnicodeData.g.cs`, `scripts/unicode/` |
 | `fts` method, options, attachment, cursor | `src/Ahtola.Core/Search/ManagedFtsIndexMethod.cs` |
 | `fts` planner adapter (`fts_match`/`fts_score` SQL matching) | `src/Ahtola.Core/Search/ManagedFtsPlannerAdapter.cs` |
 | `fts_*` scalar surface | `src/Ahtola.Core/Search/ManagedFtsFunctions.cs` |
@@ -568,6 +690,12 @@ prices the rows a query actually reads rather than the pruning it hopes for.
 | Planner selection, cost comparison, EXPLAIN evidence | `src/Ahtola.Tests/ManagedIndexMethodPlannerTests.cs` |
 | Durability, state envelope, catalog round-trip | `src/Ahtola.Tests/ManagedIndexMethodDurabilityTests.cs` |
 | Search engine semantics | `src/Ahtola.Tests/ManagedFtsSearchEngineTests.cs` |
+| Upstream `tests/integration/index_method` and `tests/fuzz/fts.rs` ports | `src/Ahtola.Tests/ManagedFtsUpstreamIntegrationTests.cs` |
+| Segmented storage differential fuzz, fork isolation, bulk builds | `src/Ahtola.Tests/ManagedFtsSegmentStorageTests.cs` |
+| Zero-rebuild incremental maintenance and rollback | `src/Ahtola.Tests/ManagedFtsIncrementalMaintenanceTests.cs` |
+| FTS join-arm planning and EXPLAIN | `src/Ahtola.Tests/ManagedFtsJoinPlanningTests.cs` |
+| Tantivy-equivalent, host-independent tokenization | `src/Ahtola.Tests/ManagedFtsUnicodePinningTests.cs` |
+| Upstream `turso/fts.sqltest` corpus (executed, not skipped) | `conformance/sqlite-sqltests/turso/fts.sqltest` |
 | SQL surface and syntax rejection | `src/Ahtola.Tests/ManagedIndexMethodSyntaxTests.cs` |
 | AOT/trim safety and builtin registration | `src/Ahtola.Tests/ManagedIndexMethodAotSafetyTests.cs` |
 | Vector index suites (syntax, recall, planner, determinism, maintenance, transactions, durability, bridge) | `src/Ahtola.Tests/ManagedVectorIndex*.cs` |

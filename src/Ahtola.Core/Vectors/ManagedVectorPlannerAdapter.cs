@@ -53,6 +53,9 @@ internal sealed class ManagedVectorPlannerAdapter : IManagedIndexMethodPlannerAd
     /// </remarks>
     public IReadOnlyList<string> OwnedFunctionNames => Owned;
 
+    /// <summary>The owned names, for callers that have no attachment.</summary>
+    public static IReadOnlyList<string> AllOwnedFunctionNames => Owned;
+
     /// <summary>The SQL function name bound to one metric.</summary>
     public static string FunctionFor(VectorDistanceKind metric)
         => metric switch

@@ -133,6 +133,7 @@ internal static class ManagedFtsTokenization
         return options.Kind switch
         {
             ManagedFtsTokenizerKind.Default => RemoveLongTerms(
+                text,
                 TokenizeUnicodeRuns(text, lowercase: true),
                 DefaultTermByteLimit),
             ManagedFtsTokenizerKind.Simple => TokenizeUnicodeRuns(text, lowercase: false),
@@ -141,7 +142,7 @@ internal static class ManagedFtsTokenization
                 TokenizeRuns(text, IsAsciiTokenChar, lowercase: true)),
             ManagedFtsTokenizerKind.Whitespace => TokenizeRuns(
                 text,
-                static value => !char.IsWhiteSpace(value),
+                static value => !ManagedUnicode.IsAsciiWhitespace(value),
                 lowercase: false),
             ManagedFtsTokenizerKind.Raw => text.Length == 0
                 ? []
@@ -210,9 +211,9 @@ internal static class ManagedFtsTokenization
         {
             ManagedFtsTokenizerKind.Raw => term,
             ManagedFtsTokenizerKind.Simple or ManagedFtsTokenizerKind.Whitespace => term,
-            ManagedFtsTokenizerKind.Default => term.ToLowerInvariant(),
+            ManagedFtsTokenizerKind.Default => ManagedUnicode.ToLower(term),
             ManagedFtsTokenizerKind.Ascii or ManagedFtsTokenizerKind.Ngram
-                or ManagedFtsTokenizerKind.Trigram => Clamp(term.ToLowerInvariant()),
+                or ManagedFtsTokenizerKind.Trigram => Clamp(ManagedUnicode.ToLower(term)),
             ManagedFtsTokenizerKind.Unicode61 => Clamp(Fold(term)),
             _ => throw new ArgumentOutOfRangeException(nameof(options)),
         };
@@ -291,7 +292,12 @@ internal static class ManagedFtsTokenization
         return truncated;
     }
 
+    /// <summary>
+    /// Tantivy's <c>RemoveLongFilter</c> runs before <c>LowerCaser</c>, so the limit applies to the
+    /// source span rather than to the lowercased text (which can be longer, e.g. U+0130).
+    /// </summary>
     private static IReadOnlyList<ManagedFtsToken> RemoveLongTerms(
+        string text,
         IReadOnlyList<ManagedFtsToken> tokens,
         int byteLimit)
     {
@@ -299,7 +305,7 @@ internal static class ManagedFtsTokenization
         for (var index = 0; index < tokens.Count; index++)
         {
             var token = tokens[index];
-            if (Encoding.UTF8.GetByteCount(token.Text) < byteLimit)
+            if (Encoding.UTF8.GetByteCount(text.AsSpan(token.Offset, token.Length)) < byteLimit)
             {
                 filtered?.Add(token);
                 continue;
@@ -346,8 +352,9 @@ internal static class ManagedFtsTokenization
         var offset = 0;
         while (offset < text.Length)
         {
-            var status = Rune.DecodeFromUtf16(text.AsSpan(offset), out var rune, out var consumed);
-            var isToken = status == OperationStatus.Done && Rune.IsLetterOrDigit(rune);
+            // Tantivy's SimpleTokenizer: maximal runs of char::is_alphanumeric.
+            var codePoint = ManagedUnicode.ReadCodePoint(text, offset, out var consumed);
+            var isToken = codePoint >= 0 && ManagedUnicode.IsAlphanumeric(codePoint);
             if (isToken)
             {
                 if (start < 0)
@@ -359,7 +366,7 @@ internal static class ManagedFtsTokenization
                 start = -1;
             }
 
-            offset += status == OperationStatus.Done ? consumed : 1;
+            offset += consumed;
         }
 
         if (start >= 0)
@@ -370,7 +377,7 @@ internal static class ManagedFtsTokenization
     private static ManagedFtsToken CreateRunToken(string text, int offset, int length, int position, bool lowercase)
     {
         var raw = text.Substring(offset, length);
-        var normalized = lowercase ? raw.ToLowerInvariant() : raw;
+        var normalized = lowercase ? ManagedUnicode.ToLower(raw) : raw;
         return new ManagedFtsToken(normalized, offset, length, position);
     }
 
@@ -415,21 +422,11 @@ internal static class ManagedFtsTokenization
         var offset = 0;
         while (offset < text.Length)
         {
-            var status = Rune.DecodeFromUtf16(text.AsSpan(offset), out _, out var consumed);
-            if (status != OperationStatus.Done)
-            {
-                units.Add(new ManagedFtsFoldedUnit(
-                    text.Substring(offset, 1).ToLowerInvariant(),
-                    offset,
-                    1));
-                offset++;
-                continue;
-            }
-
-            units.Add(new ManagedFtsFoldedUnit(
-                text.Substring(offset, consumed).ToLowerInvariant(),
-                offset,
-                consumed));
+            var codePoint = ManagedUnicode.ReadCodePoint(text, offset, out var consumed);
+            var lowered = codePoint < 0
+                ? text.Substring(offset, 1)
+                : ManagedUnicode.ToLower(text.Substring(offset, consumed));
+            units.Add(new ManagedFtsFoldedUnit(lowered, offset, consumed));
             offset += consumed;
         }
 
@@ -462,24 +459,7 @@ internal static class ManagedFtsTokenization
         return builder.ToString();
     }
 
-    private static string FoldSpan(ReadOnlySpan<char> value)
-    {
-        var decomposed = value.ToString().Normalize(NormalizationForm.FormD);
-        var builder = new StringBuilder(decomposed.Length);
-        foreach (var character in decomposed)
-        {
-            if (CharUnicodeInfo.GetUnicodeCategory(character) is UnicodeCategory.NonSpacingMark
-                or UnicodeCategory.SpacingCombiningMark
-                or UnicodeCategory.EnclosingMark)
-            {
-                continue;
-            }
-
-            builder.Append(character);
-        }
-
-        return builder.ToString().ToLowerInvariant();
-    }
+    private static string FoldSpan(ReadOnlySpan<char> value) => ManagedUnicode.Fold(value);
 
     private static string Clamp(string value)
         => value.Length > MaxTermLength ? value[..MaxTermLength] : value;

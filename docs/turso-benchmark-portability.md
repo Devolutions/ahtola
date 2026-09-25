@@ -16,6 +16,7 @@ corresponding Rust internal API.
 | `core/benches/select_star_benchmark.rs` | Wide scans under WAL and MVCC | Direct SQL port |
 | `core/benches/fts_benchmark.rs` | Cold/warm search, selectivity, ingest, commit/merge churn | Direct Ahtola index-method port |
 | `core/benches/fts_comparison_benchmark.rs` | Ahtola-style FTS versus SQLite FTS5 | Direct SQL port with storage-model labels |
+| (Ahtola workload) `TursoFtsWorkloadBenchmarks` | Zipf 20,000-term corpus: rare/mid/common terms, AND, phrase, prefix, ranked top-10, write-then-search cycle, versus SQLite FTS5 | Managed workload complementing the upstream ports |
 | `core/benches/graph_queries_benchmark.rs` | Analyzed/unanalyzed graph queries | Managed deterministic-fixture adaptation |
 | `core/benches/tpc_h_benchmark.rs` | Supported TPC-H query execution | Managed asset and supported-query adaptation |
 | `core/benches/json_benchmark.rs` | JSONB conversion and JSON Patch | Direct SQL port |
