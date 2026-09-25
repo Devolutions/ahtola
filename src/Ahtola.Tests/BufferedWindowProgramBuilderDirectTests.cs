@@ -386,13 +386,19 @@ public class BufferedWindowProgramBuilderDirectTests
     public void WindowBufferSpillsScannedRowsAndComputesWithoutReloading()
     {
         const string temporaryDirectory = "window-buffer-spill-tests";
-        var sampleRow = new[] { SqlValue.Integer(0) };
+        var sampleRow = Enumerable.Range(0, 10)
+            .Select(static value => SqlValue.Integer(value))
+            .ToArray();
         var rowBytes = VdbeManagedFootprint.EstimateSorterRow(sampleRow);
-        var rowCount = 3;
+        var rowCount = 16;
         var firstListBytes = VdbeManagedFootprint.EstimateReferenceListStorage(
             VdbeManagedFootprint.GetListCapacityForCount(0, 1));
         var infrastructure = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory);
-        var budget = checked(rowBytes + firstListBytes + infrastructure + 32);
+        var tupleBytes = VdbeManagedFootprint.EstimateSorterRow([SqlValue.Integer(0)]);
+        var cachedRowBytes = VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+            sampleRow.Length * (1 + sizeof(long)), sampleRow.Length);
+        var budget = checked(rowBytes + firstListBytes + infrastructure
+            + (tupleBytes * rowCount) + cachedRowBytes + 64);
         var fileSystem = new TrackingFileSystem();
         var metrics = new VdbeExecutionMetrics();
         var options = new VdbeExecutionOptions(
@@ -402,12 +408,13 @@ public class BufferedWindowProgramBuilderDirectTests
             metrics: metrics);
         var program = BufferedWindowProgramBuilder.Build(
             "t",
-            tableColumnCount: 1,
+            tableColumnCount: sampleRow.Length,
             windowCount: 1,
             outputs: [BufferedWindowOutput.ForColumn(0), BufferedWindowOutput.ForWindow(0)],
             windowEvaluator: RunningRowNumber);
         var source = Enumerable.Range(0, rowCount)
-            .Select(static value => new[] { SqlValue.Integer(value) })
+            .Select(value => sampleRow.Select((item, column) =>
+                column == 0 ? SqlValue.Integer(value) : item).ToArray())
             .ToArray();
 
         using var statement = ResumableStatement.CreateWithExecutionOptions(
@@ -418,8 +425,11 @@ public class BufferedWindowProgramBuilderDirectTests
 
         rows.Should().HaveCount(rowCount);
         rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger()))
-            .Should().Equal((0L, 1L), (1L, 2L), (2L, 3L));
+            .Should().Equal(Enumerable.Range(0, rowCount).Select(
+                static value => ((long)value, (long)value + 1)));
         metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeTrue();
+        metrics.SpillFilesCreated.Should().Be(2);
         metrics.SpillBytesWritten.Should().BeGreaterThan(0);
         metrics.SpillBytesRead.Should().BeGreaterThan(0);
         metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
@@ -464,11 +474,431 @@ public class BufferedWindowProgramBuilderDirectTests
         rows.Should().HaveCount(16);
         rows.Select(static row => row[0].AsInteger()).Should().Equal(Enumerable.Range(1, 16).Select(static n => (long)n));
         metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeTrue();
         metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
         metrics.CurrentRetainedBytes.Should().Be(0);
         metrics.ActiveSpillFiles.Should().Be(0);
         fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
         budget.Should().BeLessThan(checked(rowBytes * 16));
+    }
+
+    [Test]
+    public void SpillIndexStaysOnDiskDuringRandomAccessAndCancellationCleansUp()
+    {
+        const int rowCount = 1024;
+        const string temporaryDirectory = "window-index-cancellation";
+        var infrastructure = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory);
+        var budget = infrastructure + 1024;
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory, metrics: metrics);
+        using var cancellation = new CancellationTokenSource();
+        var visited = false;
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)],
+            rows =>
+            {
+                using (var indexFile = fileSystem.OpenFile(
+                    fileSystem.Created.Single(path => path.Contains(
+                        "-window-buffer-index-", StringComparison.Ordinal)),
+                    FileOpenMode.OpenExisting,
+                    readOnly: true))
+                {
+                    indexFile.Length.Should().Be((long)rowCount * sizeof(long));
+                }
+                rows[rowCount - 1][0].AsInteger().Should().Be(rowCount - 1);
+                rows[0][0].AsInteger().Should().Be(0);
+                visited = true;
+                cancellation.Cancel();
+                _ = rows[1];
+                return RunningRowNumber(rows);
+            });
+        var source = Enumerable.Range(0, rowCount)
+            .Select(static index => new[] { SqlValue.Integer(index) })
+            .ToArray();
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            Action run = () =>
+            {
+                while (statement.StepResumable(cancellation.Token) != ResumableStatementStepResult.Done)
+                {
+                }
+            };
+            run.Should().Throw<OperationCanceledException>();
+        }
+
+        visited.Should().BeTrue();
+        metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeTrue();
+        metrics.SpillFilesCreated.Should().Be(2);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void TempStoreMemoryRejectsWindowRowsWithoutCreatingSpillFiles()
+    {
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: 256,
+            allowTemporaryFileSpill: false, metrics: metrics);
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)], RunningRowNumber);
+        var source = Enumerable.Range(0, 16)
+            .Select(static index => new[] { SqlValue.Integer(index) })
+            .ToArray();
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            Action run = () => Drain(statement);
+            run.Should().Throw<VdbeMemoryLimitExceededException>();
+        }
+
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeFalse();
+        metrics.SpillFilesCreated.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Created.Should().BeEmpty();
+    }
+
+    [Test]
+    public void SpillCacheRejectsAnOversizedDecodedRowBeforeAllocatingIt()
+    {
+        const string temporaryDirectory = "window-cache-limit";
+        var sample = new[] { SqlValue.Text(new string('x', 64)) };
+        var infrastructure = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory);
+        var firstListBytes = VdbeManagedFootprint.EstimateReferenceListStorage(
+            VdbeManagedFootprint.GetListCapacityForCount(0, 1));
+        var budget = infrastructure + VdbeManagedFootprint.EstimateSorterRow(sample)
+            + firstListBytes + 16;
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory, metrics: metrics);
+        var source = Enumerable.Range(0, 16)
+            .Select(_ => new[] { SqlValue.Text(new string('x', 64)) })
+            .ToArray();
+        var evaluatorReached = false;
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)],
+            rows =>
+            {
+                evaluatorReached = true;
+                _ = rows[15];
+                return RunningRowNumber(rows);
+            });
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            Action run = () => Drain(statement);
+            run.Should().Throw<VdbeMemoryLimitExceededException>();
+        }
+
+        evaluatorReached.Should().BeTrue();
+        metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeTrue();
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void IndexFileCreationFailureReleasesTheDataFileAndReservations()
+    {
+        var fileSystem = new FailingSpillFileSystem("-window-buffer-index-");
+        var metrics = new VdbeExecutionMetrics();
+        var infrastructure = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure("window-index-failure");
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: infrastructure + 512,
+            temporaryDirectory: "window-index-failure", metrics: metrics);
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)], RunningRowNumber);
+        var source = Enumerable.Range(0, 32)
+            .Select(static index => new[] { SqlValue.Integer(index) })
+            .ToArray();
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            Action run = () => Drain(statement);
+            run.Should().Throw<IOException>().WithMessage("*spill creation failed*");
+        }
+
+        metrics.WindowBuffersSpilled.Should().Be(0);
+        metrics.SpillFilesCreated.Should().Be(1);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void WindowResultsSpillToSequentialOutputWithoutRetainingFullDrainArray()
+    {
+        const int rowCount = 512;
+        const string temporaryDirectory = "window-output-large";
+        var inputInfrastructure = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory);
+        var outputInfrastructure = VdbeManagedFootprint.EstimateWindowOutputSpillInfrastructure(temporaryDirectory);
+        var budget = inputInfrastructure + outputInfrastructure + 1024;
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory, metrics: metrics);
+        var source = Enumerable.Range(0, rowCount)
+            .Select(static index => new[] { SqlValue.Integer(index) })
+            .ToArray();
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1,
+            [BufferedWindowOutput.ForColumn(0), BufferedWindowOutput.ForWindow(0)],
+            RunningRowNumber);
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            var rows = Drain(statement);
+            rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger()))
+                .Should().Equal(Enumerable.Range(0, rowCount)
+                    .Select(static index => ((long)index, (long)index + 1)));
+        }
+
+        metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.WindowOutputsSpilled.Should().Be(1);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeTrue();
+        metrics.SpillFilesCreated.Should().Be(3);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        budget.Should().BeLessThan(
+            VdbeManagedFootprint.EstimateWindowOutputMinimum(rowCount, 1));
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void SpilledWindowOutputNextCanSkipUnreadTuple()
+    {
+        const string temporaryDirectory = "window-output-skip";
+        var buffer = new WindowBuffer(0);
+        var instructions = new List<VdbeInstruction>
+        {
+            new OpenWindowBufferInstruction(buffer, 1, 1, RunningRowNumber),
+        };
+        for (var index = 0; index < 128; index++)
+        {
+            instructions.Add(new LoadConstantInstruction(new Register(0), SqlValue.Integer(index)));
+            instructions.Add(new WindowBufferInsertInstruction(
+                buffer, new RegisterRange(new Register(0), 1)));
+        }
+        var compute = instructions.Count;
+        instructions.Add(new WindowBufferComputeInstruction(buffer, new ProgramCounter(compute + 4)));
+        instructions.Add(new WindowBufferNextInstruction(buffer, new ProgramCounter(compute + 2)));
+        instructions.Add(new WindowBufferDataInstruction(buffer, new RegisterRange(new Register(0), 2)));
+        instructions.Add(new ResultRowInstruction(new RegisterRange(new Register(1), 1)));
+        instructions.Add(new CloseWindowBufferInstruction(buffer));
+        instructions.Add(new HaltInstruction());
+        var program = new VdbeProgram(2, 0, instructions, windowBufferCount: 1);
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes:
+                VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory)
+                + VdbeManagedFootprint.EstimateWindowOutputSpillInfrastructure(temporaryDirectory)
+                + 1024,
+            temporaryDirectory: temporaryDirectory, metrics: metrics);
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(program, options))
+            Drain(statement).Should().ContainSingle().Subject[0].AsInteger().Should().Be(2);
+
+        metrics.WindowOutputsSpilled.Should().Be(1);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+    }
+
+    [Test]
+    public void TempStoreMemoryRejectsLargeWindowOutputBeforeInvokingEvaluator()
+    {
+        const int rowCount = 128;
+        var sample = new[] { SqlValue.Integer(0) };
+        var budget = checked((VdbeManagedFootprint.EstimateSorterRow(sample) * rowCount)
+            + VdbeManagedFootprint.EstimateReferenceListStorage(rowCount) + 512);
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: budget,
+            allowTemporaryFileSpill: false, metrics: metrics);
+        var evaluatorInvoked = false;
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)],
+            rows =>
+            {
+                evaluatorInvoked = true;
+                return RunningRowNumber(rows);
+            });
+        var source = Enumerable.Range(0, rowCount)
+            .Select(static index => new[] { SqlValue.Integer(index) })
+            .ToArray();
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            Action run = () => Drain(statement);
+            run.Should().Throw<VdbeMemoryLimitExceededException>();
+        }
+
+        evaluatorInvoked.Should().BeFalse();
+        metrics.WindowOutputsSpilled.Should().Be(0);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeFalse();
+        metrics.SpillFilesCreated.Should().Be(0);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        fileSystem.Created.Should().BeEmpty();
+    }
+
+    [Test]
+    public void LargeWindowValueFallsBackFromReservedOutputToSpill()
+    {
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: 1400, metrics: metrics);
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)],
+            rows => [.. Enumerable.Range(0, rows.Count)
+                .Select(static _ => new[] { SqlValue.Text(new string('v', 128)) })]);
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options,
+            [new VdbeCursorSource(
+                [[SqlValue.Integer(0)], [SqlValue.Integer(1)],
+                 [SqlValue.Integer(2)], [SqlValue.Integer(3)]])]))
+        {
+            Drain(statement).Select(static row => row[0].AsText())
+                .Should().Equal(Enumerable.Repeat(new string('v', 128), 4));
+        }
+
+        metrics.WindowBuffersSpilled.Should().Be(0);
+        metrics.WindowOutputsSpilled.Should().Be(1);
+        metrics.SpillFilesCreated.Should().Be(1);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(1400);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void SmallWindowOutputReusesEvaluatorArrayWithoutAnotherFullArray()
+    {
+        SqlValue[][]? computed = null;
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)],
+            rows => computed = [.. Enumerable.Range(1, rows.Count)
+                .Select(static index => new[] { SqlValue.Integer(index) })]);
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(), sorterMemoryLimitBytes: 8192, metrics: metrics);
+        using var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options,
+            [new VdbeCursorSource(
+                [[SqlValue.Integer(1)], [SqlValue.Integer(2)]])]);
+
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        var buffers = (Array)typeof(ResumableStatement).GetField(
+            "_windowBuffers", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(statement)!;
+        var buffer = buffers.GetValue(0)!;
+        var stored = buffer.GetType().GetField(
+            "_windowValues", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(buffer);
+        stored.Should().BeSameAs(computed);
+        metrics.WindowOutputsSpilled.Should().Be(0);
+        Drain(statement).Should().ContainSingle().Subject[0].AsInteger().Should().Be(2);
+    }
+
+    [Test]
+    public void OutputFileCreationFailureReleasesInputFilesAndBudget()
+    {
+        const string temporaryDirectory = "window-output-failure";
+        var fileSystem = new FailingSpillFileSystem("-window-output-");
+        var metrics = new VdbeExecutionMetrics();
+        var budget = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory)
+            + VdbeManagedFootprint.EstimateWindowOutputSpillInfrastructure(temporaryDirectory)
+            + 1024;
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory, metrics: metrics);
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)], RunningRowNumber);
+        var source = Enumerable.Range(0, 128)
+            .Select(static index => new[] { SqlValue.Integer(index) })
+            .ToArray();
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            Action run = () => Drain(statement);
+            run.Should().Throw<IOException>().WithMessage("*spill creation failed*");
+        }
+
+        metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.WindowOutputsSpilled.Should().Be(0);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeTrue();
+        metrics.SpillFilesCreated.Should().Be(2);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
+    }
+
+    [Test]
+    public void CancellationDuringOutputSpillReleasesPartiallyCreatedFile()
+    {
+        const string temporaryDirectory = "window-output-cancel";
+        var fileSystem = new TrackingFileSystem();
+        var metrics = new VdbeExecutionMetrics();
+        var budget = VdbeManagedFootprint.EstimateWindowBufferSpillInfrastructure(temporaryDirectory)
+            + VdbeManagedFootprint.EstimateWindowOutputSpillInfrastructure(temporaryDirectory)
+            + 1024;
+        var options = new VdbeExecutionOptions(
+            fileSystem, sorterMemoryLimitBytes: budget,
+            temporaryDirectory: temporaryDirectory, metrics: metrics);
+        using var cancellation = new CancellationTokenSource();
+        var program = BufferedWindowProgramBuilder.Build(
+            "t", 1, 1, [BufferedWindowOutput.ForWindow(0)],
+            rows =>
+            {
+                var values = RunningRowNumber(rows);
+                cancellation.Cancel();
+                return values;
+            });
+        var source = Enumerable.Range(0, 128)
+            .Select(static index => new[] { SqlValue.Integer(index) })
+            .ToArray();
+
+        using (var statement = ResumableStatement.CreateWithExecutionOptions(
+            program, options, [new VdbeCursorSource(source)]))
+        {
+            Action run = () => statement.StepResumable(cancellation.Token);
+            run.Should().Throw<OperationCanceledException>();
+        }
+
+        metrics.WindowBuffersSpilled.Should().Be(1);
+        metrics.WindowOutputsSpilled.Should().Be(0);
+        metrics.WindowEvaluatorMemoryUnbounded.Should().BeTrue();
+        metrics.SpillFilesCreated.Should().Be(3);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(budget);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        fileSystem.Deleted.Should().BeEquivalentTo(fileSystem.Created);
     }
 
     [Test]
@@ -557,6 +987,27 @@ public class BufferedWindowProgramBuilderDirectTests
             Deleted.Add(path);
             _inner.DeleteFile(path);
         }
+    }
+
+    private sealed class FailingSpillFileSystem(string failedPurpose) : IFileSystem
+    {
+        private readonly TrackingFileSystem _inner = new();
+
+        public List<string> Created => _inner.Created;
+
+        public List<string> Deleted => _inner.Deleted;
+
+        public bool FileExists(string path) => _inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+        {
+            if (mode == FileOpenMode.CreateNew
+                && path.Contains(failedPurpose, StringComparison.Ordinal))
+                throw new IOException("window spill creation failed");
+            return _inner.OpenFile(path, mode, readOnly);
+        }
+
+        public void DeleteFile(string path) => _inner.DeleteFile(path);
     }
 
     private static int GetOpenRuntimeCount(ResumableStatement runtime, string fieldName)

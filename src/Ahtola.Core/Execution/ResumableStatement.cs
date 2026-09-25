@@ -5919,17 +5919,28 @@ public sealed class ResumableStatement : IDisposable
         private readonly VdbeExecutionOptions _options;
         private readonly VdbeExecutionMemory _memory;
         private readonly List<SqlValue[]> _rows = [];
-        private SqlValue[][]? _windowValues;
+        private IReadOnlyList<SqlValue[]>? _windowValues;
         private VdbeTemporaryFile? _temporaryFile;
+        private VdbeTemporaryFile? _indexFile;
+        private VdbeTemporaryFile? _outputFile;
         private VdbeMemoryReservation? _spillInfrastructure;
-        private readonly List<long> _recordStarts = [];
+        private VdbeMemoryReservation? _outputInfrastructure;
+        private VdbeMemoryReservation? _outputReservation;
         private SqlValue[]? _cachedRow;
+        private SqlValue[]? _cachedOutput;
+        private long _cachedRowBytes;
+        private long _cachedOutputBytes;
         private int _cachedIndex = -1;
         private long _writePosition;
+        private long _outputReadPosition;
+        private long _outputExtraBytes;
+        private int _indexedRecordCount;
         private int _count;
         private int _position = -1;
         private long _retainedBytes;
         private long _retainedRows;
+        private bool _hasComputed;
+        private bool _failed;
         private bool _disposed;
 
         public WindowBufferRuntime(
@@ -5949,9 +5960,11 @@ public sealed class ResumableStatement : IDisposable
         public void Insert(SqlValue[] row, CancellationToken cancellationToken)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_failed)
+                throw new InvalidOperationException("Window buffer cannot be reused after a spill failure.");
             ArgumentNullException.ThrowIfNull(row);
             cancellationToken.ThrowIfCancellationRequested();
-            if (_windowValues is not null)
+            if (_hasComputed)
             {
                 throw new InvalidOperationException(
                     "Cannot insert into a window buffer after its window values have been computed.");
@@ -5981,46 +5994,143 @@ public sealed class ResumableStatement : IDisposable
             _count++;
         }
 
-        // Computes every row's window values and positions on the first row. Spilled partitions are
-        // handed to the evaluator as a random-access view over the temp file so Compute does not
-        // reload the whole partition into the heap. Returns false when there is nothing to drain.
+        // Spilled rows remain random-access through an on-disk offset index. The evaluator's
+        // own partition metadata and result arrays are not yet governed by the memory ledger.
         public bool Compute(CancellationToken cancellationToken)
         {
-            // Release the spill-infrastructure reservation so Compute can retain window
-            // tuples; the temp file stays open for indexed reads until Dispose.
-            _spillInfrastructure?.Dispose();
-            _spillInfrastructure = null;
+            if (_failed)
+                throw new InvalidOperationException("Window buffer cannot be computed after a spill failure.");
+            if (_hasComputed)
+                throw new InvalidOperationException("Window buffer has already computed its window values.");
+            cancellationToken.ThrowIfCancellationRequested();
+            var minimum = VdbeManagedFootprint.EstimateWindowOutputMinimum(_count, _windowCount);
+            var spillOutput = _options.AllowTemporaryFileSpill
+                && minimum > _memory.AvailableBytes / (_temporaryFile is null ? 1 : 2);
+            if (!spillOutput)
+                _outputReservation = VdbeMemoryReservation.Create(_memory, minimum);
 
-            IReadOnlyList<SqlValue[]> input = _temporaryFile is null
-                ? _rows
-                : new SpilledWindowRowList(this, cancellationToken);
-            var computed = _evaluator(input)
-                ?? throw new InvalidOperationException("A window evaluator returned null.");
-            if (computed.Count != _count)
+            try
             {
-                throw new InvalidOperationException(
-                    $"A window evaluator returned {computed.Count} window tuples for {_count} buffered rows.");
-            }
+                _options.Metrics.WindowEvaluatorStarted();
+                IReadOnlyList<SqlValue[]> input = _temporaryFile is null
+                    ? _rows
+                    : new SpilledWindowRowList(this, cancellationToken);
+                var computed = _evaluator(input)
+                    ?? throw new InvalidOperationException("A window evaluator returned null.");
+                if (computed.Count != _count)
+                {
+                    throw new InvalidOperationException(
+                        $"A window evaluator returned {computed.Count} window tuples for {_count} buffered rows.");
+                }
 
-            var values = new SqlValue[computed.Count][];
+                if (spillOutput || !TryKeepComputed(computed, cancellationToken))
+                {
+                    ReleaseOutputRetention();
+                    SpillComputed(computed, cancellationToken);
+                }
+
+                _hasComputed = true;
+                _position = _count == 0 ? -1 : 0;
+                return _position >= 0;
+            }
+            catch
+            {
+                _failed = true;
+                ReleaseOutputRetention();
+                throw;
+            }
+        }
+
+        private bool TryKeepComputed(IReadOnlyList<SqlValue[]> computed, CancellationToken cancellationToken)
+        {
+            var values = computed as SqlValue[][];
+            values ??= new SqlValue[computed.Count][];
+            var tupleSlots = VdbeManagedFootprint.EstimateWindowTupleSlots(_windowCount);
             for (var index = 0; index < computed.Count; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var tuple = computed[index]
-                    ?? throw new InvalidOperationException("A window evaluator returned a null window tuple.");
-                if (tuple.Length != _windowCount)
+                var tuple = RequireWindowTuple(computed[index]);
+                var extra = checked(VdbeManagedFootprint.EstimateSorterRow(tuple) - tupleSlots);
+                if (!_memory.TryRetain(extra))
                 {
-                    throw new InvalidOperationException(
-                        $"A window evaluator returned a {tuple.Length}-wide window tuple for a buffer declaring {_windowCount} window functions.");
+                    if (!_options.AllowTemporaryFileSpill)
+                        throw new VdbeMemoryLimitExceededException(_memory.LimitBytes, extra);
+                    return false;
                 }
 
+                _outputExtraBytes = checked(_outputExtraBytes + extra);
                 values[index] = tuple;
-                Retain(VdbeManagedFootprint.EstimateSorterRow(tuple));
             }
 
             _windowValues = values;
-            _position = _count == 0 ? -1 : 0;
-            return _position >= 0;
+            return true;
+        }
+
+        private SqlValue[] RequireWindowTuple(SqlValue[]? tuple)
+        {
+            if (tuple is null)
+                throw new InvalidOperationException("A window evaluator returned a null window tuple.");
+            if (tuple.Length != _windowCount)
+            {
+                throw new InvalidOperationException(
+                    $"A window evaluator returned a {tuple.Length}-wide window tuple for a buffer declaring {_windowCount} window functions.");
+            }
+            return tuple;
+        }
+
+        private void ReleaseOutputRetention()
+        {
+            if (_outputExtraBytes > 0)
+                _memory.Release(_outputExtraBytes, rows: 0);
+            _outputExtraBytes = 0;
+            _windowValues = null;
+            _outputReservation?.Dispose();
+            _outputReservation = null;
+        }
+
+        private void SpillComputed(IReadOnlyList<SqlValue[]> computed, CancellationToken cancellationToken)
+        {
+            var infrastructure = VdbeMemoryReservation.Create(
+                _memory,
+                VdbeManagedFootprint.EstimateWindowOutputSpillInfrastructure(
+                    _options.TemporaryDirectory));
+            VdbeTemporaryFile? output = null;
+            try
+            {
+                output = VdbeTemporaryFile.Create(_options, "window-output");
+                var position = VdbeSpillRecordCodec.InitializeFile(
+                    output.File, VdbeSpillFileKind.WindowBuffer, _options.Metrics);
+                for (var index = 0; index < computed.Count; index++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var tuple = RequireWindowTuple(computed[index]);
+                    var bytes = VdbeManagedFootprint.EstimateSorterRow(tuple);
+                    _memory.RetainOrThrow(bytes, rows: 0);
+                    try
+                    {
+                        var start = VdbeSpillRecordCodec.BeginRecord(ref position);
+                        VdbeSpillRecordCodec.WriteValues(output.File, ref position, tuple, _options.Metrics);
+                        VdbeSpillRecordCodec.CompleteRecord(
+                            output.File, start, position, _options.Metrics);
+                    }
+                    finally
+                    {
+                        _memory.Release(bytes, rows: 0);
+                    }
+                }
+
+                _outputReadPosition = VdbeSpillRecordCodec.FileHeaderSize;
+                _outputFile = output;
+                output = null;
+                _outputInfrastructure = infrastructure;
+                _options.Metrics.WindowOutputSpilled();
+            }
+            finally
+            {
+                output?.Dispose();
+                if (_outputInfrastructure is null)
+                    infrastructure.Dispose();
+            }
         }
 
         public void Dispose()
@@ -6043,6 +6153,36 @@ public sealed class ResumableStatement : IDisposable
 
                 try
                 {
+                    _indexFile?.Dispose();
+                    _indexFile = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    _outputFile?.Dispose();
+                    _outputFile = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+
+                try
+                {
+                    _outputInfrastructure?.Dispose();
+                    _outputInfrastructure = null;
+                }
+                catch (Exception exception)
+                {
+                    (failures ??= []).Add(exception);
+                }
+
+                try
+                {
                     _spillInfrastructure?.Dispose();
                     _spillInfrastructure = null;
                 }
@@ -6053,10 +6193,16 @@ public sealed class ResumableStatement : IDisposable
             }
             finally
             {
+                ReleaseOutputRetention();
                 if (_retainedBytes > 0 || _retainedRows > 0)
                     _memory.Release(_retainedBytes, _retainedRows);
                 _retainedBytes = 0;
                 _retainedRows = 0;
+                _cachedRow = null;
+                _cachedRowBytes = 0;
+                _cachedOutput = null;
+                _cachedOutputBytes = 0;
+                _windowValues = null;
                 _rows.Clear();
                 _disposed = failures is null;
             }
@@ -6121,15 +6267,19 @@ public sealed class ResumableStatement : IDisposable
             VdbeMemoryReservation? infrastructure =
                 VdbeMemoryReservation.Create(_memory, SpillInfrastructureBytes());
             VdbeTemporaryFile? temporaryFile = null;
+            VdbeTemporaryFile? indexFile = null;
             try
             {
                 temporaryFile = VdbeTemporaryFile.Create(_options, "window-buffer");
+                indexFile = VdbeTemporaryFile.Create(_options, "window-buffer-index");
                 _writePosition = VdbeSpillRecordCodec.InitializeFile(
                     temporaryFile.File,
                     VdbeSpillFileKind.WindowBuffer,
                     _options.Metrics);
                 _temporaryFile = temporaryFile;
                 temporaryFile = null;
+                _indexFile = indexFile;
+                indexFile = null;
                 _spillInfrastructure = infrastructure;
                 infrastructure = null;
 
@@ -6147,9 +6297,15 @@ public sealed class ResumableStatement : IDisposable
                 _retainedRows = 0;
                 _options.Metrics.WindowBufferSpilled();
             }
+            catch
+            {
+                _failed = true;
+                throw;
+            }
             finally
             {
                 temporaryFile?.Dispose();
+                indexFile?.Dispose();
                 infrastructure?.Dispose();
             }
         }
@@ -6164,6 +6320,11 @@ public sealed class ResumableStatement : IDisposable
                 WriteRecord(row);
                 cancellationToken.ThrowIfCancellationRequested();
             }
+            catch
+            {
+                _failed = true;
+                throw;
+            }
             finally
             {
                 _memory.Release(retainedBytes);
@@ -6174,7 +6335,9 @@ public sealed class ResumableStatement : IDisposable
         {
             var file = _temporaryFile?.File
                 ?? throw new InvalidOperationException("Window buffer has no spill file.");
-            _recordStarts.Add(_writePosition);
+            var indexFile = _indexFile?.File
+                ?? throw new InvalidOperationException("Window buffer has no spill index.");
+            var start = _writePosition;
             var recordStart = VdbeSpillRecordCodec.BeginRecord(ref _writePosition);
             VdbeSpillRecordCodec.WriteValues(file, ref _writePosition, row, _options.Metrics);
             VdbeSpillRecordCodec.CompleteRecord(
@@ -6182,6 +6345,9 @@ public sealed class ResumableStatement : IDisposable
                 recordStart,
                 _writePosition,
                 _options.Metrics);
+            var indexPosition = checked((long)_indexedRecordCount * sizeof(long));
+            VdbeSpillRecordCodec.WriteInt64(indexFile, ref indexPosition, start, _options.Metrics);
+            _indexedRecordCount++;
         }
 
         private void Retain(long bytes, long rows = 1)
@@ -6198,7 +6364,7 @@ public sealed class ResumableStatement : IDisposable
         // The current row followed by that row's computed window values, as one contiguous record.
         public SqlValue[] Current()
         {
-            if (_windowValues is null)
+            if (!_hasComputed)
             {
                 throw new InvalidOperationException(
                     "Window buffer must compute its window values before reading a record.");
@@ -6207,51 +6373,133 @@ public sealed class ResumableStatement : IDisposable
             if (_position < 0 || _position >= _count)
                 throw new InvalidOperationException("Window buffer is not positioned on a row.");
 
-            var row = ReadRow(_position);
+            var row = ReadRow(_position, CancellationToken.None);
+            var windowValues = _outputFile is null
+                ? _windowValues![_position]
+                : ReadOutputTuple();
             var record = new SqlValue[_columnCount + _windowCount];
             Array.Copy(row, record, _columnCount);
-            Array.Copy(_windowValues[_position], 0, record, _columnCount, _windowCount);
+            Array.Copy(windowValues, 0, record, _columnCount, _windowCount);
             return record;
         }
 
         // Advances to the next buffered row, returning whether one remains.
         public bool MoveNext()
         {
-            if (_windowValues is null)
+            if (!_hasComputed)
             {
                 throw new InvalidOperationException(
                     "Window buffer must compute its window values before advancing.");
             }
 
+            if (_outputFile is not null && _cachedOutput is null
+                && _position >= 0 && _position < _count)
+            {
+                var position = _outputReadPosition;
+                _outputReadPosition = VdbeSpillRecordCodec.ReadRecordEnd(
+                    _outputFile.File, ref position, _options.Metrics);
+            }
+            if (_cachedOutput is not null)
+            {
+                _cachedOutput = null;
+                _memory.Release(_cachedOutputBytes, rows: 0);
+                _retainedBytes -= _cachedOutputBytes;
+                _cachedOutputBytes = 0;
+            }
             _position++;
             return _position < _count;
         }
 
-        private SqlValue[] ReadRow(int index)
+        private SqlValue[] ReadOutputTuple()
         {
+            if (_cachedOutput is not null)
+                return _cachedOutput;
+
+            var file = _outputFile?.File
+                ?? throw new InvalidOperationException("Window output has no spill file.");
+            var position = _outputReadPosition;
+            var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(file, ref position, _options.Metrics);
+            var bytes = VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+                recordEnd - position, _windowCount);
+            _memory.RetainOrThrow(bytes, rows: 0);
+            try
+            {
+                var values = VdbeSpillRecordCodec.ReadValues(
+                    file, ref position, _windowCount, recordEnd,
+                    _options.Metrics, CancellationToken.None);
+                VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
+                var retainedBytes = checked(_retainedBytes + bytes);
+                _cachedOutput = values;
+                _cachedOutputBytes = bytes;
+                _retainedBytes = retainedBytes;
+                _outputReadPosition = recordEnd;
+                return values;
+            }
+            catch
+            {
+                _memory.Release(bytes, rows: 0);
+                throw;
+            }
+        }
+
+        private SqlValue[] ReadRow(int index, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             if (_temporaryFile is null)
                 return _rows[index];
 
             if (_cachedIndex == index && _cachedRow is not null)
                 return _cachedRow;
 
-            if ((uint)index >= (uint)_recordStarts.Count)
+            if ((uint)index >= (uint)_indexedRecordCount)
                 throw new InvalidOperationException("Window buffer spill index is out of range.");
 
+            if (_cachedRow is not null)
+            {
+                _cachedRow = null;
+                _cachedIndex = -1;
+                _memory.Release(_cachedRowBytes);
+                _retainedBytes -= _cachedRowBytes;
+                _retainedRows--;
+                _cachedRowBytes = 0;
+            }
+
+            var indexFile = _indexFile?.File
+                ?? throw new InvalidOperationException("Window buffer has no spill index.");
+            var indexPosition = checked((long)index * sizeof(long));
+            var recordStart = VdbeSpillRecordCodec.ReadInt64(indexFile, ref indexPosition, _options.Metrics);
             var file = _temporaryFile.File;
-            var position = _recordStarts[index];
+            if (recordStart < VdbeSpillRecordCodec.FileHeaderSize || recordStart >= file.Length)
+                throw new InvalidDataException("Window buffer spill index contains an invalid offset.");
+            var position = recordStart;
             var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(file, ref position, _options.Metrics);
-            var values = VdbeSpillRecordCodec.ReadValues(
-                file,
-                ref position,
-                _columnCount,
-                recordEnd,
-                _options.Metrics,
-                CancellationToken.None);
-            VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
-            _cachedIndex = index;
-            _cachedRow = values;
-            return values;
+            var rowBytes = VdbeManagedFootprint.EstimateSorterRowFromEncodedLength(
+                recordEnd - position, _columnCount);
+            _memory.RetainOrThrow(rowBytes);
+            try
+            {
+                var values = VdbeSpillRecordCodec.ReadValues(
+                    file,
+                    ref position,
+                    _columnCount,
+                    recordEnd,
+                    _options.Metrics,
+                    cancellationToken);
+                VdbeSpillRecordCodec.RequireRecordEnd(position, recordEnd);
+                var retainedBytes = checked(_retainedBytes + rowBytes);
+                var retainedRows = checked(_retainedRows + 1);
+                _cachedIndex = index;
+                _cachedRow = values;
+                _cachedRowBytes = rowBytes;
+                _retainedBytes = retainedBytes;
+                _retainedRows = retainedRows;
+                return values;
+            }
+            catch
+            {
+                _memory.Release(rowBytes);
+                throw;
+            }
         }
 
         private sealed class SpilledWindowRowList : IReadOnlyList<SqlValue[]>
@@ -6272,7 +6520,7 @@ public sealed class ResumableStatement : IDisposable
                 get
                 {
                     _cancellationToken.ThrowIfCancellationRequested();
-                    return _owner.ReadRow(index);
+                    return _owner.ReadRow(index, _cancellationToken);
                 }
             }
 
