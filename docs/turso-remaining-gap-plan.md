@@ -370,3 +370,10 @@ and remove an expected-failure entry only when its exact case passes. A
 conformance count unchanged by an architectural improvement does not mean
 the improvement was not delivered; conversely, a deliberately accepted
 difference should remain documented.
+
+The first SYNC format-depth slice stores a sparse committed-image revert
+segment for a protected snapshot when its changed-page set is smaller than
+the full image, with hash-checked reconstruction on reopen. Its format-5
+metadata and the existing format-4 decoder both remain supported. The
+original-image segment is still full and no synced prefix is retained across
+generations; **reusable multi-generation history remains open**.

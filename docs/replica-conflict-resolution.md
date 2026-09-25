@@ -141,6 +141,20 @@ process exit leaves the exact recovery range in metadata. Once remote commit or
 refusal is known, acknowledgement or conflict publication runs with
 `CancellationToken.None`.
 
+### Protected revert snapshot formats
+
+Protected sync checkpoints retain their original image as a full revert-WAL
+segment. When the committed image differs on at most 65,536 pages and the
+changed-page segment is smaller than a full image, format 5 stores only those
+changed committed pages. Recovery reconstructs the committed image from the
+original segment plus that sparse segment and checks its SHA-256 **before**
+publishing recovery metadata. The format-4 full-segment decoder remains
+available for already durable checkpoints and for captures where sparse
+storage does not help. Crash recovery checks the same reconstructed image
+before applying it; missing or mismatched pages fail closed. Each new
+checkpoint still captures a full original image: this is not reusable
+cross-generation synced-prefix history.
+
 ### Recording a definitive conflict
 
 `ManagedReplicaConnectionHost.PushLocalChangesAsync` catches any push failure

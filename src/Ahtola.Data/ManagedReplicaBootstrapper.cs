@@ -673,7 +673,7 @@ internal static class ManagedReplicaBootstrapper
     {
         using var buffer = new MemoryStream();
         using var writer = new BinaryWriter(buffer, Encoding.UTF8, leaveOpen: true);
-        writer.Write((byte)4);
+        writer.Write(state.FormatVersion);
         writer.Write((byte)state.Phase);
         writer.Write(state.SourceWalWatermark);
         writer.Write(state.AttemptedFirstSequence);
@@ -700,7 +700,7 @@ internal static class ManagedReplicaBootstrapper
     {
         const int payloadLength = 2 + (3 * sizeof(long)) + (10 * sizeof(uint)) + 96;
         const int encodedLength = payloadLength + 32;
-        if (bytes.Length != encodedLength || bytes[0] != 4)
+        if (bytes.Length != encodedLength || bytes[0] is not (4 or 5))
             throw new InvalidDataException("Managed embedded replica revert state is malformed.");
         if (!CryptographicOperations.FixedTimeEquals(
                 SHA256.HashData(bytes.AsSpan(0, payloadLength)),
@@ -754,7 +754,9 @@ internal static class ManagedReplicaBootstrapper
             || originalRevertWalFrameCount != originalDatabaseSizeInPages
             || originalRevertWalFrameCount > int.MaxValue
             || committedDatabaseSizeInPages == 0
-            || committedRevertWalFrameCount != committedDatabaseSizeInPages
+            || (bytes[0] == 4 && committedRevertWalFrameCount != committedDatabaseSizeInPages)
+            || (bytes[0] == 5 && (committedRevertWalFrameCount == 0
+                                  || committedRevertWalFrameCount > committedDatabaseSizeInPages))
             || committedRevertWalFrameCount > int.MaxValue)
         {
             throw new InvalidDataException("Managed embedded replica revert state is invalid.");
@@ -777,7 +779,8 @@ internal static class ManagedReplicaBootstrapper
             committedRevertWalFrameCount,
             originalDatabaseSha256,
             committedDatabaseSha256,
-            revertWalSha256);
+            revertWalSha256,
+            bytes[0]);
     }
 
     private static byte[] EncodePushState(ManagedReplicaPushState state)
@@ -4710,7 +4713,8 @@ internal static class ManagedReplicaBootstrapper
         uint CommittedRevertWalFrameCount,
         string OriginalDatabaseSha256,
         string CommittedDatabaseSha256,
-        string RevertWalSha256);
+        string RevertWalSha256,
+        byte FormatVersion = 4);
 
     internal readonly record struct ManagedReplicaPushState(
         long SourcePullGeneration,

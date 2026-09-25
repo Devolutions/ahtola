@@ -96,6 +96,9 @@ internal static class ManagedReplicaRevertWal
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.RevertWalPublished);
             cancellationToken.ThrowIfCancellationRequested();
 
+            // A sparse committed segment must reconstruct exactly before its recovery
+            // metadata becomes durable; otherwise a lost page could be published on reopen.
+            _ = ReadAndValidate(databasePath, state);
             var pending = metadata with
             {
                 DatabaseSha256 = state.CommittedDatabaseSha256,
@@ -569,6 +572,7 @@ internal static class ManagedReplicaRevertWal
         var pageSize = originalHeader.PageSize;
         var originalPageCount = GetDatabasePageCount(originalDatabasePath, pageSize);
         var committedPageCount = GetDatabasePageCount(committedDatabasePath, pageSize);
+        _ = checked((int)committedPageCount);
         // Skip the standalone whole-file hash when the caller already knows it (see the summary
         // above): the page-by-page capture loop below still independently recomputes and
         // cross-checks a fingerprint against this value either way, so nothing here bypasses
@@ -600,15 +604,22 @@ internal static class ManagedReplicaRevertWal
                     "Managed embedded replica original protected snapshot changed during capture.");
             }
 
-            using var committedSource = new RevertFrameSource(
-                committedPageCount,
-                pageNumber => ReadPage(committedStream, pageNumber, pageSize));
+            var changedPages = FindChangedPages(
+                originalStream, originalPageCount, committedStream, committedPageCount,
+                pageSize, committedFingerprint);
+            var sparse = changedPages is not null && changedPages.Count < committedPageCount;
+            using var fullSource = sparse
+                ? null
+                : new RevertFrameSource(
+                    committedPageCount, pageNumber => ReadPage(committedStream, pageNumber, pageSize));
+            ISqliteWalFrameSource committedSource = sparse
+                ? new SparseRevertFrameSource(
+                    changedPages!, pageNumber => ReadPage(committedStream, pageNumber, pageSize))
+                : fullSource!;
             var committedLastFrame = wal.AppendFrames(committedSource, committedPageCount);
             if (committedLastFrame != checked((long)originalSource.Count + committedSource.Count)
-                || !string.Equals(
-                    committedSource.CompleteFingerprint(),
-                    committedFingerprint,
-                    StringComparison.Ordinal))
+                || fullSource is not null
+                && !string.Equals(fullSource.CompleteFingerprint(), committedFingerprint, StringComparison.Ordinal))
             {
                 throw new InvalidDataException(
                     "Managed embedded replica committed protected snapshot changed during capture.");
@@ -629,11 +640,54 @@ internal static class ManagedReplicaRevertWal
                 originalPageCount,
                 originalPageCount,
                 committedPageCount,
-                committedPageCount,
+                checked((uint)committedSource.Count),
                 originalFingerprint,
                 committedFingerprint,
-                ComputeSha256(stagingPath));
+                ComputeSha256(stagingPath),
+                FormatVersion: sparse ? (byte)5 : (byte)4);
         }
+    }
+
+    private static IReadOnlyList<uint>? FindChangedPages(
+        FileStream originalStream,
+        uint originalPageCount,
+        FileStream committedStream,
+        uint committedPageCount,
+        int pageSize,
+        string committedFingerprint)
+    {
+        // A large delta costs more than a full image. Bound the page-number index and
+        // fall back to the existing v4 full capture while still hashing the entire input.
+        const int maxSparseChangedPages = 65_536;
+        List<uint>? changed = [];
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        for (uint pageNumber = 1; pageNumber <= committedPageCount; pageNumber++)
+        {
+            var committed = ReadPage(committedStream, pageNumber, pageSize);
+            hash.AppendData(committed.Span);
+            if (changed is not null
+                && (pageNumber > originalPageCount
+                    || !committed.Span.SequenceEqual(ReadPage(originalStream, pageNumber, pageSize).Span)))
+            {
+                changed.Add(pageNumber);
+                if (changed.Count > maxSparseChangedPages)
+                    changed = null;
+            }
+        }
+
+        if (!string.Equals(
+                Convert.ToHexString(hash.GetHashAndReset()),
+                committedFingerprint,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "Managed embedded replica committed protected snapshot changed during capture.");
+        }
+
+        // Even identical images need one committed WAL frame to record the snapshot boundary.
+        if (changed is { Count: 0 })
+            changed.Add(1);
+        return changed;
     }
 
     private static SqliteDatabaseHeader ReadDatabaseHeader(string path)
@@ -715,7 +769,9 @@ internal static class ManagedReplicaRevertWal
             var originalPages = new List<SqliteCheckpointRevertPage>(
                 checked((int)state.OriginalRevertWalFrameCount));
             var committedPages = new List<SqliteCheckpointRevertPage>(
-                checked((int)state.CommittedRevertWalFrameCount));
+                state.FormatVersion == 4
+                    ? checked((int)state.CommittedRevertWalFrameCount)
+                    : checked((int)state.CommittedDatabaseSizeInPages));
             var originalPageNumbers = new HashSet<uint>();
             var committedPageNumbers = new HashSet<uint>();
             var frames = wal.ReadFrameRange(1, totalFrameCount);
@@ -749,6 +805,45 @@ internal static class ManagedReplicaRevertWal
                     originalPages.Add(page);
                 else
                     committedPages.Add(page);
+            }
+
+            if (state.FormatVersion == 5)
+            {
+                var changedPages = committedPages.ToDictionary(page => page.PageNumber);
+                committedPages.Clear();
+                foreach (var original in originalPages)
+                {
+                    if (original.PageNumber <= state.CommittedDatabaseSizeInPages)
+                    {
+                        committedPages.Add(changedPages.Remove(original.PageNumber, out var changed)
+                            ? changed
+                            : original);
+                    }
+                }
+                for (var pageNumber = state.OriginalDatabaseSizeInPages + 1;
+                     pageNumber <= state.CommittedDatabaseSizeInPages; pageNumber++)
+                {
+                    if (!changedPages.Remove(pageNumber, out var added))
+                        throw new InvalidDataException("Managed embedded replica sparse revert WAL is missing an added page.");
+                    committedPages.Add(added);
+                }
+                if (changedPages.Count != 0
+                    || committedPages.Count != state.CommittedDatabaseSizeInPages)
+                {
+                    throw new InvalidDataException("Managed embedded replica sparse revert WAL has an invalid page range.");
+                }
+
+                using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                foreach (var page in committedPages)
+                    hash.AppendData(page.PageData.Span);
+                if (!string.Equals(
+                        Convert.ToHexString(hash.GetHashAndReset()),
+                        state.CommittedDatabaseSha256,
+                        StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException(
+                        "Managed embedded replica sparse revert WAL does not reconstruct the protected snapshot.");
+                }
             }
 
             return new ValidatedRevertWal(wal.PageSize, originalPages, committedPages);
@@ -1148,6 +1243,17 @@ internal static class ManagedReplicaRevertWal
             _hash?.Dispose();
             _hash = null;
         }
+    }
+
+    private sealed class SparseRevertFrameSource(
+        IReadOnlyList<uint> pages,
+        Func<uint, ReadOnlyMemory<byte>> readPage) : ISqliteWalFrameSource
+    {
+        public int Count => pages.Count;
+
+        public uint GetPageNumber(int index) => pages[index];
+
+        public ReadOnlySpan<byte> GetPageImage(int index) => readPage(pages[index]).Span;
     }
 
     private sealed record ValidatedRevertWal(
