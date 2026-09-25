@@ -50317,16 +50317,22 @@ out bool hasReturning)
         return values;
     }
 
-    private Dictionary<FunctionExpression, WindowFunctionInput[]> PrepareWindowFunctionInputs(
+    private Dictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>> PrepareWindowFunctionInputs(
         IReadOnlyList<FunctionExpression> functions,
         int rowCount,
         WindowInputEvaluator evaluate,
         QueryContext context,
         VdbeWindowEvaluationResources? windowEvaluation)
     {
-        var inputs = new Dictionary<FunctionExpression, WindowFunctionInput[]>();
+        var inputs = new Dictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>>();
         foreach (var function in functions)
-            inputs.Add(function, new WindowFunctionInput[rowCount]);
+        {
+            inputs.Add(
+                function,
+                function.Arguments.Count == 0 && function.Filter is null
+                    ? new ConstantWindowInputList(rowCount)
+                    : new WindowFunctionInput[rowCount]);
+        }
 
         for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
@@ -50335,6 +50341,8 @@ out bool hasReturning)
             foreach (var function in functions)
             {
                 windowEvaluation?.CancellationToken.ThrowIfCancellationRequested();
+                if (inputs[function] is not WindowFunctionInput[] prepared)
+                    continue;
                 var included = !IsAggregateWindowFunction(function)
                     || function.Filter is null
                     || IsTrue(evaluate(rowIndex, function.Filter));
@@ -50343,11 +50351,32 @@ out bool hasReturning)
                         .Select(argument => evaluate(rowIndex, argument))
                         .ToArray()
                     : [];
-                inputs[function][rowIndex] = new WindowFunctionInput(included, arguments);
+                prepared[rowIndex] = new WindowFunctionInput(included, arguments);
             }
         }
 
         return inputs;
+    }
+
+    private sealed class ConstantWindowInputList(int count) : IReadOnlyList<WindowFunctionInput>
+    {
+        private static readonly WindowFunctionInput Input = new(true, []);
+
+        public int Count => count;
+
+        public WindowFunctionInput this[int index] =>
+            (uint)index < (uint)count
+                ? Input
+                : throw new ArgumentOutOfRangeException(nameof(index));
+
+        public IEnumerator<WindowFunctionInput> GetEnumerator()
+        {
+            for (var index = 0; index < count; index++)
+                yield return Input;
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
+            GetEnumerator();
     }
 
     // Produces a collation entry per output column (not per projection) so that DISTINCT
@@ -50738,7 +50767,7 @@ out bool hasReturning)
         IReadOnlyList<FunctionExpression> functions,
         int rowCount,
         WindowInputEvaluator evaluate,
-        IReadOnlyDictionary<FunctionExpression, WindowFunctionInput[]> inputs,
+        IReadOnlyDictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>> inputs,
         SqlValue[] parameters,
         QueryContext context,
         IReadOnlyList<OrderByTerm>? emissionOrder,

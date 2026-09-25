@@ -505,6 +505,74 @@ public sealed class WindowFunctionSemanticsTests
     }
 
     [Test]
+    public void NoArgumentWindowsShareConstantInputsAcrossLargeBufferedPartition()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE input(value INTEGER);");
+        Execute(connection, "INSERT INTO input SELECT value FROM generate_series(1, 2048);");
+        const string query =
+            """
+            SELECT value,
+                   row_number() OVER (ORDER BY value),
+                   rank() OVER (ORDER BY value),
+                   count(*) OVER ()
+            FROM input
+            ORDER BY value;
+            """;
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query))
+            .Should().Contain("WindowBufferCompute");
+        var rows = ReadRows(connection, query);
+        rows.Should().HaveCount(2048);
+        rows[0].Should().Equal(
+            SqlValue.Integer(1),
+            SqlValue.Integer(1),
+            SqlValue.Integer(1),
+            SqlValue.Integer(2048));
+        rows[^1].Should().Equal(
+            SqlValue.Integer(2048),
+            SqlValue.Integer(2048),
+            SqlValue.Integer(2048),
+            SqlValue.Integer(2048));
+    }
+
+    [Test]
+    public void ArgumentFreeWindowsDoNotRepeatNeighborCallbackEvaluation()
+    {
+        var events = new List<string>();
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction("record_a", 1, values =>
+        {
+            events.Add($"a:{values[0].AsInteger()}");
+            return values[0];
+        });
+        database.RegisterScalarFunction("record_b", 1, values =>
+        {
+            events.Add($"b:{values[0].AsInteger()}");
+            return values[0];
+        });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE input(id INTEGER);");
+        Execute(connection, "INSERT INTO input VALUES (1), (2), (3);");
+
+        var rows = ReadRows(
+            connection,
+            """
+            SELECT row_number() OVER (ORDER BY id),
+                   first_value(record_a(id)) OVER (ORDER BY id),
+                   rank() OVER (ORDER BY id),
+                   lag(record_b(id)) OVER (ORDER BY id)
+            FROM input ORDER BY id;
+            """);
+
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(),
+                row[2].AsInteger(), row[3].Kind == SqlValueKind.Null ? -1 : row[3].AsInteger()))
+            .Should().Equal((1L, 1L, 1L, -1L), (2L, 1L, 2L, 1L), (3L, 1L, 3L, 2L));
+        events.Should().Equal("a:1", "b:1", "a:2", "b:2", "a:3", "b:3");
+    }
+
+    [Test]
     public void CompiledAndFallbackRoutingRemainTruthful()
     {
         using var connection = OpenManaged(Setup);
