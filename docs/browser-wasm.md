@@ -355,10 +355,13 @@ decides whether to retry the same statement against an ordinary
 The page budget caps decoded pages retained by the cursor. Encrypted reads
 add a transient encrypted page and AEAD buffers per in-flight fetch. WAL
 recovery retains page-number/frame-number locations, **not page images**;
-that metadata scales with the number of distinct changed WAL pages. A
-requested WAL page is checked against the on-disk checksum chain again before
-decryption. A clean, authoritative WAL-mode main database can open without a
-WAL; if its header requires WAL recovery and the WAL is missing, open fails.
+each of the committed and pending location maps is capped at `PageBudget`
+entries (at most twice that many locations while a transaction is pending).
+An oversized WAL fails at open with `AhtolaBrowserBoundedQueryException`,
+without switching to the whole-image path. A requested WAL page is checked
+against the on-disk checksum chain again before decryption. A clean,
+authoritative WAL-mode main database can open without a WAL; if its header
+requires WAL recovery and the WAL is missing, open fails.
 
 ## EF Core
 

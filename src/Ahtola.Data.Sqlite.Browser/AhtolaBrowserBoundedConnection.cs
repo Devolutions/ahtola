@@ -122,7 +122,7 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
                 var pages = encryptedPages;
                 encryptedPages = null;
                 encryptedSnapshot = await EncryptedBoundedPageSnapshot.OpenAsync(
-                    fileSystem, canonicalPath, pages, cancellationToken).ConfigureAwait(false);
+                    fileSystem, canonicalPath, pages, pageBudget, cancellationToken).ConfigureAwait(false);
             }
             else
             {

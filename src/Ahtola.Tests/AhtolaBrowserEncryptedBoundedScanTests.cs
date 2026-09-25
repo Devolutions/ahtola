@@ -259,6 +259,125 @@ public sealed class AhtolaBrowserEncryptedBoundedScanTests
         reader.GetValue(0).AsText().Should().Be("old");
     }
 
+    [Test]
+    public async Task CommittedWalLocationsRespectMetadataBudgetAcrossReopens()
+    {
+        var storage = CreateWalWithDistinctPages(3, commitEachFrame: true);
+        using (var wal = SqliteWalFile.Open(storage, Path + "-wal"))
+            wal.ScanRecovery().LastCommittedFrameNumber.Should().Be(3);
+
+        var overBudget = async () => await OpenAsync(storage, pageBudget: 2);
+        (await overBudget.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>())
+            .Which.Message.Should().Contain("PageBudget of 2");
+
+        for (var reopen = 0; reopen < 2; reopen++)
+        {
+            await using var bounded = await OpenAsync(storage, pageBudget: 3);
+            await using var reader = await bounded.ExecuteBoundedScanAsync("SELECT label FROM items");
+            (await reader.ReadAsync()).Should().BeTrue();
+            reader.GetValue(0).AsText().Should().Be("new");
+            (await reader.ReadAsync()).Should().BeFalse();
+        }
+    }
+
+    [Test]
+    public async Task UncommittedWalLocationsRespectMetadataBudgetBeforeTailRejection()
+    {
+        var storage = CreateWalWithDistinctPages(4, commitEachFrame: false);
+        using (var wal = SqliteWalFile.Open(storage, Path + "-wal"))
+        {
+            wal.ScanRecovery().LastValidFrameNumber.Should().Be(4);
+            wal.ScanRecovery().LastCommittedFrameNumber.Should().Be(0);
+        }
+
+        var overBudget = async () => await OpenAsync(storage, pageBudget: 2);
+        (await overBudget.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>())
+            .Which.Message.Should().Contain("PageBudget of 2");
+
+        var tail = async () => await OpenAsync(storage, pageBudget: 4);
+        (await tail.Should().ThrowAsync<InvalidDataException>())
+            .Which.Message.Should().Contain("uncommitted tail");
+    }
+
+    [Test]
+    public async Task CancellationDuringWalLocationScanReleasesHandlesAndAllowsReopen()
+    {
+        var storage = CreateWalWithDistinctPages(4, commitEachFrame: true);
+        var controller = new DeterministicAsyncIoController(forceYield: true);
+        var fileSystem = DeterministicAsyncFileSystem.Create(
+            AsyncFileSystemAdapter.Create(storage), controller);
+        using var cancellation = new CancellationTokenSource();
+        var cipher = new DesktopAsyncPageCipher(StorageCipher.Aes256Gcm, Convert.FromHexString(Key));
+        var opening = AhtolaBrowserBoundedConnection.OpenAsync(
+            fileSystem, ownsFileSystem: false, Path, pageBudget: 4, cancellation.Token,
+            new AhtolaAsyncPageTransformer(cipher)).AsTask();
+
+        var released = 0;
+        while (!opening.IsCompleted)
+        {
+            if (controller.PendingYieldCount == 0)
+            {
+                await Task.Yield();
+                continue;
+            }
+
+            var pending = controller.PendingOperations[0];
+            if (pending.Type == FileSystemOperation.Read
+                && pending.Path == Path + "-wal"
+                && pending.PathOccurrence >= 2)
+            {
+                cancellation.Cancel();
+                break;
+            }
+            controller.Release(pending.Id);
+            if (++released > 30)
+                throw new InvalidOperationException("The encrypted WAL scan did not reach a frame read.");
+        }
+
+        while (!opening.IsCompleted)
+        {
+            if (controller.PendingYieldCount > 0)
+                controller.ReleaseNext();
+            else
+                await Task.Yield();
+        }
+
+        var canceled = async () => await opening;
+        await canceled.Should().ThrowAsync<OperationCanceledException>();
+        cipher.IsReleased.Should().BeTrue();
+
+        await using var reopened = await OpenAsync(storage, pageBudget: 4);
+        await using var reader = await reopened.ExecuteBoundedScanAsync("SELECT label FROM items");
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetValue(0).AsText().Should().Be("new");
+    }
+
+    private static InMemoryFileSystem CreateWalWithDistinctPages(int frameCount, bool commitEachFrame)
+    {
+        var storage = CreateWalDatabase();
+        using var encryption = AhtolaEncryptionOptions.FromHex(StorageCipher.Aes256Gcm, Key);
+        using var store = SqlitePageStore.Open(storage, Path, encryption: encryption);
+        var walPage = store.ReadPage(2);
+        var old = walPage.AsSpan().IndexOf("old"u8);
+        old.Should().BeGreaterThanOrEqualTo(0);
+        "new"u8.CopyTo(walPage.AsSpan(old));
+        var mainPage = store.ReadPage(2);
+        for (var pageNumber = 3U; pageNumber <= (uint)frameCount + 1; pageNumber++)
+            store.WritePage(pageNumber, mainPage);
+
+        storage.DeleteFile(Path + "-wal");
+        using (var wal = SqliteWalFile.Create(
+                   storage, Path + "-wal",
+                   SqliteWalHeader.Create(store.PageSize, salt1: 17, salt2: 19),
+                   encryption))
+        {
+            for (var index = 0; index < frameCount; index++)
+                wal.AppendFrame((uint)index + 2, walPage, commitEachFrame ? store.PageCount : 0);
+            wal.Flush();
+        }
+        return storage;
+    }
+
     private static InMemoryFileSystem CreateWalDatabase()
     {
         var storage = new InMemoryFileSystem();

@@ -45,8 +45,10 @@ internal sealed class EncryptedBoundedPageSnapshot : IAsyncDisposable
         IAsyncFileSystem fileSystem,
         string path,
         AhtolaAsyncPageTransformer pages,
+        int pageBudget,
         CancellationToken cancellationToken)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(pageBudget, 1);
         IAsyncFile? database = null;
         SqliteWalFile? wal = null;
         EncryptedBoundedPageSnapshot? snapshot = null;
@@ -106,6 +108,9 @@ internal sealed class EncryptedBoundedPageSnapshot : IAsyncDisposable
                 var pending = new Dictionary<uint, long>();
                 var recovery = await wal.ScanFrameHeadersAsync((frameNumber, frame) =>
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!pending.ContainsKey(frame.PageNumber) && pending.Count >= pageBudget)
+                        throw MetadataBudgetExceeded(pageBudget);
                     pending[frame.PageNumber] = frameNumber;
                     if (!frame.IsCommit)
                         return;
@@ -115,8 +120,13 @@ internal sealed class EncryptedBoundedPageSnapshot : IAsyncDisposable
                         walPages.Remove(number);
                     foreach (var entry in pending)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         if (entry.Key <= pageCount)
+                        {
+                            if (!walPages.ContainsKey(entry.Key) && walPages.Count >= pageBudget)
+                                throw MetadataBudgetExceeded(pageBudget);
                             walPages[entry.Key] = entry.Value;
+                        }
                     }
                     pending.Clear();
                 }, cancellationToken).ConfigureAwait(false);
@@ -125,6 +135,7 @@ internal sealed class EncryptedBoundedPageSnapshot : IAsyncDisposable
                     || recovery.LastValidFrameNumber != recovery.LastCommittedFrameNumber)
                     throw new InvalidDataException("Encrypted WAL has an incomplete, invalid, or uncommitted tail.");
             }
+
             else if (header.ReadVersion == SqliteFileFormatVersion.Legacy
                      && await fileSystem.FileExistsAsync(path + "-wal", cancellationToken).ConfigureAwait(false))
             {
@@ -181,6 +192,11 @@ internal sealed class EncryptedBoundedPageSnapshot : IAsyncDisposable
             throw;
         }
     }
+
+    private static AhtolaBrowserBoundedQueryException MetadataBudgetExceeded(int pageBudget)
+        => new(
+            $"Encrypted WAL page-location metadata exceeds the configured PageBudget of {pageBudget}; "
+            + "at most that many committed and that many pending page locations may be held during recovery.");
 
     internal IAsyncBoundedReadSnapshot BeginRead()
     {
