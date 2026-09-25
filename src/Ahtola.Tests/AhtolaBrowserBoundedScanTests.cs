@@ -328,6 +328,32 @@ public sealed class AhtolaBrowserBoundedScanTests
         }
     }
 
+    [Test]
+    public async Task OffsetSkipsAnOverflowRowWithoutLoadingItsPayload()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT);");
+            Execute(connection, $"INSERT INTO items VALUES (1, '{new string('x', 6000)}');");
+            Execute(connection, "INSERT INTO items VALUES (2, 'small');");
+        }
+
+        await using var boundedConnection = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false,
+            DatabasePath,
+            pageBudget: 1,
+            CancellationToken.None);
+
+        await using var reader = await boundedConnection.ExecuteBoundedScanAsync(
+            "SELECT id FROM items LIMIT 1 OFFSET 1");
+        (await reader.ReadAsync()).Should().BeTrue();
+        reader.GetValue(0).AsInteger().Should().Be(2);
+        (await reader.ReadAsync()).Should().BeFalse();
+    }
+
     [TestCase("SELECT id FROM items WHERE label = 'text'")]
     [TestCase("SELECT id FROM items WHERE id != 0")]
     [TestCase("SELECT id FROM items WHERE id = 1 OR id = 2")]
