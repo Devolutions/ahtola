@@ -1,5 +1,6 @@
 using Ahtola.Core;
 using Ahtola.Core.Indexing;
+using Ahtola.Core.Storage;
 using Ahtola.Core.Vectors;
 using AwesomeAssertions;
 using static Ahtola.Tests.ManagedVectorIndexTestHarness;
@@ -187,6 +188,21 @@ public sealed class ManagedVectorIndexMaintenanceTests
 
         Action missing = () => Execute(connection, "OPTIMIZE INDEX missing;");
         missing.Should().Throw<EmbeddedSqlException>().WithMessage("*no such index*");
+    }
+
+    [Test]
+    public void OptimizeIndexSqlRejectsReadOnlyDatabase()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "vector-optimize-readonly.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = Seed(database, rows: 64))
+            AssertAgreesWithScan(connection);
+
+        using var readOnly = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var reader = readOnly.Connect();
+        Action optimize = () => Execute(reader, "OPTIMIZE INDEX docs_knn;");
+        optimize.Should().Throw<EmbeddedSqlException>().WithMessage("*readonly database*");
     }
 
     [Test]
