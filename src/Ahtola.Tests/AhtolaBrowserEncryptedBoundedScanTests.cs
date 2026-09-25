@@ -82,6 +82,16 @@ public sealed class AhtolaBrowserEncryptedBoundedScanTests
             "SELECT label FROM items WHERE tenant = 2 AND seq = 81");
         (await missing.ReadAsync()).Should().BeFalse();
 
+        await using (var range = await bounded.ExecuteBoundedScanAsync(
+            "SELECT label FROM items WHERE tenant >= 2 AND tenant < 3 ORDER BY tenant DESC, seq DESC LIMIT 2 OFFSET 1"))
+        {
+            (await range.ReadAsync()).Should().BeTrue();
+            range.GetValue(0).AsText().Should().Be("item-2-79");
+            (await range.ReadAsync()).Should().BeTrue();
+            range.GetValue(0).AsText().Should().Be("item-2-78");
+            (await range.ReadAsync()).Should().BeFalse();
+        }
+
         await using var textKey = await bounded.ExecuteBoundedScanAsync(
             "SELECT label FROM labels WHERE tenant = 'a' AND seq = 1");
         (await textKey.ReadAsync()).Should().BeTrue();

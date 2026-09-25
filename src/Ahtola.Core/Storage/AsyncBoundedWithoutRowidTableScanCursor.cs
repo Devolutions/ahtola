@@ -3,6 +3,11 @@ using Ahtola.Core;
 
 namespace Ahtola.Core.Storage;
 
+internal readonly record struct SqlitePrimaryKeyConstraint(
+    SqlValue Value,
+    bool Lower,
+    bool Inclusive);
+
 /// <summary>
 /// Page-bounded traversal of a WITHOUT ROWID table's index b-tree in either key direction.
 /// Both index leaves and interior separator cells contain complete table records.
@@ -42,11 +47,13 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         long? limit,
         long offset,
         CancellationToken cancellationToken = default,
-        SqlValue? firstPrimaryKeyEquals = null)
+        SqlValue? firstPrimaryKeyEquals = null,
+        IReadOnlyList<SqlitePrimaryKeyConstraint>? firstPrimaryKeyBounds = null)
         => ScanAscendingAsync(
             pageCache, rootPage, table, textEncoding, limit, offset, cancellationToken,
             firstPrimaryKeyEquals,
-            descending: true);
+            descending: true,
+            firstPrimaryKeyBounds: firstPrimaryKeyBounds);
 
     public static async IAsyncEnumerable<SqlValue[]> ScanAscendingAsync(
         BoundedAsyncPageCache pageCache,
@@ -57,7 +64,8 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
         long offset,
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
         SqlValue? firstPrimaryKeyEquals = null,
-        bool descending = false)
+        bool descending = false,
+        IReadOnlyList<SqlitePrimaryKeyConstraint>? firstPrimaryKeyBounds = null)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
         ArgumentNullException.ThrowIfNull(table);
@@ -72,6 +80,7 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
             ? new[] { target }
             : null;
         var candidate = new SqlValue[1];
+        var boundTarget = new SqlValue[1];
         var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
         var stack = new List<(uint PageNumber, SqliteIndexInteriorPageView View, int ChildIndex)>();
         var currentPage = rootPage;
@@ -140,6 +149,16 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
                             if (comparison != 0)
                                 continue;
                         }
+                        if (firstPrimaryKeyBounds is not null)
+                        {
+                            candidate[0] = key[0];
+                            var (matches, beyond) = CheckFirstKeyBounds(
+                                candidate, boundTarget, firstPrimaryKeyBounds, comparer, descending);
+                            if (beyond)
+                                yield break;
+                            if (!matches)
+                                continue;
+                        }
 
                         if (skipped < offset)
                         {
@@ -188,6 +207,15 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
                                 yield break;
                             matches = comparison == 0;
                         }
+                        if (firstPrimaryKeyBounds is not null)
+                        {
+                            candidate[0] = key[0];
+                            var (inRange, beyond) = CheckFirstKeyBounds(
+                                candidate, boundTarget, firstPrimaryKeyBounds, comparer, descending);
+                            if (beyond)
+                                yield break;
+                            matches &= inRange;
+                        }
 
                         var nextChildIndex = frame.ChildIndex + (descending ? -1 : 1);
                         stack[frameIndex] = frame with { ChildIndex = nextChildIndex };
@@ -229,6 +257,30 @@ internal static class AsyncBoundedWithoutRowidTableScanCursor
             foreach (var frame in stack)
                 pageCache.Unpin(frame.PageNumber);
         }
+    }
+
+    private static (bool Matches, bool Beyond) CheckFirstKeyBounds(
+        SqlValue[] candidate,
+        SqlValue[] target,
+        IReadOnlyList<SqlitePrimaryKeyConstraint> bounds,
+        SqliteIndexRecordComparer comparer,
+        bool descending)
+    {
+        var matches = true;
+        foreach (var bound in bounds)
+        {
+            target[0] = bound.Value;
+            var comparison = comparer.Compare(candidate, target);
+            var excluded = bound.Lower
+                ? comparison < 0 || comparison == 0 && !bound.Inclusive
+                : comparison > 0 || comparison == 0 && !bound.Inclusive;
+            if (!excluded)
+                continue;
+            if (bound.Lower == descending)
+                return (false, true);
+            matches = false;
+        }
+        return (matches, false);
     }
 
     private static SqlValue[] ValidateAndExtractKey(

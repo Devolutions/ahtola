@@ -175,6 +175,38 @@ public sealed class AsyncBoundedWithoutRowidScanTests
                 sequences.Add(reader.GetValue(0).AsInteger());
             sequences.Should().Equal(65L, 64L, 63L);
         }
+
+        await using (var range = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE tenant > 1 AND tenant <= 2 ORDER BY tenant, seq LIMIT 3 OFFSET 15"))
+        {
+            var sequences = new List<long>();
+            while (await range.ReadAsync())
+                sequences.Add(range.GetValue(0).AsInteger());
+            sequences.Should().Equal(16L, 17L, 18L);
+        }
+
+        await using (var reverseRange = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE tenant BETWEEN 1 AND 2 ORDER BY tenant DESC, seq DESC LIMIT 3"))
+        {
+            var sequences = new List<long>();
+            while (await reverseRange.ReadAsync())
+                sequences.Add(reverseRange.GetValue(0).AsInteger());
+            sequences.Should().Equal(80L, 79L, 78L);
+        }
+
+        await using (var literalFirst = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE 2 <= tenant AND 3 > tenant ORDER BY tenant, seq LIMIT 2 OFFSET 15"))
+        {
+            (await literalFirst.ReadAsync()).Should().BeTrue();
+            literalFirst.GetValue(0).AsInteger().Should().Be(16);
+            (await literalFirst.ReadAsync()).Should().BeTrue();
+            literalFirst.GetValue(0).AsInteger().Should().Be(17);
+            (await literalFirst.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var impossible = await bounded.ExecuteBoundedScanAsync(
+            "SELECT seq FROM items WHERE tenant > 2 AND tenant < 2"))
+            (await impossible.ReadAsync()).Should().BeFalse();
     }
 
     [Test]
@@ -349,9 +381,33 @@ public sealed class AsyncBoundedWithoutRowidScanTests
             (await textTuple.ReadAsync()).Should().BeFalse();
         }
 
+        await using (var textRange = await bounded.ExecuteBoundedScanAsync(
+            $"SELECT payload FROM items WHERE tenant >= 'a' AND tenant < '{accented}' ORDER BY tenant, seq"))
+        {
+            (await textRange.ReadAsync()).Should().BeTrue();
+            textRange.GetValue(0).AsText().Should().Be("lower");
+            (await textRange.ReadAsync()).Should().BeTrue();
+            textRange.GetValue(0).AsText().Should().Be("second");
+            (await textRange.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var reverseText = await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE tenant BETWEEN 'A' AND 'a' ORDER BY tenant DESC, seq DESC LIMIT 2"))
+        {
+            (await reverseText.ReadAsync()).Should().BeTrue();
+            reverseText.GetValue(0).AsText().Should().Be("second");
+            (await reverseText.ReadAsync()).Should().BeTrue();
+            reverseText.GetValue(0).AsText().Should().Be("lower");
+            (await reverseText.ReadAsync()).Should().BeFalse();
+        }
+
         var wrongType = async () => await bounded.ExecuteBoundedScanAsync(
             "SELECT payload FROM items WHERE tenant = 1 AND seq = 1");
         await wrongType.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
+            .WithMessage("*WHERE*");
+        var wrongRangeType = async () => await bounded.ExecuteBoundedScanAsync(
+            "SELECT payload FROM items WHERE tenant < 2");
+        await wrongRangeType.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>()
             .WithMessage("*WHERE*");
     }
 
@@ -511,6 +567,16 @@ public sealed class AsyncBoundedWithoutRowidScanTests
                 (await exact.ReadAsync()).Should().BeTrue();
                 exact.GetValue(0).AsText().Should().Be(expected[219].Payload);
                 (await exact.ReadAsync()).Should().BeFalse();
+            }
+
+            await using (var range = await bounded.ExecuteBoundedScanAsync(
+                $"SELECT payload FROM items WHERE code >= '{expected[117].Code}' "
+                + $"AND code < '{expected[120].Code}' ORDER BY code"))
+            {
+                var actual = new List<string>();
+                while (await range.ReadAsync())
+                    actual.Add(range.GetValue(0).AsText());
+                actual.Should().Equal(expected.Skip(117).Take(3).Select(row => row.Payload));
             }
 
             await using (var reader = await bounded.ExecuteBoundedScanAsync(

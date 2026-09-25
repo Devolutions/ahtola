@@ -20,7 +20,8 @@ internal sealed record BoundedRowidScanPlan(
     bool Descending,
     bool WithoutRowid,
     SqlValue? FirstPrimaryKeyEquals,
-    IReadOnlyList<SqlValue>? FullPrimaryKeyEquals);
+    IReadOnlyList<SqlValue>? FullPrimaryKeyEquals,
+    IReadOnlyList<SqlitePrimaryKeyConstraint>? FirstPrimaryKeyBounds);
 
 /// <summary>
 /// Classifies a parsed SQL statement against an <see cref="AsyncSchemaCatalog"/>, either
@@ -159,21 +160,29 @@ internal static class BoundedRowidScanShapeClassifier
         SqliteRowIdRange? rowIdRange = null;
         SqlValue? firstPrimaryKeyEquals = null;
         IReadOnlyList<SqlValue>? fullPrimaryKeyEquals = null;
+        IReadOnlyList<SqlitePrimaryKeyConstraint>? firstPrimaryKeyBounds = null;
         if (select.Where is { } predicate)
         {
             if (withoutRowid)
             {
-                if (!TryParseWithoutRowidKeyEquality(
-                        predicate, tableSource, entry.Table, out var keys))
+                if (TryParseWithoutRowidKeyEquality(
+                    predicate, tableSource, entry.Table, out var keys))
+                {
+                    firstPrimaryKeyEquals = keys[0];
+                    if (keys.Length == entry.Table.PrimaryKeySchema!.Terms.Count)
+                        fullPrimaryKeyEquals = keys;
+                }
+                else if (TryParseWithoutRowidFirstKeyBounds(
+                    predicate, tableSource, entry.Table, out var bounds))
+                {
+                    firstPrimaryKeyBounds = bounds;
+                }
+                else
                 {
                     rejectionReason =
-                        "WHERE on a bounded WITHOUT ROWID scan requires equality on the first INTEGER/TEXT primary-key column or every INTEGER/TEXT primary-key column.";
+                        "WHERE on a bounded WITHOUT ROWID scan requires first-key INTEGER/TEXT literal bounds or equality on every INTEGER/TEXT primary-key column.";
                     return null;
                 }
-
-                firstPrimaryKeyEquals = keys[0];
-                if (keys.Length == entry.Table.PrimaryKeySchema!.Terms.Count)
-                    fullPrimaryKeyEquals = keys;
             }
             else if (!TryParseRowIdRange(predicate, tableSource, entry.Table, out var bounds))
             {
@@ -286,7 +295,68 @@ internal static class BoundedRowidScanShapeClassifier
             select.OrderBy.Count != 0 && select.OrderBy[0].Descending,
             withoutRowid,
             firstPrimaryKeyEquals,
-            fullPrimaryKeyEquals);
+            fullPrimaryKeyEquals,
+            firstPrimaryKeyBounds);
+    }
+
+    private static bool TryParseWithoutRowidFirstKeyBounds(
+        Expression predicate,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out IReadOnlyList<SqlitePrimaryKeyConstraint> bounds)
+    {
+        var first = table.PrimaryKeySchema!.Terms[0];
+        var declaredType = table.ColumnDefinitions[first.ColumnIndex].DeclaredType;
+        var parsed = new List<SqlitePrimaryKeyConstraint>();
+
+        bool AddBounds(BinaryOperator op, SqlValue value)
+        {
+            switch (op)
+            {
+                case BinaryOperator.Equal:
+                    parsed.Add(new SqlitePrimaryKeyConstraint(value, Lower: true, Inclusive: true));
+                    parsed.Add(new SqlitePrimaryKeyConstraint(value, Lower: false, Inclusive: true));
+                    return true;
+                case BinaryOperator.GreaterThan:
+                case BinaryOperator.GreaterThanOrEqual:
+                    parsed.Add(new SqlitePrimaryKeyConstraint(
+                        value, Lower: true, Inclusive: op == BinaryOperator.GreaterThanOrEqual));
+                    return true;
+                case BinaryOperator.LessThan:
+                case BinaryOperator.LessThanOrEqual:
+                    parsed.Add(new SqlitePrimaryKeyConstraint(
+                        value, Lower: false, Inclusive: op == BinaryOperator.LessThanOrEqual));
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        bool Visit(Expression expression)
+        {
+            if (expression is BinaryExpression { Operator: BinaryOperator.And } conjunction)
+                return Visit(conjunction.Left) && Visit(conjunction.Right);
+            if (expression is BetweenExpression { Negated: false } between
+                && TryMatchPrimaryKey(between.Value, between.Lower, source, first, declaredType, out var lower)
+                && TryMatchPrimaryKey(between.Value, between.Upper, source, first, declaredType, out var upper))
+            {
+                AddBounds(BinaryOperator.GreaterThanOrEqual, lower);
+                AddBounds(BinaryOperator.LessThanOrEqual, upper);
+                return true;
+            }
+            if (expression is not BinaryExpression comparison)
+                return false;
+            return (TryMatchPrimaryKey(
+                    comparison.Left, comparison.Right, source, first, declaredType, out var value)
+                && AddBounds(comparison.Operator, value))
+                || (TryMatchPrimaryKey(
+                    comparison.Right, comparison.Left, source, first, declaredType, out value)
+                && AddBounds(ReverseComparison(comparison.Operator), value));
+        }
+
+        var valid = Visit(predicate);
+        bounds = valid ? parsed : [];
+        return valid && parsed.Count > 0;
     }
 
     private static bool TryParseWithoutRowidKeyEquality(

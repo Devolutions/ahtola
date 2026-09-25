@@ -498,7 +498,7 @@
                 "CREATE TABLE probe(id INTEGER PRIMARY KEY, value INTEGER NOT NULL);"
                 + "INSERT INTO probe VALUES (1, 5), (2, 7);"
                 + "CREATE TABLE keys(name TEXT, seq INTEGER, value INTEGER, PRIMARY KEY(name, seq)) WITHOUT ROWID;"
-                + "INSERT INTO keys VALUES ('b', 3, 11);",
+                + "INSERT INTO keys VALUES ('a', 2, 13), ('b', 3, 11), ('c', 4, 17);",
                 "encrypted bounded setup");
         }
 
@@ -527,6 +527,15 @@
             total += composite.GetValue(0).AsInteger();
             if (await composite.ReadAsync())
                 throw new InvalidOperationException("Encrypted bounded composite lookup returned extra rows.");
+        }
+        await using (var range = await bounded.ExecuteBoundedScanAsync(
+            "SELECT value FROM keys WHERE name >= 'a' AND name < 'c' ORDER BY name DESC LIMIT 1"))
+        {
+            if (!await range.ReadAsync())
+                throw new InvalidOperationException("Encrypted bounded key range returned no row.");
+            total += range.GetValue(0).AsInteger();
+            if (await range.ReadAsync())
+                throw new InvalidOperationException("Encrypted bounded key range exceeded its LIMIT.");
         }
         return total;
     }
