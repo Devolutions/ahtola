@@ -360,6 +360,32 @@ public sealed class ManagedTypeRegistryTests
     }
 
     [Test]
+    public void ReturningCastOnOrdinaryTableDoesNotBypassDomainRejection()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        connection.ExperimentalCustomTypesEnabled = true;
+        Execute(connection, "CREATE DOMAIN positive AS INTEGER CHECK (value > 0)");
+        Execute(connection, "CREATE TABLE ordinary(v INTEGER)");
+
+        Action insert = () => Execute(connection,
+            "INSERT INTO ordinary VALUES (-1) RETURNING CAST(v AS positive)");
+        insert.Should().Throw<EmbeddedSqlException>().WithMessage("*CAST to custom type*");
+        Scalar(connection, "SELECT count(*) FROM ordinary").Should().Be(0);
+
+        Execute(connection, "INSERT INTO ordinary VALUES (5)");
+        Action update = () => Execute(connection,
+            "UPDATE ordinary SET v = -2 RETURNING CAST(v AS positive)");
+        update.Should().Throw<EmbeddedSqlException>().WithMessage("*CAST to custom type*");
+        Scalar(connection, "SELECT v FROM ordinary").Should().Be(5);
+
+        Action delete = () => Execute(connection,
+            "DELETE FROM ordinary RETURNING CAST(v AS positive)");
+        delete.Should().Throw<EmbeddedSqlException>().WithMessage("*CAST to custom type*");
+        Scalar(connection, "SELECT count(*) FROM ordinary").Should().Be(1);
+    }
+
+    [Test]
     public void CascadedForeignKeyUpdateCannotBypassDomainChecks()
     {
         using var database = new EmbeddedDatabase();

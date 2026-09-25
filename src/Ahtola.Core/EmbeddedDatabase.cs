@@ -10498,6 +10498,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     groupByScope);
                 return;
             case CastExpression cast:
+                RejectTypedCast(cast.TypeName, context);
                 ValidateExpressionSchema(
                     cast.Expression,
                     row,
@@ -11239,6 +11240,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName), out var virtualTable))
             return ExecuteVirtualTableInsert(statement, virtualTable, parameters, context);
+
+        if (statement.Returning is not null
+            && context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            && context.Tables.TryGetValue(statement.TableName, out var returningTable))
+            ValidateInsertReturning(statement, returningTable, context);
 
         var mayReplaceRows = statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace
             || context.Tables.TryGetValue(statement.TableName, out var triggerTable)
@@ -17585,9 +17591,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // Foreign keys: INSERT/UPDATE Commit* paths already call ValidateForeignKeys*; plain DELETE still
     // lacks parent-action validation in its write-target Commit, so it stays evaluator-owned when FKs are on
     // (self-referential cascades use CanCompileForeignKeyCascadeDelete instead).
+    // Registered domains can appear in RETURNING on ordinary tables; their casts need evaluator routing.
     private bool CanCompileDml(QueryContext context)
         => !context.CancellationToken.CanBeCanceled
             && !HasOpenBlobHandles
+            && !context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
             && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsDomain);
 
     private bool CanCompilePlainDelete(QueryContext context)
@@ -17597,6 +17605,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         => !context.CancellationToken.CanBeCanceled
             && context.ForeignKeysEnabled
             && !HasOpenBlobHandles
+            && !context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
             && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsDomain);
 
     private bool CanRouteInsertThroughCompiler(InsertStatement statement, QueryContext context)
