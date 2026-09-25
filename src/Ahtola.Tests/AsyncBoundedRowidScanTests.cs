@@ -111,6 +111,24 @@ public sealed class AsyncBoundedRowidScanTests
         }
 
         ids.Should().Equal(0L, 1L, 2L);
+
+        var pointPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT id FROM items WHERE id = 1999 LIMIT 1", catalog, out var pointReason);
+        pointPlan.Should().NotBeNull(pointReason);
+        var found = new List<long>();
+        await foreach (var row in AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
+            pageCache,
+            pointPlan!.RootPage,
+            pointPlan.Table,
+            textEncoding,
+            pointPlan.Limit,
+            equalRowId: pointPlan.EqualRowId))
+        {
+            found.Add(row[pointPlan.ProjectedColumnIndexes[0]].AsInteger());
+        }
+
+        found.Should().Equal(1999L);
+        pageCache.ResidentPageCount.Should().BeLessThanOrEqualTo(pageCache.Capacity);
     }
 
     [Test]
@@ -326,17 +344,33 @@ public sealed class AsyncBoundedRowidScanTests
         var textEncoding = await ReadTextEncodingAsync(pageCache);
         var catalog = await AsyncSchemaCatalogLoader.LoadAsync(pageCache, textEncoding);
 
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE id = 1", catalog, out var whereReason)
+        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE value = 'a'", catalog, out var whereReason)
             .Should().BeNull();
         whereReason.Should().Contain("WHERE");
 
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM indexed", catalog, out var indexedReason)
-            .Should().BeNull();
-        indexedReason.Should().Contain("index");
+        var pointPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT value FROM plain WHERE id = 1 LIMIT 1", catalog, out var pointReason);
+        pointPlan.Should().NotBeNull(pointReason);
+        pointPlan!.EqualRowId.Should().Be(1);
 
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM wr", catalog, out var withoutRowidReason)
+        var rangePlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT * FROM plain WHERE id >= 0 AND id < 5", catalog, out var rangeReason);
+        rangePlan.Should().NotBeNull(rangeReason);
+        rangePlan!.RowIdRange.Should().Be(new SqliteRowIdRange(0, true, 5, false));
+
+        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE id != 0", catalog, out rangeReason)
             .Should().BeNull();
-        withoutRowidReason.Should().Contain("WITHOUT ROWID");
+        rangeReason.Should().Contain("WHERE");
+
+        var indexedPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT * FROM indexed", catalog, out var indexedReason);
+        indexedPlan.Should().NotBeNull(indexedReason);
+        indexedPlan!.TableName.Should().Be("indexed");
+
+        var withoutRowidPlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT * FROM wr", catalog, out var withoutRowidReason);
+        withoutRowidPlan.Should().NotBeNull(withoutRowidReason);
+        withoutRowidPlan!.WithoutRowid.Should().BeTrue();
 
         BoundedRowidScanShapeClassifier.TryClassify("INSERT INTO plain VALUES (2, 'b')", catalog, out var writeReason)
             .Should().BeNull();
@@ -349,7 +383,7 @@ public sealed class AsyncBoundedRowidScanTests
         // Classification never reads a page: the cache's resident count must stay exactly what
         // schema loading alone required, proving rejection happens before any scan I/O.
         var residentAfterClassification = pageCache.ResidentPageCount;
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM indexed", catalog, out _);
+        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM wr", catalog, out _);
         pageCache.ResidentPageCount.Should().Be(residentAfterClassification);
     }
 

@@ -323,15 +323,13 @@ internal sealed class EmbeddedFileStore : IDisposable
     // exclusive-lock upgrade against a "reader" that was really just this store's own bookkeeping
     // — a regression confirmed by broad test failures across ManagedMaintenanceStatementTests,
     // MvccCheckpointStateMachineTests, and ManagedVacuumStorageTests. Every lazy row loader below
-    // therefore reads through the store's live pager (ReadPageForLoad et al. below), exactly like
-    // the eager path always has. This reopens a narrower, explicitly tracked gap instead: a
-    // transaction that begins before touching a still-pending table, and only touches it after a
-    // peer commits new data to that specific table, can observe the peer's write instead of its
-    // own pinned snapshot for that one table. Closing this correctly requires routing the lazy
-    // loader through the *active transaction's own* existing pinned snapshot
-    // (EmbeddedFileReadSnapshot / the transactionPinnedSnapshot plumbing already used by classic
-    // transactions and BEGIN CONCURRENT) instead of a new, separate, store-level pin — tracked as
-    // follow-up work, not resolved here.
+    // therefore reads through the store's live pager (ReadPageForLoad et al. below). Classic
+    // transactions hydrate their cloned catalog while the file write gate is held, before
+    // opening their pinned snapshot (CreateTransactionSnapshotWithPin). MVCC establishes a
+    // stable heap baseline before concurrent readers begin and on every catalog publication
+    // (EstablishHeapBaselineForMvccLocked / PublishCatalog). Those transaction paths cannot
+    // first invoke this live loader after a peer commit; do not add a separate store-level
+    // reader lease to solve an isolation gap they already prevent.
     private byte[] ReadPageForLoad(uint pageNumber, object? pinnedTransaction = null)
         => _pager.ReadCommittedPage(pageNumber);
 
@@ -1514,8 +1512,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                 .Where(entry => entry.Type is "table" or "index" && entry.RootPage != 0)
                 .Select(entry => entry.RootPage));
 
-        // Materialize tables first so views and triggers can be parsed afterwards.
-        foreach (var entry in schemaEntries)
+        // Materialize type definitions first so a typed table cannot be admitted under
+        // ordinary SQLite affinity before its declared type has been resolved.
+        IReadOnlyDictionary<string, ParsedStatement> typeDefinitions =
+            new Dictionary<string, ParsedStatement>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in schemaEntries.OrderBy(static entry =>
+                     entry.Name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase) ? 0 : 1))
         {
             if (!string.Equals(entry.Type, "table", StringComparison.Ordinal))
                 continue;
@@ -1526,7 +1528,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 continue;
             }
 
-            var table = ManagedSchemaRowParser.ParseTable(entry);
+            var table = ManagedSchemaRowParser.ParseTable(entry, typeDefinitions);
             // The lazy re-walk's seed must be captured BEFORE this table's own eager pass below
             // mutates occupiedBtreePages with its own interior/leaf child pages — otherwise the
             // seed would already contain this table's own pages, and the later, independent lazy
@@ -1574,6 +1576,11 @@ internal sealed class EmbeddedFileStore : IDisposable
                         materializeRows: true));
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
+            if (entry.Name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase))
+            {
+                _ = table.Rows;
+                typeDefinitions = ManagedTypeRegistry.Load(tables);
+            }
         }
 
         foreach (var entry in schemaEntries)
@@ -3433,8 +3440,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             ValidateTableRepresentable(name, table, previousTables);
         EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateSchemaDefinitions(tables, views, triggers, virtualTables);
+        _ = ManagedTypeRegistry.Load(tables);
+        var typeMetadataChanged = _committedTables is null
+            ? tables.ContainsKey(ManagedTypeRegistry.TableName)
+            : !ManagedTypeRegistry.MetadataMatches(tables, _committedTables);
 
-        if (!forceFullRewrite
+        if (!typeMetadataChanged
+            && !forceFullRewrite
             && !reclaimTrailingPages
             && pragmaHeader is null)
         {
@@ -3593,7 +3605,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             _usableSpace);
 
         var signature = ComputeSchemaSignature(schemaEntries);
-        var schemaChanged = !string.Equals(signature, _lastSchemaSignature, StringComparison.Ordinal);
+        var schemaChanged = typeMetadataChanged
+            || !string.Equals(signature, _lastSchemaSignature, StringComparison.Ordinal);
 
         var newChangeCounter = currentHeader.ChangeCounter + 1;
         var newHeader = currentHeader with
@@ -12365,7 +12378,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         return values;
     }
 
-    private static SqlValue[] RestoreWithoutRowidRecord(
+    internal static SqlValue[] RestoreWithoutRowidRecord(
         string tableName,
         EmbeddedTable table,
         SqlitePrimaryKeySchema primaryKeySchema,

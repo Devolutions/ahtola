@@ -7,8 +7,8 @@ namespace Ahtola.Tests;
 
 /// <summary>
 /// Verifies the PAGE workstream's first vertical slice: physical open of a managed file
-/// database reconstructs only the schema catalog, and a base table's committed rows are read
-/// from its b-tree at most once, the first time anything actually observes
+/// database validates table b-trees without materializing their rows, and a base table's
+/// committed rows are decoded the first time anything actually observes
 /// <c>EmbeddedTable.Rows</c>/<c>RowIds</c> (see <c>EmbeddedTable.AttachPendingRowLoader</c> and
 /// <c>EmbeddedFileStore.Load</c>). A table with a registered secondary/PK index is still
 /// eagerly validated (and thus hydrated) during <c>Load()</c>, because index content/uniqueness

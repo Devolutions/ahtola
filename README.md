@@ -329,6 +329,11 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   materializes both sides as the query result by design, so it is not a spill
   candidate (an architectural property of the evaluator, not a missing spill
   path); an aggregate's own accumulator is a single bounded value per group.
+  Buffered-window input, its offset index, large row-dependent function inputs,
+  and its drained output can spill, but the window evaluator's partition
+  metadata, smaller retained function inputs, and computed result scratch are
+  not yet fully bounded by the execution ledger;
+  `WindowEvaluatorMemoryUnbounded` makes that limitation explicit.
   Prefer modest databases
   and explicit transactions for writes (managed writes are slower than native
   SQLite and the gap grows with table size).
@@ -415,11 +420,37 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   changes without closing sibling hosts, then applies one-shot staged changes
   under the publication and cross-process leases. Local journal advancement is
   rebased without another network pull; genuinely stale remote bases retry with
-  a bound. Page replacement retains crash-safe revert evidence. Pulls request
+  a bound. Page replacement retains crash-safe revert evidence; protected
+  snapshots can reuse a SHA-pinned full-image history root across generations
+  and store sparse original/committed revert segments. Pulls request
   raw pages explicitly and reject zstd responses because no approved
   pure-managed, trim-safe zstd implementation is shipped.
 - **Not implemented** — loadable extensions, raw `sqlite3*` handles (`Handle`
-  is null), zstd-compressed replica page sets, and typed-value extensions.
+  is null), zstd-compressed replica page sets, and general typed-value semantics.
+  The core-only `EmbeddedConnection.ExperimentalCustomTypesEnabled` opt-in
+  allows `CREATE TYPE name BASE INTEGER` (identity types) and
+  `CREATE DOMAIN name AS INTEGER` with DEFAULT, NOT NULL and CHECK clauses to
+  persist definitions in `__turso_internal_types`. Definitions survive reopen,
+  participate in transactions and advance the schema cookie. **INTEGER-based
+  DOMAIN columns** and identity `TYPE name BASE INTEGER` columns are supported
+  only in STRICT tables. Domain writes apply INTEGER affinity and inherited
+  DEFAULT/NOT NULL/CHECK constraints; identity TYPE columns use INTEGER
+  affinity and declared column constraints without an encode/decode expression.
+  `CAST(value AS identity_type)` preserves the input storage value.
+  Reads use the primitive INTEGER storage class. Both retain their type
+  metadata through reopen, transactions, and savepoints; compiled DML
+  falls back to the validating evaluator while the type registry is present.
+  Domain CHECK remains enforced even when `ignore_check_constraints` disables
+  ordinary table CHECKs.
+  Non-STRICT custom columns, generated/custom-primary-key columns, and
+  ALTER TABLE on typed tables fail closed. Domain DEFAULT is
+  limited to constant INTEGER expressions and CHECK to literal/value unary
+  and binary expressions; unsupported expressions are rejected at declaration.
+  Non-identity TYPE bodies, non-INTEGER bases, DROP TYPE/DOMAIN and domain or
+  non-identity typed casts are not supported. The opt-in is not exposed through
+  the ADO.NET connection string.
+  The bounded asynchronous catalog scan fails closed for databases containing
+  type definitions until that reader can resolve their metadata.
   `CREATE SEQUENCE` / `DROP SEQUENCE` and the `nextval` / `currval` / `setval`
   functions are supported as a Turso-compatible extension: sequences persist a
   backing table whose watermark row is ordinary transactional state (a rolled-back
@@ -438,8 +469,9 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   machine-readable envelope from Turso's `docs/eqp-json.md`. The inner
   statement's result columns (including DML `RETURNING`) and several
   structured per-node `op` variants are modeled, including virtual-table
-  scans and selected managed index methods; other plan shapes still carry
-  explicit `unmodeled` operations or no nodes when no access path is proven
+  scans, selected managed index methods, compiled two-table join scans/seeks,
+  and proven materialized three-table hash prefixes. Other plan shapes still
+  carry explicit `unmodeled` operations or no nodes when no access path is proven
   (for example, an unmodeled view). Built-in `get_byte`/`set_byte`
   (PostgreSQL-compatible byte access) and `json_object(*)`/`jsonb_object(*)`
   (one label/value pair per FROM-row column) match the pinned Turso corpus.

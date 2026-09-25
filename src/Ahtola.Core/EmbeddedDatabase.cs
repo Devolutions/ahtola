@@ -1357,6 +1357,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public Dictionary<string, VirtualTableDefinition> VirtualTables { get; }
 
+        public IReadOnlyDictionary<string, ParsedStatement> TypeDefinitions
+            => ManagedTypeRegistry.Load(Tables);
+
         public SchemaCatalog Clone()
         {
             var virtualTables = new Dictionary<string, VirtualTableDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -2784,6 +2787,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
             or DropTableStatement or CreateIndexStatement or DropIndexStatement
             or CreateSequenceStatement or DropSequenceStatement
+            or CreateTypeStatement or CreateDomainStatement
             or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
             or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
             or AlterTableAlterColumnStatement or AlterTableDropColumnStatement
@@ -2991,6 +2995,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CreateTableStatement or CreateVirtualTableStatement or CreateTableAsSelectStatement
         or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateSequenceStatement or DropSequenceStatement
+        or CreateTypeStatement or CreateDomainStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableAlterColumnStatement or AlterTableDropColumnStatement;
@@ -4170,9 +4175,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// concurrent commit — silently promoting the reader's view past its own pinned snapshot.
     /// Establishing the baseline once here, before any concurrent transaction can begin relying
     /// on it, is far cheaper than making every page-backed table ineligible for lazy
-    /// materialization, and MVCC-mode connections are the only ones that need it: an ordinary
-    /// (non-MVCC) reader's isolation is a separate, already-tracked gap — see the "NOTE ON A
-    /// REJECTED DESIGN" comment in EmbeddedFileStore.
+    /// materialization, and MVCC-mode connections are the only ones that need it: classic
+    /// transactions hydrate their own catalog before pinning it in
+    /// <see cref="CreateTransactionSnapshotWithPin"/>.
     /// </remarks>
     private void EstablishHeapBaselineForMvccLocked()
     {
@@ -5158,9 +5163,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // BEGIN CONCURRENT reader has not yet touched, can be after a peer's concurrent commit —
         // silently promoting the reader's view past its own pinned snapshot. Establishing the
         // baseline here, on every publish, for as long as this connection has MVCC active, is
-        // the single chokepoint that catches every one of those reload paths; an ordinary
-        // (non-MVCC) reader's isolation remains a separate, already-tracked gap — see the "NOTE
-        // ON A REJECTED DESIGN" comment in EmbeddedFileStore.
+        // the single chokepoint that catches every one of those reload paths; classic
+        // transactions instead hydrate their own cloned catalog before opening the pager pin
+        // in CreateTransactionSnapshotWithPin.
         if (_mvStore is not null)
         {
             foreach (var table in catalog.Tables.Values)
@@ -5622,6 +5627,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var result = statement switch
             {
                 CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
+                CreateTypeStatement or CreateDomainStatement => ExecuteCreateTypeDefinition(
+                    statement,
+                    catalog,
+                    cancellationToken),
                 CreateVirtualTableStatement createVirtual => ExecuteCreateVirtualTable(
                     createVirtual,
                     catalog,
@@ -5899,7 +5908,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 continue;
 
             var primaryKeyPosition = table.PrimaryKeyPosition(index);
-            var notNull = column.NotNull || (table.WithoutRowid && primaryKeyPosition > 0);
+            var notNull = column.NotNull || column.Domain?.NotNull == true
+                || (table.WithoutRowid && primaryKeyPosition > 0);
 
             // table_info renumbers cid over the columns it reports, so hiding a generated
             // column closes the gap it would otherwise leave; table_xinfo reports every
@@ -6493,6 +6503,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new ExecutionResult([], [], 0, true);
     }
 
+    private ExecutionResult ExecuteCreateTypeDefinition(
+        ParsedStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
+    {
+        var compiled = DdlStatementCompiler.CompileCreateTypeDefinition(
+            statement,
+            CreateDdlCompilationContext(catalog));
+        if (compiled.IsNoOp)
+            return ExecutionResult.Empty;
+
+        RunSchemaProgram(compiled, catalog, cancellationToken);
+        _ = catalog.TypeDefinitions;
+        return new ExecutionResult([], [], 0, true);
+    }
+
     /// <summary>
     /// The connection-dependent facts and checks a DDL compilation needs.
     /// </summary>
@@ -6761,6 +6787,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.Name);
         var compiled = DdlStatementCompiler.CompileDropTable(
             statement,
             CreateDdlCompilationContext(catalog));
@@ -6997,6 +7024,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         CancellationToken cancellationToken)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         var compiled = DdlStatementCompiler.CompileCreateIndex(
             statement,
             CreateDdlCompilationContext(catalog));
@@ -7992,6 +8020,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        var tableName = statement switch
+        {
+            AlterTableAddColumnStatement add => add.TableName,
+            AlterTableAlterColumnStatement alter => alter.TableName,
+            AlterTableDropColumnStatement drop => drop.TableName,
+            AlterTableRenameStatement rename => rename.TableName,
+            AlterTableRenameColumnStatement renameColumn => renameColumn.TableName,
+            _ => throw new ArgumentException("Expected ALTER TABLE statement.", nameof(statement)),
+        };
+        RejectInternalTypeTableMutation(tableName);
+        var typeDefinitions = catalog.TypeDefinitions;
+        if (catalog.Tables.TryGetValue(tableName, out var existingTable)
+            && ManagedTypeRegistry.ContainsCustomType(existingTable))
+            throw new EmbeddedSqlException($"ALTER TABLE of custom-typed table '{tableName}' is not yet supported.");
+        if (statement is AlterTableAddColumnStatement { Column: var added })
+            ManagedTypeRegistry.RejectTypedColumn(added, typeDefinitions);
+        if (statement is AlterTableAlterColumnStatement { Column: var altered })
+            ManagedTypeRegistry.RejectTypedColumn(altered, typeDefinitions);
+
         if (statement is AlterTableRenameStatement virtualRename
             && catalog.VirtualTables.TryGetValue(virtualRename.TableName, out var virtualTable))
         {
@@ -10451,6 +10498,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     groupByScope);
                 return;
             case CastExpression cast:
+                _ = IsIdentityTypedCast(cast.TypeName, context);
                 ValidateExpressionSchema(
                     cast.Expression,
                     row,
@@ -11180,6 +11228,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         if (context.InsideTrigger && context.TriggerConflictAlgorithm is { } triggerConflictAlgorithm)
             statement = statement with { ConflictAlgorithm = triggerConflictAlgorithm };
         else if (context.InsideTrigger
@@ -11191,6 +11240,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName), out var virtualTable))
             return ExecuteVirtualTableInsert(statement, virtualTable, parameters, context);
+
+        if (statement.Returning is not null
+            && context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            && context.Tables.TryGetValue(statement.TableName, out var returningTable))
+            ValidateInsertReturning(statement, returningTable, context);
 
         var mayReplaceRows = statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace
             || context.Tables.TryGetValue(statement.TableName, out var triggerTable)
@@ -14411,7 +14465,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             var column = table.ColumnDefinitions[columnIndex];
             var conflictAlgorithm = statementAlgorithm ?? column.NotNullConflictAlgorithm;
-            if (!column.NotNull
+            if (!(column.NotNull || column.Domain?.NotNull == true)
                 || row[columnIndex].Kind != SqlValueKind.Null
                 || conflictAlgorithm != InsertConflictAlgorithm.Replace
                 || !column.HasDefault)
@@ -14422,7 +14476,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             row[columnIndex] = column.DefaultExpression is { } expression
                 ? Evaluate(expression, EmptyParameters, row: null, context)
                 : column.DefaultValue
-                    ?? throw new InvalidOperationException("Default metadata is incomplete.");
+                    ?? (column.Domain?.Default is { } domainDefault
+                        ? Evaluate(domainDefault, EmptyParameters, row: null, context)
+                        : throw new InvalidOperationException("Default metadata is incomplete."));
             changed = true;
         }
 
@@ -14870,6 +14926,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
             return ExecuteVirtualTableUpdate(statement, virtualTable, parameters, context);
 
@@ -15612,9 +15669,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!table.HasCheckConstraints)
             return;
 
-        // PRAGMA ignore_check_constraints suppresses CHECK enforcement for the connection
-        // (Turso emitter::emit_check_constraints returns early when the flag is set).
-        if (context.IgnoreCheckConstraints)
+        // Ordinary CHECK constraints honor the pragma; a domain CHECK remains part of
+        // the typed value's validation contract even when ordinary checks are disabled.
+        if (context.IgnoreCheckConstraints && !ManagedTypeRegistry.ContainsDomain(table))
             return;
 
         // On UPDATE, SQLite only re-evaluates CHECK constraints that reference at least
@@ -15631,18 +15688,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ColumnDefinitions: table.ColumnDefinitions);
         foreach (var column in table.ColumnDefinitions)
         {
-            foreach (var check in column.CheckConstraints)
+            if (!context.IgnoreCheckConstraints)
+            {
+                foreach (var check in column.CheckConstraints)
+                {
+                    if (changedColumns is not null && !ReferencesAnyChangedColumn(check.Expression, changedColumns))
+                        continue;
+                    Validate(check);
+                }
+            }
+            if (column.Domain is { } domain
+                && (changedColumns is null || changedColumns.Contains(column.Name)))
+            {
+                for (var index = 0; index < domain.Checks.Count; index++)
+                {
+                    var check = domain.Checks[index];
+                    var value = Evaluate(
+                        ManagedTypeRegistry.RewriteDomainCheck(check.Expression, column.Name),
+                        EmptyParameters,
+                        source,
+                        context);
+                    if (value.Kind != SqlValueKind.Null && !IsTrue(value))
+                        throw new EmbeddedSqlException(
+                            $"value for domain {domain.Name} violates check constraint \"{check.Name ?? $"{domain.Name}_{index}"}\"",
+                            InsertConflictAlgorithm.Abort);
+                }
+            }
+        }
+        if (!context.IgnoreCheckConstraints)
+        {
+            foreach (var check in table.CheckConstraints)
             {
                 if (changedColumns is not null && !ReferencesAnyChangedColumn(check.Expression, changedColumns))
                     continue;
                 Validate(check);
             }
-        }
-        foreach (var check in table.CheckConstraints)
-        {
-            if (changedColumns is not null && !ReferencesAnyChangedColumn(check.Expression, changedColumns))
-                continue;
-            Validate(check);
         }
 
         void Validate(CheckConstraint check)
@@ -16455,7 +16535,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private SqlValue EvaluateForeignKeyDefault(EmbeddedColumn column, QueryContext context)
         => column.DefaultExpression is { } expression
             ? Evaluate(expression, EmptyParameters, row: null, context)
-            : column.DefaultValue ?? SqlValue.Null;
+            : column.DefaultValue
+                ?? (column.Domain?.Default is { } domainDefault
+                    ? Evaluate(domainDefault, EmptyParameters, row: null, context)
+                    : SqlValue.Null);
 
     private static QueryContext EnterForeignKeyAction(QueryContext context)
     {
@@ -17443,6 +17526,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        RejectInternalTypeTableMutation(statement.TableName);
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
             return ExecuteVirtualTableDelete(statement, virtualTable, parameters, context);
 
@@ -17507,9 +17591,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // Foreign keys: INSERT/UPDATE Commit* paths already call ValidateForeignKeys*; plain DELETE still
     // lacks parent-action validation in its write-target Commit, so it stays evaluator-owned when FKs are on
     // (self-referential cascades use CanCompileForeignKeyCascadeDelete instead).
+    // Registered domains can appear in RETURNING on ordinary tables; their casts need evaluator routing.
     private bool CanCompileDml(QueryContext context)
         => !context.CancellationToken.CanBeCanceled
-            && !HasOpenBlobHandles;
+            && !HasOpenBlobHandles
+            && !context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsCustomType);
 
     private bool CanCompilePlainDelete(QueryContext context)
         => CanCompileDml(context) && !context.ForeignKeysEnabled;
@@ -17517,7 +17604,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private bool CanCompileForeignKeyCascadeDelete(QueryContext context)
         => !context.CancellationToken.CanBeCanceled
             && context.ForeignKeysEnabled
-            && !HasOpenBlobHandles;
+            && !HasOpenBlobHandles
+            && !context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            && !context.Tables.Values.Any(ManagedTypeRegistry.ContainsCustomType);
 
     private bool CanRouteInsertThroughCompiler(InsertStatement statement, QueryContext context)
         => CanCompileDml(context)
@@ -18433,6 +18522,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName))
+            return false;
         var isVirtualTableScan = select.Source is TableValuedFunctionSource
             || select.Source is NamedTableSource named
                 && TryGetVirtualTable(context, named, out _);
@@ -18465,6 +18556,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? outerRow,
         out CompiledSelect compiled)
     {
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName))
+        {
+            compiled = null!;
+            return false;
+        }
         select = ConsumeTursoFullOuterDuplicateEquijoinWhere(select);
         select = ResolveNamedWindows(select);
         context = EnterCollationSource(context, select.Source);
@@ -19937,7 +20033,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         compiled = null!;
 
-        if (context.CancellationToken.CanBeCanceled
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            || context.CancellationToken.CanBeCanceled
             || statement.Operators.Count == 0
             || statement.OrderBy.Count != 0)
         {
@@ -22068,7 +22165,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return true;
         }
 
-        if (source is NamedTableSource)
+        if (source is NamedTableSource namedTable)
         {
             CompiledJoinIndexSelection? selectedSeek = null;
             if (indexSeekSelections is not null)
@@ -22129,7 +22226,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     target.Columns.Length,
                     selectedSeek is null
                         ? target.CreateCursorSource()
-                        : new VdbeCursorSource([])),
+                        : new VdbeCursorSource([]))
+                {
+                    Alias = namedTable.Alias,
+                },
                 target.TableName,
                 target.Columns,
                 BuildQualifiedColumns(target.Qualifier, target.Columns),
@@ -22678,13 +22778,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return key;
         }
 
-        var prefix = string.Join(
-            ", ",
-            selection.Candidate.Columns
-                .Take(keys.Length)
-                .Select((column, position) => column.IndexExpression is not null
-                    ? $"{(index!.Columns[position].ExpressionSql ?? "expr")}=?"
-                    : $"{table.Columns[column.ColumnOrdinal]}=?"));
+        var constraints = selection.Candidate.Columns
+            .Take(keys.Length)
+            .Select((column, position) => column.IndexExpression is not null
+                ? $"{(index!.Columns[position].ExpressionSql ?? "expr")}=?"
+                : $"{table.Columns[column.ColumnOrdinal]}=?")
+            .ToArray();
+        var prefix = string.Join(", ", constraints);
+        var searchMetadata = new VdbeJoinSearchMetadata(
+            table.Name,
+            named.Alias,
+            indexName,
+            selection.Candidate.Covering,
+            selection.Candidate.Automatic,
+            constraints);
         var usingClause = selection.Candidate.Automatic
             ? "USING AUTOMATIC COVERING INDEX"
             : selection.Candidate.Covering
@@ -22701,6 +22808,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 BuildSeekKey,
                 CanonicalizeAutomaticKey,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"automatic-index-seek {table.Name} ({prefix})";
             return true;
         }
@@ -22737,6 +22845,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 concurrentMvccAccessor.Open,
                 concurrentMvccAccessor.Dispose,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
             return true;
         }
@@ -22773,6 +22882,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 transactionAccessor.Open,
                 transactionAccessor.Dispose,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
             return true;
         }
@@ -22810,6 +22920,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 accessor.Open,
                 accessor.Dispose,
                 _joinIndexSeekMetrics);
+            plan.SearchMetadata = searchMetadata;
             description = $"pager-index-seek {table.Name} {usingClause} ({prefix})";
             return true;
         }
@@ -22823,6 +22934,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             BuildSeekKey,
             ComparePrefix,
             _joinIndexSeekMetrics);
+        plan.SearchMetadata = searchMetadata;
         description = $"materialized-index-seek {table.Name} {usingClause} ({prefix})";
         return true;
     }
@@ -25235,14 +25347,47 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        var functions = windowFunctions.ToArray();
-        return bufferedRows => ComputeWindowFunctionValueRows(
-            functions,
-            new LazyWindowSourceRows(
-                bufferedRows,
-                row => CreateScanSourceRow(target, row, context, outerRow)),
-            parameters,
-            context);
+        var evaluator = new WindowEvaluatorAdapter(
+            this, target, windowFunctions.ToArray(), parameters, context, outerRow);
+        return evaluator.Evaluate;
+    }
+
+    private sealed class WindowEvaluatorAdapter(
+        EmbeddedDatabase database,
+        ScanTarget target,
+        FunctionExpression[] functions,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow) : IVdbeWindowEvaluationScope
+    {
+        private readonly AsyncLocal<VdbeWindowEvaluationResources?> _resources = new();
+
+        public IReadOnlyList<SqlValue[]> Evaluate(IReadOnlyList<SqlValue[]> bufferedRows) =>
+            database.ComputeWindowFunctionValueRows(
+                functions,
+                new LazyWindowSourceRows(
+                    bufferedRows,
+                    row => CreateScanSourceRow(target, row, context, outerRow)),
+                parameters,
+                context,
+                windowEvaluation: _resources.Value);
+
+        public IDisposable Enter(
+            VdbeExecutionMemory memory,
+            VdbeExecutionOptions options,
+            CancellationToken cancellationToken)
+        {
+            var previous = _resources.Value;
+            _resources.Value = new VdbeWindowEvaluationResources(memory, options, cancellationToken);
+            return new WindowEvaluationBinding(_resources, previous);
+        }
+
+        private sealed class WindowEvaluationBinding(
+            AsyncLocal<VdbeWindowEvaluationResources?> resources,
+            VdbeWindowEvaluationResources? previous) : IDisposable
+        {
+            public void Dispose() => resources.Value = previous;
+        }
     }
 
     private sealed class LazyWindowSourceRows : IReadOnlyList<SourceRow>
@@ -28719,7 +28864,7 @@ out bool hasReturning)
         QueryContext context)
     {
         var result = ExecuteExplainQueryPlanText(
-            statement, parameters, context, out var ops, out var cteMaterialization);
+            statement, parameters, context, out var ops, out var cteMaterialization, out var compiledJoinRoot);
         if (statement.Format != ExplainQueryPlanFormat.Json)
             return result;
 
@@ -28755,10 +28900,10 @@ out bool hasReturning)
 
         // A lone "MANAGED COMPILED VDBE"/"MANAGED EVALUATOR FALLBACK" row is the text path's
         // placeholder for "no per-step plan is modeled for this statement yet", not a real scan
-        // or search step -- but for a plain SELECT the query still genuinely executes some real
-        // access path (a FROM-less constant row, or an ordinary full table scan), and the JSON
-        // envelope can describe that faithfully even while the TEXT convention keeps reporting
-        // the placeholder (ExplainQueryPlanTests.cs pins that TEXT routing marker independently
+        // or search step -- but a FROM-less or plain-table SELECT still executes a real access
+        // path, and a compiled named-table join exposes its actual plan tree. JSON can describe
+        // those without changing the TEXT convention, which keeps reporting the placeholder
+        // (ExplainQueryPlanTests.cs pins that TEXT routing marker independently
         // of what FORMAT=JSON reports). A write statement with nothing to scan (a constant
         // INSERT ... VALUES) has no equivalent real access path, so it still reports no nodes.
         var isPlaceholderOnly = result.Rows.Count == 1
@@ -28795,6 +28940,15 @@ out bool hasReturning)
                 var op = ops is not null && index < ops.Count ? ops[index] : null;
                 return (nodeId, parent, detailText, op);
             }).ToArray();
+        }
+
+        if (compiledJoinRoot is not null)
+        {
+            var additionalNodes = DescribeCompiledNamedJoinNonIndexedNodes(
+                compiledJoinRoot,
+                nodes.Count == 0 ? 1 : nodes.Max(static node => node.Id) + 1);
+            if (additionalNodes.Count != 0)
+                nodes = [.. nodes, .. additionalNodes];
         }
 
         var json = new System.Text.StringBuilder()
@@ -28837,9 +28991,8 @@ out bool hasReturning)
     /// a FROM-less SELECT (one synthesized row of literal/computed values) and a single plain
     /// base table with no join, no index chosen (an ordinary full table scan). Both are
     /// determined from the statement and its bound base-table catalog, never by treating a view
-    /// or other named row source as a table. A multi-table join's real per-leg
-    /// access method (index seek vs. hash join vs. full scan) is not yet reconstructable this
-    /// way and stays unmodeled.
+    /// or other named row source as a table. Joins cannot be reconstructed from this syntax;
+    /// supported compiled joins instead use their actual OpenJoinCursor plan tree.
     /// </summary>
     private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(
         SelectStatement select,
@@ -28896,10 +29049,13 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         out IReadOnlyList<EqpJsonOp?>? ops,
-        out (int CteId, string Name, int NodeId)? cteMaterialization)
+        out (int CteId, string Name, int NodeId)? cteMaterialization,
+        out VdbeJoinPlanNode? compiledJoinRoot)
     {
         ops = null;
         cteMaterialization = null;
+        compiledJoinRoot = null;
+        VdbeJoinPlanNode? compiledJoinCandidate = null;
         var compilationContext = EnsureAutoIncrementStatementState(context);
         if (statement.Inner is SelectStatement tableValuedSelect)
             statement = statement with { Inner = BindTableValuedFunctionSources(tableValuedSelect, compilationContext) };
@@ -29328,19 +29484,27 @@ out bool hasReturning)
                 parameters,
                 compilationContext,
                 outerRow: null,
-                out var compiledJoinProgram)
-            && GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program) is { Count: > 0 } searches)
+                out var compiledJoinProgram))
         {
-            return new ExecutionResult(
-                ExplainQueryPlanColumns(),
-                searches.Select((detail, index) => new[]
-                {
-                    SqlValue.Integer(index + 1),
-                    SqlValue.Integer(0),
-                    SqlValue.Integer(0),
-                    SqlValue.Text(detail),
-                }).ToArray(),
-                0);
+            compiledJoinCandidate = compiledJoinProgram.Program.Instructions
+                .OfType<OpenJoinCursorInstruction>()
+                .FirstOrDefault()?.Plan.Root;
+            var searches = GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program);
+            if (searches.Count > 0)
+            {
+                compiledJoinRoot = compiledJoinCandidate;
+                ops = searches.Select(static search => search.Op).ToArray();
+                return new ExecutionResult(
+                    ExplainQueryPlanColumns(),
+                    searches.Select((search, index) => new[]
+                    {
+                        SqlValue.Integer(index + 1),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text(search.Detail),
+                    }).ToArray(),
+                    0);
+            }
         }
         if (statement.Inner is SelectStatement correlatedAggregateSelect
             && TryDescribeCorrelatedAggregateSubqueryPlan(
@@ -29356,9 +29520,10 @@ out bool hasReturning)
 
         var usesCompiledProgram = statement.Inner switch
         {
-            SelectStatement select => HasExplainSafeBounds(select)
-                && CanUseCompiledSelectRoute(select, compilationContext, outerRow: null)
-                && TryCompileSelect(select, parameters, compilationContext, outerRow: null, out _),
+            SelectStatement select => compiledJoinCandidate is not null
+                || HasExplainSafeBounds(select)
+                    && CanUseCompiledSelectRoute(select, compilationContext, outerRow: null)
+                    && TryCompileSelect(select, parameters, compilationContext, outerRow: null, out _),
             CompoundSelectStatement compound => !compilationContext.CancellationToken.CanBeCanceled
                 && TryCompileCompoundSelect(
                     compound,
@@ -29392,6 +29557,8 @@ out bool hasReturning)
         var detail = usesCompiledProgram
             ? "MANAGED COMPILED VDBE"
             : "MANAGED EVALUATOR FALLBACK";
+        if (usesCompiledProgram)
+            compiledJoinRoot = compiledJoinCandidate;
         return new ExecutionResult(
             ExplainQueryPlanColumns(),
             [
@@ -29405,33 +29572,169 @@ out bool hasReturning)
             0);
     }
 
-    private static IReadOnlyList<string> GetCompiledJoinIndexSearchDescriptions(VdbeProgram program)
+    private sealed record EqpJsonCompiledJoinHashBuildOp(string Table, string? Alias) : EqpJsonOp
     {
-        var searches = new List<string>();
+        public override string ToJson()
+        {
+            var json = new System.Text.StringBuilder("{\"type\":\"hash_build\",");
+            AppendTableFields(json, Table, Alias, join: null);
+            return json.Append('}').ToString();
+        }
+    }
+
+    private static IReadOnlyList<(int Id, int Parent, string Detail, EqpJsonOp? Op)>
+        DescribeCompiledNamedJoinNonIndexedNodes(VdbeJoinPlanNode root, int nextId)
+    {
+        // VdbeHashJoinRuntime enumerates the complete left prefix before probing the right
+        // when HashBuildRight is false. Model that materialization only for a proven two-table
+        // named-table hash prefix; upstream's HashBuild is likewise the parent of its
+        // materialization subtree (joins__hash-join-three-table.snap).
+        if (root is VdbeJoinOperatorPlan
+            {
+                Left: VdbeJoinOperatorPlan
+                {
+                    Left: VdbeJoinScanPlan,
+                    Right: VdbeJoinScanPlan,
+                    EquiProbe: not null,
+                } prefix,
+                Right: VdbeJoinScanPlan outerProbe,
+                EquiProbe: not null,
+                HashBuildRight: false,
+                Kind: VdbeJoinKind.Inner,
+            })
+        {
+            var prefixProbe = prefix.HashBuildRight ? prefix.Left : prefix.Right;
+            if (prefixProbe is not VdbeJoinScanPlan labeledProbe)
+                return [];
+            var prefixNodes = DescribeCompiledNamedJoinNonIndexedNodes(prefix, nextId + 1);
+            if (prefixNodes.Count != 2)
+                return [];
+
+            var parentId = nextId;
+            var detail = $"MATERIALIZE hash build input for {labeledProbe.TableName}"
+                + (labeledProbe.Alias is null ? string.Empty : $" AS {labeledProbe.Alias}");
+            var result = new List<(int Id, int Parent, string Detail, EqpJsonOp? Op)>
+            {
+                (parentId, 0, detail,
+                    new EqpJsonCompiledJoinHashBuildOp(labeledProbe.TableName, labeledProbe.Alias)),
+            };
+            result.AddRange(prefixNodes.Select(node => (
+                node.Id,
+                node.Parent == 0 ? parentId : node.Parent,
+                node.Detail,
+                node.Op)));
+            result.Add((
+                nextId + 1 + prefixNodes.Count,
+                0,
+                $"HASH JOIN {outerProbe.TableName}"
+                    + (outerProbe.Alias is null ? string.Empty : $" AS {outerProbe.Alias}"),
+                new EqpJsonHashJoinOp(outerProbe.TableName, outerProbe.Alias, "inner")));
+            return result;
+        }
+
+        // A scan leaf in a compiled plan is a real named-table cursor. Do not expand a derived
+        // leaf or an otherwise unmodeled N-way subtree.
+        if (root is not VdbeJoinOperatorPlan { Left: VdbeJoinScanPlan left } join
+            || join.Right is not VdbeJoinScanPlan
+                && (join.Right is not IVdbeJoinSeekPlan || join.Right.SearchMetadata is null))
+        {
+            return [];
+        }
+
+        var nodes = new List<(int Id, int Parent, string Detail, EqpJsonOp? Op)>();
+        string? joinMarker = GetCompiledJoinMarker(join.Kind);
+
+        void AddScan(VdbeJoinScanPlan scan, string? marker)
+        {
+            var detail = $"SCAN {scan.TableName}"
+                + (scan.Alias is null ? string.Empty : $" AS {scan.Alias}");
+            nodes.Add((
+                nextId++,
+                0,
+                detail,
+                new EqpJsonScanOp(scan.TableName, scan.Alias, IndexName: null, Covering: false, marker)));
+        }
+
+        if (join.Right is not VdbeJoinScanPlan right)
+        {
+            AddScan(left, marker: null);
+            return nodes;
+        }
+
+        if (join.EquiProbe is null)
+        {
+            AddScan(left, marker: null);
+            AddScan(right, marker: joinMarker);
+            return nodes;
+        }
+
+        // A two-table hash join needs no separate materialized build-input subtree. Like
+        // Turso's two-table EQP, report HASH JOIN for the probe and SCAN for the build source;
+        // the multi-table HashBuild parent only exists when a join prefix is materialized.
+        var build = join.HashBuildRight ? right : left;
+        var probe = join.HashBuildRight ? left : right;
+        var hashJoinDetail = $"HASH JOIN {probe.TableName}"
+            + (probe.Alias is null ? string.Empty : $" AS {probe.Alias}");
+        nodes.Add((nextId++, 0, hashJoinDetail,
+            new EqpJsonHashJoinOp(probe.TableName, probe.Alias,
+                join.HashBuildRight ? null : joinMarker)));
+        AddScan(build, marker: join.HashBuildRight ? joinMarker : null);
+        return nodes;
+    }
+
+    private static string? GetCompiledJoinMarker(VdbeJoinKind kind) => kind switch
+    {
+        VdbeJoinKind.Inner => "inner",
+        VdbeJoinKind.Left => "left",
+        VdbeJoinKind.Full => "full",
+        VdbeJoinKind.Semi => "semi",
+        VdbeJoinKind.Anti => "anti",
+        _ => null,
+    };
+
+    private static IReadOnlyList<(string Detail, EqpJsonOp? Op)> GetCompiledJoinIndexSearchDescriptions(VdbeProgram program)
+    {
+        var searches = new List<(string Detail, EqpJsonOp? Op)>();
         foreach (var instruction in program.Instructions)
         {
             if (instruction is OpenJoinCursorInstruction open)
-                Collect(open.Plan.Root, suffix: null);
+                Collect(open.Plan.Root, suffix: null, joinMarker: null);
         }
 
         return searches;
 
-        void Collect(VdbeJoinPlanNode node, string? suffix)
+        void Collect(VdbeJoinPlanNode node, string? suffix, string? joinMarker)
         {
             if (node is IVdbeJoinSeekPlan index)
             {
-                searches.Add(suffix is null ? index.SearchDescription : index.SearchDescription + suffix);
+                var metadata = node.SearchMetadata;
+                EqpJsonOp? op = metadata is null
+                    ? null
+                    : new EqpJsonSearchOp(
+                        metadata.TableName,
+                        metadata.Alias,
+                        metadata.IndexName,
+                        metadata.Covering,
+                        metadata.Constraints,
+                        joinMarker,
+                        metadata.Ephemeral);
+                searches.Add((
+                    suffix is null ? index.SearchDescription : index.SearchDescription + suffix,
+                    op));
                 return;
             }
 
             if (node is not VdbeJoinOperatorPlan join)
                 return;
-            Collect(join.Left, suffix);
+            Collect(join.Left, suffix, joinMarker);
             // Turso tags the preserved (right) side of a LEFT JOIN's access-method line with
             // " LEFT-JOIN" so EXPLAIN QUERY PLAN reads which side the outer join keeps NULL-padded
             // rows for (core/translate/eqp.rs). RIGHT/FULL have no equivalent fixture evidence yet,
             // so they are left exactly as before rather than guessed at.
-            Collect(join.Right, join.Kind == VdbeJoinKind.Left ? " LEFT-JOIN" : suffix);
+            Collect(
+                join.Right,
+                join.Kind == VdbeJoinKind.Left ? " LEFT-JOIN" : suffix,
+                GetCompiledJoinMarker(join.Kind));
         }
     }
 
@@ -38374,7 +38677,7 @@ out bool hasReturning)
     private static ColumnAffinity? GetJoinKeyAffinity(EmbeddedColumn? definition)
         => definition is null || definition.StrictAny
             ? null
-            : EmbeddedTable.GetAffinity(definition.DeclaredType);
+            : EmbeddedTable.GetDeclaredColumnAffinity(definition);
 
     private static bool IsHashableJoinKeyCollation(string collation)
         => string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase)
@@ -38930,12 +39233,20 @@ out bool hasReturning)
         return backing;
     }
 
-    // SQLite rejects any user-created object whose name begins with "sqlite_" (case
-    // insensitive); those names are reserved for the internal schema.
+    // SQLite reserves "sqlite_" and the managed type registry owns its backing-table name.
     internal static bool IsReservedObjectName(string name)
         => name.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase)
+            || name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase)
             || IsAutoIncrementSequenceBackingTable(name)
             || Indexing.ManagedIndexMethodNames.IsReserved(name);
+
+    private static void RejectInternalTypeTableMutation(string name)
+    {
+        if (ManagedSchemaName.TrySplit(name, out _, out var localName))
+            name = localName;
+        if (name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException("The internal type registry cannot be modified directly.");
+    }
 
     private static SourceData GetNamedTableRows(
         NamedTableSource source,
@@ -39466,7 +39777,7 @@ out bool hasReturning)
             {
                 definition += FormatConstraintName(column.NullConstraintName) + " NULL";
             }
-            if (column.HasDefault)
+            if (column.DefaultValue.HasValue || column.DefaultExpression is not null)
             {
                 definition += FormatConstraintName(column.DefaultConstraintName)
                     + " DEFAULT "
@@ -40783,7 +41094,7 @@ out bool hasReturning)
                     return new QueryAffinityColumn(
                         null,
                         column,
-                        definition is not null ? EmbeddedTable.GetAffinity(definition.DeclaredType) : ColumnAffinity.Blob,
+                        definition is not null ? EmbeddedTable.GetDeclaredColumnAffinity(definition) : ColumnAffinity.Blob,
                         definition?.DeclaredType,
                         HasAffinity: definition is not null);
                 })
@@ -42130,7 +42441,23 @@ out bool hasReturning)
         SqlValue[] parameters,
         SourceRow? row,
         QueryContext context)
-        => CastValue(Evaluate(expression.Expression, parameters, row, context), expression.TypeName);
+    {
+        var identity = IsIdentityTypedCast(expression.TypeName, context);
+        var value = Evaluate(expression.Expression, parameters, row, context);
+        return identity ? value : CastValue(value, expression.TypeName);
+    }
+
+    private static bool IsIdentityTypedCast(string typeName, QueryContext context)
+    {
+        if (context.Tables.ContainsKey(ManagedTypeRegistry.TableName)
+            && ManagedTypeRegistry.Load(context.Tables).TryGetValue(typeName, out var definition))
+        {
+            if (definition is CreateTypeStatement)
+                return true;
+            throw new EmbeddedSqlException($"CAST to custom type '{typeName}' is not yet supported.");
+        }
+        return false;
+    }
 
     private SqlValue EvaluateCase(
         CaseExpression expression,
@@ -43592,6 +43919,18 @@ out bool hasReturning)
         };
     }
 
+    private SqlValue EvaluateAggregateCast(
+        CastExpression cast,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? representative)
+    {
+        var identity = IsIdentityTypedCast(cast.TypeName, context);
+        var value = EvaluateAggregate(cast.Expression, rows, parameters, context, representative);
+        return identity ? value : CastValue(value, cast.TypeName);
+    }
+
     private SqlValue EvaluateAggregate(
         Expression expression,
         IReadOnlyList<SourceRow> rows,
@@ -43635,9 +43974,7 @@ out bool hasReturning)
                 GetComparisonCollation(binary.Left, binary.Right, context)),
             CollationExpression collation
                 => EvaluateAggregate(collation.Expression, rows, parameters, context, representative),
-            CastExpression cast => CastValue(
-                EvaluateAggregate(cast.Expression, rows, parameters, context, representative),
-                cast.TypeName),
+            CastExpression cast => EvaluateAggregateCast(cast, rows, parameters, context, representative),
             CaseExpression @case => EvaluateAggregateCase(@case, rows, parameters, context, representative),
             LikeExpression like => EvaluateLikeValues(
                 EvaluateAggregate(like.Value, rows, parameters, context, representative),
@@ -48666,7 +49003,7 @@ out bool hasReturning)
         {
             return definition.StrictAny
                 ? null
-                : EmbeddedTable.GetAffinity(definition.DeclaredType);
+                : EmbeddedTable.GetDeclaredColumnAffinity(definition);
         }
 
         // rowid/_rowid_/oid resolve to the hidden rowid even without a column definition;
@@ -49984,7 +50321,8 @@ out bool hasReturning)
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
         QueryContext context,
-        IReadOnlySet<int>? evaluationSourceIndexes = null)
+        IReadOnlySet<int>? evaluationSourceIndexes = null,
+        VdbeWindowEvaluationResources? windowEvaluation = null)
     {
         return ComputeWindowFunctionValueRows(
             windowFunctions,
@@ -49993,7 +50331,8 @@ out bool hasReturning)
             parameters,
             context,
             WindowEmissionOrder(windowFunctions),
-            evaluationSourceIndexes);
+            evaluationSourceIndexes,
+            windowEvaluation);
     }
 
     // The window pass reads every one of its inputs - arguments, FILTER, PARTITION BY and window
@@ -50007,7 +50346,8 @@ out bool hasReturning)
         SqlValue[] parameters,
         QueryContext context,
         IReadOnlyList<OrderByTerm>? emissionOrder = null,
-        IReadOnlySet<int>? evaluationSourceIndexes = null)
+        IReadOnlySet<int>? evaluationSourceIndexes = null,
+        VdbeWindowEvaluationResources? windowEvaluation = null)
     {
         var values = new SqlValue[rowCount][];
         for (var index = 0; index < rowCount; index++)
@@ -50016,7 +50356,9 @@ out bool hasReturning)
         if (windowFunctions.Count == 0)
             return values;
 
-        var inputs = PrepareWindowFunctionInputs(windowFunctions, rowCount, evaluate, context);
+        using var inputScope = new WindowInputScope();
+        var inputs = PrepareWindowFunctionInputs(
+            windowFunctions, rowCount, evaluate, context, windowEvaluation, inputScope);
         var groups = new List<List<int>>();
         foreach (var ordinal in Enumerable.Range(0, windowFunctions.Count))
         {
@@ -50034,7 +50376,10 @@ out bool hasReturning)
         foreach (var group in groups)
         {
             var functions = group.Select(ordinal => windowFunctions[ordinal]).ToArray();
-            var computed = ComputeWindowFunctions(
+            var resultOrdinals = new Dictionary<FunctionExpression, int>(functions.Length);
+            for (var position = 0; position < functions.Length; position++)
+                resultOrdinals.Add(functions[position], group[position]);
+            ComputeWindowFunctions(
                 functions,
                 rowCount,
                 evaluate,
@@ -50042,33 +50387,69 @@ out bool hasReturning)
                 parameters,
                 context,
                 emissionOrder,
-                evaluationSourceIndexes);
-            for (var position = 0; position < functions.Length; position++)
-            {
-                var series = computed[functions[position]];
-                for (var index = 0; index < rowCount; index++)
-                    values[index][group[position]] = series[index];
-            }
+                evaluationSourceIndexes,
+                values,
+                resultOrdinals);
         }
 
         return values;
     }
 
-    private Dictionary<FunctionExpression, WindowFunctionInput[]> PrepareWindowFunctionInputs(
+    private Dictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>> PrepareWindowFunctionInputs(
         IReadOnlyList<FunctionExpression> functions,
         int rowCount,
         WindowInputEvaluator evaluate,
-        QueryContext context)
+        QueryContext context,
+        VdbeWindowEvaluationResources? windowEvaluation,
+        WindowInputScope inputScope)
     {
-        var inputs = new Dictionary<FunctionExpression, WindowFunctionInput[]>();
+        var inputs = new Dictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>>();
         foreach (var function in functions)
-            inputs.Add(function, new WindowFunctionInput[rowCount]);
+        {
+            var constant = function.Filter is null
+                && function.Arguments.All(static argument => argument is LiteralExpression);
+            if (constant)
+            {
+                inputs.Add(function, new ConstantWindowInputList(
+                    rowCount,
+                    new WindowFunctionInput(
+                        true,
+                        function.Arguments
+                            .Select(static argument => ((LiteralExpression)argument).Value)
+                            .ToArray())));
+            }
+            else if (windowEvaluation is { } resources)
+            {
+                var minimum = VdbeManagedFootprint.EstimateWindowOutputMinimum(
+                    rowCount, function.Arguments.Count);
+                if (resources.Options.AllowTemporaryFileSpill
+                    && minimum > resources.Memory.AvailableBytes / 2)
+                {
+                    var spill = new SpilledWindowInputList(rowCount, function.Arguments.Count, resources);
+                    inputScope.Own(spill);
+                    inputs.Add(function, spill);
+                }
+                else
+                {
+                    inputScope.Own(VdbeMemoryReservation.Create(resources.Memory, minimum));
+                    inputs.Add(function, new WindowFunctionInput[rowCount]);
+                }
+            }
+            else
+            {
+                inputs.Add(function, new WindowFunctionInput[rowCount]);
+            }
+        }
 
         for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
             context.CheckInterrupt();
+            windowEvaluation?.CancellationToken.ThrowIfCancellationRequested();
             foreach (var function in functions)
             {
+                windowEvaluation?.CancellationToken.ThrowIfCancellationRequested();
+                if (inputs[function] is ConstantWindowInputList)
+                    continue;
                 var included = !IsAggregateWindowFunction(function)
                     || function.Filter is null
                     || IsTrue(evaluate(rowIndex, function.Filter));
@@ -50077,11 +50458,35 @@ out bool hasReturning)
                         .Select(argument => evaluate(rowIndex, argument))
                         .ToArray()
                     : [];
-                inputs[function][rowIndex] = new WindowFunctionInput(included, arguments);
+                var input = new WindowFunctionInput(included, arguments);
+                if (inputs[function] is WindowFunctionInput[] prepared)
+                    prepared[rowIndex] = input;
+                else
+                    ((SpilledWindowInputList)inputs[function]).Append(input);
             }
         }
 
         return inputs;
+    }
+
+    private sealed class ConstantWindowInputList(int count, WindowFunctionInput input)
+        : IReadOnlyList<WindowFunctionInput>
+    {
+        public int Count => count;
+
+        public WindowFunctionInput this[int index] =>
+            (uint)index < (uint)count
+                ? input
+                : throw new ArgumentOutOfRangeException(nameof(index));
+
+        public IEnumerator<WindowFunctionInput> GetEnumerator()
+        {
+            for (var index = 0; index < count; index++)
+                yield return input;
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
+            GetEnumerator();
     }
 
     // Produces a collation entry per output column (not per projection) so that DISTINCT
@@ -50160,7 +50565,7 @@ out bool hasReturning)
 
         public SqlValue[] Keys { get; }
 
-        public List<int> Members { get; } = [];
+        public List<WindowOrderEntry> Entries { get; } = [];
     }
 
     private sealed record WindowOrderEntry(
@@ -50468,21 +50873,19 @@ out bool hasReturning)
 
     private delegate SqlValue WindowInputEvaluator(int rowIndex, Expression expression);
 
-    private Dictionary<FunctionExpression, SqlValue[]> ComputeWindowFunctions(
+    private void ComputeWindowFunctions(
         IReadOnlyList<FunctionExpression> functions,
         int rowCount,
         WindowInputEvaluator evaluate,
-        IReadOnlyDictionary<FunctionExpression, WindowFunctionInput[]> inputs,
+        IReadOnlyDictionary<FunctionExpression, IReadOnlyList<WindowFunctionInput>> inputs,
         SqlValue[] parameters,
         QueryContext context,
         IReadOnlyList<OrderByTerm>? emissionOrder,
-        IReadOnlySet<int>? evaluationSourceIndexes)
+        IReadOnlySet<int>? evaluationSourceIndexes,
+        SqlValue[][] results,
+        IReadOnlyDictionary<FunctionExpression, int> resultOrdinals)
     {
         var spec = functions[0].Window!;
-        var results = new Dictionary<FunctionExpression, SqlValue[]>();
-        foreach (var function in functions)
-            results.Add(function, new SqlValue[rowCount]);
-
         var partitionCollations = spec.PartitionBy
             .Select(expression => GetEffectiveCollation(expression, context))
             .ToArray();
@@ -50497,7 +50900,6 @@ out bool hasReturning)
             : new Dictionary<SqlValue[], WindowPartition>(
                 new GroupKeyEqualityComparer(partitionEquality, partitionHasher));
         var partitions = new List<WindowPartition>();
-        var orderKeysBySource = new SqlValue[rowCount][];
         for (var index = 0; index < rowCount; index++)
         {
             context.CheckInterrupt();
@@ -50521,14 +50923,16 @@ out bool hasReturning)
                 partitionIndexByKey?.Add(keys, partition);
             }
 
-            partition.Members.Add(index);
-            orderKeysBySource[index] = spec.OrderBy
-                .Select(term => evaluate(index, term.Expression))
-                .ToArray();
+            partition.Entries.Add(new WindowOrderEntry(
+                index,
+                partition.Entries.Count,
+                spec.OrderBy
+                    .Select(term => evaluate(index, term.Expression))
+                    .ToArray()));
         }
 
         if (partitions.Count == 0)
-            return results;
+            return;
 
         var needsFrame = functions.Any(WindowFunctionUsesFrame);
         var frameRuntime = needsFrame
@@ -50555,15 +50959,7 @@ out bool hasReturning)
         foreach (var partition in partitions)
         {
             context.CheckInterrupt();
-            var entries = new List<WindowOrderEntry>(partition.Members.Count);
-            for (var ordinal = 0; ordinal < partition.Members.Count; ordinal++)
-            {
-                var sourceIndex = partition.Members[ordinal];
-                entries.Add(new WindowOrderEntry(
-                    sourceIndex,
-                    ordinal,
-                    orderKeysBySource[sourceIndex]));
-            }
+            var entries = partition.Entries;
 
             if (spec.OrderBy.Count > 0)
             {
@@ -50822,14 +51218,14 @@ out bool hasReturning)
                             cumulativeValues[function] = cumulative.GetValue();
                         }
 
-                        results[function][entries[position].SourceIndex] =
+                        results[entries[position].SourceIndex][resultOrdinals[function]] =
                             cumulativeValues[function];
                         continue;
                     }
 
                     if (slidingAggregates.TryGetValue(function, out var sliding))
                     {
-                        results[function][entries[position].SourceIndex] = sliding.GetValue();
+                        results[entries[position].SourceIndex][resultOrdinals[function]] = sliding.GetValue();
                         continue;
                     }
 
@@ -50849,11 +51245,11 @@ out bool hasReturning)
                                 context);
                         }
 
-                        results[function][entries[position].SourceIndex] = sharedAggregateValues![function];
+                        results[entries[position].SourceIndex][resultOrdinals[function]] = sharedAggregateValues![function];
                         continue;
                     }
 
-                    results[function][entries[position].SourceIndex] = EvaluateWindowFunctionAtPosition(
+                    results[entries[position].SourceIndex][resultOrdinals[function]] = EvaluateWindowFunctionAtPosition(
                         function,
                         entries,
                         peers,
@@ -50867,7 +51263,6 @@ out bool hasReturning)
             }
         }
 
-        return results;
     }
 
     private Dictionary<FunctionExpression, CumulativeWindowAggregate>
@@ -56887,6 +57282,12 @@ public sealed partial class EmbeddedConnection : IDisposable
     private bool _queryOnly;
 
     /// <summary>
+    /// Opts this connection into experimental TYPE/DOMAIN declarations. INTEGER domain columns
+    /// are supported in STRICT tables; custom TYPE columns remain unsupported.
+    /// </summary>
+    public bool ExperimentalCustomTypesEnabled { get; set; }
+
+    /// <summary>
     /// <c>PRAGMA count_changes</c>: when enabled, each INSERT/UPDATE/DELETE returns one row
     /// carrying the number of changed rows (SQLite's deprecated count_changes behavior,
     /// pinned by pragma-count-changes.sqltest).
@@ -58158,6 +58559,8 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfInsideHookCallback();
         var parameterMap = SqlParameterMap.Parse(sql);
         var statement = SqlParser.Parse(sql, parameterMap, IsKnownTableOrViewName);
+        if (statement is CreateTypeStatement or CreateDomainStatement && !ExperimentalCustomTypesEnabled)
+            throw new EmbeddedSqlException("Custom types are experimental and are not enabled for this connection.");
         if (_hooks.Authorizer is not null)
             statement = Authorize(statement);
 
@@ -58827,6 +59230,8 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         ThrowIfInsideHookCallback();
+        if (statement is CreateTypeStatement or CreateDomainStatement && !ExperimentalCustomTypesEnabled)
+            throw new EmbeddedSqlException("Custom types are experimental and are not enabled for this connection.");
         cancellationToken.ThrowIfCancellationRequested();
         ThrowIfRequireWhereViolated(statement);
         if (_transactionMutationDatabase is not null && StatementMayMutate(_database, statement))
@@ -67133,7 +67538,7 @@ internal sealed class EmbeddedTable
     }
 
     public bool HasCheckConstraints => CheckConstraints.Count > 0
-        || ColumnDefinitions.Any(column => column.CheckConstraints.Count > 0);
+        || ColumnDefinitions.Any(column => column.CheckConstraints.Count > 0 || column.Domain?.Checks.Count > 0);
 
     public bool HasNonDefaultConflictAlgorithms => TablePrimaryKeyConflictAlgorithm is not null
         || TableUniqueConstraints.Any(constraint => constraint.ConflictAlgorithm is not null)
@@ -67183,7 +67588,9 @@ internal sealed class EmbeddedTable
     }
 
     public ColumnAffinity GetColumnAffinity(EmbeddedColumn column)
-        => Strict
+        => column.Domain is not null || column.IdentityType is not null
+            ? ColumnAffinity.Integer
+            : Strict
             && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase)
                 ? ColumnAffinity.Blob
                 : GetAffinity(column.DeclaredType);
@@ -68329,7 +68736,10 @@ internal sealed class EmbeddedTable
                 ? SqlValue.Null
                 : column.DefaultExpression is { } expression
                     ? evaluate(expression)
-                    : column.DefaultValue ?? SqlValue.Null;
+                    : column.DefaultValue
+                        ?? (column.Domain?.Default is { } domainDefault
+                            ? evaluate(domainDefault)
+                            : SqlValue.Null);
             row[index] = CoerceColumnAffinity(column, value);
         }
 
@@ -68695,7 +69105,7 @@ internal sealed class EmbeddedTable
                 continue;
 
             var column = ColumnDefinitions[columnIndex];
-            if ((column.NotNull || (Strict && IsPrimaryKeyColumn(columnIndex)))
+            if ((column.NotNull || column.Domain?.NotNull == true || (Strict && IsPrimaryKeyColumn(columnIndex)))
                 && rows.Any(row => row[columnIndex].Kind == SqlValueKind.Null))
             {
                 throw new EmbeddedSqlException(
@@ -68731,6 +69141,8 @@ internal sealed class EmbeddedTable
 
     private static SqlValue ApplyAffinity(EmbeddedColumn column, SqlValue value, bool strict)
     {
+        if (column.Domain is not null || column.IdentityType is not null)
+            return ApplyAffinity(ColumnAffinity.Integer, value);
         if (strict
             && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase))
         {
@@ -68741,7 +69153,9 @@ internal sealed class EmbeddedTable
     }
 
     internal static ColumnAffinity GetDeclaredColumnAffinity(EmbeddedColumn column)
-        => GetAffinity(column.DeclaredType);
+        => column.Domain is not null || column.IdentityType is not null
+            ? ColumnAffinity.Integer
+            : GetAffinity(column.DeclaredType);
 
     internal static SqlValue ApplyColumnAffinity(ColumnAffinity affinity, SqlValue value)
         => ApplyAffinity(affinity, value);
@@ -68777,7 +69191,8 @@ internal sealed class EmbeddedTable
                 throw new EmbeddedSqlException($"missing datatype for {Name}.{column.Name}");
 
             var declaredType = column.DeclaredType.Trim();
-            if (declaredType.Equals("INT", StringComparison.OrdinalIgnoreCase)
+            if (column.Domain is not null || column.IdentityType is not null
+                || declaredType.Equals("INT", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("REAL", StringComparison.OrdinalIgnoreCase)
                 || declaredType.Equals("TEXT", StringComparison.OrdinalIgnoreCase)
@@ -68797,7 +69212,9 @@ internal sealed class EmbeddedTable
         if (!Strict || value.Kind == SqlValueKind.Null)
             return;
 
-        var declaredType = column.DeclaredType!.Trim().ToUpperInvariant();
+        var declaredType = column.Domain is not null || column.IdentityType is not null
+            ? "INTEGER"
+            : column.DeclaredType!.Trim().ToUpperInvariant();
         var valid = declaredType switch
         {
             "INT" or "INTEGER" => value.Kind == SqlValueKind.Integer,
@@ -68828,7 +69245,9 @@ internal sealed class EmbeddedTable
     // exempt and must be handled by the caller.
     private static bool StrictValueMatchesDeclaredType(EmbeddedColumn column, SqlValue value)
     {
-        var declaredType = column.DeclaredType!.Trim().ToUpperInvariant();
+        var declaredType = column.Domain is not null || column.IdentityType is not null
+            ? "INTEGER"
+            : column.DeclaredType!.Trim().ToUpperInvariant();
         return declaredType switch
         {
             "INT" or "INTEGER" => value.Kind == SqlValueKind.Integer,

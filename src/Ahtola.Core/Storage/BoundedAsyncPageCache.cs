@@ -2,23 +2,20 @@ namespace Ahtola.Core.Storage;
 
 /// <summary>
 /// A capacity-capped, LRU-evicting page cache wrapping an
-/// <see cref="AsyncSqlitePagerReadTransaction"/>, used by bounded asynchronous b-tree
+/// <see cref="IAsyncBoundedReadSnapshot"/>, used by bounded asynchronous b-tree
 /// traversals. Never grows past its configured capacity: a page still pinned on a live
 /// traversal's ancestor stack can never be evicted, so a genuinely full cache with nothing
 /// evictable throws <see cref="SqliteBoundedPageBudgetExceededException"/> instead of either
 /// silently exceeding the cap or corrupting the in-progress traversal.
 /// </summary>
 /// <remarks>
-/// Within one single-table ascending full scan (the only shape this cache currently serves),
-/// pages are visited in strictly increasing rowid order and each page is read at most once, so
-/// this cache mostly avoids growth rather than eviction. Its real value is amortizing repeated
-/// scans on the same connection (every scan revisits the same root and near-root interior
-/// pages), and it is also where the "resident pages never exceed a configured budget" contract
-/// is mechanically enforced, rather than merely true by construction of the traversal.
+/// An ascending full scan visits pages in rowid order; an exact rowid lookup retains only its
+/// search path and any overflow pages. Both paths use this cache to enforce the resident-page
+/// budget rather than relying on a presumed bound from their traversal shape.
 /// </remarks>
 internal sealed class BoundedAsyncPageCache : IAsyncSqliteBtreePageIo
 {
-    private readonly AsyncSqlitePagerReadTransaction _transaction;
+    private readonly IAsyncBoundedReadSnapshot _transaction;
     private readonly int _capacity;
     private readonly LinkedList<uint> _lruOrder = new();
     private readonly Dictionary<uint, LinkedListNode<uint>> _nodesByPage = [];
@@ -26,7 +23,7 @@ internal sealed class BoundedAsyncPageCache : IAsyncSqliteBtreePageIo
     private readonly HashSet<uint> _pinned = [];
 
     public BoundedAsyncPageCache(
-        AsyncSqlitePagerReadTransaction transaction,
+        IAsyncBoundedReadSnapshot transaction,
         int usableSpace,
         int capacity)
     {

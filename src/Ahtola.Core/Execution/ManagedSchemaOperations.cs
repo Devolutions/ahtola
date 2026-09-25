@@ -823,7 +823,9 @@ internal sealed class ManagedSchemaOperations : IVdbeResettableSchemaOperations
             return;
         }
 
-        var table = ManagedSchemaRowParser.ParseTable(row);
+        var table = ManagedSchemaRowParser.ParseTable(
+            row,
+            ManagedTypeRegistry.Load(tables));
         if (tables.TryGetValue(row.Name, out var existing))
             table.AdoptContentFrom(existing);
 

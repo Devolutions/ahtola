@@ -9,6 +9,19 @@ sync/replication. The read-only `turso-src/` submodule now pins
 `git -C turso-src show v0.7.2:<path>` when reproducing citations from this
 historical analysis.
 
+**Current status (2026-09-25).** This is a historical v0.7.2 analysis, **not**
+a live list of unported capabilities. The current `v0.8.0-pre.7` conformance
+ledger has **73 case-level differences**, including deliberate policy,
+schema-text, diagnostic and eager-corruption-open differences. PR #71 delivers
+restricted STRICT INTEGER DOMAIN and identity TYPE behavior, reusable sparse
+replica history, bounded plaintext/encrypted browser read shapes, partial
+window input/output spilling, and selected JSON EQP nodes. General typed
+encode/decode, transactional incremental materialized views, a fully budgeted
+window evaluator, and planner/browser/locale depth remain open. Follow the
+[live TODOs](turso-remaining-gap-plan.md#live-todos-not-all-represented-by-expected-failure-cases);
+the inventory closure counts and executive summary below describe their
+original analysis-time baseline.
+
 **Companion artifact.** [`turso-gap-inventory.json`](./turso-gap-inventory.json) —
 the machine-readable inventory, with stable IDs for status tracking
 (`open → closed`). This report is the human-readable analysis **as of analysis

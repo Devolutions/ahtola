@@ -156,6 +156,8 @@ internal enum ManagedReplicaDurableBoundary
     /// hash) is durable, and strictly before the superseded snapshot copy is retired.
     /// </summary>
     PartialImageMetadataPublished,
+    RevertHistoryStaged,
+    RevertHistoryPublished,
     RevertWalStaged,
     RevertWalPublished,
     RevertMetadataPublished,

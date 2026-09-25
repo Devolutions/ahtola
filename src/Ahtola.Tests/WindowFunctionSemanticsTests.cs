@@ -1,6 +1,8 @@
 using AwesomeAssertions;
 using MsData = Microsoft.Data.Sqlite;
 using Ahtola.Core;
+using Ahtola.Core.Execution;
+using Ahtola.Core.Parsing;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
@@ -505,6 +507,74 @@ public sealed class WindowFunctionSemanticsTests
     }
 
     [Test]
+    public void NoArgumentWindowsShareConstantInputsAcrossLargeBufferedPartition()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE input(value INTEGER);");
+        Execute(connection, "INSERT INTO input SELECT value FROM generate_series(1, 2048);");
+        const string query =
+            """
+            SELECT value,
+                   row_number() OVER (ORDER BY value),
+                   rank() OVER (ORDER BY value),
+                   count(*) OVER ()
+            FROM input
+            ORDER BY value;
+            """;
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query))
+            .Should().Contain("WindowBufferCompute");
+        var rows = ReadRows(connection, query);
+        rows.Should().HaveCount(2048);
+        rows[0].Should().Equal(
+            SqlValue.Integer(1),
+            SqlValue.Integer(1),
+            SqlValue.Integer(1),
+            SqlValue.Integer(2048));
+        rows[^1].Should().Equal(
+            SqlValue.Integer(2048),
+            SqlValue.Integer(2048),
+            SqlValue.Integer(2048),
+            SqlValue.Integer(2048));
+    }
+
+    [Test]
+    public void ArgumentFreeWindowsDoNotRepeatNeighborCallbackEvaluation()
+    {
+        var events = new List<string>();
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction("record_a", 1, values =>
+        {
+            events.Add($"a:{values[0].AsInteger()}");
+            return values[0];
+        });
+        database.RegisterScalarFunction("record_b", 1, values =>
+        {
+            events.Add($"b:{values[0].AsInteger()}");
+            return values[0];
+        });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE input(id INTEGER);");
+        Execute(connection, "INSERT INTO input VALUES (1), (2), (3);");
+
+        var rows = ReadRows(
+            connection,
+            """
+            SELECT row_number() OVER (ORDER BY id),
+                   first_value(record_a(id)) OVER (ORDER BY id),
+                   rank() OVER (ORDER BY id),
+                   lag(record_b(id)) OVER (ORDER BY id)
+            FROM input ORDER BY id;
+            """);
+
+        rows.Select(static row => (row[0].AsInteger(), row[1].AsInteger(),
+                row[2].AsInteger(), row[3].Kind == SqlValueKind.Null ? -1 : row[3].AsInteger()))
+            .Should().Equal((1L, 1L, 1L, -1L), (2L, 1L, 2L, 1L), (3L, 1L, 3L, 2L));
+        events.Should().Equal("a:1", "b:1", "a:2", "b:2", "a:3", "b:3");
+    }
+
+    [Test]
     public void CompiledAndFallbackRoutingRemainTruthful()
     {
         using var connection = OpenManaged(Setup);
@@ -550,6 +620,139 @@ public sealed class WindowFunctionSemanticsTests
         ReadRows(connection, "EXPLAIN QUERY PLAN " + fallback)[0][3].AsText()
             .Should().Be("SCAN t");
         AssertMatchesSqlite(Setup, fallback);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void SharedAndIndependentWindowSpecsPreserveMovingFramesAndPeerOrder(bool distinct)
+    {
+        var query =
+            $"""
+            SELECT {(distinct ? "DISTINCT" : "")} grp, id,
+                   sum(value) OVER moving,
+                   count(*) OVER moving,
+                   lag(value) OVER ordered,
+                   rank() OVER (PARTITION BY grp ORDER BY ord)
+            FROM t
+            WINDOW moving AS (
+                PARTITION BY grp ORDER BY id
+                ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),
+                   ordered AS (PARTITION BY grp ORDER BY id)
+            ORDER BY grp, id;
+            """;
+
+        using var connection = OpenManaged(Setup);
+        if (distinct)
+        {
+            Action explain = () => ReadRows(connection, "EXPLAIN " + query);
+            explain.Should().Throw<EmbeddedSqlException>();
+        }
+        else
+        {
+            Opcodes(ReadRows(connection, "EXPLAIN " + query))
+                .Should().Contain("WindowBufferCompute");
+        }
+
+        AssertMatchesSqlite(Setup, query);
+    }
+
+    [Test]
+    public void LiteralWindowArgumentsMatchSqliteAcrossBufferedAndEvaluatorRoutes()
+    {
+        const string buffered =
+            """
+            SELECT id,
+                   sum(2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW),
+                   nth_value('fixed', 2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                   count('present') OVER (PARTITION BY grp)
+            FROM t ORDER BY id;
+            """;
+        const string evaluator =
+            """
+            SELECT DISTINCT id,
+                   sum(2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW),
+                   nth_value('fixed', 2) OVER (
+                       PARTITION BY grp ORDER BY id
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                   count('present') OVER (PARTITION BY grp)
+            FROM t ORDER BY id;
+            """;
+
+        using var connection = OpenManaged(Setup);
+        Opcodes(ReadRows(connection, "EXPLAIN " + buffered))
+            .Should().Contain("WindowBufferCompute");
+        AssertMatchesSqlite(Setup, buffered);
+        AssertMatchesSqlite(Setup, evaluator);
+    }
+
+    [Test]
+    public void RowDependentWindowInputsSpillAndReleaseTheirIndexedFiles()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(value INTEGER);");
+        for (var value = 1; value <= 400; value++)
+            Execute(connection, $"INSERT INTO items VALUES ({value});");
+
+        const string sql =
+            """
+            SELECT value, sum(value) OVER (
+                ORDER BY value ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+                EXCLUDE CURRENT ROW),
+                   sum(value) FILTER (WHERE value > 200) OVER (
+                       ORDER BY value ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+                       EXCLUDE CURRENT ROW)
+            FROM items ORDER BY value;
+            """;
+        var metrics = new VdbeExecutionMetrics();
+        var options = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 32 * 1024,
+            temporaryDirectory: "window-input-spill-tests",
+            metrics: metrics);
+        var result = database.Execute(
+            SqlParser.Parse(sql, SqlParameterMap.Parse(sql)),
+            [],
+            vdbeExecutionOptions: options);
+
+        result.Rows.Should().HaveCount(400);
+        result.Rows[0][1].AsInteger().Should().Be(2);
+        result.Rows[^1][1].AsInteger().Should().Be(399);
+        result.Rows[0][2].Kind.Should().Be(SqlValueKind.Null);
+        result.Rows[^1][2].AsInteger().Should().Be(399);
+        metrics.WindowInputsSpilled.Should().Be(2);
+        metrics.ActiveSpillFiles.Should().Be(0);
+        metrics.CurrentRetainedBytes.Should().Be(0);
+        metrics.PeakRetainedBytes.Should().BeLessThanOrEqualTo(options.SorterMemoryLimitBytes);
+
+        const string invalid =
+            """
+            SELECT ntile(0) OVER (ORDER BY value
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW),
+                   sum(value) OVER (ORDER BY value
+                       ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW)
+            FROM items;
+            """;
+        var failureMetrics = new VdbeExecutionMetrics();
+        var failureOptions = new VdbeExecutionOptions(
+            new InMemoryFileSystem(),
+            sorterMemoryLimitBytes: 32 * 1024,
+            temporaryDirectory: "window-input-failure-tests",
+            metrics: failureMetrics);
+        Action fail = () => database.Execute(
+            SqlParser.Parse(invalid, SqlParameterMap.Parse(invalid)),
+            [],
+            vdbeExecutionOptions: failureOptions);
+        fail.Should().Throw<EmbeddedSqlException>().WithMessage("*ntile*");
+        failureMetrics.WindowInputsSpilled.Should().BeGreaterThan(0);
+        failureMetrics.ActiveSpillFiles.Should().Be(0);
+        failureMetrics.CurrentRetainedBytes.Should().Be(0);
     }
 
     [Test]

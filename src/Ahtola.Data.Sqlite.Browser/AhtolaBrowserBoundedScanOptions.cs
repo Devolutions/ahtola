@@ -18,6 +18,8 @@ public sealed class AhtolaBrowserBoundedScanOptions
     /// flight). This is an enforced ceiling, not an advisory default: a cursor whose actual
     /// required stack depth exceeds it throws
     /// <see cref="AhtolaBrowserBoundedQueryException"/> rather than silently exceeding it.
+    /// For encrypted WAL databases, committed and in-flight WAL page-location maps are each
+    /// capped at this number of entries during open; an oversized WAL fails before scanning.
     /// </summary>
     public int PageBudget { get; init; } = DefaultPageBudget;
 }

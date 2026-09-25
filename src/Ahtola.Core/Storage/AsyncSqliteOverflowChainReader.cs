@@ -24,39 +24,61 @@ internal sealed class AsyncSqliteOverflowChainReader(IAsyncSqliteBtreePageIo pag
 
     /// <summary>
     /// Reconstructs the complete logical payload of a decoded table-leaf cell, following its
-    /// overflow chain (if any) one page at a time.
+    /// overflow chain (if any) one page at a time. Index cells use the same overflow layout.
     /// </summary>
     public async ValueTask<byte[]> ReadPayloadAsync(
         SqliteTableLeafCell cell,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(cell);
-        if (cell.PayloadLength > int.MaxValue)
+        return await ReadPayloadAsync(
+            cell.PayloadLength, cell.LocalPayload, cell.FirstOverflowPage,
+            "table-leaf", cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Reconstructs an index-leaf or index-interior record, including its overflow chain.</summary>
+    public ValueTask<byte[]> ReadPayloadAsync(
+        SqliteIndexLeafCell cell,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(cell);
+        return ReadPayloadAsync(
+            cell.PayloadLength, cell.LocalPayload, cell.FirstOverflowPage,
+            "index", cancellationToken);
+    }
+
+    private async ValueTask<byte[]> ReadPayloadAsync(
+        ulong payloadLength,
+        ReadOnlyMemory<byte> localPayload,
+        uint? firstOverflowPage,
+        string cellKind,
+        CancellationToken cancellationToken)
+    {
+        if (payloadLength > int.MaxValue)
         {
             throw new NotSupportedException(
                 "A SQLite payload larger than Int32.MaxValue bytes cannot be materialized as one managed array.");
         }
 
-        var localPayload = cell.LocalPayload;
-        if ((ulong)localPayload.Length > cell.PayloadLength)
-            throw new InvalidDataException("SQLite table-leaf cell local payload exceeds its logical payload length.");
+        if ((ulong)localPayload.Length > payloadLength)
+            throw new InvalidDataException($"SQLite {cellKind} cell local payload exceeds its logical payload length.");
 
-        var payload = new byte[checked((int)cell.PayloadLength)];
+        var payload = new byte[checked((int)payloadLength)];
         localPayload.Span.CopyTo(payload);
         var overflowPayloadLength = payload.Length - localPayload.Length;
         if (overflowPayloadLength == 0)
         {
-            if (cell.FirstOverflowPage is not null)
-                throw new InvalidDataException("SQLite table-leaf cell has an unnecessary overflow page.");
+            if (firstOverflowPage is not null)
+                throw new InvalidDataException($"SQLite {cellKind} cell has an unnecessary overflow page.");
 
             return payload;
         }
 
-        if (cell.FirstOverflowPage is not { } firstOverflowPage)
-            throw new InvalidDataException("SQLite table-leaf cell is missing its first overflow page.");
+        if (firstOverflowPage is not { } first)
+            throw new InvalidDataException($"SQLite {cellKind} cell is missing its first overflow page.");
 
         await ReadAsync(
-            firstOverflowPage,
+            first,
             payload.AsMemory(localPayload.Length),
             cancellationToken).ConfigureAwait(false);
         return payload;

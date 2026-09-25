@@ -435,7 +435,9 @@ Honest limits of the Ahtola implementation:
 - **Exactness is not free.** On data with no exploitable cluster structure — uniform noise, or a
   shell where every point is equidistant from the query — the certificate reads everything. The index
   stays exact and the cost model stops choosing it; it does not silently become approximate.
-- **`Optimize` is reachable only through opcode 109**, not from SQL: Ahtola has no `PRAGMA optimize`.
+- **`OPTIMIZE INDEX [name]` invokes opcode 109** for one or all managed method indexes.
+  Ordinary B-tree indexes are skipped. This is Turso's standalone statement,
+  not SQLite's `PRAGMA optimize`, which Ahtola does not implement.
 - **`lists` does not default to `sqrt(rows)`.** A data-dependent default would make the persisted
   envelope depend on when the index happened to be built, so the default is the constant `64`.
 

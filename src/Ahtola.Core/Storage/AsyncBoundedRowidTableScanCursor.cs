@@ -3,8 +3,24 @@ using Ahtola.Core;
 
 namespace Ahtola.Core.Storage;
 
+internal readonly record struct SqliteRowIdRange(
+    long? Lower,
+    bool IncludeLower,
+    long? Upper,
+    bool IncludeUpper)
+{
+    internal bool IsEmpty => Lower is { } lower && Upper is { } upper
+        && (lower > upper || lower == upper && (!IncludeLower || !IncludeUpper));
+
+    internal bool IsBelowLower(long rowId) => Lower is { } lower
+        && (rowId < lower || rowId == lower && !IncludeLower);
+
+    internal bool IsAboveUpper(long rowId) => Upper is { } upper
+        && (rowId > upper || rowId == upper && !IncludeUpper);
+}
+
 /// <summary>
-/// A genuinely asynchronous, page-bounded ascending full-table-scan cursor for an ordinary
+/// A genuinely asynchronous, page-bounded rowid scan or exact-rowid seek for an ordinary
 /// (indexless, has-rowid) SQLite table b-tree.
 /// </summary>
 /// <remarks>
@@ -41,16 +57,58 @@ internal static class AsyncBoundedRowidTableScanCursor
 {
     private const int MaximumDepth = 64;
 
+    public static IAsyncEnumerable<SqlValue[]> ScanDescendingAsync(
+        BoundedAsyncPageCache pageCache,
+        uint rootPage,
+        EmbeddedTable table,
+        SqliteTextEncoding textEncoding,
+        long? limit,
+        CancellationToken cancellationToken = default,
+        long? equalRowId = null,
+        SqliteRowIdRange? rowIdRange = null,
+        long offset = 0,
+        bool includeHiddenRowId = false)
+        => ScanAscendingAsync(
+            pageCache, rootPage, table, textEncoding, limit, cancellationToken, equalRowId, rowIdRange, offset,
+            descending: true, includeHiddenRowId: includeHiddenRowId);
+
     public static async IAsyncEnumerable<SqlValue[]> ScanAscendingAsync(
         BoundedAsyncPageCache pageCache,
         uint rootPage,
         EmbeddedTable table,
         SqliteTextEncoding textEncoding,
         long? limit,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        long? equalRowId = null,
+        SqliteRowIdRange? rowIdRange = null,
+        long offset = 0,
+        bool descending = false,
+        bool includeHiddenRowId = false)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
         ArgumentNullException.ThrowIfNull(table);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+
+        if (equalRowId is { } soughtRowId)
+        {
+            if (limit != 0 && offset == 0
+                && await TrySeekRowIdAsync(
+                    pageCache,
+                    rootPage,
+                    table,
+                    textEncoding,
+                    soughtRowId,
+                    cancellationToken,
+                    includeHiddenRowId).ConfigureAwait(false) is { } found)
+            {
+                yield return found;
+            }
+
+            yield break;
+        }
+
+        if (rowIdRange is { IsEmpty: true })
+            yield break;
 
         var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
         // Each frame is one still-open ancestor interior page: the page number (for
@@ -59,6 +117,7 @@ internal static class AsyncBoundedRowidTableScanCursor
         var stack = new List<(uint PageNumber, SqliteTableInteriorPageView View, int NextChildIndex)>();
         var currentPage = rootPage;
         var yielded = 0L;
+        var skipped = 0L;
 
         try
         {
@@ -87,9 +146,16 @@ internal static class AsyncBoundedRowidTableScanCursor
                     }
 
                     var interior = SqliteTableInteriorPageView.Parse(image, pageCache.UsableSpace, isFirstPage);
+                    var startChild = descending
+                        ? rowIdRange?.Upper is { } upper
+                            ? interior.SearchChild(upper).ChildIndex
+                            : interior.Cells.Count
+                        : rowIdRange?.Lower is { } lower
+                            ? interior.SearchChild(lower).ChildIndex
+                            : 0;
                     pageCache.Pin(currentPage);
-                    stack.Add((currentPage, interior, 0));
-                    currentPage = ChildAt(interior, 0);
+                    stack.Add((currentPage, interior, startChild));
+                    currentPage = ChildAt(interior, startChild);
                     continue;
                 }
 
@@ -111,10 +177,36 @@ internal static class AsyncBoundedRowidTableScanCursor
                 pageCache.Pin(leafPage);
                 try
                 {
-                    foreach (var cell in leaf.Cells)
+                    for (var index = descending ? leaf.Cells.Count - 1 : 0;
+                         descending ? index >= 0 : index < leaf.Cells.Count;
+                         index += descending ? -1 : 1)
                     {
+                        var cell = leaf.Cells[index];
                         if (limit is { } cellMax && yielded >= cellMax)
                             yield break;
+                        if (rowIdRange is { } bounds)
+                        {
+                            if (descending)
+                            {
+                                if (bounds.IsAboveUpper(cell.Cell.RowId))
+                                    continue;
+                                if (bounds.IsBelowLower(cell.Cell.RowId))
+                                    yield break;
+                            }
+                            else
+                            {
+                                if (bounds.IsBelowLower(cell.Cell.RowId))
+                                    continue;
+                                if (bounds.IsAboveUpper(cell.Cell.RowId))
+                                    yield break;
+                            }
+                        }
+
+                        if (skipped < offset)
+                        {
+                            skipped++;
+                            continue;
+                        }
 
                         var record = await overflowReader
                             .ReadPayloadAsync(cell.Cell, cancellationToken)
@@ -128,7 +220,7 @@ internal static class AsyncBoundedRowidTableScanCursor
                         if (table.RowidAliasColumnIndex >= 0)
                             values[table.RowidAliasColumnIndex] = SqlValue.Integer(cell.Cell.RowId);
 
-                        yield return values;
+                        yield return WithHiddenRowId(values, cell.Cell.RowId, includeHiddenRowId);
                         yielded++;
                     }
                 }
@@ -144,8 +236,8 @@ internal static class AsyncBoundedRowidTableScanCursor
                 {
                     var frameIndex = stack.Count - 1;
                     var frame = stack[frameIndex];
-                    var nextChildIndex = frame.NextChildIndex + 1;
-                    if (nextChildIndex <= frame.View.Cells.Count)
+                    var nextChildIndex = frame.NextChildIndex + (descending ? -1 : 1);
+                    if (nextChildIndex >= 0 && nextChildIndex <= frame.View.Cells.Count)
                     {
                         stack[frameIndex] = frame with { NextChildIndex = nextChildIndex };
                         nextPage = ChildAt(frame.View, nextChildIndex);
@@ -167,6 +259,77 @@ internal static class AsyncBoundedRowidTableScanCursor
             foreach (var frame in stack)
                 pageCache.Unpin(frame.PageNumber);
         }
+    }
+
+    private static async ValueTask<SqlValue[]?> TrySeekRowIdAsync(
+        BoundedAsyncPageCache pageCache,
+        uint rootPage,
+        EmbeddedTable table,
+        SqliteTextEncoding textEncoding,
+        long rowId,
+        CancellationToken cancellationToken,
+        bool includeHiddenRowId)
+    {
+        var pinnedPages = new List<uint>();
+        var pageNumber = rootPage;
+        try
+        {
+            for (var depth = 0; depth < MaximumDepth; depth++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var isFirstPage = pageNumber == 1;
+                var image = await pageCache.ReadPageAsync(pageNumber, cancellationToken).ConfigureAwait(false);
+                switch (SqliteBtreePageHeader.Parse(image, isFirstPage, pageCache.UsableSpace).PageType)
+                {
+                    case SqliteBtreePageType.TableInterior:
+                        var interior = SqliteTableInteriorPageView.Parse(image, pageCache.UsableSpace, isFirstPage);
+                        pageCache.Pin(pageNumber);
+                        pinnedPages.Add(pageNumber);
+                        pageNumber = interior.SearchChild(rowId).ChildPage;
+                        break;
+
+                    case SqliteBtreePageType.TableLeaf:
+                        var leaf = SqliteTableLeafPageView.Parse(image, pageCache.UsableSpace, isFirstPage);
+                        var search = leaf.Search(rowId);
+                        if (!search.IsExact)
+                            return null;
+
+                        pageCache.Pin(pageNumber);
+                        pinnedPages.Add(pageNumber);
+                        var record = await new AsyncSqliteOverflowChainReader(pageCache)
+                            .ReadPayloadAsync(leaf.Cells[search.Index].Cell, cancellationToken)
+                            .ConfigureAwait(false);
+                        var values = EmbeddedFileStore.RestoreRowidTableRecord(
+                            table,
+                            SqliteRecordCodec.Decode(record, textEncoding));
+                        if (table.RowidAliasColumnIndex >= 0)
+                            values[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
+                        return WithHiddenRowId(values, rowId, includeHiddenRowId);
+
+                    default:
+                        throw new InvalidDataException(
+                            $"SQLite page {pageNumber} is not part of a rowid-table b-tree.");
+                }
+            }
+
+            throw new InvalidDataException(
+                $"SQLite table b-tree rooted at page {rootPage} is deeper than {MaximumDepth} levels.");
+        }
+        finally
+        {
+            foreach (var pinnedPage in pinnedPages)
+                pageCache.Unpin(pinnedPage);
+        }
+    }
+
+    private static SqlValue[] WithHiddenRowId(SqlValue[] values, long rowId, bool includeHiddenRowId)
+    {
+        if (!includeHiddenRowId)
+            return values;
+        var projected = new SqlValue[values.Length + 1];
+        values.CopyTo(projected, 0);
+        projected[^1] = SqlValue.Integer(rowId);
+        return projected;
     }
 
     private static uint ChildAt(SqliteTableInteriorPageView view, int childIndex)

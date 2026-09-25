@@ -315,6 +315,13 @@ does not share any code path with the `WholeImage` mirror or with
 `AhtolaBrowserSynchronousMode.ReadOnlyMirror` above, and opening one while the
 other already holds the directory's OPFS Web Lock fails closed the same way
 opening two ordinary data sources over one directory already does.
+When the data source has AHTLA encryption options, this same opt-in method
+uses a separate read-only asynchronous page decoder: it authenticates the
+database header and each requested database page, validates WAL checksums and
+salts before decrypting requested frame bodies, and never loads the encrypted
+database into the whole-image mirror. AES-GCM uses Web Crypto's non-extractable
+key handle; AEGIS uses the managed cipher. The normal connection and its
+`WholeImage` behavior do not change.
 
 ```csharp
 await using var dataSource = new AhtolaBrowserDataSource("inventory/main.db");
@@ -327,22 +334,34 @@ while (await reader.ReadAsync())
     Console.WriteLine($"{reader.GetValue(0).AsInteger()} {reader.GetValue(1).AsText()}");
 ```
 
-### Supported shape (v1)
+### Supported shape (preview)
 
 Only a narrow, explicitly classified shape is supported; everything else
-throws `AhtolaBrowserBoundedQueryException` **before any page is read** —
+throws `AhtolaBrowserBoundedQueryException` **before any scan page is read** —
 this connection never silently falls back to a slower path. The caller
 decides whether to retry the same statement against an ordinary
 `OpenConnectionAsync`/`OpenSynchronousReadConnectionAsync` connection instead.
 
 | Statement / database shape | Behavior |
 | --- | --- |
-| `SELECT column-list \| * FROM one-ordinary-rowid-base-table [LIMIT n]` | Supported: ascending rowid scan, page-bounded, structural checks performed lazily per page on first visit rather than eagerly for the whole table at open |
-| `WHERE`, joins, subqueries, `ORDER BY`, `GROUP BY`/`HAVING`, `DISTINCT`, window definitions, `OFFSET`, expressions beyond a plain column reference, generated columns | `AhtolaBrowserBoundedQueryException`, naming the exact unsupported construct — natural follow-on slices |
-| `WITHOUT ROWID` tables, or any table with a registered index | `AhtolaBrowserBoundedQueryException` — these need the index-b-tree traversal shape, a distinct follow-on |
+| `SELECT column-list \| * FROM one-ordinary-rowid-base-table [WHERE rowid-key <comparison> integer-literal [AND ...] \| rowid-key BETWEEN integer-literal AND integer-literal] [ORDER BY rowid-key [ASC \| DESC] [NULLS FIRST \| LAST]] [LIMIT n [OFFSET m]]` | The rowid key may be an INTEGER PRIMARY KEY alias or an unshadowed `rowid`, `_rowid_`, or `oid` on a rowid table. Unshadowed hidden rowid names can also be projected as unqualified columns; `*` includes only declared columns, and a declared column with the same name shadows its pseudo-name. Supported comparisons: `=`, `<`, `<=`, `>`, `>=` (including literal-first forms); `BETWEEN` is inclusive. Equality performs a point seek; ranges seek their starting bound and stop at the opposite bound in the requested direction. Rowid is never NULL, so explicit NULL placement does not change its order. Non-negative literal `OFFSET` skips matching rows before `LIMIT` counts emitted rows; reads remain page-bounded and validate visited pages lazily. |
+| Other `WHERE`/`ORDER BY` forms, joins, subqueries, `GROUP BY`/`HAVING`, `DISTINCT`, window definitions, non-literal `OFFSET`, expressions beyond a plain column reference, generated columns | `AhtolaBrowserBoundedQueryException`, naming the exact unsupported construct — natural follow-on slices |
+| An ordinary rowid table with secondary indexes | Supported for base-table scans and rowid predicates; secondary indexes are not traversed or used to satisfy other predicates/orderings |
+| `SELECT column-list \| * FROM one-WITHOUT-ROWID-base-table [WHERE first-PK-column <comparison> matching-literal [AND ...] \| first-PK-column BETWEEN matching-literal AND matching-literal \| first-PK-column = matching-literal [AND remaining-PK-column = matching-literal ...]] [ORDER BY primary-key-prefix [ASC \| DESC]] [LIMIT n [OFFSET m]]` | Supported for ascending BINARY primary keys with declared INTEGER keys matched by integer literals or declared TEXT keys matched by text literals; implicit type conversions and other declared key types reject. First-key `=`, `<`, `<=`, `>`, `>=`, inclusive `BETWEEN`, and AND-combined bounds descend to the strongest starting bound, filter the page-bounded stream before OFFSET/LIMIT, and stop after crossing the far bound in the requested direction. Equality on every supported PK column instead uses direct B-tree descent, including interior separator records. The scan includes interior and overflowing records and remaps physical PK-first records to logical column order. Partial prefixes beyond the first column reject. An explicit uniformly ascending or descending PK prefix needs no extra sort. Other declared PK collation/direction, non-key predicates/orderings, and `INDEXED BY` reject before scanning. No rowid is exposed. |
 | Any DDL, DML (`INSERT`/`UPDATE`/`DELETE`), `PRAGMA`, `ATTACH`, transactions | `AhtolaBrowserBoundedQueryException` — this connection is read-only by construction; there is no writer path, so there is no side-effect-duplication risk |
-| Encrypted (AHTLA page format) databases | `PlatformNotSupportedException` at `OpenBoundedScanConnectionAsync` — Web Crypto page decryption is asynchronous, and the pager's page-codec hook is currently synchronous-only; a `IAsyncPageCodec` hook is named future work |
+| Encrypted (AHTLA page format) databases | Supported with matching browser encryption options. Wrong keys, cipher IDs, authentication tags, malformed WAL frames, nonempty rollback journals, and unsupported journal modes fail closed; there is no plaintext or whole-image fallback. |
 | A cursor whose actual required interior-page stack depth exceeds `PageBudget` | `AhtolaBrowserBoundedQueryException` at the exact `ReadAsync` call that would have exceeded it — the budget is an enforced ceiling, not an advisory default |
+
+The page budget caps decoded pages retained by the cursor. Encrypted reads
+add a transient encrypted page and AEAD buffers per in-flight fetch. WAL
+recovery retains page-number/frame-number locations, **not page images**;
+each of the committed and pending location maps is capped at `PageBudget`
+entries (at most twice that many locations while a transaction is pending).
+An oversized WAL fails at open with `AhtolaBrowserBoundedQueryException`,
+without switching to the whole-image path. A requested WAL page is checked
+against the on-disk checksum chain again before decryption. A clean,
+authoritative WAL-mode main database can open without a WAL; if its header
+requires WAL recovery and the WAL is missing, open fails.
 
 ## EF Core
 

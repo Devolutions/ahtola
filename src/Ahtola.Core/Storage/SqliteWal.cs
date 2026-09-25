@@ -1240,16 +1240,30 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         }
 
         var previousChecksum = (Header.Checksum1, Header.Checksum2);
-        for (var currentFrameNumber = 1L; currentFrameNumber <= frameNumber; currentFrameNumber++)
+        var frameSize = checked((int)FrameSize);
+        var rented = ArrayPool<byte>.Shared.Rent(frameSize);
+        try
         {
-            var frame = await ReadFrameBytesAsync(
-                FrameOffset(currentFrameNumber),
-                cancellationToken).ConfigureAwait(false);
-            var frameHeader = ValidateFrame(frame, previousChecksum, out var checksum);
-            if (currentFrameNumber == frameNumber)
-                return DecodeFrame(frame, frameHeader);
+            for (var currentFrameNumber = 1L; currentFrameNumber <= frameNumber; currentFrameNumber++)
+            {
+                var read = await GetAsyncFile().ReadAsync(
+                    FrameOffset(currentFrameNumber),
+                    rented.AsMemory(0, frameSize),
+                    cancellationToken).ConfigureAwait(false);
+                if (read != frameSize)
+                    throw new InvalidDataException($"Short read on SQLite WAL frame: expected {frameSize} bytes, got {read} bytes.");
 
-            previousChecksum = checksum;
+                var frameHeader = ValidateFrame(
+                    rented.AsSpan(0, frameSize), previousChecksum, out var checksum);
+                if (currentFrameNumber == frameNumber)
+                    return DecodeFrame(rented.AsSpan(0, frameSize), frameHeader);
+
+                previousChecksum = checksum;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented, clearArray: true);
         }
 
         throw new InvalidOperationException("SQLite WAL frame traversal ended unexpectedly.");
@@ -1429,6 +1443,20 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
     {
         ThrowIfDisposed();
         return (await ScanCoreAsync(long.MaxValue, cancellationToken).ConfigureAwait(false)).Info;
+    }
+
+    /// <summary>
+    /// Scans checksummed frames without decoding or retaining their page bodies.
+    /// The callback sees only frames whose WAL checksum and salts are valid.
+    /// Callers must use the returned committed boundary, not a partial tail.
+    /// </summary>
+    internal async ValueTask<SqliteWalRecoveryInfo> ScanFrameHeadersAsync(
+        Action<long, SqliteWalFrameHeader> onValidFrame,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(onValidFrame);
+        ThrowIfDisposed();
+        return (await ScanCoreAsync(long.MaxValue, cancellationToken, onValidFrame).ConfigureAwait(false)).Info;
     }
 
     /// <summary>
@@ -1837,7 +1865,8 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
 
     private async ValueTask<ScanState> ScanCoreAsync(
         long maxVisibleFrameNumber,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<long, SqliteWalFrameHeader>? onValidFrame = null)
     {
         var file = GetAsyncFile();
         var length = await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
@@ -1920,6 +1949,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
 
                 lastValidFrameNumber = frameNumber;
                 previousChecksum = checksum;
+                onValidFrame?.Invoke(frameNumber, frameHeader);
                 if (frameHeader.IsCommit)
                 {
                     lastCommittedFrameNumber = frameNumber;

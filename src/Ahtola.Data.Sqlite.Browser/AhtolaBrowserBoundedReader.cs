@@ -14,7 +14,7 @@ public sealed class AhtolaBrowserBoundedReader : IAsyncDisposable
     private readonly IAsyncEnumerator<SqlValue[]> _rows;
     private readonly IReadOnlyList<int> _projectedColumnIndexes;
     private readonly IReadOnlyList<string> _columnNames;
-    private readonly AsyncSqlitePagerReadTransaction _readTransaction;
+    private readonly IAsyncBoundedReadSnapshot _readTransaction;
     private SqlValue[]? _current;
     private int _disposed;
 
@@ -22,7 +22,7 @@ public sealed class AhtolaBrowserBoundedReader : IAsyncDisposable
         IAsyncEnumerable<SqlValue[]> rows,
         IReadOnlyList<int> projectedColumnIndexes,
         IReadOnlyList<string> columnNames,
-        AsyncSqlitePagerReadTransaction readTransaction,
+        IAsyncBoundedReadSnapshot readTransaction,
         CancellationToken cancellationToken)
     {
         _rows = rows.GetAsyncEnumerator(cancellationToken);

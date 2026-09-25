@@ -475,6 +475,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             var legacy = metadata with
             {
                 PushState = null,
+                HistorySha256 = null,
                 RevertState = metadata.RevertState!.Value with
                 {
                     Phase = ManagedReplicaBootstrapper.ManagedReplicaRevertPhase.PushOutcomeUnknown,

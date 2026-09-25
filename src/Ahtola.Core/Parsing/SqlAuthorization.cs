@@ -157,6 +157,14 @@ internal static class SqlAuthorization
                         break;
                     }
 
+                case CreateTypeStatement createType:
+                    Require(SqliteAuthorizerAction.CreateTable, createType.Name, null, "main");
+                    break;
+
+                case CreateDomainStatement createDomain:
+                    Require(SqliteAuthorizerAction.CreateTable, createDomain.Name, null, "main");
+                    break;
+
                 case DropSequenceStatement dropSequence:
                     {
                         var (schema, name) = Split(dropSequence.Name);

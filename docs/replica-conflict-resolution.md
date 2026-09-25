@@ -141,6 +141,42 @@ process exit leaves the exact recovery range in metadata. Once remote commit or
 refusal is known, acknowledgement or conflict publication runs with
 `CancellationToken.None`.
 
+### Protected revert snapshot formats
+
+Protected sync checkpoints retain their original image as a full revert-WAL
+segment. When the committed image differs on at most 65,536 pages and the
+changed-page segment is smaller than a full image, format 5 stores only those
+changed committed pages. Recovery reconstructs the committed image from the
+original segment plus that sparse segment and checks its SHA-256 **before**
+publishing recovery metadata. The format-4 full-segment decoder remains
+available for already durable checkpoints and for captures where sparse
+storage does not help. Crash recovery checks the same reconstructed image
+before applying it; missing or mismatched pages fail closed. Existing format-4
+and format-5 revert states remain readable without a history file.
+
+Metadata versions 9–12 extend the previous four combinations (no revert/push
+intent, revert only, push only, both) with `history_sha256`. The referenced
+`-wal-revert.history` file is a durable, immutable full-image root captured
+before the first checkpoint. The root is published before metadata starts
+referring to it; an interrupted, unreferenced root is deleted on reopen.
+Later checkpoint captures verify the entire root hash **before** publishing a
+new sidecar. The root remains pinned across revert phases, ambiguous pushes,
+acknowledgement, conflict restoration, and subsequent generations. Only when
+metadata no longer references it may recovery delete it; bootstrap deletion
+removes both metadata and history.
+
+Format 6 adds the 32-byte SHA-256 parent reference to the checksummed revert
+state, without changing any format-4/5 bytes. Both original and committed
+segments are sparse: the original is reconstructed from the immutable root,
+the committed image from the reconstructed original. Both complete images are
+SHA-256 checked before pending metadata is published or recovery installs a
+file. If either delta is not smaller than a full image (or exceeds the
+65,536-page index bound), capture falls back to the compatible full-original
+format. The root's age therefore trades bounded retention of one full
+baseline for reusable, small changes across multiple generations; if a later
+generation changes most of its pages, that generation may require a full
+capture. The root is not the rotating remote-base snapshot.
+
 ### Recording a definitive conflict
 
 `ManagedReplicaConnectionHost.PushLocalChangesAsync` catches any push failure

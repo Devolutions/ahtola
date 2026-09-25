@@ -72,6 +72,18 @@ public sealed class VdbeExecutionMetrics
 
     public long WindowBuffersSpilled { get; private set; }
 
+    /// <summary>Buffered-window result blocks moved to a temporary sequential output file.</summary>
+    public long WindowOutputsSpilled { get; private set; }
+
+    /// <summary>Row-dependent or filtered window inputs moved to indexed temporary files.</summary>
+    public long WindowInputsSpilled { get; private set; }
+
+    /// <summary>
+    /// Buffered-window evaluation and draining can allocate outside the execution memory
+    /// ledger. PeakRetainedBytes is not a bound on the window's total working set.
+    /// </summary>
+    public bool WindowEvaluatorMemoryUnbounded { get; private set; }
+
     public long WorkTableFrontiersSpilled { get; private set; }
 
     public long EphemeralTablesSpilled { get; private set; }
@@ -146,6 +158,14 @@ public sealed class VdbeExecutionMetrics
     internal void WindowBufferSpilled() =>
         WindowBuffersSpilled = checked(WindowBuffersSpilled + 1);
 
+    internal void WindowOutputSpilled() =>
+        WindowOutputsSpilled = checked(WindowOutputsSpilled + 1);
+
+    internal void WindowInputSpilled() =>
+        WindowInputsSpilled = checked(WindowInputsSpilled + 1);
+
+    internal void WindowEvaluatorStarted() => WindowEvaluatorMemoryUnbounded = true;
+
     internal void WorkTableFrontierSpilled() =>
         WorkTableFrontiersSpilled = checked(WorkTableFrontiersSpilled + 1);
 
@@ -192,6 +212,23 @@ internal sealed class VdbeExecutionMemory(long limitBytes, VdbeExecutionMetrics 
         metrics.Release(bytes, rows);
     }
 }
+
+/// <summary>
+/// Gives a buffered evaluator its statement-local resources for the duration of a compute pass.
+/// The legacy evaluator delegate does not carry an execution context.
+/// </summary>
+internal interface IVdbeWindowEvaluationScope
+{
+    IDisposable Enter(
+        VdbeExecutionMemory memory,
+        VdbeExecutionOptions options,
+        CancellationToken cancellationToken);
+}
+
+internal sealed record VdbeWindowEvaluationResources(
+    VdbeExecutionMemory Memory,
+    VdbeExecutionOptions Options,
+    CancellationToken CancellationToken);
 
 internal sealed class VdbeMemoryReservation : IDisposable
 {
@@ -498,7 +535,34 @@ internal static class VdbeManagedFootprint
             WindowBufferSpillObjectBytes
             + EstimateTemporaryFileInfrastructure(
                 temporaryDirectory.Length,
-                "window-buffer".Length));
+                "window-buffer".Length)
+            + EstimateTemporaryFileInfrastructure(
+                temporaryDirectory.Length,
+                "window-buffer-index".Length));
+    }
+
+    public static long EstimateWindowOutputMinimum(int rowCount, int columnCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(rowCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(columnCount);
+        return rowCount == 0
+            ? 0
+            : checked(EstimateReferenceListStorage(rowCount)
+                + (rowCount * EstimateWindowTupleSlots(columnCount)));
+    }
+
+    public static long EstimateWindowTupleSlots(int columnCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(columnCount);
+        return EstimateArray(SqlValueSlotBytes, columnCount);
+    }
+
+    public static long EstimateWindowOutputSpillInfrastructure(string temporaryDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(temporaryDirectory);
+        return EstimateTemporaryFileInfrastructure(
+            temporaryDirectory.Length,
+            "window-output".Length);
     }
 
     public static long EstimateWorkTableFrontierSpillInfrastructure(string temporaryDirectory)
