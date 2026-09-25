@@ -165,14 +165,13 @@ public sealed class AhtolaBrowserBoundedConnection : IAsyncDisposable
         try
         {
             var pageCache = new BoundedAsyncPageCache(readTransaction, _pager.UsableSpace, _pageBudget);
-            var rows = AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
-                pageCache,
-                plan.RootPage,
-                plan.Table,
-                _textEncoding,
-                plan.Limit,
-                cancellationToken,
-                equalRowId: plan.EqualRowId);
+            var rows = plan.Descending
+                ? AsyncBoundedRowidTableScanCursor.ScanDescendingAsync(
+                    pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, cancellationToken,
+                    equalRowId: plan.EqualRowId, rowIdRange: plan.RowIdRange)
+                : AsyncBoundedRowidTableScanCursor.ScanAscendingAsync(
+                    pageCache, plan.RootPage, plan.Table, _textEncoding, plan.Limit, cancellationToken,
+                    equalRowId: plan.EqualRowId, rowIdRange: plan.RowIdRange);
             return new AhtolaBrowserBoundedReader(
                 rows,
                 plan.ProjectedColumnIndexes,

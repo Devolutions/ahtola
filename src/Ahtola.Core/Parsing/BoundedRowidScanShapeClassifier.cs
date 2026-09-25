@@ -1,4 +1,5 @@
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Core.Parsing;
 
@@ -13,7 +14,9 @@ internal sealed record BoundedRowidScanPlan(
     IReadOnlyList<int> ProjectedColumnIndexes,
     IReadOnlyList<string> ColumnNames,
     long? Limit,
-    long? EqualRowId);
+    long? EqualRowId,
+    SqliteRowIdRange? RowIdRange,
+    bool Descending);
 
 /// <summary>
 /// Classifies a parsed SQL statement against an <see cref="AsyncSchemaCatalog"/>, either
@@ -28,7 +31,10 @@ internal sealed record BoundedRowidScanPlan(
 /// <c>AhtolaBrowserBoundedConnection.ExecuteBoundedScanAsync</c>.
 /// <para>
 /// Supported shape: <c>SELECT column-list|* FROM one-ordinary-rowid-base-table
-/// [WHERE integer-primary-key = integer-literal] [LIMIT n]</c>.
+/// [WHERE integer-primary-key integer-comparison integer-literal
+/// [AND integer-primary-key integer-comparison integer-literal ...]]
+/// (or an inclusive integer-literal BETWEEN range)
+/// [ORDER BY integer-primary-key [ASC|DESC]] [LIMIT n]</c>.
 /// No other <c>WHERE</c>, joins/subqueries, <c>ORDER BY</c>/<c>GROUP BY</c>/<c>HAVING</c>, no
 /// aggregates, no <c>DISTINCT</c>, no expressions beyond plain column references, no
 /// <c>WITHOUT ROWID</c> or indexed tables, no <c>OFFSET</c>. Everything else is named follow-on
@@ -77,12 +83,6 @@ internal static class BoundedRowidScanShapeClassifier
         if (select.NamedWindows.Count != 0)
         {
             rejectionReason = "Window definitions are not supported by a bounded scan connection.";
-            return null;
-        }
-
-        if (select.OrderBy.Count != 0)
-        {
-            rejectionReason = "ORDER BY is not supported by a bounded scan connection (scans are always in natural rowid-ascending order).";
             return null;
         }
 
@@ -138,20 +138,39 @@ internal static class BoundedRowidScanShapeClassifier
             return null;
         }
 
+        if (select.OrderBy.Count != 0
+            && (entry.Table.RowidAliasColumnIndex < 0
+                || select.OrderBy is not [var order]
+                || order.NullPlacement != NullPlacement.Default
+                || !IsRowIdColumn(order.Expression, tableSource, entry.Table)))
+        {
+            rejectionReason = "ORDER BY supports only the INTEGER PRIMARY KEY column.";
+            return null;
+        }
+
         long? equalRowId = null;
+        SqliteRowIdRange? rowIdRange = null;
         if (select.Where is { } predicate)
         {
             if (entry.Table.RowidAliasColumnIndex < 0
-                || predicate is not BinaryExpression { Operator: BinaryOperator.Equal } equality
-                || !(TryMatchRowId(equality.Left, equality.Right, tableSource, entry.Table, out var rowId)
-                    || TryMatchRowId(equality.Right, equality.Left, tableSource, entry.Table, out rowId)))
+                || !TryParseRowIdRange(predicate, tableSource, entry.Table, out var bounds))
             {
                 rejectionReason =
-                    "WHERE supports only equality between an INTEGER PRIMARY KEY column and an integer literal.";
+                    "WHERE supports only AND-combined comparisons between an INTEGER PRIMARY KEY column and integer literals.";
                 return null;
             }
 
-            equalRowId = rowId;
+            if (bounds.Lower is { } exact
+                && bounds.Upper == exact
+                && bounds.IncludeLower
+                && bounds.IncludeUpper)
+            {
+                equalRowId = exact;
+            }
+            else
+            {
+                rowIdRange = bounds;
+            }
         }
 
         var columnIndexes = new List<int>();
@@ -218,7 +237,95 @@ internal static class BoundedRowidScanShapeClassifier
             columnIndexes,
             columnNames,
             limit,
-            equalRowId);
+            equalRowId,
+            rowIdRange,
+            select.OrderBy.Count != 0 && select.OrderBy[0].Descending);
+    }
+
+    private static bool TryParseRowIdRange(
+        Expression expression,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out SqliteRowIdRange range)
+    {
+        if (expression is BinaryExpression { Operator: BinaryOperator.And } conjunction)
+        {
+            if (TryParseRowIdRange(conjunction.Left, source, table, out var left)
+                && TryParseRowIdRange(conjunction.Right, source, table, out var right))
+            {
+                range = Intersect(left, right);
+                return true;
+            }
+        }
+        else if (expression is BetweenExpression { Negated: false } between
+            && TryMatchRowId(between.Value, between.Lower, source, table, out var lower)
+            && TryMatchRowId(between.Value, between.Upper, source, table, out var upper))
+        {
+            range = new SqliteRowIdRange(lower, true, upper, true);
+            return true;
+        }
+        else if (expression is BinaryExpression comparison
+            && (TryMatchRowId(comparison.Left, comparison.Right, source, table, out var rowId)
+                && TryCreateBound(comparison.Operator, rowId, out range)
+                || TryMatchRowId(comparison.Right, comparison.Left, source, table, out rowId)
+                && TryCreateBound(ReverseComparison(comparison.Operator), rowId, out range)))
+        {
+            return true;
+        }
+
+        range = default;
+        return false;
+    }
+
+    private static bool TryCreateBound(BinaryOperator comparison, long rowId, out SqliteRowIdRange range)
+    {
+        range = comparison switch
+        {
+            BinaryOperator.Equal => new SqliteRowIdRange(rowId, true, rowId, true),
+            BinaryOperator.GreaterThan => new SqliteRowIdRange(rowId, false, null, true),
+            BinaryOperator.GreaterThanOrEqual => new SqliteRowIdRange(rowId, true, null, true),
+            BinaryOperator.LessThan => new SqliteRowIdRange(null, true, rowId, false),
+            BinaryOperator.LessThanOrEqual => new SqliteRowIdRange(null, true, rowId, true),
+            _ => default,
+        };
+        return comparison is BinaryOperator.Equal
+            or BinaryOperator.GreaterThan or BinaryOperator.GreaterThanOrEqual
+            or BinaryOperator.LessThan or BinaryOperator.LessThanOrEqual;
+    }
+
+    private static BinaryOperator ReverseComparison(BinaryOperator comparison)
+        => comparison switch
+        {
+            BinaryOperator.GreaterThan => BinaryOperator.LessThan,
+            BinaryOperator.GreaterThanOrEqual => BinaryOperator.LessThanOrEqual,
+            BinaryOperator.LessThan => BinaryOperator.GreaterThan,
+            BinaryOperator.LessThanOrEqual => BinaryOperator.GreaterThanOrEqual,
+            _ => comparison,
+        };
+
+    private static SqliteRowIdRange Intersect(SqliteRowIdRange left, SqliteRowIdRange right)
+    {
+        var lower = left.Lower;
+        var includeLower = left.IncludeLower;
+        if (right.Lower is { } rightLower
+            && (lower is null || rightLower > lower
+                || rightLower == lower && !right.IncludeLower))
+        {
+            lower = rightLower;
+            includeLower = right.IncludeLower;
+        }
+
+        var upper = left.Upper;
+        var includeUpper = left.IncludeUpper;
+        if (right.Upper is { } rightUpper
+            && (upper is null || rightUpper < upper
+                || rightUpper == upper && !right.IncludeUpper))
+        {
+            upper = rightUpper;
+            includeUpper = right.IncludeUpper;
+        }
+
+        return new SqliteRowIdRange(lower, includeLower, upper, includeUpper);
     }
 
     private static bool TryMatchRowId(
@@ -229,19 +336,8 @@ internal static class BoundedRowidScanShapeClassifier
         out long rowId)
     {
         rowId = 0;
-        if (columnExpression is not ColumnExpression { Schema: null } column
-            || !string.Equals(
-                column.UnqualifiedName ?? column.Name,
-                table.Columns[table.RowidAliasColumnIndex],
-                StringComparison.OrdinalIgnoreCase)
-            || column.Qualifier is { } qualifier
-                && !string.Equals(
-                    qualifier,
-                    source.Alias ?? source.Name,
-                    StringComparison.OrdinalIgnoreCase))
-        {
+        if (!IsRowIdColumn(columnExpression, source, table))
             return false;
-        }
 
         switch (valueExpression)
         {
@@ -259,4 +355,16 @@ internal static class BoundedRowidScanShapeClassifier
                 return false;
         }
     }
+
+    private static bool IsRowIdColumn(Expression expression, NamedTableSource source, EmbeddedTable table)
+        => expression is ColumnExpression { Schema: null } column
+            && string.Equals(
+                column.UnqualifiedName ?? column.Name,
+                table.Columns[table.RowidAliasColumnIndex],
+                StringComparison.OrdinalIgnoreCase)
+            && (column.Qualifier is null
+                || string.Equals(
+                    column.Qualifier,
+                    source.Alias ?? source.Name,
+                    StringComparison.OrdinalIgnoreCase));
 }

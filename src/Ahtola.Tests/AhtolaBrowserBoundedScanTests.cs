@@ -119,6 +119,11 @@ public sealed class AhtolaBrowserBoundedScanTests
 
         var assertion = await act.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>();
         assertion.Which.Message.Should().Contain("WHERE");
+
+        var unsupportedOrder = async () => await boundedConnection.ExecuteBoundedScanAsync(
+            "SELECT id FROM items ORDER BY label");
+        var orderAssertion = await unsupportedOrder.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>();
+        orderAssertion.Which.Message.Should().Contain("ORDER BY");
     }
 
     [Test]
@@ -166,11 +171,152 @@ public sealed class AhtolaBrowserBoundedScanTests
             (await reader.ReadAsync()).Should().BeFalse();
     }
 
+    [Test]
+    public async Task RowidRangesSeekTheirLowerBoundAndApplyLimitAfterFiltering()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT);");
+            Execute(connection, "INSERT INTO items VALUES (-4, 'negative');");
+            foreach (var id in Enumerable.Range(0, 200))
+                Execute(connection, $"INSERT INTO items VALUES ({id}, 'row-{id}');");
+        }
+
+        await using var boundedConnection = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false,
+            DatabasePath,
+            pageBudget: 16,
+            CancellationToken.None);
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id >= 119 AND id < 125 ORDER BY id ASC LIMIT 3"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(119L, 120L, 121L);
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items AS i WHERE -4 <= i.id AND i.id <= 0 ORDER BY i.id"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(-4L, 0L);
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id > 120 AND id <= 120"))
+            (await reader.ReadAsync()).Should().BeFalse();
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id < -4"))
+            (await reader.ReadAsync()).Should().BeFalse();
+    }
+
+    [Test]
+    public async Task DescendingRowidOrderPreservesRangeBoundsAndLimit()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY);");
+            Execute(connection, "INSERT INTO items VALUES (-2);");
+            foreach (var id in Enumerable.Range(0, 200))
+                Execute(connection, $"INSERT INTO items VALUES ({id});");
+        }
+
+        await using var boundedConnection = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false,
+            DatabasePath,
+            pageBudget: 16,
+            CancellationToken.None);
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id >= 119 AND id < 125 ORDER BY id DESC LIMIT 3"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(124L, 123L, 122L);
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items ORDER BY id DESC LIMIT 2"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(199L, 198L);
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id <= 0 ORDER BY id DESC"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(0L, -2L);
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id BETWEEN 5 AND 7 ORDER BY id DESC"))
+        {
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetValue(0).AsInteger());
+            ids.Should().Equal(7L, 6L, 5L);
+        }
+    }
+
+    [Test]
+    public async Task RowidRangeHandlesBothSigned64BitExtremes()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY);");
+            Execute(connection, "INSERT INTO items VALUES (-9223372036854775808), (9223372036854775807);");
+        }
+
+        await using var boundedConnection = await AhtolaBrowserBoundedConnection.OpenAsync(
+            AsyncFileSystemAdapter.Create(fileSystem),
+            ownsFileSystem: false,
+            DatabasePath,
+            pageBudget: 16,
+            CancellationToken.None);
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id = -9223372036854775808"))
+        {
+            (await reader.ReadAsync()).Should().BeTrue();
+            reader.GetValue(0).AsInteger().Should().Be(long.MinValue);
+            (await reader.ReadAsync()).Should().BeFalse();
+        }
+
+        await using (var reader = await boundedConnection.ExecuteBoundedScanAsync(
+                         "SELECT id FROM items WHERE id > 9223372036854775806 ORDER BY id DESC"))
+        {
+            (await reader.ReadAsync()).Should().BeTrue();
+            reader.GetValue(0).AsInteger().Should().Be(long.MaxValue);
+            (await reader.ReadAsync()).Should().BeFalse();
+        }
+    }
+
     [TestCase("SELECT id FROM items WHERE label = 'text'")]
-    [TestCase("SELECT id FROM items WHERE id > 0")]
+    [TestCase("SELECT id FROM items WHERE id != 0")]
     [TestCase("SELECT id FROM items WHERE id = 1 OR id = 2")]
+    [TestCase("SELECT id FROM items WHERE id >= 0 AND label = 'text'")]
     [TestCase("SELECT id FROM items WHERE id = NULL")]
     [TestCase("SELECT id FROM items WHERE id = 1.5")]
+    [TestCase("SELECT id FROM items WHERE id NOT BETWEEN 0 AND 1")]
     public async Task RejectsOtherWherePredicatesBeforeStartingAScan(string sql)
     {
         var fileSystem = new InMemoryFileSystem();
@@ -223,6 +369,16 @@ public sealed class AhtolaBrowserBoundedScanTests
             "SELECT id FROM items WHERE id = 4999");
         var seekAct = async () => await seekReader.ReadAsync();
         await seekAct.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>();
+
+        await using var rangeReader = await boundedConnection.ExecuteBoundedScanAsync(
+            "SELECT id FROM items WHERE id >= 4998 AND id < 5000");
+        var rangeAct = async () => await rangeReader.ReadAsync();
+        await rangeAct.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>();
+
+        await using var descendingReader = await boundedConnection.ExecuteBoundedScanAsync(
+            "SELECT id FROM items WHERE id >= 4998 ORDER BY id DESC");
+        var descendingAct = async () => await descendingReader.ReadAsync();
+        await descendingAct.Should().ThrowAsync<AhtolaBrowserBoundedQueryException>();
     }
 
     [Test]

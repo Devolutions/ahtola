@@ -3,8 +3,24 @@ using Ahtola.Core;
 
 namespace Ahtola.Core.Storage;
 
+internal readonly record struct SqliteRowIdRange(
+    long? Lower,
+    bool IncludeLower,
+    long? Upper,
+    bool IncludeUpper)
+{
+    internal bool IsEmpty => Lower is { } lower && Upper is { } upper
+        && (lower > upper || lower == upper && (!IncludeLower || !IncludeUpper));
+
+    internal bool IsBelowLower(long rowId) => Lower is { } lower
+        && (rowId < lower || rowId == lower && !IncludeLower);
+
+    internal bool IsAboveUpper(long rowId) => Upper is { } upper
+        && (rowId > upper || rowId == upper && !IncludeUpper);
+}
+
 /// <summary>
-/// A genuinely asynchronous, page-bounded ascending scan or exact-rowid seek for an ordinary
+/// A genuinely asynchronous, page-bounded rowid scan or exact-rowid seek for an ordinary
 /// (indexless, has-rowid) SQLite table b-tree.
 /// </summary>
 /// <remarks>
@@ -41,6 +57,19 @@ internal static class AsyncBoundedRowidTableScanCursor
 {
     private const int MaximumDepth = 64;
 
+    public static IAsyncEnumerable<SqlValue[]> ScanDescendingAsync(
+        BoundedAsyncPageCache pageCache,
+        uint rootPage,
+        EmbeddedTable table,
+        SqliteTextEncoding textEncoding,
+        long? limit,
+        CancellationToken cancellationToken = default,
+        long? equalRowId = null,
+        SqliteRowIdRange? rowIdRange = null)
+        => ScanAscendingAsync(
+            pageCache, rootPage, table, textEncoding, limit, cancellationToken, equalRowId, rowIdRange,
+            descending: true);
+
     public static async IAsyncEnumerable<SqlValue[]> ScanAscendingAsync(
         BoundedAsyncPageCache pageCache,
         uint rootPage,
@@ -48,7 +77,9 @@ internal static class AsyncBoundedRowidTableScanCursor
         SqliteTextEncoding textEncoding,
         long? limit,
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
-        long? equalRowId = null)
+        long? equalRowId = null,
+        SqliteRowIdRange? rowIdRange = null,
+        bool descending = false)
     {
         ArgumentNullException.ThrowIfNull(pageCache);
         ArgumentNullException.ThrowIfNull(table);
@@ -69,6 +100,9 @@ internal static class AsyncBoundedRowidTableScanCursor
 
             yield break;
         }
+
+        if (rowIdRange is { IsEmpty: true })
+            yield break;
 
         var overflowReader = new AsyncSqliteOverflowChainReader(pageCache);
         // Each frame is one still-open ancestor interior page: the page number (for
@@ -105,9 +139,16 @@ internal static class AsyncBoundedRowidTableScanCursor
                     }
 
                     var interior = SqliteTableInteriorPageView.Parse(image, pageCache.UsableSpace, isFirstPage);
+                    var startChild = descending
+                        ? rowIdRange?.Upper is { } upper
+                            ? interior.SearchChild(upper).ChildIndex
+                            : interior.Cells.Count
+                        : rowIdRange?.Lower is { } lower
+                            ? interior.SearchChild(lower).ChildIndex
+                            : 0;
                     pageCache.Pin(currentPage);
-                    stack.Add((currentPage, interior, 0));
-                    currentPage = ChildAt(interior, 0);
+                    stack.Add((currentPage, interior, startChild));
+                    currentPage = ChildAt(interior, startChild);
                     continue;
                 }
 
@@ -129,10 +170,30 @@ internal static class AsyncBoundedRowidTableScanCursor
                 pageCache.Pin(leafPage);
                 try
                 {
-                    foreach (var cell in leaf.Cells)
+                    for (var index = descending ? leaf.Cells.Count - 1 : 0;
+                         descending ? index >= 0 : index < leaf.Cells.Count;
+                         index += descending ? -1 : 1)
                     {
+                        var cell = leaf.Cells[index];
                         if (limit is { } cellMax && yielded >= cellMax)
                             yield break;
+                        if (rowIdRange is { } bounds)
+                        {
+                            if (descending)
+                            {
+                                if (bounds.IsAboveUpper(cell.Cell.RowId))
+                                    continue;
+                                if (bounds.IsBelowLower(cell.Cell.RowId))
+                                    yield break;
+                            }
+                            else
+                            {
+                                if (bounds.IsBelowLower(cell.Cell.RowId))
+                                    continue;
+                                if (bounds.IsAboveUpper(cell.Cell.RowId))
+                                    yield break;
+                            }
+                        }
 
                         var record = await overflowReader
                             .ReadPayloadAsync(cell.Cell, cancellationToken)
@@ -162,8 +223,8 @@ internal static class AsyncBoundedRowidTableScanCursor
                 {
                     var frameIndex = stack.Count - 1;
                     var frame = stack[frameIndex];
-                    var nextChildIndex = frame.NextChildIndex + 1;
-                    if (nextChildIndex <= frame.View.Cells.Count)
+                    var nextChildIndex = frame.NextChildIndex + (descending ? -1 : 1);
+                    if (nextChildIndex >= 0 && nextChildIndex <= frame.View.Cells.Count)
                     {
                         stack[frameIndex] = frame with { NextChildIndex = nextChildIndex };
                         nextPage = ChildAt(frame.View, nextChildIndex);

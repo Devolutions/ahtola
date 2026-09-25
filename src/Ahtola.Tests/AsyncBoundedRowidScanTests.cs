@@ -353,7 +353,12 @@ public sealed class AsyncBoundedRowidScanTests
         pointPlan.Should().NotBeNull(pointReason);
         pointPlan!.EqualRowId.Should().Be(1);
 
-        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE id > 0", catalog, out var rangeReason)
+        var rangePlan = BoundedRowidScanShapeClassifier.TryClassify(
+            "SELECT * FROM plain WHERE id >= 0 AND id < 5", catalog, out var rangeReason);
+        rangePlan.Should().NotBeNull(rangeReason);
+        rangePlan!.RowIdRange.Should().Be(new SqliteRowIdRange(0, true, 5, false));
+
+        BoundedRowidScanShapeClassifier.TryClassify("SELECT * FROM plain WHERE id != 0", catalog, out rangeReason)
             .Should().BeNull();
         rangeReason.Should().Contain("WHERE");
 
