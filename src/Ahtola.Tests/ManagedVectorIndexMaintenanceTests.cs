@@ -126,8 +126,7 @@ public sealed class ManagedVectorIndexMaintenanceTests
     [Test]
     public void OptimizeCompactsWithoutChangingTheAnswer()
     {
-        // Optimize is reachable only through the method-index opcode, never from SQL and never
-        // inline in DML, so it is driven at the cursor level the way the bytecode path drives it.
+        // Exercise the cursor's compaction contract independently of the SQL maintenance path.
         var attachment = (ManagedVectorIndexAttachment)ManagedIndexMethodRegistry.Resolve("vector").Attach(
             new ManagedIndexMethodConfiguration(
                 "points",
@@ -166,6 +165,28 @@ public sealed class ManagedVectorIndexMaintenanceTests
         attachment.Index.IndexedRowCount.Should().Be(before);
         attachment.Index.NeedsCompaction.Should().BeFalse();
         attachment.Index.MaximumRadius.Should().BeLessThanOrEqualTo(radiusBefore);
+    }
+
+    [Test]
+    public void OptimizeIndexSqlMaintainsVectorSearchAndSkipsOrdinaryIndexes()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = Seed(database, rows: 200);
+        Execute(connection, "DELETE FROM docs WHERE id <= 150;");
+        Execute(connection, "DELETE FROM plain WHERE id <= 150;");
+        AssertAgreesWithScan(connection);
+
+        Execute(connection, "OPTIMIZE INDEX docs_knn;");
+        AssertAgreesWithScan(connection);
+        Execute(connection, "OPTIMIZE INDEX;");
+        AssertAgreesWithScan(connection);
+
+        Execute(connection, "CREATE INDEX docs_id ON docs(id);");
+        Execute(connection, "OPTIMIZE INDEX docs_id;");
+        AssertAgreesWithScan(connection);
+
+        Action missing = () => Execute(connection, "OPTIMIZE INDEX missing;");
+        missing.Should().Throw<EmbeddedSqlException>().WithMessage("*no such index*");
     }
 
     [Test]
