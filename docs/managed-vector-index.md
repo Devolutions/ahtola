@@ -200,7 +200,7 @@ arithmetics disagree at the extremes, and the disagreement is not a rounding dif
 
 | Components | `float` norm accumulator | Reported distance |
 | --- | --- | --- |
-| `1e-24` | squares are `1e-48`, below the smallest subnormal ⇒ `0` | the degenerate branch: `0` or `1` |
+| `1e-24` | squares are `1e-48`, below the smallest subnormal ⇒ `0` | `0` against another zero-norm row; otherwise `1 − dot/0`, which is `+∞` (or `1` when the dot product is also zero) |
 | `1e20` | squares are `1e40`, above `float.MaxValue` ⇒ `+∞` | `1 − dot/∞` ⇒ `1` |
 
 In both cases the widened `double` direction is perfectly ordinary, so an angular bound built from it

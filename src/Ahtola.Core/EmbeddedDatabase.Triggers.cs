@@ -2035,10 +2035,10 @@ public sealed partial class EmbeddedDatabase
 
     private static void ResetInsertPlan(EmbeddedTable table, InsertPlan plan)
     {
-        plan.Used.Clear();
-        plan.Used.UnionWith(table.RowIds);
-        plan.AnyRow = table.RowIds.Count > 0;
-        plan.LargestRowId = plan.AnyRow ? table.RowIds.Max() : long.MinValue;
+        var current = table.GetRowIdSet();
+        plan.Used.Reset(current.Ids);
+        plan.AnyRow = current.Count > 0;
+        plan.LargestRowId = plan.AnyRow ? current.Max : long.MinValue;
     }
 
     private static void FinalizeExplicitRowId(InsertPlan plan, long rowId)
