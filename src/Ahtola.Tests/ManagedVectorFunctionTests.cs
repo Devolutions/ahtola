@@ -82,6 +82,33 @@ public sealed class ManagedVectorFunctionTests
             .Should().Be(SqlValue.Text("[]"));
     }
 
+    // Turso v0.8.0-pre.13 (b9414023d, core/vector/operations/distance_cos.rs): the pure-Rust
+    // cosine fallback returns 0 only when both norms are zero and 1 whenever the dot product is
+    // zero, before dividing. 1e-20 squares to a nonzero subnormal float whose product with
+    // itself underflows (likewise 1e-100 as a double), so the pre-13 rule divided 0 by 0 and
+    // reported NULL for that pair.
+    [TestCase("vector32", "[0,0]", "[0,0]", 0.0)]
+    [TestCase("vector32", "[1,2]", "[0,0]", 1.0)]
+    [TestCase("vector32", "[0,0]", "[1,2]", 1.0)]
+    [TestCase("vector32", "[1,0]", "[0,1]", 1.0)]
+    [TestCase("vector32", "[1e-20,0]", "[0,1e-20]", 1.0)]
+    [TestCase("vector64", "[0,0]", "[0,0]", 0.0)]
+    [TestCase("vector64", "[1,2]", "[0,0]", 1.0)]
+    [TestCase("vector64", "[1,0]", "[0,1]", 1.0)]
+    [TestCase("vector64", "[1e-100,0]", "[0,1e-100]", 1.0)]
+    public void CosineZeroDotAndZeroNormRulesMatchTursoFallback(
+        string constructor,
+        string left,
+        string right,
+        double expected)
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        ReadReal(connection, $"SELECT vector_distance_cos({constructor}('{left}'), {constructor}('{right}'));")
+            .Should().Be(expected);
+    }
+
     [Test]
     public void DistanceFunctionsMatchTursoScalarSemantics()
     {

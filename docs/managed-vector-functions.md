@@ -2,7 +2,7 @@
 
 Ahtola implements Turso-compatible vector scalar functions without a native
 companion. The implementation mirrors the serialized BLOB layouts and scalar
-semantics in Turso commit `277ddd050b1243bc19792e845c77f1ccd31896c8`:
+semantics in Turso `v0.8.0-pre.13` (commit `64b8ef5742fc18937f9c89806c81e3f6475dc7a3`):
 
 - `core/vector/vector_types.rs` and `core/vector/operations/serialize.rs`
   define the dense float32/float64, sparse float32, 1-bit, and 8-bit formats.
@@ -35,7 +35,34 @@ the same dimensions and encoded type. Text constructors reject non-finite
 values. Results that are NaN under Turso's operation rules become SQL `NULL`,
 matching SQLite's real-value behavior.
 
+Dense `float32`/`float64` cosine distance follows the rule Turso adopted in
+`v0.8.0-pre.13` (commit `b9414023d`): two zero vectors are at distance `0`,
+and any pair whose dot product is zero (which includes a zero vector against a
+non-zero one) is at distance `1`, decided before the division. The arithmetic
+is Turso's pure-Rust fallback — single-precision accumulation for `float32` —
+which is the code path Turso itself runs on WebAssembly. Turso's native builds
+use simsimd instead and can differ from it in the last bits.
+
 The implementation is scalar managed code and is NativeAOT/trimming safe.
+
+## Parity with Turso and platform coverage
+
+Against Turso's Rust engine through `v0.8.0-pre.13`, the vector surface is
+complete: every built-in vector function, the serialized formats, and the
+`turso/vector.sqltest` corpus (byte-identical between `v0.8.0-pre.7` and
+`v0.8.0-pre.13`). The only behavioral change in `core/vector` over that range
+is the cosine rule above; the rest is build-feature plumbing for simsimd.
+Turso's Rust engine has no `vector_top_k`, `libsql_vector_idx`, `F32_BLOB(N)`
+typing, or DiskANN index — those belong to libSQL, not to the engine Ahtola
+ports. `F32_BLOB(N)`-style declared types are accepted as ordinary column
+types with BLOB affinity.
+
+The same engine code runs unchanged in desktop .NET and in browser
+WebAssembly. The browser package consumer smoke test
+(`samples/BrowserWasmConsumer`, gated by
+`scripts/Invoke-BrowserPackageConsumer.ps1`) builds a `USING vector` index over
+OPFS storage, reopens it, and requires the planner to choose it and to return
+the same rows as the unindexed scan.
 
 A dense vector index is available as `CREATE INDEX … USING vector (col) WITH (…)`, built on the
 managed index-method foundation and documented in

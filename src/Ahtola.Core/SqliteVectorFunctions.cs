@@ -237,9 +237,14 @@ internal static partial class SqliteVectorFunctions
 
         return kind switch
         {
-            DistanceKind.Cosine => leftNorm == 0.0f || rightNorm == 0.0f
-                ? leftNorm == rightNorm ? 0.0 : 1.0
-                : 1.0f - dot / MathF.Sqrt(leftNorm * rightNorm),
+            // Turso v0.8.0-pre.13 (b9414023d) aligned its pure-Rust fallback with simsimd: two
+            // zero vectors are identical, and a zero dot product (which includes one zero vector)
+            // is maximally distant. The fallback is the code path Turso runs on wasm.
+            DistanceKind.Cosine => leftNorm == 0.0f && rightNorm == 0.0f
+                ? 0.0
+                : dot == 0.0f
+                    ? 1.0
+                    : 1.0f - dot / MathF.Sqrt(leftNorm * rightNorm),
             DistanceKind.L2 => Math.Sqrt(l2),
             DistanceKind.Jaccard => max == 0.0f ? double.NaN : 1.0 - min / max,
             DistanceKind.Dot => -dot64,
@@ -270,9 +275,12 @@ internal static partial class SqliteVectorFunctions
 
         return kind switch
         {
-            DistanceKind.Cosine => leftNorm == 0.0 || rightNorm == 0.0
-                ? leftNorm == rightNorm ? 0.0 : 1.0
-                : 1.0 - dot / Math.Sqrt(leftNorm * rightNorm),
+            // Same rule as DistanceFloat32 (Turso b9414023d).
+            DistanceKind.Cosine => leftNorm == 0.0 && rightNorm == 0.0
+                ? 0.0
+                : dot == 0.0
+                    ? 1.0
+                    : 1.0 - dot / Math.Sqrt(leftNorm * rightNorm),
             DistanceKind.L2 => Math.Sqrt(l2),
             DistanceKind.Jaccard => max == 0.0 ? double.NaN : 1.0 - min / max,
             DistanceKind.Dot => -dot,

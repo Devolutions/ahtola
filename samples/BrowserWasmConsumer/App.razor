@@ -45,6 +45,7 @@
             var encryptedWrongKeyRejected = await RunEncryptedWrongKeyAsync();
             var encryptedCipherMismatchRejected = await RunEncryptedCipherMismatchAsync();
             var syncReadMirror = await RunSynchronousReadMirrorAsync();
+            var vectorSearch = await RunPersistentVectorSearchAsync();
             status =
                 $"PASS:capabilities={capabilities.IsSupported};"
                 + $"storage={storage.Succeeded};"
@@ -65,7 +66,8 @@
                 + $"persistent-encrypted-raw-key={persistentEncryptedRawKey};"
                 + $"encrypted-wrong-key-rejected={encryptedWrongKeyRejected};"
                 + $"encrypted-cipher-mismatch-rejected={encryptedCipherMismatchRejected};"
-                + $"sync-read-mirror={syncReadMirror}";
+                + $"sync-read-mirror={syncReadMirror};"
+                + $"vector-search={vectorSearch}";
         }
         catch (Exception exception)
         {
@@ -730,6 +732,92 @@
         }
 
         return false;
+    }
+
+    // Turso-compatible vector search end to end in WebAssembly: a dense `USING vector` index is
+    // built over OPFS storage, survives a reopen, is chosen by the planner, and answers exactly
+    // what the unindexed scan answers. The corpus is a closed-form function of the row id so the
+    // expected status is the same on every engine and every run.
+    private static async Task<string> RunPersistentVectorSearchAsync()
+    {
+        const string path = "packed-consumer-vector/main.db";
+        const int dimensions = 64;
+        const int rowCount = 2048;
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            var insert = new System.Text.StringBuilder("INSERT INTO docs(id, embedding) VALUES ");
+            for (var id = 1; id <= rowCount; id++)
+            {
+                if (id > 1)
+                    insert.Append(',');
+                insert.Append('(').Append(id).Append(", vector('[");
+                for (var component = 0; component < dimensions; component++)
+                {
+                    if (component > 0)
+                        insert.Append(',');
+                    var value = (component == id % dimensions ? 10.0 : 0.0)
+                        + ((id * 31 + component * 17) % 97) / 97.0;
+                    insert.Append(value.ToString("R", CultureInfo.InvariantCulture));
+                }
+
+                insert.Append("]'))");
+            }
+
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE docs(id INTEGER PRIMARY KEY, embedding BLOB)",
+                "vector create table");
+            await ExecuteFeatureAsync(connection, insert.ToString(), "vector insert");
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE INDEX docs_knn ON docs USING vector (embedding) "
+                + $"WITH (metric = 'l2', dims = {dimensions}, lists = 64)",
+                "vector create index");
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            var query = "vector('[" + string.Join(",", Enumerable.Range(0, dimensions)
+                .Select(static component => component == 3 ? "10" : "0")) + "]')";
+            var knn = $"SELECT id FROM docs ORDER BY vector_distance_l2(embedding, {query}) LIMIT 3";
+            await using (var explain = connection.CreateCommand())
+            {
+                explain.CommandText = "EXPLAIN QUERY PLAN " + knn;
+                await using var reader = await explain.ExecuteReaderAsync();
+                var plan = new List<string>();
+                while (await reader.ReadAsync())
+                    plan.Add(reader.GetString(3));
+                if (!plan.Any(static detail => detail.Contains(
+                        "USING INDEX METHOD vector INDEX docs_knn",
+                        StringComparison.Ordinal)))
+                {
+                    throw new InvalidOperationException(
+                        $"vector search was not planned through the index: {string.Join(" / ", plan)}");
+                }
+            }
+
+            // A residual WHERE makes the index decline, so this is the exact unindexed answer.
+            var indexed = await ReadIdsAsync(connection, knn);
+            var scanned = await ReadIdsAsync(
+                connection,
+                $"SELECT id FROM docs WHERE id > 0 ORDER BY vector_distance_l2(embedding, {query}) LIMIT 3");
+            if (indexed != scanned)
+                throw new InvalidOperationException($"vector index answered {indexed}, scan answered {scanned}");
+            return indexed;
+        }
+
+        static async Task<string> ReadIdsAsync(SqliteConnection connection, string sql)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await using var reader = await command.ExecuteReaderAsync();
+            var ids = new List<long>();
+            while (await reader.ReadAsync())
+                ids.Add(reader.GetInt64(0));
+            return string.Join("-", ids);
+        }
     }
 
     private static async Task ExecuteFeatureAsync(

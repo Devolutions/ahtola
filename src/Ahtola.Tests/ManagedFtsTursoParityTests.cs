@@ -31,6 +31,28 @@ public sealed class ManagedFtsTursoParityTests
             .Should().Equal(3);
     }
 
+    // Turso v0.8.0-pre.13 (78395e704, fts.sqltest fts-ranked-limit-offset, issue #7523): an
+    // index-method search that applies LIMIT must not be chosen when it cannot apply OFFSET too,
+    // or the early LIMIT drops rows the OFFSET still has to skip.
+    [TestCase(0, new long[] { 4, 3 })]
+    [TestCase(1, new long[] { 3, 2 })]
+    [TestCase(3, new long[] { 1 })]
+    [TestCase(4, new long[0])]
+    public void RankedLimitWithOffsetSkipsBeforeLimiting(int offset, long[] expected)
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT);");
+        Execute(connection, "CREATE INDEX fx ON d USING fts(body);");
+        Execute(connection, "INSERT INTO d VALUES (1, 'x'), (2, 'x x'), (3, 'x x x'), (4, 'x x x x');");
+
+        QueryIntegers(
+                connection,
+                "SELECT id FROM d WHERE fts_match(body, 'x') ORDER BY fts_score(body, 'x') DESC "
+                + $"LIMIT 2 OFFSET {offset};")
+            .Should().Equal(expected);
+    }
+
     [Test]
     public void ColumnPhrasePrefixAndQueryBoostsAffectMethodResults()
     {

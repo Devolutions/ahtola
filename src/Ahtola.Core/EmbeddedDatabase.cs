@@ -8671,12 +8671,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!tables.TryGetValue(SqliteSequenceTableName, out var sequence))
             throw new InvalidOperationException("An AUTOINCREMENT table is missing sqlite_sequence.");
 
-        foreach (var row in sequence.Rows)
+        // Stored row arrays are shared with catalog clones, so a renamed row is replaced with a
+        // copy rather than patched in place (see RowStore).
+        var rows = sequence.Rows;
+        for (var index = 0; index < rows.Count; index++)
         {
+            var row = rows[index];
             if (row[0].Kind == SqlValueKind.Text
                 && string.Equals(row[0].AsText(), previousName, StringComparison.Ordinal))
             {
-                row[0] = SqlValue.Text(newName);
+                var renamed = row.ToArray();
+                renamed[0] = SqlValue.Text(newName);
+                rows.ReplaceRowPreservingRevision(index, renamed);
             }
         }
     }
@@ -13625,20 +13631,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private static void SynchronizeInsertAllocation(InsertPlan plan, EmbeddedTable table)
     {
+        var current = table.GetRowIdSet();
         if (plan.AutoIncrement is null)
         {
-            plan.Used.Clear();
-            plan.Used.UnionWith(table.RowIds);
-            plan.AnyRow = table.RowIds.Count > 0;
-            plan.LargestRowId = plan.AnyRow ? table.RowIds.Max() : long.MinValue;
+            plan.Used.Reset(current.Ids);
+            plan.AnyRow = current.Count > 0;
+            plan.LargestRowId = plan.AnyRow ? current.Max : long.MinValue;
             return;
         }
 
-        plan.Used.UnionWith(table.RowIds);
-        if (table.RowIds.Count == 0)
+        plan.Used.UnionWith(current.Ids);
+        if (current.Count == 0)
             return;
         plan.AnyRow = true;
-        plan.LargestRowId = Math.Max(plan.LargestRowId, table.RowIds.Max());
+        plan.LargestRowId = Math.Max(plan.LargestRowId, current.Max);
     }
 
     private sealed record InsertAllocationSnapshot(
@@ -14251,14 +14257,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var anyRow = table.RowIds.Count > 0;
+        var existingRowIds = table.GetRowIdSet();
         return new InsertPlan
         {
             TargetIndices = targetIndices,
             RowidTargetPosition = rowidTargetPosition,
             AliasIndex = table.RowidAliasColumnIndex,
-            Used = new HashSet<long>(table.RowIds),
+            Used = new RowIdAllocationSet(existingRowIds.Ids),
             AnyRow = anyRow,
-            LargestRowId = anyRow ? table.RowIds.Max() : long.MinValue,
+            LargestRowId = anyRow ? existingRowIds.Max : long.MinValue,
             AutoIncrement = table.IsAutoIncrement
                 ? context.AutoIncrementState?.GetTracker(statement.TableName, table, context.Tables)
                     ?? throw new InvalidOperationException("AUTOINCREMENT allocation is missing statement state.")
@@ -14500,8 +14507,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             context,
             table,
             TriggerMutationKind.Insert);
+        // ValidateRowids has just made the rowid set current; extend it rather than rebuild it.
+        var rowIdsBefore = table.HasRowid ? table.TryGetCurrentRowIdSet() : null;
         table.Rows.AddRange(rowsToInsert);
         table.RowIds.AddRange(insertedRowIds);
+        table.RecordAppendedRowIds(rowIdsBefore, insertedRowIds);
         SortWithoutRowid(table);
         if (table.HasRowid)
         {
@@ -14521,13 +14531,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyList<long> insertedRowIds)
     {
         ValidateRowids(tableName, table, insertedRowIds);
-        var allRows = new List<SqlValue[]>(table.Rows.Count + rowsToInsert.Count);
-        allRows.AddRange(table.Rows);
-        allRows.AddRange(rowsToInsert);
-        table.ValidateRows(tableName, allRows);
-        ValidateColumnUniqueConstraints(table, allRows);
+        // A view rather than a copy: every INSERT statement would otherwise copy the whole table.
+        var allRows = new ConcatenatedRows(table.Rows, rowsToInsert);
+        // ValidateRowids has just proven the rowid unique, and a rowid alias column stores exactly
+        // the rowid, so rescanning every stored row for that column's uniqueness is redundant; and
+        // only the inserted rows can violate NOT NULL (SQLite checks the row being written).
+        var rowidAliasColumn = table.HasRowid ? table.RowidAliasColumnIndex : -1;
+        table.ValidateRows(tableName, allRows, rowsToInsert, skipUniqueColumnIndex: rowidAliasColumn);
+        ValidateColumnUniqueConstraints(table, allRows, skipColumnIndex: rowidAliasColumn);
         ValidatePrimaryKey(tableName, table, allRows);
-        ValidateUniqueIndexes(tableName, table, allRows);
+        // Stored rows' index keys were evaluated when those rows were written; an INSERT can only
+        // introduce a key-evaluation error in the rows it adds.
+        ValidateUniqueIndexes(tableName, table, allRows, rowsToInsert);
         ValidateForeignKeysAfterInsert(context, tableName, table, rowsToInsert, allRows);
     }
 
@@ -14539,10 +14554,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!table.HasRowid)
             return;
 
-        var used = new HashSet<long>(table.RowIds);
+        var existing = table.GetRowIdSet().Ids;
+        var inserted = insertedRowIds.Count > 1 ? new HashSet<long>() : null;
         foreach (var rowId in insertedRowIds)
         {
-            if (used.Add(rowId))
+            if (!existing.Contains(rowId) && (inserted is null || inserted.Add(rowId)))
                 continue;
 
             var aliasIndex = table.RowidAliasColumnIndex;
@@ -14565,7 +14581,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         public required int AliasIndex { get; init; }
 
-        public required HashSet<long> Used { get; init; }
+        public required RowIdAllocationSet Used { get; init; }
 
         public bool AnyRow { get; set; }
 
@@ -14651,6 +14667,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // Computes the next autogenerated rowid: one greater than the largest rowid in use,
     // or a random unused positive value once the maximum integer rowid is reached, exactly
     // as SQLite does.
+    private static long NextAutoRowId(long largestRowId, RowIdAllocationSet used)
+    {
+        if (largestRowId != long.MaxValue)
+            return largestRowId + 1;
+
+        while (true)
+        {
+            var candidate = Random.Shared.NextInt64(1, long.MaxValue);
+            if (!used.Contains(candidate))
+                return candidate;
+        }
+    }
+
     private static long NextAutoRowId(long largestRowId, HashSet<long> used)
     {
         if (largestRowId != long.MaxValue)
@@ -17030,10 +17059,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // Column-level UNIQUE and PRIMARY KEY constraints are not represented in Indexes. They
     // still use the column's declared collation, so validate them with the same comparer as
     // explicit UNIQUE indexes rather than SqlValue's binary HashSet equality.
-    private void ValidateColumnUniqueConstraints(EmbeddedTable table, IReadOnlyList<SqlValue[]> rows)
+    private void ValidateColumnUniqueConstraints(
+        EmbeddedTable table,
+        IReadOnlyList<SqlValue[]> rows,
+        int skipColumnIndex = -1)
     {
         for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
         {
+            if (columnIndex == skipColumnIndex)
+                continue;
             if ((table.WithoutRowid || table.TableLevelPrimaryKey is not null)
                 && table.IsPrimaryKeyColumn(columnIndex))
             {
@@ -17109,14 +17143,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
-    private void ValidateUniqueIndexes(string tableName, EmbeddedTable table, IReadOnlyList<SqlValue[]> rows)
+    // expressionRows: the rows whose non-unique index keys still need evaluating, when only some of
+    // `rows` are new (an INSERT); defaults to all of them. A unique index always checks every row.
+    private void ValidateUniqueIndexes(
+        string tableName,
+        EmbeddedTable table,
+        IReadOnlyList<SqlValue[]> rows,
+        IReadOnlyList<SqlValue[]>? expressionRows = null)
     {
         foreach (var index in table.Indexes)
         {
             if (index.Unique)
                 ValidateUniqueIndex(tableName, table, index, rows);
             else
-                ValidateIndexExpressions(table, index, rows);
+                ValidateIndexExpressions(table, index, expressionRows ?? rows);
         }
     }
 
@@ -52801,8 +52841,9 @@ out bool hasReturning)
 
     // Shallow per-statement DML rollback snapshot: shares per-row SqlValue[] references
     // with the live catalog (see EmbeddedTable.CloneShallow). Use this for INSERT/UPDATE/
-    // DELETE/UPSERT/trigger backups; the deep CloneTables is still used for transaction
-    // snapshots (SchemaCatalog.Clone) and DDL rollback, which may outlive the statement.
+    // DELETE/UPSERT/trigger backups. CloneTables (transaction snapshots via SchemaCatalog.Clone,
+    // DDL rollback) shares the same row arrays too, through a copy-on-write row list that also
+    // preserves each table's row-store identity (see RowStore.ReplaceContentsPreservingRevision).
     internal static Dictionary<string, EmbeddedTable> CloneTablesShallow(Dictionary<string, EmbeddedTable> source)
     {
         var clone = new Dictionary<string, EmbeddedTable>(source.Comparer);
@@ -59129,8 +59170,12 @@ public sealed partial class EmbeddedConnection : IDisposable
                 var blob = row[logicalColumnIndex].AsBlobSpan().ToArray();
                 if (offset < blob.Length && source.Length <= blob.Length - offset)
                 {
+                    // The stored row array is shared with catalog clones and snapshots, so
+                    // replace it rather than patching it in place (see RowStore).
                     source.CopyTo(blob.AsSpan((int)offset));
-                    row[logicalColumnIndex] = SqlValue.BlobOwned(blob);
+                    var updated = row.ToArray();
+                    updated[logicalColumnIndex] = SqlValue.BlobOwned(blob);
+                    table.Rows.ReplaceRowPreservingRevision(position, updated);
                 }
             }
         }
@@ -66217,11 +66262,36 @@ internal interface IPendingRowLoadResourceLease
     void Release();
 }
 
+/// <summary>A read-only view of <paramref name="first"/> followed by <paramref name="second"/>.</summary>
+internal sealed class ConcatenatedRows(IReadOnlyList<SqlValue[]> first, IReadOnlyList<SqlValue[]> second)
+    : IReadOnlyList<SqlValue[]>
+{
+    public int Count => first.Count + second.Count;
+
+    public SqlValue[] this[int index]
+        => index < first.Count ? first[index] : second[index - first.Count];
+
+    public IEnumerator<SqlValue[]> GetEnumerator()
+    {
+        foreach (var row in first)
+            yield return row;
+        foreach (var row in second)
+            yield return row;
+    }
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
 internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
 {
     private static long _lineageSequence;
 
-    private readonly List<SqlValue[]> _rows = [];
+    // The row list is shared copy-on-write, chunk by chunk, between a RowStore and every clone
+    // made from it by ReplaceContentsPreservingRevision (see CowChunkedList). The per-row
+    // SqlValue[] arrays are shared outright: stored rows are never mutated in place (a changed row
+    // is replaced through the indexer or ReplaceRowPreservingRevision), which is what lets a clone
+    // skip copying them at all.
+    private readonly CowChunkedList<SqlValue[]> _rows = new();
 
     public long Revision { get; private set; }
 
@@ -66302,10 +66372,12 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
 
     public bool Remove(SqlValue[] item)
     {
-        var removed = _rows.Remove(item);
-        if (removed)
-            Revision++;
-        return removed;
+        var index = _rows.IndexOf(item);
+        if (index < 0)
+            return false;
+
+        RemoveAt(index);
+        return true;
     }
 
     public void RemoveAt(int index)
@@ -66314,23 +66386,51 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
         Revision++;
     }
 
-    // EmbeddedTable.Clone() deep-copies every table in the working catalog on every
-    // statement (so a rolled-back statement never mutates the live, published catalog),
-    // even tables the statement never touches. Populating the clone through the ordinary
-    // Add() path would bump Revision once per copied row, making a fully-untouched clone's
-    // Revision diverge from its source (row count vs. the source's full mutation history)
-    // and defeating any same-instance staleness check built on it. Copying the rows
-    // directly and assigning Revision verbatim instead means an untouched clone keeps
-    // exactly its source's Revision, so a later mutation (via the ordinary Add/Insert/
-    // Remove/indexer members, all of which still bump Revision as usual) is the only thing
-    // that can make it diverge again. LineageId is carried forward the same way, so a
-    // same-statement clone also keeps proving "this is still the very same physical row
-    // store" even when Revision alone would be ambiguous (see LineageId's doc comment).
+    /// <summary>
+    /// Replaces one stored row with a new array without bumping <see cref="Revision"/>. For
+    /// callers that previously patched a stored row array in place to mirror a change that has
+    /// already been written to page storage (incremental blob I/O, sqlite_sequence renames):
+    /// the stored row arrays are shared with clones, so they must be replaced, never mutated,
+    /// but the change is not a new logical mutation of the row store.
+    /// </summary>
+    internal void ReplaceRowPreservingRevision(int index, SqlValue[] row)
+    {
+        _rows[index] = row;
+    }
+
+    /// <summary>
+    /// Shares <paramref name="source"/>'s rows copy-on-write under this store's own, fresh
+    /// identity, exactly as if every row had been added one by one (see
+    /// <see cref="EmbeddedTable.CloneShallow"/>).
+    /// </summary>
+    internal void ShareRowsWithFreshIdentity(RowStore source)
+    {
+        if (_rows.Count != 0)
+            throw new InvalidOperationException("ShareRowsWithFreshIdentity requires an empty RowStore.");
+
+        _rows.ShareFrom(source._rows);
+        Revision += _rows.Count;
+    }
+
+    // EmbeddedTable.Clone() clones every table in the working catalog on every statement
+    // (so a rolled-back statement never mutates the live, published catalog), even tables
+    // the statement never touches. Populating the clone through the ordinary Add() path
+    // would bump Revision once per copied row, making a fully-untouched clone's Revision
+    // diverge from its source (row count vs. the source's full mutation history) and
+    // defeating any same-instance staleness check built on it. Sharing the rows directly
+    // and assigning Revision verbatim instead means an untouched clone keeps exactly its
+    // source's Revision, so a later mutation (via the ordinary Add/Insert/Remove/indexer
+    // members, all of which still bump Revision as usual) is the only thing that can make
+    // it diverge again. LineageId is carried forward the same way, so a same-statement
+    // clone also keeps proving "this is still the very same physical row store" even when
+    // Revision alone would be ambiguous (see LineageId's doc comment).
+    //
+    // The list itself is shared copy-on-write rather than copied: a statement pays only for
+    // the chunks it actually writes, instead of reallocating every row of every table, which
+    // made each statement in a transaction O(database rows).
     internal void ReplaceContentsPreservingRevision(RowStore source)
     {
-        _rows.Clear();
-        foreach (var row in source._rows)
-            _rows.Add(row.ToArray());
+        _rows.ShareFrom(source._rows);
         Revision = source.Revision;
         LineageId = source.LineageId;
     }
@@ -67082,7 +67182,7 @@ internal sealed class EmbeddedTable
 
     // Parallel to <see cref="Rows"/> (index-aligned): the SQLite rowid backing each row.
     // Every row-mutating site keeps this list the same length and order as Rows.
-    private readonly List<long> _rowIdsStore = [];
+    private readonly CowChunkedList<long> _rowIdsStore = new();
 
     // Set by EmbeddedFileStore.Load() for a page-backed base table instead of eagerly
     // walking its b-tree at physical-open time (see AttachPendingRowLoader). Null for
@@ -67135,7 +67235,7 @@ internal sealed class EmbeddedTable
 
     // Parallel to <see cref="Rows"/> (index-aligned): the SQLite rowid backing each row.
     // Every row-mutating site keeps this list the same length and order as Rows.
-    public List<long> RowIds
+    public CowChunkedList<long> RowIds
     {
         get
         {
@@ -67158,6 +67258,77 @@ internal sealed class EmbeddedTable
     /// decoding a whole table's pages just to answer that.
     /// </summary>
     internal (long LineageId, long Revision) RowStorageIdentity => (_rowsStore.LineageId, _rowsStore.Revision);
+
+    // The rowids as an immutable set, cached against the row store's identity. Every rowid change
+    // is paired with a row change that bumps RowStore.Revision (RowIds and Rows are index-aligned),
+    // so a matching lineage, revision and count proves the set current. It is immutable so a clone
+    // can share it and each side can extend it without affecting the other.
+    private RowIdSet? _rowIdSet;
+
+    /// <summary>The table's current rowids and their maximum, rebuilt only when stale.</summary>
+    internal RowIdSet GetRowIdSet()
+    {
+        if (TryGetCurrentRowIdSet() is { } current)
+            return current;
+
+        var rowIds = RowIds;
+        var builder = System.Collections.Immutable.ImmutableHashSet.CreateBuilder<long>();
+        var max = long.MinValue;
+        for (var index = 0; index < rowIds.Count; index++)
+        {
+            var rowId = rowIds[index];
+            builder.Add(rowId);
+            if (rowId > max)
+                max = rowId;
+        }
+
+        var built = new RowIdSet(
+            _rowsStore.LineageId,
+            _rowsStore.Revision,
+            rowIds.Count,
+            builder.ToImmutable(),
+            max);
+        _rowIdSet = built;
+        return built;
+    }
+
+    /// <summary>The cached rowid set if it is still current, without building one.</summary>
+    internal RowIdSet? TryGetCurrentRowIdSet()
+    {
+        var rowIds = RowIds;
+        return _rowIdSet is { } cached
+            && cached.LineageId == _rowsStore.LineageId
+            && cached.Revision == _rowsStore.Revision
+            && cached.Count == rowIds.Count
+                ? cached
+                : null;
+    }
+
+    /// <summary>
+    /// Extends <paramref name="before"/>, the set that was current immediately before
+    /// <paramref name="inserted"/> were appended, so the next statement does not rebuild it.
+    /// </summary>
+    internal void RecordAppendedRowIds(RowIdSet? before, IReadOnlyList<long> inserted)
+    {
+        if (before is null || before.Count + inserted.Count != RowIds.Count)
+            return;
+
+        var builder = before.Ids.ToBuilder();
+        var max = before.Max;
+        foreach (var rowId in inserted)
+        {
+            builder.Add(rowId);
+            if (rowId > max)
+                max = rowId;
+        }
+
+        _rowIdSet = new RowIdSet(
+            _rowsStore.LineageId,
+            _rowsStore.Revision,
+            RowIds.Count,
+            builder.ToImmutable(),
+            max);
+    }
 
     /// <summary>
     /// True while this table's committed base rows have not yet been read from page
@@ -67706,8 +67877,8 @@ internal sealed class EmbeddedTable
         if (!source.TryCopyPendingRowLoadTo(this))
         {
             Rows.ReplaceContentsPreservingRevision(source.Rows);
-            RowIds.Clear();
-            RowIds.AddRange(source.RowIds);
+            RowIds.ShareFrom(source.RowIds);
+            _rowIdSet = source._rowIdSet;
         }
 
         Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
@@ -68962,7 +69133,8 @@ internal sealed class EmbeddedTable
         if (!TryCopyPendingRowLoadTo(clone))
         {
             clone.Rows.ReplaceContentsPreservingRevision(Rows);
-            clone.RowIds.AddRange(RowIds);
+            clone.RowIds.ShareFrom(RowIds);
+            clone._rowIdSet = _rowIdSet;
         }
 
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
@@ -69056,8 +69228,8 @@ internal sealed class EmbeddedTable
     }
 
     // Shallow snapshot for DML statement rollback: a fresh table shell with a fresh
-    // RowStore/RowIds list, but sharing the per-row SqlValue[] references with the live
-    // table. DML never mutates a row array in place (it rebuilds the row list via
+    // RowStore identity, sharing the row list (copy-on-write) and the per-row SqlValue[]
+    // references with the live table. DML never mutates a row array in place (it rebuilds the row list via
     // Clear/AddRange/Add/RemoveAt/whole-slot replacement), so the shared arrays keep
     // their pre-statement values. RestoreTables deep-clones this snapshot on the rare
     // throw path, so the common no-throw path avoids the O(rows) per-row allocation
@@ -69078,10 +69250,8 @@ internal sealed class EmbeddedTable
             Strict);
         clone.SchemaSqlCompact = SchemaSqlCompact;
         clone.Sql = Sql;
-        foreach (var row in Rows)
-            clone.Rows.Add(row);
-
-        clone.RowIds.AddRange(RowIds);
+        clone.Rows.ShareRowsWithFreshIdentity(Rows);
+        clone.RowIds.ShareFrom(RowIds);
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         CopyMethodAttachmentsTo(clone);
@@ -69094,8 +69264,16 @@ internal sealed class EmbeddedTable
             row[columnIndex] = ApplyColumnAffinity(ColumnDefinitions[columnIndex], row[columnIndex]);
     }
 
-    public void ValidateRows(string tableName, IReadOnlyList<SqlValue[]> rows)
+    // notNullRows: the rows to check for NOT NULL when only some of `rows` can have changed
+    // (defaults to all of them). skipUniqueColumnIndex: a column whose uniqueness the caller has
+    // already proven (an INSERT's rowid alias).
+    public void ValidateRows(
+        string tableName,
+        IReadOnlyList<SqlValue[]> rows,
+        IReadOnlyList<SqlValue[]>? notNullRows = null,
+        int skipUniqueColumnIndex = -1)
     {
+        notNullRows ??= rows;
         for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
         {
             // A WITHOUT ROWID primary key (and any table-level PRIMARY KEY) is validated
@@ -69106,14 +69284,14 @@ internal sealed class EmbeddedTable
 
             var column = ColumnDefinitions[columnIndex];
             if ((column.NotNull || column.Domain?.NotNull == true || (Strict && IsPrimaryKeyColumn(columnIndex)))
-                && rows.Any(row => row[columnIndex].Kind == SqlValueKind.Null))
+                && notNullRows.Any(row => row[columnIndex].Kind == SqlValueKind.Null))
             {
                 throw new EmbeddedSqlException(
                     $"NOT NULL constraint failed: {tableName}.{column.Name}",
                     column.NotNullConflictAlgorithm);
             }
 
-            if (!column.PrimaryKey)
+            if (!column.PrimaryKey || columnIndex == skipUniqueColumnIndex)
                 continue;
             if (Indexes.Any(index =>
                     index.Origin == EmbeddedIndexOrigin.PrimaryKey

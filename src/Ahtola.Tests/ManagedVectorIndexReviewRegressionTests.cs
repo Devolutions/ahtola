@@ -234,17 +234,28 @@ public sealed class ManagedVectorIndexReviewRegressionTests
                      "[0.1,0.2,0.3,0.4]",
                  })
         {
-            var sql = $"SELECT id FROM docs ORDER BY vector_distance_cos(embedding, vector32('{query}')) LIMIT 10;";
-            var scanned = sql.Replace("FROM docs", "FROM plain", StringComparison.Ordinal);
-            QueryIntegers(connection, sql).Should().Equal(QueryIntegers(connection, scanned), query);
+            foreach (var limit in new[] { 10, collapsed + ordinary })
+            {
+                var sql = $"SELECT id FROM docs ORDER BY vector_distance_cos(embedding, vector32('{query}')) LIMIT {limit};";
+                var scanned = sql.Replace("FROM docs", "FROM plain", StringComparison.Ordinal);
+                QueryIntegers(connection, sql).Should().Equal(QueryIntegers(connection, scanned), query);
+            }
         }
 
-        // The negative control: the first query's answer really is the collapsing rows, so the
-        // assertion above is comparing something the geometry would have pruned.
-        QueryIntegers(
-                connection,
-                "SELECT id FROM plain ORDER BY vector_distance_cos(embedding, vector32('[1,0,0,0]')) LIMIT 10;")
-            .Should().OnlyContain(id => id <= collapsed);
+        // The negative control: the collapsing rows really do report a distance the double
+        // geometry cannot predict, so the assertions above compare something it would misjudge.
+        // An overflowing norm divides the dot product by infinity and reports exactly 1, which
+        // beats every ordinary row. An underflowing norm is zero while the dot product is not, so
+        // Turso's fallback (b9414023d) divides by zero and reports +infinity: last, not first.
+        var collapsedAnswer = QueryIntegers(
+            connection,
+            "SELECT id FROM plain ORDER BY vector_distance_cos(embedding, vector32('[1,0,0,0]')) LIMIT 10;");
+        if (magnitude > 1.0)
+            collapsedAnswer.Should().OnlyContain(id => id <= collapsed);
+        else
+            collapsedAnswer.Should().OnlyContain(id => id > collapsed);
+        Query(connection, "SELECT vector_distance_cos(embedding, vector32('[1,0,0,0]')) FROM plain WHERE id = 1;")[0][0]
+            .AsReal().Should().Be(magnitude > 1.0 ? 1.0 : double.PositiveInfinity);
     }
 
     [Test]
