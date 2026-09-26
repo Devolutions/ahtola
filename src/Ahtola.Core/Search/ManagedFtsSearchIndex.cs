@@ -35,7 +35,7 @@ internal enum ManagedFtsScoringProfile
 /// new image even before compaction reclaims them.
 /// </para>
 /// </remarks>
-internal sealed class ManagedFtsSearchIndex
+internal sealed partial class ManagedFtsSearchIndex
 {
     /// <summary>Okapi BM25 term-frequency saturation parameter.</summary>
     private const double BM25K1 = 1.2;
@@ -55,12 +55,7 @@ internal sealed class ManagedFtsSearchIndex
     private readonly ManagedFtsDetailLevel _detail;
     private readonly bool _columnSize;
     private readonly ManagedFtsScoringProfile _scoringProfile;
-    private readonly Dictionary<long, Document> _documents = [];
-    private readonly Dictionary<string, PostingList> _postings = new(StringComparer.Ordinal);
     private readonly long[] _columnTokenTotals;
-    private string[]? _sortedTerms;
-    private long _tombstonedPostings;
-    private long _generation;
 
     public ManagedFtsSearchIndex(
         int columnCount,
@@ -105,17 +100,30 @@ internal sealed class ManagedFtsSearchIndex
         _columnTokenTotals = new long[columnCount];
     }
 
+    /// <summary>Configuration-only copy used by <see cref="Fork"/>; storage is attached by the caller.</summary>
+    private ManagedFtsSearchIndex(ManagedFtsSearchIndex source)
+    {
+        _columnCount = source._columnCount;
+        _columnTokenizers = source._columnTokenizers;
+        _columnWeights = source._columnWeights;
+        _detail = source._detail;
+        _columnSize = source._columnSize;
+        _scoringProfile = source._scoringProfile;
+        _columnTokenTotals = new long[source._columnCount];
+        ColumnIndexResolver = source.ColumnIndexResolver;
+    }
+
     /// <summary>Live document count (tombstones excluded).</summary>
-    public int DocumentCount => _documents.Count;
+    public int DocumentCount => _documentCount;
 
     /// <summary>Distinct indexed terms, including terms whose postings are entirely tombstoned.</summary>
-    public int TermCount => _postings.Count;
+    public int TermCount => CountDistinctTerms();
 
     /// <summary>Posting entries that refer to deleted or superseded documents, awaiting compaction.</summary>
-    public long TombstonedPostings => _tombstonedPostings;
+    public long TombstonedPostings => _overlay.TombstonedPostings + SegmentTombstonedPostings();
 
     /// <summary>Total posting entries, live and tombstoned.</summary>
-    public long TotalPostings { get; private set; }
+    public long TotalPostings => _overlay.TotalPostings + SegmentPostings();
 
     /// <summary>The detail level this index was configured with.</summary>
     public ManagedFtsDetailLevel Detail => _detail;
@@ -126,34 +134,16 @@ internal sealed class ManagedFtsSearchIndex
     /// <summary>True when tombstones exceed the compaction threshold ported from Turso.</summary>
     public bool NeedsCompaction
         => TotalPostings > 0
-            && (double)_tombstonedPostings / TotalPostings >= DeletedDocumentsCompactionThreshold;
+            && (double)TombstonedPostings / TotalPostings >= DeletedDocumentsCompactionThreshold;
 
-    public bool ContainsDocument(long rowId) => _documents.ContainsKey(rowId);
+    public bool ContainsDocument(long rowId) => TryGetDocument(rowId, out _);
 
-    /// <summary>The base row this document was derived from, used for reference-identity refresh.</summary>
-    public bool TryGetSource(long rowId, out SqlValue[] source)
-    {
-        if (_documents.TryGetValue(rowId, out var document))
-        {
-            source = document.Source;
-            return true;
-        }
-
-        source = [];
-        return false;
-    }
-
-    public IEnumerable<long> RowIds => _documents.Keys;
+    public IEnumerable<long> RowIds => EnumerateLiveRowIds();
 
     public void Clear()
     {
-        _documents.Clear();
-        _postings.Clear();
-        Array.Clear(_columnTokenTotals);
-        _sortedTerms = null;
-        _tombstonedPostings = 0;
-        TotalPostings = 0;
-        _generation = 0;
+        lock (_sync)
+            ClearStorage();
     }
 
     /// <summary>
@@ -171,7 +161,8 @@ internal sealed class ManagedFtsSearchIndex
             throw new ArgumentException("Column value count does not match the index column count.", nameof(columnValues));
 
         var staged = Stage(columnValues);
-        Publish(rowId, source, staged);
+        lock (_sync)
+            Publish(rowId, staged);
     }
 
     /// <summary>
@@ -234,27 +225,39 @@ internal sealed class ManagedFtsSearchIndex
         return new StagedDocument(lengths, perTerm);
     }
 
-    private void Publish(long rowId, SqlValue[] source, StagedDocument staged)
+    private void Publish(long rowId, StagedDocument staged)
     {
-        // Remove first so a re-inserted rowid retires its previous postings, then take the new
+        if (_bulk is { } bulk)
+        {
+            if (bulk.TryAdd(rowId, staged))
+            {
+                AddDocumentStatistics(staged.ColumnLengths);
+                return;
+            }
+
+            // A rowid the bulk load already holds: fall back to ordinary upsert semantics.
+            FlushBulkBuilder();
+        }
+
+        // Remove first so a re-inserted rowid retires its previous image, then take the new
         // generation: readers compare a posting's generation against the live document's, so a
         // superseded posting is invisible immediately rather than only after compaction.
-        Remove(rowId);
+        RemoveCore(rowId);
+        EnsureOverlayWritable();
 
-        var generation = ++_generation;
-        for (var column = 0; column < _columnCount; column++)
-            _columnTokenTotals[column] += staged.ColumnLengths[column];
-
-        _documents.Add(
+        var overlay = _overlay;
+        var generation = ++overlay.Generation;
+        AddDocumentStatistics(staged.ColumnLengths);
+        overlay.Documents.Add(
             rowId,
-            new Document(rowId, source, staged.ColumnLengths, staged.Terms.Count, generation));
+            new Document(rowId, staged.ColumnLengths, staged.Terms.Count, generation));
         foreach (var (term, occurrence) in staged.Terms)
         {
-            if (!_postings.TryGetValue(term, out var list))
+            if (!overlay.Postings.TryGetValue(term, out var list))
             {
                 list = new PostingList();
-                _postings.Add(term, list);
-                _sortedTerms = null;
+                overlay.Postings.Add(term, list);
+                overlay.InvalidateSortedTerms();
             }
 
             var positions = Array.Empty<long>();
@@ -287,52 +290,28 @@ internal sealed class ManagedFtsSearchIndex
                 occurrence.ColumnMask,
                 positions,
                 columnFrequencies));
-            TotalPostings++;
+            overlay.TotalPostings++;
         }
+
+        FreezeIfNeeded();
     }
 
     /// <summary>
-    /// Removes one document. Postings are left in place as tombstones and skipped by every reader
-    /// (through the generation stamp) until <see cref="Compact"/> physically purges them.
+    /// Removes one document. Its postings stay physically present as tombstones — superseded
+    /// overlay entries, or a deleted rowid in a segment's view — and are skipped by every reader until
+    /// <see cref="Compact"/> or a segment merge purges them.
     /// </summary>
     public bool Remove(long rowId)
     {
-        if (!_documents.Remove(rowId, out var document))
-            return false;
-
-        for (var column = 0; column < _columnCount; column++)
-            _columnTokenTotals[column] -= document.ColumnLengths[column];
-
-        // Cheap delete: the posting entries become tombstones, discovered by readers through the
-        // generation check and reclaimed by compaction.
-        _tombstonedPostings += document.PostingCount;
-        return true;
+        lock (_sync)
+            return RemoveCore(rowId);
     }
 
-    /// <summary>Physically purges tombstoned postings and drops terms that became empty.</summary>
+    /// <summary>Merges every segment and the overlay into one segment and purges all tombstones.</summary>
     public int Compact()
     {
-        if (_tombstonedPostings == 0)
-            return 0;
-
-        var removed = 0;
-        var emptyTerms = new List<string>();
-        foreach (var (term, list) in _postings)
-        {
-            removed += list.Purge(_documents);
-            if (list.Count == 0)
-                emptyTerms.Add(term);
-        }
-
-        foreach (var term in emptyTerms)
-            _postings.Remove(term);
-
-        if (emptyTerms.Count > 0)
-            _sortedTerms = null;
-
-        TotalPostings -= removed;
-        _tombstonedPostings = 0;
-        return removed;
+        lock (_sync)
+            return CompactStorage();
     }
 
     /// <summary>Evaluates a parsed query and returns hits ordered by score desc, rowid asc.</summary>
@@ -415,7 +394,7 @@ internal sealed class ManagedFtsSearchIndex
     public bool Matches(ManagedFtsNode query, long rowId)
     {
         ArgumentNullException.ThrowIfNull(query);
-        return _documents.ContainsKey(rowId)
+        return ContainsDocument(rowId)
             && Evaluate(query, null, _columnWeights).Contains(rowId);
     }
 
@@ -513,17 +492,14 @@ internal sealed class ManagedFtsSearchIndex
         var matches = new HashSet<long>();
         foreach (var expanded in ExpandTerm(term))
         {
-            if (!_postings.TryGetValue(expanded, out var list))
-                continue;
-
             var candidates = new List<ScoreCandidate>();
-            foreach (var posting in list.Entries)
+            foreach (var posting in EnumerateLivePostings(expanded))
             {
-                if (!IsLive(posting) || (posting.ColumnMask & columnMask) == 0)
+                if ((posting.ColumnMask & columnMask) == 0)
                     continue;
 
                 var frequency = term.AnchoredAtStart
-                    ? CountAnchored(posting.Positions, columnMask)
+                    ? CountAnchored(posting.Positions.Span, columnMask)
                     : CountInColumns(posting, columnMask);
                 if (frequency == 0)
                     continue;
@@ -532,7 +508,7 @@ internal sealed class ManagedFtsSearchIndex
                     posting.RowId,
                     frequency,
                     term.AnchoredAtStart
-                        ? posting.Positions
+                        ? posting.Positions.ToArray()
                             .Where(encoded => (encoded & 0xFFFFFFFFL) == 0
                                 && (columnMask & (1u << (int)(encoded >> 32))) != 0)
                             .ToArray()
@@ -558,16 +534,13 @@ internal sealed class ManagedFtsSearchIndex
         var aggregates = new Dictionary<long, PrefixScoreCandidate>();
         foreach (var expanded in ExpandTerm(term))
         {
-            if (!_postings.TryGetValue(expanded, out var list))
-                continue;
-
-            foreach (var posting in list.Entries)
+            foreach (var posting in EnumerateLivePostings(expanded))
             {
-                if (!IsLive(posting) || (posting.ColumnMask & columnMask) == 0)
+                if ((posting.ColumnMask & columnMask) == 0)
                     continue;
 
                 var frequency = term.AnchoredAtStart
-                    ? CountAnchored(posting.Positions, columnMask)
+                    ? CountAnchored(posting.Positions.Span, columnMask)
                     : CountInColumns(posting, columnMask);
                 if (frequency == 0)
                     continue;
@@ -582,7 +555,7 @@ internal sealed class ManagedFtsSearchIndex
                 aggregate.ColumnMask |= posting.ColumnMask & columnMask;
                 if (posting.Positions.Length != 0)
                 {
-                    foreach (var encoded in posting.Positions)
+                    foreach (var encoded in posting.Positions.Span)
                     {
                         var bit = 1u << (int)(encoded >> 32);
                         if ((columnMask & bit) != 0
@@ -601,7 +574,7 @@ internal sealed class ManagedFtsSearchIndex
                         if ((posting.ColumnMask & bit) == 0)
                             continue;
                         if ((columnMask & bit) != 0)
-                            aggregate.ColumnFrequencies[column] += posting.ColumnFrequencies[next];
+                            aggregate.ColumnFrequencies[column] += posting.ColumnFrequencies.Span[next];
                         next++;
                     }
                 }
@@ -691,7 +664,7 @@ internal sealed class ManagedFtsSearchIndex
                 continue;
 
             matches.Add(rowId);
-            candidates.Add(new ScoreCandidate(rowId, frequency, [], [], columnMask));
+            candidates.Add(new ScoreCandidate(rowId, frequency, ReadOnlyMemory<long>.Empty, ReadOnlyMemory<int>.Empty, columnMask));
         }
 
         if (accumulator is not null)
@@ -781,23 +754,17 @@ internal sealed class ManagedFtsSearchIndex
             _ => throw new EmbeddedSqlException($"unknown fts detail level: {value}"),
         };
 
-    private bool IsLive(in Posting posting)
-        => _documents.TryGetValue(posting.RowId, out var document) && document.Generation == posting.Generation;
-
     private IEnumerable<long> IntersectTerms(IReadOnlyList<string> terms)
     {
         HashSet<long>? candidates = null;
         foreach (var term in terms)
         {
-            if (!_postings.TryGetValue(term, out var list))
-                return [];
-
             var rowIds = new HashSet<long>();
-            foreach (var posting in list.Entries)
-            {
-                if (IsLive(posting))
-                    rowIds.Add(posting.RowId);
-            }
+            foreach (var posting in EnumerateLivePostings(term))
+                rowIds.Add(posting.RowId);
+
+            if (rowIds.Count == 0)
+                return [];
 
             if (candidates is null)
                 candidates = rowIds;
@@ -845,14 +812,8 @@ internal sealed class ManagedFtsSearchIndex
                 : [phraseTerm.Text];
             foreach (var term in terms)
             {
-                if (!_postings.TryGetValue(term, out var list))
-                    continue;
-
-                foreach (var posting in list.Entries)
-                {
-                    if (IsLive(posting))
-                        termRows.Add(posting.RowId);
-                }
+                foreach (var posting in EnumerateLivePostings(term))
+                    termRows.Add(posting.RowId);
             }
 
             if (candidates is null)
@@ -876,7 +837,7 @@ internal sealed class ManagedFtsSearchIndex
         if (phrase.Terms.Count == 0)
             return [];
 
-        var streams = new long[phrase.Terms.Count][];
+        var streams = new ReadOnlyMemory<long>[phrase.Terms.Count];
         for (var index = 0; index < phrase.Terms.Count; index++)
         {
             var phraseTerm = phrase.Terms[index];
@@ -897,7 +858,7 @@ internal sealed class ManagedFtsSearchIndex
         }
 
         var occurrences = new List<PhraseOccurrence>();
-        foreach (var start in streams[0])
+        foreach (var start in streams[0].Span)
         {
             var column = (int)(start >> 32);
             var position = (int)(start & 0xFFFFFFFFL);
@@ -907,7 +868,7 @@ internal sealed class ManagedFtsSearchIndex
             var matched = true;
             for (var index = 1; index < streams.Length; index++)
             {
-                if (Array.BinarySearch(streams[index], start + index) < 0)
+                if (streams[index].Span.BinarySearch(start + index) < 0)
                 {
                     matched = false;
                     break;
@@ -936,7 +897,7 @@ internal sealed class ManagedFtsSearchIndex
                      AnchoredAtStart: false)))
         {
             if (TryGetPositions(expanded, rowId, out var expandedPositions))
-                positions.AddRange(expandedPositions);
+                positions.AddRange(expandedPositions.Span);
         }
 
         positions.Sort();
@@ -957,7 +918,7 @@ internal sealed class ManagedFtsSearchIndex
                 compact[next++] = frequency;
         }
 
-        return new ScoreCandidate(rowId, total, [], compact, columnMask);
+        return new ScoreCandidate(rowId, total, ReadOnlyMemory<long>.Empty, compact, columnMask);
     }
 
     private uint GetFrequencyColumnMask(IReadOnlyList<int> frequencies)
@@ -993,7 +954,7 @@ internal sealed class ManagedFtsSearchIndex
 
     private int CountNear(long rowId, IReadOnlyList<string> terms, int distance, uint columnMask)
     {
-        var streams = new long[terms.Count][];
+        var streams = new ReadOnlyMemory<long>[terms.Count];
         for (var index = 0; index < terms.Count; index++)
         {
             if (!TryGetPositions(terms[index], rowId, out var positions))
@@ -1003,7 +964,7 @@ internal sealed class ManagedFtsSearchIndex
         }
 
         var count = 0;
-        foreach (var anchor in streams[0])
+        foreach (var anchor in streams[0].Span)
         {
             var column = (int)(anchor >> 32);
             if ((columnMask & (1u << column)) == 0)
@@ -1013,7 +974,7 @@ internal sealed class ManagedFtsSearchIndex
             var matched = true;
             for (var index = 1; index < streams.Length; index++)
             {
-                if (!HasPositionWithin(streams[index], column, anchorPosition, distance))
+                if (!HasPositionWithin(streams[index].Span, column, anchorPosition, distance))
                 {
                     matched = false;
                     break;
@@ -1161,7 +1122,7 @@ internal sealed class ManagedFtsSearchIndex
         ranges[^1] = new OccurrenceRange(previous.Start, Math.Max(previous.End, next.End));
     }
 
-    private static bool HasPositionWithin(long[] positions, int column, int anchorPosition, int distance)
+    private static bool HasPositionWithin(ReadOnlySpan<long> positions, int column, int anchorPosition, int distance)
     {
         var low = EncodePosition(column, Math.Max(anchorPosition - distance, 0));
         var high = EncodePosition(column, anchorPosition + distance);
@@ -1169,7 +1130,7 @@ internal sealed class ManagedFtsSearchIndex
         return start < positions.Length && positions[start] <= high;
     }
 
-    private static int LowerBound(long[] values, long target)
+    private static int LowerBound(ReadOnlySpan<long> values, long target)
     {
         var low = 0;
         var high = values.Length;
@@ -1185,17 +1146,15 @@ internal sealed class ManagedFtsSearchIndex
         return low;
     }
 
-    private bool TryGetPositions(string term, long rowId, out long[] positions)
+    private bool TryGetPositions(string term, long rowId, out ReadOnlyMemory<long> positions)
     {
-        if (_postings.TryGetValue(term, out var list)
-            && list.TryGet(rowId, out var posting)
-            && IsLive(posting))
+        if (TryGetLivePosting(term, rowId, out var posting))
         {
             positions = posting.Positions;
             return true;
         }
 
-        positions = [];
+        positions = ReadOnlyMemory<long>.Empty;
         return false;
     }
 
@@ -1212,51 +1171,17 @@ internal sealed class ManagedFtsSearchIndex
 
         // Stale terms must not consume the expansion budget: a term whose only postings are
         // tombstones is not a live term and could otherwise make a legitimate prefix query fail.
-        PurgeStaleTermsForExpansion();
-
-        var sorted = GetSortedTerms();
-        var start = Array.BinarySearch(sorted, term.Text, StringComparer.Ordinal);
-        if (start < 0)
-            start = ~start;
-
         var produced = 0;
-        for (var index = start; index < sorted.Length; index++)
+        foreach (var expanded in EnumerateLiveTermsWithPrefix(term.Text))
         {
-            if (!sorted[index].StartsWith(term.Text, StringComparison.Ordinal))
-                yield break;
-
             if (++produced > ManagedFtsLimits.MaxPrefixTerms)
             {
                 throw new EmbeddedSqlException(
                     $"fts prefix term '{term.Text}*' expands to more than {ManagedFtsLimits.MaxPrefixTerms} terms");
             }
 
-            yield return sorted[index];
+            yield return expanded;
         }
-    }
-
-    /// <summary>
-    /// Drops terms whose postings are all tombstoned, so prefix expansion counts live terms only.
-    /// This is the same physical purge <see cref="Compact"/> performs; it is run here regardless of
-    /// the merge threshold because correctness of the limit, not throughput, is at stake.
-    /// </summary>
-    private void PurgeStaleTermsForExpansion()
-    {
-        if (_tombstonedPostings == 0)
-            return;
-
-        Compact();
-    }
-
-    private string[] GetSortedTerms()
-    {
-        if (_sortedTerms is { } cached)
-            return cached;
-
-        var terms = _postings.Keys.ToArray();
-        Array.Sort(terms, StringComparer.Ordinal);
-        _sortedTerms = terms;
-        return terms;
     }
 
     private void Accumulate(
@@ -1269,7 +1194,7 @@ internal sealed class ManagedFtsSearchIndex
         if (candidates.Count == 0)
             return;
 
-        var documentCount = _documents.Count;
+        var documentCount = _documentCount;
         var idf = _scoringProfile == ManagedFtsScoringProfile.SqliteFts5
             ? Math.Max(
                 0.000001,
@@ -1277,7 +1202,7 @@ internal sealed class ManagedFtsSearchIndex
             : Math.Log(1.0 + ((documentCount - candidates.Count + 0.5) / (candidates.Count + 0.5)));
         foreach (var originalCandidate in candidates)
         {
-            if (!_documents.TryGetValue(originalCandidate.RowId, out var document))
+            if (!TryGetDocument(originalCandidate.RowId, out var document))
                 continue;
 
             var candidate = originalCandidate;
@@ -1305,7 +1230,7 @@ internal sealed class ManagedFtsSearchIndex
             {
                 score = ScorePerColumn(
                     document,
-                    candidate.Positions,
+                    candidate.Positions.Span,
                     idf,
                     effectiveColumnMask,
                     columnWeights);
@@ -1346,7 +1271,7 @@ internal sealed class ManagedFtsSearchIndex
         if (candidate.Positions.Length != 0)
         {
             Span<int> perColumn = stackalloc int[_columnCount];
-            foreach (var encoded in candidate.Positions)
+            foreach (var encoded in candidate.Positions.Span)
             {
                 var column = (int)(encoded >> 32);
                 if ((columnMask & (1u << column)) != 0)
@@ -1367,7 +1292,7 @@ internal sealed class ManagedFtsSearchIndex
                 if ((candidate.PostingColumnMask & bit) == 0)
                     continue;
 
-                var frequency = candidate.ColumnFrequencies[next++];
+                var frequency = candidate.ColumnFrequencies.Span[next++];
                 if ((columnMask & bit) != 0)
                     weightedFrequency += frequency * columnWeights[column];
             }
@@ -1393,7 +1318,7 @@ internal sealed class ManagedFtsSearchIndex
         var totalTokens = 0L;
         foreach (var total in _columnTokenTotals)
             totalTokens += total;
-        var averageLength = _documents.Count == 0 ? 0.0 : (double)totalTokens / _documents.Count;
+        var averageLength = _documentCount == 0 ? 0.0 : (double)totalTokens / _documentCount;
         var normalization = averageLength <= 0.0
             ? 1.0
             : 1.0 - BM25B + (BM25B * documentLength / averageLength);
@@ -1428,7 +1353,7 @@ internal sealed class ManagedFtsSearchIndex
             if ((candidate.PostingColumnMask & bit) == 0)
                 continue;
 
-            var frequency = candidate.ColumnFrequencies[next++];
+            var frequency = candidate.ColumnFrequencies.Span[next++];
             if ((columnMask & bit) == 0 || frequency == 0)
                 continue;
 
@@ -1440,7 +1365,7 @@ internal sealed class ManagedFtsSearchIndex
 
     private double ScorePerColumn(
         Document document,
-        long[] positions,
+        ReadOnlySpan<long> positions,
         double idf,
         uint columnMask,
         IReadOnlyList<double> columnWeights)
@@ -1502,9 +1427,9 @@ internal sealed class ManagedFtsSearchIndex
         if (!_columnSize)
             return frequency * (BM25K1 + 1.0) / (frequency + BM25K1);
 
-        var averageLength = _documents.Count == 0
+        var averageLength = _documentCount == 0
             ? 0.0
-            : (double)_columnTokenTotals[column] / _documents.Count;
+            : (double)_columnTokenTotals[column] / _documentCount;
         var normalization = averageLength <= 0.0
             ? 1.0
             : 1.0 - BM25B + (BM25B * documentLength / averageLength);
@@ -1541,7 +1466,7 @@ internal sealed class ManagedFtsSearchIndex
         if (posting.Positions.Length != 0)
         {
             var count = 0;
-            foreach (var encoded in posting.Positions)
+            foreach (var encoded in posting.Positions.Span)
             {
                 if ((columnMask & (1u << (int)(encoded >> 32))) != 0)
                     count++;
@@ -1563,7 +1488,7 @@ internal sealed class ManagedFtsSearchIndex
                 if ((posting.ColumnMask & bit) == 0)
                     continue;
                 if ((columnMask & bit) != 0)
-                    count += posting.ColumnFrequencies[next];
+                    count += posting.ColumnFrequencies.Span[next];
                 next++;
             }
 
@@ -1577,7 +1502,7 @@ internal sealed class ManagedFtsSearchIndex
             "fts index does not record column attribution, so a column-filtered term cannot be scored");
     }
 
-    private static int CountAnchored(long[] positions, uint columnMask)
+    private static int CountAnchored(ReadOnlySpan<long> positions, uint columnMask)
     {
         var count = 0;
         foreach (var encoded in positions)
@@ -1603,7 +1528,7 @@ internal sealed class ManagedFtsSearchIndex
 
     private HashSet<long> Exclude(HashSet<long> excluded)
     {
-        var result = new HashSet<long>(_documents.Keys);
+        var result = new HashSet<long>(EnumerateLiveRowIds());
         result.ExceptWith(excluded);
         return result;
     }
@@ -1661,7 +1586,6 @@ internal sealed class ManagedFtsSearchIndex
 
     private sealed record Document(
         long RowId,
-        SqlValue[] Source,
         int[] ColumnLengths,
         int PostingCount,
         long Generation);
@@ -1692,8 +1616,8 @@ internal sealed class ManagedFtsSearchIndex
         long Generation,
         int Frequency,
         uint ColumnMask,
-        long[] Positions,
-        int[] ColumnFrequencies);
+        ReadOnlyMemory<long> Positions,
+        ReadOnlyMemory<int> ColumnFrequencies);
 
     private readonly record struct PhraseOccurrence(int Column, int StartPosition, int EndPosition);
 
@@ -1713,8 +1637,8 @@ internal sealed class ManagedFtsSearchIndex
     private readonly record struct ScoreCandidate(
         long RowId,
         int Frequency,
-        long[] Positions,
-        int[] ColumnFrequencies,
+        ReadOnlyMemory<long> Positions,
+        ReadOnlyMemory<int> ColumnFrequencies,
         uint PostingColumnMask);
 
     private sealed class PrefixScoreCandidate(int columnCount)
@@ -1752,32 +1676,13 @@ internal sealed class ManagedFtsSearchIndex
             return false;
         }
 
-        public int Purge(Dictionary<long, Document> liveDocuments)
+        public PostingList Clone()
         {
-            var removed = 0;
-            var write = 0;
-            for (var read = 0; read < _entries.Count; read++)
-            {
-                var entry = _entries[read];
-                if (!liveDocuments.TryGetValue(entry.RowId, out var document)
-                    || document.Generation != entry.Generation)
-                {
-                    removed++;
-                    continue;
-                }
-
-                _entries[write++] = entry;
-            }
-
-            if (removed == 0)
-                return 0;
-
-            _entries.RemoveRange(write, _entries.Count - write);
-            _byRowId.Clear();
-            for (var index = 0; index < _entries.Count; index++)
-                _byRowId[_entries[index].RowId] = index;
-
-            return removed;
+            var clone = new PostingList();
+            clone._entries.AddRange(_entries);
+            foreach (var (rowId, index) in _byRowId)
+                clone._byRowId.Add(rowId, index);
+            return clone;
         }
     }
 }

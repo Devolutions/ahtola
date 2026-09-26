@@ -20,9 +20,12 @@ namespace Ahtola.Core.Indexing;
 /// full rebuild, never a stale answer.
 /// </para>
 /// <para>
-/// The journal is deliberately not copied by <c>EmbeddedTable</c>'s clone/snapshot paths. A catalog
-/// snapshot forks its method attachments into empty ones, so the restored attachment rebuilds from
-/// the restored rows and no pre-rollback delta can ever be replayed against post-rollback state.
+/// A table clone that preserves its source's row revision and storage lineage (the per-statement
+/// and per-transaction working copies) receives an independent <see cref="Clone"/> of the journal
+/// together with state-carrying attachment forks, so the pair stays consistent with the copied rows
+/// and later writes on either side cannot leak into the other. Any other clone gets empty forks and
+/// a fresh journal, so it rebuilds from its own rows and no delta recorded against different rows
+/// can ever be replayed onto it.
 /// </para>
 /// </remarks>
 internal sealed class ManagedIndexMethodJournal
@@ -57,12 +60,44 @@ internal sealed class ManagedIndexMethodJournal
         if (revision > _coveredRevision)
             _coveredRevision = revision;
 
+        TrimRetainedEntries();
+    }
+
+    private void TrimRetainedEntries()
+    {
         if (_entries.Count > MaxRetainedEntries)
         {
             var drop = _entries.Count / 2;
             _oldestValidRevision = Math.Max(_oldestValidRevision, _entries[drop - 1].Revision);
             _entries.RemoveRange(0, drop);
         }
+    }
+
+    /// <summary>
+    /// Records a bulk row-store rewrite whose complete change set the caller knows exactly: every
+    /// revision bump from <paramref name="revisionBeforeRewrite"/> to <paramref name="revision"/> belongs to it, and
+    /// <paramref name="rowIds"/> names every rowid whose image it changed.
+    /// </summary>
+    /// <remarks>
+    /// A statement that replaces the whole row list in one step (UPDATE swaps in its fully validated
+    /// post-update image) bumps the revision once per row it re-adds, not once per row it changed,
+    /// so the ordinary per-row <see cref="Record"/> would read the jump as an unreported mutation and
+    /// poison the journal. The caller must invoke this immediately after the rewrite, before any
+    /// other mutation, which is what makes attributing all of those bumps to the named rowids sound.
+    /// </remarks>
+    public void RecordBulk(IEnumerable<long> rowIds, long revisionBeforeRewrite, long revision)
+    {
+        // Only the rewrite's own bumps are vouched for: anything unreported before it still poisons.
+        if (revisionBeforeRewrite > _coveredRevision)
+            _poisoned = true;
+
+        foreach (var rowId in rowIds)
+            _entries.Add(new Entry(rowId, revision));
+
+        if (revision > _coveredRevision)
+            _coveredRevision = revision;
+
+        TrimRetainedEntries();
     }
 
     /// <summary>
@@ -115,6 +150,18 @@ internal sealed class ManagedIndexMethodJournal
             return null;
 
         return new ManagedIndexSourceDelta(currentRevision, changed);
+    }
+
+    /// <summary>An independent copy: later records on either journal are invisible to the other.</summary>
+    public ManagedIndexMethodJournal Clone()
+    {
+        var clone = new ManagedIndexMethodJournal(_coveredRevision)
+        {
+            _oldestValidRevision = _oldestValidRevision,
+            _poisoned = _poisoned,
+        };
+        clone._entries.AddRange(_entries);
+        return clone;
     }
 
     private readonly record struct Entry(long RowId, long Revision);

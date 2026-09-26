@@ -363,6 +363,22 @@ against the on-disk checksum chain again before decryption. A clean,
 authoritative WAL-mode main database can open without a WAL; if its header
 requires WAL recovery and the WAL is missing, open fails.
 
+## Full-text search
+
+`CREATE INDEX … USING fts`, `fts_match`, `fts_score`, `fts_highlight`, `MATCH` and
+`OPTIMIZE INDEX` work in the browser exactly as on the desktop — the pinned Turso
+release compiles its Tantivy-backed FTS out of every WebAssembly build, but Ahtola's
+index is pure managed code. The package lane exercises it over OPFS, including a
+reopen that rebuilds the postings from the persisted rows (see
+`RunPersistentFullTextSearchAsync` in `samples/BrowserWasmConsumer/App.razor`).
+
+- Tokenization reads a pinned Unicode 16.0 table instead of the runtime's ICU, so it is
+  identical in globalization-invariant and hybrid-globalization builds.
+- The postings are derived state held in memory next to the database image: plan for
+  about 20 bytes plus 8 per token position per indexed term occurrence, and a one-pass
+  rebuild the first time an index is queried after the database is opened.
+- Bounded scan connections do not plan FTS queries; use an ordinary connection.
+
 ## EF Core
 
 Create and asynchronously open a browser connection, then give that existing

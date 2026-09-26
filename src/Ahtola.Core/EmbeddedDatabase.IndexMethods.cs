@@ -22,6 +22,7 @@ internal sealed class ManagedIndexMethodScanBinding
 {
     private readonly Dictionary<QueryKey, IReadOnlyList<ManagedIndexMethodResultRow>> _results = [];
     private readonly Dictionary<QueryKey, Dictionary<long, SqlValue>> _rankByRowId = [];
+    private readonly Dictionary<QueryKey, HashSet<long>> _membership = [];
 
     public ManagedIndexMethodScanBinding(
         string tableName,
@@ -83,6 +84,48 @@ internal sealed class ManagedIndexMethodScanBinding
     }
 
     /// <summary>
+    /// Whether <paramref name="rowId"/> is in the complete match set of a filtering pattern this
+    /// statement already ran for <paramref name="argument"/>. Returns false, without running
+    /// anything, when no such result exists yet.
+    /// </summary>
+    /// <remarks>
+    /// The WHERE clause is re-applied to every row a method scan produced, so each of those rows
+    /// re-evaluates the very predicate the scan just answered. Only an unlimited filtering pattern
+    /// holds the complete match set; a ranking-only or limited result proves nothing about a row it
+    /// omitted, so neither is consulted.
+    /// </remarks>
+    public bool TryGetExecutedMembership(SqlValue argument, long rowId, out bool member)
+    {
+        member = false;
+        if (_results.Count == 0)
+            return false;
+
+        var described = DescribeArgument(argument);
+        foreach (var (key, rows) in _results)
+        {
+            if (key.Limit is not null
+                || !string.Equals(key.Argument, described, StringComparison.Ordinal)
+                || ManagedIndexPatternShapes.IsRankingOnly(Attachment.Definition.Patterns[key.PatternIndex].Shape))
+            {
+                continue;
+            }
+
+            if (!_membership.TryGetValue(key, out var set))
+            {
+                set = new HashSet<long>(rows.Count);
+                foreach (var row in rows)
+                    set.Add(row.RowId);
+                _membership.Add(key, set);
+            }
+
+            member = set.Contains(rowId);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// A stable memo key for any argument value. Method arguments are not necessarily text — a
     /// vector method receives a blob — so the key has to describe the value's type as well as its
     /// contents, or two differently typed arguments with the same rendering would collide.
@@ -137,6 +180,20 @@ internal sealed class ManagedIndexMethodScanCache
     /// Only the access path that was actually selected, and a scalar call that actually needs a
     /// corpus rank, reach this. Planning deliberately does not.
     /// </remarks>
+    /// <summary>The binding this statement already opened for an index, without opening one.</summary>
+    public bool TryGetOpened(string tableName, EmbeddedTable table, EmbeddedIndex index, out ManagedIndexMethodScanBinding binding)
+    {
+        if (_bindings.TryGetValue(BuildKey(tableName, index), out binding!)
+            && ReferenceEquals(binding.Index, index)
+            && ReferenceEquals(binding.Table, table))
+        {
+            return true;
+        }
+
+        binding = null!;
+        return false;
+    }
+
     public ManagedIndexMethodScanBinding GetOrOpen(string tableName, EmbeddedTable table, EmbeddedIndex index)
     {
         // Key on table + index: two tables may legitimately carry indexes with the same name in
@@ -365,6 +422,9 @@ public sealed partial class EmbeddedDatabase
     /// </remarks>
     private bool IsShadowedMethodFunction(string name)
     {
+        if (!_hasScalarFunctions)
+            return false;
+
         lock (_gate)
         {
             foreach (var (registeredName, _) in _scalarFunctions)
@@ -529,23 +589,49 @@ public sealed partial class EmbeddedDatabase
         // plan-specific work: choosing an index must never convert an error into a row set.
         plan.ValidateArgument?.Invoke(queryValue);
 
-        var rowPositions = new Dictionary<long, int>(table.Rows.Count);
-        var orderedRowIds = new List<long>(table.Rows.Count);
-        for (var position = 0; position < table.Rows.Count; position++)
+        // Hits are mapped back to base-row positions through the table's own rowid lookup, which is
+        // cached across statements and validated against the live rowid list, so a selective query
+        // costs O(hits) rather than O(table). Tables without that lookup fall back to one map.
+        Dictionary<long, int>? rowPositions = null;
+        var useTableLookup = table.HasRowid && table.RowIds.Count == table.Rows.Count;
+        bool TryGetPosition(long rowId, out int position)
         {
-            var rowId = position < table.RowIds.Count ? table.RowIds[position] : position + 1L;
-            rowPositions[rowId] = position;
-            orderedRowIds.Add(rowId);
+            if (useTableLookup)
+            {
+                position = table.TryGetRowIdPosition(rowId, out _);
+                return position >= 0;
+            }
+
+            if (rowPositions is null)
+            {
+                rowPositions = new Dictionary<long, int>(table.Rows.Count);
+                for (var index = 0; index < table.Rows.Count; index++)
+                    rowPositions[index < table.RowIds.Count ? table.RowIds[index] : index + 1L] = index;
+            }
+
+            return rowPositions.TryGetValue(rowId, out position);
         }
 
         // An ordinary table scan rewinds a b-tree cursor to its smallest integer key, so it produces
         // rows in ascending rowid order regardless of the order they were inserted in or the order
-        // the evaluator's heap-backed row list happens to hold them in. This path has to emit the
-        // rows it did not rank in exactly that order: a stable ORDER BY keeps its input order among
-        // equal keys, so appending them in storage order would make a tie at the LIMIT boundary
-        // resolve differently here than on the scan — and differently again after a reopen, which
-        // reloads the rows in b-tree order.
-        orderedRowIds.Sort();
+        // the evaluator's heap-backed row list happens to hold them in. A plan that has to emit the
+        // rows it did not rank must emit them in exactly that order: a stable ORDER BY keeps its
+        // input order among equal keys, so appending them in storage order would make a tie at the
+        // LIMIT boundary resolve differently here than on the scan — and differently again after a
+        // reopen, which reloads the rows in b-tree order. Only those plans pay for the sorted list.
+        List<long>? orderedRowIdList = null;
+        List<long> OrderedRowIds()
+        {
+            if (orderedRowIdList is null)
+            {
+                orderedRowIdList = new List<long>(table.Rows.Count);
+                for (var index = 0; index < table.Rows.Count; index++)
+                    orderedRowIdList.Add(index < table.RowIds.Count ? table.RowIds[index] : index + 1L);
+                orderedRowIdList.Sort();
+            }
+
+            return orderedRowIdList;
+        }
 
         IReadOnlyList<ManagedIndexMethodResultRow> ranked;
         var retainUnranked = plan.RetainsUnrankedRows;
@@ -595,6 +681,7 @@ public sealed partial class EmbeddedDatabase
         // storage order instead of the lowest rowid an unindexed scan of the same statement keeps.
         if (!plan.FiltersRows && retainUnranked && plan.UnrankedMergePolicy == ManagedIndexUnrankedMergePolicy.MergeByDescendingRank)
         {
+            var orderedRowIds = OrderedRowIds();
             var merged = new List<(double Rank, long RowId)>(ranked.Count + orderedRowIds.Count);
             foreach (var hit in ranked)
             {
@@ -632,7 +719,7 @@ public sealed partial class EmbeddedDatabase
                 context.CheckInterrupt();
                 if (sourceMaximumRows is { } cap && rows.Count >= cap)
                     break;
-                if (!rowPositions.TryGetValue(rowId, out var position))
+                if (!TryGetPosition(rowId, out var position))
                     continue;
 
                 rows.Add(CreateMethodIndexRow(table, position, rowId, qualifier, qualifiedColumns, qualifiedColumnDefinitions, outerRow, methodIndexSource));
@@ -646,7 +733,7 @@ public sealed partial class EmbeddedDatabase
             context.CheckInterrupt();
             if (sourceMaximumRows is { } cap && rows.Count >= cap)
                 return new SourceData(table.Columns, rows);
-            if (!rowPositions.TryGetValue(hit.RowId, out var position) || !emitted.Add(hit.RowId))
+            if (!TryGetPosition(hit.RowId, out var position) || !emitted.Add(hit.RowId))
                 continue;
 
             rows.Add(CreateMethodIndexRow(table, position, hit.RowId, qualifier, qualifiedColumns, qualifiedColumnDefinitions, outerRow, methodIndexSource));
@@ -660,12 +747,12 @@ public sealed partial class EmbeddedDatabase
         if (!retainUnranked)
             return new SourceData(table.Columns, rows);
 
-        foreach (var rowId in orderedRowIds)
+        foreach (var rowId in OrderedRowIds())
         {
             context.CheckInterrupt();
             if (sourceMaximumRows is { } cap && rows.Count >= cap)
                 break;
-            if (!emitted.Add(rowId) || !rowPositions.TryGetValue(rowId, out var position))
+            if (!emitted.Add(rowId) || !TryGetPosition(rowId, out var position))
                 continue;
 
             rows.Add(CreateMethodIndexRow(table, position, rowId, qualifier, qualifiedColumns, qualifiedColumnDefinitions, outerRow, methodIndexSource));
@@ -843,10 +930,166 @@ public sealed partial class EmbeddedDatabase
     /// method index, never pays for the full planner probe.
     /// </remarks>
     private bool ShouldDeferSelectToMethodIndexPlan(SelectStatement select, QueryContext context)
-        => select.Source is NamedTableSource named
-            && named.IndexDirective is null
-            && TryResolveMethodIndexTable(named, context, out _, out _)
-            && TryPlanMethodIndexScanForSelect(select, context, out _);
+        => select.Source switch
+        {
+            NamedTableSource named => named.IndexDirective is null
+                && TryResolveMethodIndexTable(named, context, out _, out _)
+                && TryPlanMethodIndexScanForSelect(select, context, out _),
+            JoinTableSource join => select.Where is not null
+                && JoinReferencesMethodIndexedTable(join, context)
+                && TryDescribeMethodIndexJoinPlan(select, context, out _),
+            _ => false,
+        };
+
+    /// <summary>Cheap gate: true when some named arm of the join is a table carrying a method index.</summary>
+    private static bool JoinReferencesMethodIndexedTable(JoinTableSource join, QueryContext context)
+    {
+        foreach (var side in new[] { join.Left, join.Right })
+        {
+            if (side is JoinTableSource nested && JoinReferencesMethodIndexedTable(nested, context))
+                return true;
+            if (side is NamedTableSource named && TryResolveMethodIndexTable(named, context, out _, out _))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Describes the per-arm access paths of an evaluator join in which WHERE pushdown lets a method
+    /// index serve at least one arm.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Upstream collects index-method candidates for every join arm and lets join ordering pick them
+    /// (<c>turso-src/core/translate/optimizer/mod.rs</c>, <c>collect_index_method_candidates</c>).
+    /// The managed evaluator materializes each arm once — the left arm drives, the right arm is
+    /// hashed or scanned — after pushing each preserved side's own WHERE conjuncts into it, so a
+    /// method-owned conjunct such as <c>fts_match(a.title, a.body, ?)</c> reaches that arm's method
+    /// index exactly as it would in a single-table query.
+    /// </para>
+    /// <para>
+    /// The steps mirror <c>GetJoinRowsWithPredicatePushdown</c> and <c>GetSideSourceRows</c> in
+    /// order: an ordinary managed index plan wins first, then the method index, then a scan. Any
+    /// arm whose path this cannot prove (a view, a CTE, a virtual table, a subquery, a transient
+    /// equality probe, a semi/anti join) makes it decline, so the caller keeps reporting the
+    /// generic placeholder instead of a plan that might not be the one that runs. One adaptive
+    /// choice stays runtime-only: when the driving arm yields at most one row, the right arm may
+    /// probe a declared index instead of being scanned, which changes cost but never rows.
+    /// </para>
+    /// </remarks>
+    private bool TryDescribeMethodIndexJoinPlan(
+        SelectStatement select,
+        QueryContext context,
+        out IReadOnlyList<(string Detail, EqpJsonOp Op)> steps)
+    {
+        steps = [];
+        if (select.Source is not JoinTableSource join || select.Where is null)
+            return false;
+
+        var described = new List<(string Detail, EqpJsonOp Op)>();
+        var usesMethod = false;
+        var orderBy = ResolveOrderBy(select.OrderBy, select.Projections);
+        if (!TryDescribeMethodIndexJoinArms(join, select.Where, orderBy, context, described, ref usesMethod)
+            || !usesMethod)
+        {
+            return false;
+        }
+
+        steps = described;
+        return true;
+    }
+
+    private bool TryDescribeMethodIndexJoinArms(
+        JoinTableSource join,
+        Expression? where,
+        IReadOnlyList<OrderByTerm> orderBy,
+        QueryContext context,
+        List<(string Detail, EqpJsonOp Op)> steps,
+        ref bool usesMethod)
+    {
+        if (join.Kind is not (JoinKind.Inner or JoinKind.Left))
+            return false;
+
+        var (leftPredicate, rightPredicate) = where is null
+            ? (null, null)
+            : SplitJoinSidePredicates(where, join, context, IsPushableMethodFunction);
+        var rightPush = join.Kind == JoinKind.Inner ? rightPredicate : null;
+        return TryDescribeMethodIndexJoinArm(join.Left, leftPredicate, orderBy, context, steps, ref usesMethod, joinKind: null)
+            && TryDescribeMethodIndexJoinArm(
+                join.Right,
+                rightPush,
+                orderBy,
+                context,
+                steps,
+                ref usesMethod,
+                join.Kind == JoinKind.Left ? "left" : null);
+    }
+
+    private bool TryDescribeMethodIndexJoinArm(
+        TableSource side,
+        Expression? predicate,
+        IReadOnlyList<OrderByTerm> orderBy,
+        QueryContext context,
+        List<(string Detail, EqpJsonOp Op)> steps,
+        ref bool usesMethod,
+        string? joinKind)
+    {
+        if (side is JoinTableSource nested)
+        {
+            // Without a pushed predicate the nested join still materializes each of its arms by scan.
+            return joinKind is null
+                && TryDescribeMethodIndexJoinArms(nested, predicate, orderBy, context, steps, ref usesMethod);
+        }
+
+        if (side is not NamedTableSource { IndexDirective: null } named
+            || IsCommonTableExpression(named, context)
+            || context.Views?.ContainsKey(named.Name) == true
+            || TryGetVirtualTable(context, named, out _)
+            || !context.Tables.TryGetValue(ResolveMethodIndexSourceName(named.Name), out var table))
+        {
+            return false;
+        }
+
+        var alias = named.Alias ?? named.Name;
+        var suffix = joinKind == "left" ? " LEFT-JOIN" : string.Empty;
+        if (predicate is not null)
+        {
+            var sideSelect = new SelectStatement(
+                Distinct: false,
+                Projections: [],
+                Source: named,
+                Where: predicate,
+                GroupBy: [],
+                Having: null,
+                NamedWindows: [],
+                OrderBy: orderBy,
+                Limit: null,
+                Offset: null);
+            if (TryPlanManagedIndexScan(sideSelect, context) is not null
+                || TryCreateTransientEqualityLookup(named, table, predicate, context, outerRow: null, out _))
+            {
+                // An ordinary index or a transient equality probe serves this arm before any method
+                // index is considered; that path is described elsewhere, not here.
+                return false;
+            }
+
+            if (TryPlanMethodIndexScan(named, context, predicate, orderBy, maximumRows: null, out var plan))
+            {
+                steps.Add((
+                    FormatMethodIndexExplainDetail(plan) + suffix,
+                    new EqpJsonIndexMethodOp(plan.Index.Method
+                        ?? throw new InvalidOperationException("The selected method index has no method name."))));
+                usesMethod = true;
+                return true;
+            }
+        }
+
+        steps.Add((
+            (named.Alias is null ? $"SCAN {named.Name}" : $"SCAN {named.Name} AS {alias}") + suffix,
+            new EqpJsonScanOp(named.Name, named.Alias, IndexName: null, Covering: false, Join: joinKind)));
+        return true;
+    }
 
     private static long? ReadLiteralLimit(Expression? limit)
         => limit is LiteralExpression { Value.Kind: SqlValueKind.Integer } literal

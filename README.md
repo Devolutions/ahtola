@@ -398,6 +398,12 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
   foreign shadow layouts fail closed. FTS5 storage is likewise not a portable
   shadow-table representation. See
   [docs/managed-vtab-fts-rtree-integration.md](docs/managed-vtab-fts-rtree-integration.md).
+- **Turso full-text search** — `CREATE INDEX … USING fts` with `fts_match`,
+  `fts_score`, `fts_highlight`, `MATCH` and `OPTIMIZE INDEX`, Tantivy-exact
+  tokenizers over a pinned Unicode table, incremental maintenance, and join-arm
+  planning, on the desktop and in the browser (Turso's own WebAssembly builds omit
+  FTS). Postings are derived state rebuilt on open, not a Tantivy file layout. See
+  [docs/managed-index-methods.md](docs/managed-index-methods.md).
 - **SQL CDC** — `PRAGMA capture_data_changes_conn` implements Turso v0.7.2's
   per-connection V1/V2 CDC tables and transactional COMMIT records. It is
   independent of the managed replica's private journal and does not provide a

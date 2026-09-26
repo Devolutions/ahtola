@@ -28,6 +28,21 @@ public sealed partial class EmbeddedDatabase
         QueryContext context)
     {
         var bound = ResolveBoundFtsIndex(function, row, context);
+
+        // A row a method scan just produced re-runs this predicate as part of the full WHERE. When
+        // this statement already holds that scan's complete match set for the same index and query,
+        // answer from it by rowid instead of re-tokenizing the row: the index and the scalar agree
+        // by construction (same bound index, same analyzers), and that agreement is what the
+        // residual check exists to prove on the paths where it is not already established.
+        if (bound is { RowId: { } rowId }
+            && arguments.Count >= 2
+            && arguments[^1].Kind == SqlValueKind.Text
+            && context.MethodIndexCache.TryGetOpened(bound.TableName, bound.Table, bound.Index, out var binding)
+            && binding.TryGetExecutedMembership(arguments[^1], rowId, out var member))
+        {
+            return SqlValue.Integer(member ? 1 : 0);
+        }
+
         return ManagedFtsFunctions.Match(
             arguments,
             CollectArgumentColumnNames(function),

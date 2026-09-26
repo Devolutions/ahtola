@@ -32,6 +32,7 @@
             }
             var persistentCore = await RunPersistentCoreAsync();
             var persistentFeatures = await RunPersistentFeaturesAsync();
+            var persistentFts = await RunPersistentFullTextSearchAsync();
             var browserMemory = await RunBrowserMemoryAsync();
             var reservedPathRejected = await RunReservedPathRejectedAsync();
             var workerIsolation = await RunWorkerIsolationAsync();
@@ -54,6 +55,7 @@
                 + $"persistent-ado={persistentAdo};"
                 + $"persistent-core={persistentCore};"
                 + $"persistent-features={persistentFeatures};"
+                + $"persistent-fts={persistentFts};"
                 + $"browser-memory={browserMemory};"
                 + $"reserved-path-rejected={reservedPathRejected};"
                 + $"worker-isolation={workerIsolation};"
@@ -187,6 +189,121 @@
                 "read local");
             return attached + local;
         }
+    }
+
+    // Turso compiles its Tantivy-backed FTS out of the browser build; Ahtola's managed index method
+    // runs unchanged in WebAssembly. Every check throws with its phase name on a mismatch, so the
+    // status only reports the number of checks once all of them hold, including after reopening
+    // from OPFS (where the postings are rebuilt from the persisted rows).
+    private static async Task<long> RunPersistentFullTextSearchAsync()
+    {
+        const string path = "packed-consumer-fts/main.db";
+        const string hindiWord = "\u0939\u093F\u0928\u094D\u0926\u0940";
+        const string hindiPrefix = "\u0939\u093F\u0928";
+        long checks = 0;
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)",
+                "fts create table");
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE INDEX docs_fts ON docs USING fts(title, body) WITH (weights = 'title=2.0,body=1.0')",
+                "fts create index");
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)",
+                "fts create notes");
+            await ExecuteFeatureAsync(
+                connection,
+                "CREATE INDEX notes_fts ON notes USING fts(body) WITH (tokenizer = 'unicode61')",
+                "fts create unicode61 index");
+            await ExecuteFeatureAsync(
+                connection,
+                $"INSERT INTO docs VALUES (1, 'Browser Search', 'Full text search in the browser'), (2, 'Recipes', 'Creme brulee'), (3, '{hindiWord}', 'search tools'), (4, 'Unrelated', 'nothing here')",
+                "fts insert docs");
+            await ExecuteFeatureAsync(
+                connection,
+                "INSERT INTO notes VALUES (1, 'Caf\u00E9 au lait'), (2, 'na\u00EFve r\u00E9sum\u00E9'), (3, 'plain')",
+                "fts insert notes");
+
+            checks += await ExpectTextAsync(
+                connection,
+                "SELECT group_concat(id) FROM (SELECT id FROM docs WHERE fts_match(title, body, 'search') ORDER BY fts_score(title, body, 'search') DESC)",
+                "1,3",
+                "fts ranked match");
+            checks += await ExpectTextAsync(
+                connection,
+                "SELECT group_concat(id) FROM docs WHERE (title, body) MATCH 'browser'",
+                "1",
+                "fts match operator");
+            checks += await ExpectTextAsync(
+                connection,
+                "SELECT fts_highlight(title, '<b>', '</b>', 'search') FROM docs WHERE id = 1",
+                "Browser <b>Search</b>",
+                "fts highlight");
+            checks += await ExpectTextAsync(
+                connection,
+                "SELECT group_concat(id) FROM notes WHERE fts_match(body, 'cafe resume')",
+                "1,2",
+                "fts unicode61 folding");
+            checks += await ExpectTextAsync(
+                connection,
+                $"SELECT group_concat(id) FROM docs WHERE fts_match(title, body, '{hindiPrefix}')",
+                "3",
+                "fts devanagari tokenization");
+        }
+
+        await using (var source = new AhtolaBrowserDataSource(path))
+        {
+            await using var connection = await source.OpenConnectionAsync();
+            checks += await ExpectTextAsync(
+                connection,
+                "SELECT group_concat(id) FROM (SELECT id FROM docs WHERE fts_match(title, body, 'search') ORDER BY fts_score(title, body, 'search') DESC)",
+                "1,3",
+                "fts ranked match after reopen");
+            await ExecuteFeatureAsync(connection, "DELETE FROM docs WHERE id = 1", "fts delete");
+            await ExecuteFeatureAsync(connection, "OPTIMIZE INDEX docs_fts", "fts optimize");
+            checks += await ExpectTextAsync(
+                connection,
+                "SELECT group_concat(id) FROM docs WHERE fts_match(title, body, 'search')",
+                "3",
+                "fts match after delete and optimize");
+            checks += await ExpectTextAsync(
+                connection,
+                "SELECT group_concat(id) FROM notes WHERE fts_match(body, 'NAIVE')",
+                "2",
+                "fts unicode61 after reopen");
+        }
+
+        return checks;
+    }
+
+    private static async Task<long> ExpectTextAsync(
+        SqliteConnection connection,
+        string sql,
+        string expected,
+        string phase)
+    {
+        object? actual;
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            actual = await command.ExecuteScalarAsync();
+        }
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException($"persistent feature phase '{phase}' failed", exception);
+        }
+
+        var text = Convert.ToString(actual, CultureInfo.InvariantCulture);
+        if (!string.Equals(text, expected, StringComparison.Ordinal))
+            throw new InvalidOperationException($"persistent feature phase '{phase}' returned '{text}', expected '{expected}'");
+
+        return 1;
     }
 
     private static async Task<long> RunBrowserMemoryAsync()
