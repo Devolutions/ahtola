@@ -1563,7 +1563,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
         var blockedPath = ReadWorkerValue("AHTOLA_REPLICA_RACE_BLOCKED");
         var completedPath = ReadWorkerValue("AHTOLA_REPLICA_RACE_COMPLETED");
         var releasePath = ReadWorkerValue("AHTOLA_REPLICA_RACE_RELEASE");
-        File.WriteAllText(startedPath, string.Empty);
+        PublishWorkerSignal(startedPath, string.Empty);
 
         if (mode == "sqlite-hold")
         {
@@ -1575,13 +1575,13 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             command.Transaction = transaction;
             command.CommandText = "UPDATE bootstrap_marker SET value = value;";
             command.ExecuteNonQuery().Should().Be(1);
-            File.WriteAllText(blockedPath, "acquired");
+            PublishWorkerSignal(blockedPath, "acquired");
             WaitForWorkerFile(
                 releasePath,
                 TimeSpan.FromSeconds(30),
                 "The ordinary SQLite writer was not released from the handoff probe.");
             transaction.Rollback();
-            File.WriteAllText(completedPath, mode);
+            PublishWorkerSignal(completedPath, mode);
             return;
         }
 
@@ -1604,7 +1604,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 transaction.Commit();
             }
             File.Exists(databasePath + "-wal").Should().BeTrue();
-            File.WriteAllText(blockedPath, "committed");
+            PublishWorkerSignal(blockedPath, "committed");
             Process.GetCurrentProcess().Kill(entireProcessTree: false);
             Thread.Sleep(Timeout.Infinite);
         }
@@ -1629,19 +1629,19 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                         acknowledgedLocalChanges: [],
                         probeTimeout.Token)
                     .ConfigureAwait(false);
-                File.WriteAllText(completedPath, "alias-noop-pull-acquired-without-blocking");
+                PublishWorkerSignal(completedPath, "alias-noop-pull-acquired-without-blocking");
                 return;
             }
             catch (OperationCanceledException) when (probeTimeout.IsCancellationRequested)
             {
-                File.WriteAllText(blockedPath, "blocked");
+                PublishWorkerSignal(blockedPath, "blocked");
             }
 
             WaitForWorkerFile(
                 releasePath,
                 TimeSpan.FromSeconds(30),
                 "The alias no-op pull was not released after publication.");
-            File.WriteAllText(completedPath, mode);
+            PublishWorkerSignal(completedPath, mode);
             return;
         }
 
@@ -1650,14 +1650,14 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             try
             {
                 ProbeOrdinarySqliteWrite(databasePath, timeoutSeconds: 1);
-                File.WriteAllText(completedPath, "sqlite-write-acquired-without-blocking");
+                PublishWorkerSignal(completedPath, "sqlite-write-acquired-without-blocking");
                 return;
             }
 
             catch (Microsoft.Data.Sqlite.SqliteException exception)
                 when (exception.SqliteErrorCode is 5 or 6 or 8)
             {
-                File.WriteAllText(blockedPath, "blocked");
+                PublishWorkerSignal(blockedPath, "blocked");
             }
 
             WaitForWorkerFile(
@@ -1665,7 +1665,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 TimeSpan.FromSeconds(30),
                 "The ordinary SQLite writer was not released after publication.");
             ProbeOrdinarySqliteWrite(databasePath, timeoutSeconds: 30);
-            File.WriteAllText(completedPath, mode);
+            PublishWorkerSignal(completedPath, mode);
             return;
         }
 
@@ -1674,13 +1674,13 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             try
             {
                 CommitOrdinarySqliteMainMutation(databasePath, mode, timeoutSeconds: 1);
-                File.WriteAllText(completedPath, $"{mode}-acquired-without-blocking");
+                PublishWorkerSignal(completedPath, $"{mode}-acquired-without-blocking");
                 return;
             }
             catch (Microsoft.Data.Sqlite.SqliteException exception)
                 when (exception.SqliteErrorCode is 5 or 6 or 8)
             {
-                File.WriteAllText(blockedPath, "blocked");
+                PublishWorkerSignal(blockedPath, "blocked");
             }
 
             WaitForWorkerFile(
@@ -1688,7 +1688,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 TimeSpan.FromSeconds(30),
                 "The main-mutating SQLite writer was not released after rollback recovery.");
             CommitOrdinarySqliteMainMutation(databasePath, mode, timeoutSeconds: 30);
-            File.WriteAllText(completedPath, mode);
+            PublishWorkerSignal(completedPath, mode);
             return;
         }
 
@@ -1705,12 +1705,12 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
                 probeApplyLease = await ManagedReplicaApplyLock
                     .AcquireExclusiveAsync(databasePath, probeTimeout.Token)
                     .ConfigureAwait(false);
-                File.WriteAllText(completedPath, "publication-acquired-without-blocking");
+                PublishWorkerSignal(completedPath, "publication-acquired-without-blocking");
                 return;
             }
             catch (OperationCanceledException) when (probeTimeout.IsCancellationRequested)
             {
-                File.WriteAllText(blockedPath, "blocked");
+                PublishWorkerSignal(blockedPath, "blocked");
             }
             finally
             {
@@ -1747,7 +1747,17 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             throw new InvalidOperationException($"Unknown replica race worker mode '{mode}'.");
         }
 
-        File.WriteAllText(completedPath, mode);
+        PublishWorkerSignal(completedPath, mode);
+    }
+
+    // The test side polls for these files with File.Exists and then reads them, so each one
+    // must appear with its content already in place: File.WriteAllText creates the file before
+    // writing it, and a read in between saw an empty (or still-locked) probe file.
+    private static void PublishWorkerSignal(string path, string value)
+    {
+        var staging = path + ".tmp";
+        File.WriteAllText(staging, value);
+        File.Move(staging, path, overwrite: true);
     }
 
     private static void ProbeOrdinarySqliteWrite(string databasePath, int timeoutSeconds)
