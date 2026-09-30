@@ -134,14 +134,20 @@ public sealed partial class EmbeddedDatabase
     /// <summary>
     /// Plans the inner access of one semi/anti join. <paramref name="leftPredicate"/> is the
     /// part of the outer WHERE pushed onto the outer table (the same predicate
-    /// <c>GetSemiOrAntiJoinRows</c> receives); it only feeds the outer row estimate.
+    /// <c>GetSemiOrAntiJoinRows</c> receives); it only feeds the outer row estimate. The same
+    /// B-tree/temporary-index choice prices the null-supplying side of a two-table LEFT JOIN,
+    /// whose projection may read further inner columns (<paramref name="otherInnerColumns"/>,
+    /// which decide whether an index covers them); no hash join is considered for it.
     /// </summary>
     private SemiAntiInnerAccess? PlanSemiOrAntiInnerAccess(
         JoinTableSource join,
         Expression? leftPredicate,
-        QueryContext context)
+        QueryContext context,
+        IReadOnlyCollection<int>? otherInnerColumns = null,
+        double? inputRowsOverride = null)
     {
-        if (join.Kind is not (JoinKind.Semi or JoinKind.Anti)
+        if (join.Kind is not (JoinKind.Semi or JoinKind.Anti or JoinKind.Left)
+            || join.Kind == JoinKind.Left && join.Left is not NamedTableSource
             || join.Condition is null
             || context.ConcurrentMvStore is not null
             || !TryGetDecorrelationBaseTable(join.Right, context, out var inner, out var innerQualifier)
@@ -205,12 +211,16 @@ public sealed partial class EmbeddedDatabase
             return null;
         }
 
+        if (otherInnerColumns is not null)
+            usedColumns.UnionWith(otherInnerColumns);
+
         // Stable partition: equalities first (constraints.rs:1165-1171).
         constraints = [.. constraints.Where(static c => IsTursoEqualityOperator(c.Operator)),
             .. constraints.Where(static c => !IsTursoEqualityOperator(c.Operator))];
 
-        var inputRows = EstimateTursoTableRows(outerLeaf.Name, context)
-            * EstimateTursoLocalSelectivity(leftPredicate, outerLeaf, outerTable, context);
+        var inputRows = inputRowsOverride
+            ?? EstimateTursoTableRows(outerLeaf.Name, context)
+                * EstimateTursoLocalSelectivity(leftPredicate, outerLeaf, outerTable, context);
         var innerRows = EstimateTursoTableRows(inner.Name, context);
         var covering = usedColumns.Count > 0;
 
@@ -386,6 +396,374 @@ public sealed partial class EmbeddedDatabase
         var cost = TursoCostModel.EstimateScanCost(baseRows, 1.0)
             + TursoCostModel.EstimateWhereWork(1.0, baseRows, consumedSteps: 0, extraSteps);
         return (baseRows * EstimateTursoLocalSelectivity(predicate, outer, table, context), cost);
+    }
+
+    /// <summary>
+    /// The estimate of a first loop that searches a declared index with the table's own
+    /// constant constraints (<paramref name="predicate"/>): estimate_cost_for_scan_or_seek with
+    /// one input row plus the WHERE work of every term (access_method.rs:687-707), producing the
+    /// rows per seek reduced by the constraints the search leaves as filters. Returns
+    /// <see langword="null"/> unless the ported seek terms are exactly
+    /// <paramref name="constraintTexts"/> — the search the caller describes — and every term is
+    /// a modeled column constraint.
+    /// </summary>
+    private EqpJsonEstimate? EstimateTursoFirstLoopIndexSearch(
+        NamedTableSource source,
+        EmbeddedIndex index,
+        Expression predicate,
+        IReadOnlyCollection<int> usedColumns,
+        IReadOnlyList<string> constraintTexts,
+        QueryContext context)
+    {
+        if (!context.Tables.TryGetValue(source.Name, out var table) || index.IsPartial || index.IsMethodIndex)
+            return null;
+
+        var qualifier = source.Alias ?? source.Name;
+        var columns = new HashSet<string>(table.Columns, StringComparer.OrdinalIgnoreCase);
+        var conjuncts = IndexExpressionSemantics.SplitConjuncts(predicate);
+        var steps = new int[conjuncts.Count];
+        var constraints = new List<SemiAntiConstraint>();
+        for (var position = 0; position < conjuncts.Count; position++)
+        {
+            steps[position] = CountTursoWhereSteps(conjuncts[position]) - 1;
+            if (!TryDescribeSemiAntiConstraint(position, conjuncts[position], table, qualifier, columns, source, table, context, out var constraint)
+                || constraint.DependsOnOuter)
+            {
+                return null;
+            }
+
+            constraints.Add(constraint);
+        }
+
+        constraints = [.. constraints.Where(static c => IsTursoEqualityOperator(c.Operator)),
+            .. constraints.Where(static c => !IsTursoEqualityOperator(c.Operator))];
+        var terms = BuildSemiAntiIndexSeekTerms(index, table, constraints);
+        if (terms.Count == 0)
+            return null;
+
+        var covering = index.Columns.All(static column => !column.IsExpression)
+            && usedColumns.All(ordinal => ordinal == table.RowidAliasColumnIndex
+                || index.Columns.Any(column => column.ColumnIndex == ordinal));
+        var info = new TursoIndexInfo(
+            index.Unique,
+            index.Columns.Count,
+            covering,
+            TursoCostModel.IndexLeafRowsPerPage(index.Columns.Count, table.Columns.Length, table.HasRowidAlias));
+        var rows = EstimateTursoTableRows(source.Name, context);
+        var cost = EstimateTursoScanOrSeekCost(info, terms, 1.0, rows, table, index, context);
+        var rowsPerSeek = EstimateTursoRowsPerSeek(info, terms, rows, table, index, context);
+        var access = new SemiAntiInnerAccess(
+            SemiAntiInnerAccessKind.DeclaredIndexSearch,
+            source,
+            table,
+            index,
+            terms,
+            HashKeys: [],
+            covering,
+            InputRows: 1.0,
+            rowsPerSeek,
+            cost);
+        if (!access.ConstraintTexts.SequenceEqual(constraintTexts, StringComparer.OrdinalIgnoreCase))
+            return null;
+
+        // constraint_output_multipliers: the constraints the search does not consume still
+        // filter its rows, a column bounded on both sides as one closed range.
+        var remaining = 1.0;
+        var bounds = new Dictionary<int, (bool Lower, bool Upper)>();
+        foreach (var constraint in constraints)
+        {
+            if (terms.Any(term => ReferenceEquals(term.Equality, constraint)
+                    || ReferenceEquals(term.Lower, constraint)
+                    || ReferenceEquals(term.Upper, constraint)))
+            {
+                continue;
+            }
+
+            remaining *= constraint.Selectivity;
+            var isLower = constraint.Operator is TursoConstraintOperator.Greater or TursoConstraintOperator.GreaterOrEqual;
+            var isUpper = constraint.Operator is TursoConstraintOperator.Less or TursoConstraintOperator.LessOrEqual;
+            if (isLower || isUpper)
+            {
+                bounds.TryGetValue(constraint.ColumnOrdinal, out var bound);
+                bounds[constraint.ColumnOrdinal] = (bound.Lower || isLower, bound.Upper || isUpper);
+            }
+        }
+
+        foreach (var bound in bounds.Values)
+        {
+            if (bound.Lower && bound.Upper)
+                remaining *= TursoCostParams.ClosedRangeSelectivityFactor;
+        }
+
+        var accessCost = cost + EstimateSemiAntiWhereWork(access, steps, 1.0);
+        var output = rowsPerSeek * remaining;
+        return new EqpJsonEstimate(1, output, output, accessCost, accessCost);
+    }
+
+    /// <summary>
+    /// The estimate of a first loop that reads a whole declared index in key order (a SCAN …
+    /// USING INDEX serving ORDER BY or GROUP BY): estimate_cost_for_scan_or_seek with no seek
+    /// terms plus the WHERE work of every filter over each visited row, producing the rows the
+    /// table's own column constraints keep. Returns <see langword="null"/> for a filter shape
+    /// the ported constraint model does not describe.
+    /// </summary>
+    private EqpJsonEstimate? EstimateTursoFirstLoopIndexScan(
+        NamedTableSource source,
+        EmbeddedIndex index,
+        Expression? predicate,
+        IReadOnlyCollection<int> usedColumns,
+        bool isIndexOrdered,
+        QueryContext context)
+    {
+        if (!context.Tables.TryGetValue(source.Name, out var table) || index.IsPartial || index.IsMethodIndex)
+            return null;
+
+        var steps = 0;
+        if (predicate is not null)
+        {
+            if (ContainsSubqueryExpression(predicate) || GetImpliedOrInFilters(predicate, source, table).Count != 0)
+                return null;
+            var qualifier = source.Alias ?? source.Name;
+            var columns = new HashSet<string>(table.Columns, StringComparer.OrdinalIgnoreCase);
+            foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(predicate))
+            {
+                steps += CountTursoWhereSteps(conjunct) - 1;
+                if (conjunct is BinaryExpression { Operator: BinaryOperator.Or })
+                    continue;
+                if (!TryDescribeSemiAntiConstraint(0, conjunct, table, qualifier, columns, source, table, context, out var constraint)
+                    || constraint.DependsOnOuter)
+                {
+                    return null;
+                }
+            }
+        }
+
+        var covering = index.Columns.All(static column => !column.IsExpression)
+            && usedColumns.All(ordinal => ordinal == table.RowidAliasColumnIndex
+                || index.Columns.Any(column => column.ColumnIndex == ordinal));
+        var info = new TursoIndexInfo(
+            index.Unique,
+            index.Columns.Count,
+            covering,
+            TursoCostModel.IndexLeafRowsPerPage(index.Columns.Count, table.Columns.Length, table.HasRowidAlias));
+        var rows = EstimateTursoTableRows(source.Name, context);
+        var cost = EstimateTursoScanOrSeekCost(info, [], 1.0, rows, table, index, context, isIndexOrdered)
+            + TursoCostModel.EstimateWhereWork(1.0, rows, consumedSteps: 0, steps);
+        var output = rows * EstimateTursoLocalSelectivity(predicate, source, table, context);
+        return new EqpJsonEstimate(1, output, output, cost, cost);
+    }
+
+    /// <summary>
+    /// The estimate of a multi-index OR union that is the whole WHERE clause
+    /// (multi_index.rs:195-235 estimate_multi_index_scan_cost with its branches costed by
+    /// choose_multi_index_branch_access): every branch seeks its constraints with a
+    /// rowid-only (covering) read, the union deduplicates rowids and fetches the distinct
+    /// rows, and the consumed OR term's WHERE work is charged per output row. A branch with
+    /// residual conjuncts, or a WHERE with other terms, reports no estimate.
+    /// </summary>
+    private EqpJsonEstimate? EstimateTursoMultiIndexOrUnion(
+        NamedTableSource source,
+        EmbeddedTable table,
+        Expression where,
+        IReadOnlyList<(EmbeddedIndex? Index, Expression Predicate)> branches,
+        QueryContext context)
+    {
+        if (IndexExpressionSemantics.SplitConjuncts(where).Count != 1
+            || where is not BinaryExpression { Operator: BinaryOperator.Or }
+            || ContainsSubqueryExpression(where))
+        {
+            return null;
+        }
+
+        var qualifier = source.Alias ?? source.Name;
+        var columns = new HashSet<string>(table.Columns, StringComparer.OrdinalIgnoreCase);
+        var rows = EstimateTursoTableRows(source.Name, context);
+        var treeDepth = TursoCostModel.EstimateBtreeDepth(rows, JoinCostParams.RowsPerTablePage);
+        var branchCosts = new List<double>(branches.Count);
+        var branchRows = new List<double>(branches.Count);
+        foreach (var (index, predicate) in branches)
+        {
+            var constraints = new List<SemiAntiConstraint>();
+            var conjuncts = IndexExpressionSemantics.SplitConjuncts(predicate);
+            for (var position = 0; position < conjuncts.Count; position++)
+            {
+                if (!TryDescribeSemiAntiConstraint(position, conjuncts[position], table, qualifier, columns, source, table, context, out var constraint)
+                    || constraint.DependsOnOuter)
+                {
+                    return null;
+                }
+
+                constraints.Add(constraint);
+            }
+
+            if (index is null)
+            {
+                // The rowid branch: a unique point lookup on the table b-tree
+                // (index_info_for_branch with no index).
+                if (constraints is not [{ Operator: TursoConstraintOperator.Equal } rowid]
+                    || rowid.ColumnOrdinal != table.RowidAliasColumnIndex
+                    || !table.HasRowidAlias)
+                {
+                    return null;
+                }
+
+                branchCosts.Add(TursoCostModel.EstimateIndexCost(
+                    rows,
+                    treeDepth,
+                    new TursoIndexInfo(Unique: true, ColumnCount: 1, Covering: true, JoinCostParams.RowsPerTablePage),
+                    1.0,
+                    1.0));
+                branchRows.Add(1.0);
+                continue;
+            }
+
+            constraints = [.. constraints.Where(static c => IsTursoEqualityOperator(c.Operator)),
+                .. constraints.Where(static c => !IsTursoEqualityOperator(c.Operator))];
+            var terms = BuildSemiAntiIndexSeekTerms(index, table, constraints);
+            var consumed = terms.Sum(static term => term.Equality is not null ? 1 : (term.Lower is null ? 0 : 1) + (term.Upper is null ? 0 : 1));
+            if (terms.Count == 0 || consumed != constraints.Count)
+                return null;
+
+            var info = new TursoIndexInfo(
+                index.Unique,
+                index.Columns.Count,
+                Covering: true,
+                TursoCostModel.IndexLeafRowsPerPage(index.Columns.Count, table.Columns.Length, table.HasRowidAlias));
+            branchCosts.Add(EstimateTursoScanOrSeekCost(info, terms, 1.0, rows, table, index, context));
+            branchRows.Add(EstimateTursoRowsPerSeek(info, terms, rows, table, index, context));
+        }
+
+        var uniqueRatio = 1.0;
+        foreach (var branch in branchRows)
+            uniqueRatio *= 1.0 - Math.Min(branch / rows, 1.0);
+        var uniqueRows = rows * (1.0 - uniqueRatio);
+        var rowsetCost = branchRows.Sum() * JoinCostParams.CpuCostPerRow * 2.0;
+        var tablePages = Math.Max(rows / JoinCostParams.RowsPerTablePage, 1.0);
+        var fetchCost = uniqueRows / Math.Max(rows, 1.0) * tablePages;
+        var cost = branchCosts.Sum() + rowsetCost + fetchCost
+            + TursoCostModel.EstimateWhereWork(1.0, uniqueRows, CountTursoWhereSteps(where) - 1, remainingSteps: 0);
+        return new EqpJsonEstimate(1, uniqueRows, uniqueRows, cost, cost);
+    }
+
+    /// <summary>
+    /// The estimate of a first loop driven by an uncorrelated <c>column IN (SELECT …)</c> seek
+    /// (access_method.rs:505-645 choose_best_in_seek_candidate, constraints.rs:1068-1160): the
+    /// list contributes its body's estimated rows, capped at the square root of the table's
+    /// rows (Turso's in_subquery_rows when the body has no estimate), one index seek per value,
+    /// and the rows that selectivity keeps.
+    /// </summary>
+    private static EqpJsonEstimate EstimateTursoInSubquerySeek(
+        NamedTableSource source,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        double? listRows,
+        bool covering,
+        QueryContext context)
+    {
+        var rows = EstimateTursoTableRows(source.Name, context);
+        var values = listRows is { } planned
+            ? Math.Clamp(planned, 0.0, Math.Max(Math.Sqrt(rows), 1.0))
+            : Math.Min(TursoCostParams.InSubqueryRows, rows);
+        var selectivity = Math.Min(values / rows, 1.0);
+        var info = new TursoIndexInfo(
+            index.Unique,
+            index.Columns.Count,
+            covering,
+            TursoCostModel.IndexLeafRowsPerPage(index.Columns.Count, table.Columns.Length, table.HasRowidAlias));
+        var rowsPerSeek = index.Unique && index.Columns.Count == 1
+            ? 1.0
+            : Math.Max(Math.Sqrt(rows * JoinCostParams.SelectivityEqualityIndexed), 1.0);
+        var cost = TursoCostModel.EstimateIndexCost(
+            rows,
+            TursoCostModel.EstimateBtreeDepth(rows, JoinCostParams.RowsPerTablePage),
+            info,
+            values,
+            rowsPerSeek);
+        var output = Math.Max(selectivity * rows, 1.0);
+        return new EqpJsonEstimate(1, output, output, cost, cost);
+    }
+
+    /// <summary>
+    /// The ordinals of every column of <paramref name="source"/> the statement reads, the input
+    /// to Turso's covering-index test. Returns <see langword="false"/> for a <c>*</c>
+    /// projection, a subquery, or an unqualified reference that could name this table.
+    /// </summary>
+    private static bool TryCollectReferencedTableColumns(
+        SelectStatement select,
+        NamedTableSource source,
+        EmbeddedTable table,
+        out HashSet<int> ordinals)
+    {
+        var found = new HashSet<int>();
+        ordinals = found;
+        var qualifier = source.Alias ?? source.Name;
+        foreach (var projection in select.Projections)
+        {
+            // * reads every column of every source; q.* every column of q.
+            if (projection.Expression is StarExpression
+                || projection.Expression is QualifiedStarExpression qualified
+                    && string.Equals(qualified.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+            {
+                for (var ordinal = 0; ordinal < table.Columns.Length; ordinal++)
+                    found.Add(ordinal);
+            }
+        }
+
+        var roots = new List<Expression>();
+        roots.AddRange(select.Projections.Select(static projection => projection.Expression));
+        if (select.Where is not null)
+            roots.Add(select.Where);
+        roots.AddRange(select.GroupBy);
+        if (select.Having is not null)
+            roots.Add(select.Having);
+        roots.AddRange(select.OrderBy.Select(static term => term.Expression));
+        var pendingSources = new Stack<TableSource?>();
+        pendingSources.Push(select.Source);
+        while (pendingSources.Count > 0)
+        {
+            if (pendingSources.Pop() is JoinTableSource join)
+            {
+                if (join.Condition is not null)
+                    roots.Add(join.Condition);
+                pendingSources.Push(join.Left);
+                pendingSources.Push(join.Right);
+            }
+        }
+
+        // In a single-table statement an unqualified name can only mean this table.
+        var soleSource = ReferenceEquals(select.Source, source);
+        foreach (var root in roots)
+        {
+            if (ContainsSubqueryExpression(root))
+                return false;
+            if (!ForEachColumnReference(root, column =>
+                {
+                    var name = column.UnqualifiedName ?? column.Name;
+                    if (column.Qualifier is null && soleSource)
+                    {
+                        if (table.TryGetColumnIndex(name, out var soleOrdinal))
+                            found.Add(soleOrdinal);
+                        return true;
+                    }
+
+                    if (column.Qualifier is null)
+                        return !table.TryGetColumnIndex(name, out _) && !IsRowIdAlias(name);
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                    if (table.TryGetColumnIndex(name, out var ordinal))
+                    {
+                        found.Add(ordinal);
+                        return true;
+                    }
+
+                    return IsRowIdAlias(name);
+                }))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -945,7 +1323,8 @@ public sealed partial class EmbeddedDatabase
         double baseRows,
         EmbeddedTable table,
         EmbeddedIndex index,
-        QueryContext context)
+        QueryContext context,
+        bool isIndexOrdered = false)
     {
         var treeDepth = TursoCostModel.EstimateBtreeDepth(baseRows, JoinCostParams.RowsPerTablePage);
         if (IsTursoUniquePointLookup(info, terms))
@@ -953,7 +1332,8 @@ public sealed partial class EmbeddedDatabase
 
         var rowsPerSeek = EstimateTursoRowsPerSeek(info, terms, baseRows, table, index, context);
         var cost = TursoCostModel.EstimateIndexCost(baseRows, treeDepth, info, inputRows, rowsPerSeek);
-        return !info.Covering && terms.Count == 0 ? cost * 2.0 : cost;
+        // A non-covering full index scan that no ORDER BY needs pays for its table lookups.
+        return !info.Covering && terms.Count == 0 && !isIndexOrdered ? cost * 2.0 : cost;
     }
 
     /// <summary>cost.rs:252-264 <c>is_unique_point_lookup</c>.</summary>
@@ -1108,6 +1488,7 @@ public sealed partial class EmbeddedDatabase
         var qualifier = source.Alias ?? source.Name;
         var columns = new HashSet<string>(table.Columns, StringComparer.OrdinalIgnoreCase);
         var selectivity = 1.0;
+        var bounds = new Dictionary<int, (bool Lower, bool Upper)>();
         foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(predicate))
         {
             if (TryDescribeSemiAntiConstraint(
@@ -1123,7 +1504,21 @@ public sealed partial class EmbeddedDatabase
                 && !constraint.DependsOnOuter)
             {
                 selectivity *= constraint.Selectivity;
+                var isLower = constraint.Operator is TursoConstraintOperator.Greater or TursoConstraintOperator.GreaterOrEqual;
+                var isUpper = constraint.Operator is TursoConstraintOperator.Less or TursoConstraintOperator.LessOrEqual;
+                if (isLower || isUpper)
+                {
+                    bounds.TryGetValue(constraint.ColumnOrdinal, out var bound);
+                    bounds[constraint.ColumnOrdinal] = (bound.Lower || isLower, bound.Upper || isUpper);
+                }
             }
+        }
+
+        // A column bounded from both sides is a closed range (join.rs:141-147).
+        foreach (var bound in bounds.Values)
+        {
+            if (bound.Lower && bound.Upper)
+                selectivity *= TursoCostParams.ClosedRangeSelectivityFactor;
         }
 
         return Math.Clamp(selectivity, 0.0, 1.0);

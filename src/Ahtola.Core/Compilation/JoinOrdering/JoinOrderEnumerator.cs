@@ -786,7 +786,13 @@ internal static class JoinOrderEnumerator
         // (constraint_output_multipliers, join.rs:94-152).
         double RemainingSelectivity(IReadOnlyCollection<int> consumed)
         {
-            var selectivity = memberLocalSelectivity;
+            var selectivity = 1.0;
+            foreach (var index in ready)
+            {
+                if (segment.Terms[index].TableMask == memberBit && !consumed.Contains(index))
+                    selectivity *= segment.Terms[index].TursoLocalSelectivity;
+            }
+
             foreach (var equality in joinEqualities)
             {
                 if (!consumed.Contains(equality.Term))
@@ -854,13 +860,38 @@ internal static class JoinOrderEnumerator
                     }
                 }
 
+                // A constant equality on the member binds the column as well
+                // (constraints.rs: a constraint whose other side reads no table).
+                if (bound < 0 && column.IndexExpression is null)
+                {
+                    foreach (var index in ready)
+                    {
+                        var term = segment.Terms[index];
+                        if (term.TableMask == memberBit
+                            && !term.CostOnly
+                            && term.ConstantEqualityOrdinal == column.ColumnOrdinal
+                            && string.Equals(term.ConstantEqualityCollation, column.Collation, StringComparison.OrdinalIgnoreCase)
+                            && !termIndices.Contains(index))
+                        {
+                            bound = index;
+                            selectivityProduct *= term.TursoLocalSelectivity;
+                            break;
+                        }
+                    }
+                }
+
                 if (bound < 0)
                     break;
                 termIndices.Add(bound);
             }
 
-            if (termIndices.Count == 0)
+            // The managed seek is keyed by the outer row, so at least one bound column must come
+            // from a join equality; constants may only extend that key.
+            if (termIndices.Count == 0
+                || !termIndices.Any(index => joinEqualities.Any(equality => equality.Term == index)))
+            {
                 continue;
+            }
 
             var unique = candidate.Unique && termIndices.Count >= candidate.Columns.Count;
             var rowsPerSeek = unique

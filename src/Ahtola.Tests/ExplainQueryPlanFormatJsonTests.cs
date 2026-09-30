@@ -331,7 +331,7 @@ public class ExplainQueryPlanFormatJsonTests
     }
 
     [Test]
-    public void UnfilteredTableScanReportsThePlannersCurrentRowEstimate()
+    public void TableScanReportsThePlannersCurrentRowEstimate()
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
@@ -364,10 +364,24 @@ public class ExplainQueryPlanFormatJsonTests
         ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t;").Single()
             .Should().Contain("\"rows_per_input\":100,\"output_rows\":100,");
 
-        // A filtered scan needs the unported selectivity model, so it reports no estimate.
-        using var filtered = JsonDocument.Parse(
-            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE value > 3;").Single());
-        foreach (var node in filtered.RootElement.GetProperty("nodes").EnumerateArray())
+        // A filtered scan keeps the rows its column constraints select (sel_range 0.4) and pays
+        // the WHERE work of its terms beyond their first step (none for one comparison).
+        var filtered = Estimate("SELECT * FROM t WHERE value > 3;");
+        filtered.GetProperty("rows_per_input").GetDouble().Should().BeApproximately(40, 1e-9);
+        filtered.GetProperty("output_rows").GetDouble().Should().BeApproximately(40, 1e-9);
+        filtered.GetProperty("access_cost").GetDouble().Should().BeApproximately(2.3, 1e-12);
+
+        // An OR is not a column constraint: every row survives the estimate, and its extra
+        // comparison steps are charged per visited row (100 rows x 2 steps x 0.003).
+        var disjunction = Estimate("SELECT * FROM t WHERE value = 1 OR value > 50;");
+        disjunction.GetProperty("output_rows").GetDouble().Should().Be(100);
+        disjunction.GetProperty("access_cost").GetDouble().Should().BeApproximately(2.9, 1e-12);
+
+        // BETWEEN is rewritten by Turso into two range terms before costing; that shape is not
+        // modeled, so it reports no estimate rather than an approximated one.
+        using var between = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE value BETWEEN 3 AND 9;").Single());
+        foreach (var node in between.RootElement.GetProperty("nodes").EnumerateArray())
             node.GetProperty("op").TryGetProperty("estimate", out _).Should().BeFalse();
     }
 

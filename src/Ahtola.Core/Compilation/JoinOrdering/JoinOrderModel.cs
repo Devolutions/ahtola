@@ -161,6 +161,16 @@ internal sealed record JoinPredicateTerm(
     /// synthesized join node, because the surviving WHERE evaluates it.
     /// </summary>
     public bool CostOnly { get; init; }
+
+    /// <summary>
+    /// For <c>column = literal</c> on one member (a constant constraint Turso lets an index seek
+    /// consume, constraints.rs), the column's table ordinal; otherwise -1. Such a term is never
+    /// an <see cref="IsEquality"/> join key and is never hashed.
+    /// </summary>
+    public int ConstantEqualityOrdinal { get; init; } = -1;
+
+    /// <summary>The collation a <see cref="ConstantEqualityOrdinal"/> comparison uses.</summary>
+    public string? ConstantEqualityCollation { get; init; }
 }
 
 /// <summary>

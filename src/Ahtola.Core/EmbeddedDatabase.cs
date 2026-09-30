@@ -22740,9 +22740,34 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // matched against the persisted index expression back in TryCreateJoinOrderTerm. Exactly
         // one of keys[position]/expressionOuterOrdinal[position] is populated per position.
         var expressionOuterOrdinal = new int?[selection.EqualityTerms.Count];
+        // Set only for a position bound by a column = literal constant of the right table:
+        // the literal, used verbatim as that key column's seek value.
+        var constantKeys = new SqlValue?[selection.EqualityTerms.Count];
         for (var position = 0; position < keys.Length; position++)
         {
             var candidateColumn = selection.Candidate.Columns[position];
+            if (candidateColumn.IndexExpression is null
+                && !selection.Candidate.Automatic
+                && TryGetConstantEqualityOperands(selection.EqualityTerms[position], out var constantColumn, out var constantValue)
+                && ResolveJoinSideColumn(constantColumn, right.OutputColumns) is { } constantRightColumn
+                && ResolveJoinSideColumn(constantColumn, left.OutputColumns) is null)
+            {
+                var constantDefinition = GetOutputColumnDefinition(join.Right, constantRightColumn, context);
+                if (constantRightColumn.Index != candidateColumn.ColumnOrdinal
+                    || constantDefinition is null
+                    || !IsVerbatimConstantSeekKey(constantDefinition, constantValue)
+                    || !string.Equals(
+                        NormalizeDeclaredCollation(constantDefinition.Collation),
+                        candidateColumn.Collation,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                constantKeys[position] = constantValue;
+                continue;
+            }
+
             if (candidateColumn.IndexExpression is { } indexExpression)
             {
                 // The enumerator only binds this candidate column to a term shaped as an equality
@@ -22868,6 +22893,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var result = new SqlValue[keys.Length];
             for (var position = 0; position < keys.Length; position++)
             {
+                if (constantKeys[position] is { } constantKey)
+                {
+                    result[position] = constantKey;
+                    continue;
+                }
+
                 if (expressionOuterOrdinal[position] is { } ordinal)
                 {
                     if (ordinal < 0 || ordinal >= outer.Values.Length)
@@ -29168,7 +29199,7 @@ out bool hasReturning)
     /// or other named row source as a table. Joins cannot be reconstructed from this syntax;
     /// supported compiled joins instead use their actual OpenJoinCursor plan tree.
     /// </summary>
-    private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(
+    private (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(
         SelectStatement select,
         QueryContext context)
         => select.Source switch
@@ -29185,7 +29216,9 @@ out bool hasReturning)
                     source.Alias,
                     IndexName: null,
                     Covering: false,
-                    Estimate: select.Where is null ? EstimateUnfilteredTableScan(source.Name, context) : null)),
+                    Estimate: select.Where is null
+                        ? EstimateUnfilteredTableScan(source.Name, context)
+                        : EstimateFilteredTableScan(source, select.Where, context))),
             _ => null,
         };
 
@@ -29193,8 +29226,7 @@ out bool hasReturning)
     /// The estimate of a lone, unfiltered full table scan: one input row, every table row out,
     /// priced by the ported Turso scan formula (optimizer/cost.rs estimate_scan_cost). The row
     /// count is the planner's current <c>sqlite_stat1</c> figure, or Turso's 1,000,000-row
-    /// default for an unanalyzed table. A filtered scan needs Turso's per-constraint selectivity
-    /// model, which is not ported, so it reports no estimate rather than an invented one.
+    /// default for an unanalyzed table.
     /// </summary>
     private static EqpJsonEstimate EstimateUnfilteredTableScan(string tableName, QueryContext context)
     {
@@ -29203,6 +29235,238 @@ out bool hasReturning)
             : JoinCostParams.RowsPerTableFallback;
         var cost = JoinCostModel.EstimateFullScanCost(rows, scanCount: 1.0);
         return new EqpJsonEstimate(1, rows, rows, cost, cost);
+    }
+
+    /// <summary>
+    /// The estimate of a lone full table scan filtered by <paramref name="where"/>: one input
+    /// row, every table row visited, priced by <c>estimate_scan_cost</c> plus the WHERE work of
+    /// every ready term (access_method.rs:687-707 cost_with_where_work), producing the rows the
+    /// table's own column constraints keep (join.rs:72-152 constraint_output_multipliers). An
+    /// OR, a subquery or any other term that is not a column constraint visits rows without
+    /// reducing the estimate, as in Turso. Any other term shape (BETWEEN, which Turso first
+    /// rewrites into two range terms, LIKE, IN, subqueries, …) reports no estimate rather than
+    /// an approximated one.
+    /// </summary>
+    private EqpJsonEstimate? EstimateFilteredTableScan(
+        NamedTableSource source,
+        Expression where,
+        QueryContext context)
+    {
+        // An OR-implied IN filter (lift_common_subexpressions.rs) would itself be a constraint.
+        if (ContainsSubqueryExpression(where)
+            || !context.Tables.TryGetValue(source.Name, out var table)
+            || GetImpliedOrInFilters(where, source, table).Count != 0)
+        {
+            return null;
+        }
+
+        var qualifier = source.Alias ?? source.Name;
+        var columns = new HashSet<string>(table.Columns, StringComparer.OrdinalIgnoreCase);
+        foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(where))
+        {
+            if (conjunct is BinaryExpression { Operator: BinaryOperator.Or })
+                continue;
+            if (!TryDescribeSemiAntiConstraint(0, conjunct, table, qualifier, columns, source, table, context, out var constraint)
+                || constraint.DependsOnOuter)
+            {
+                return null;
+            }
+
+            // A constraint Turso could seek (a rowid or a leading index key) means its plan
+            // would not be this full scan; the scan estimate would describe a plan Turso never
+            // picks, so none is reported.
+            if (constraint.Operator is not (TursoConstraintOperator.NotEqual or TursoConstraintOperator.IsNot)
+                && (constraint.ColumnOrdinal == table.RowidAliasColumnIndex
+                    || table.Indexes.Any(index => !index.IsMethodIndex
+                        && index.Columns.Count > 0
+                        && !index.Columns[0].IsExpression
+                        && index.Columns[0].ColumnIndex == constraint.ColumnOrdinal)))
+            {
+                return null;
+            }
+        }
+
+        var (rows, cost) = EstimateSemiAntiOuterScan(source, where, context);
+        return new EqpJsonEstimate(1, rows, rows, cost, cost);
+    }
+
+    /// <summary>
+    /// Turso's first-loop estimate for a single-table index plan: the search of its seek
+    /// constraints, or the ordered scan of the whole index.
+    /// </summary>
+    private EqpJsonEstimate? EstimateSingleTableIndexPlan(
+        SelectStatement select,
+        ManagedIndexScanPlan plan,
+        string constraint,
+        QueryContext context)
+    {
+        if (select.Source is not NamedTableSource source
+            || !TryCollectReferencedTableColumns(select, source, plan.Table, out var usedColumns))
+        {
+            return null;
+        }
+
+        return plan.Search
+            ? select.Where is { } where
+                ? EstimateTursoFirstLoopIndexSearch(
+                    source,
+                    plan.Index,
+                    where,
+                    usedColumns,
+                    constraint.Split(" AND ", StringSplitOptions.TrimEntries),
+                    context)
+                : null
+            : EstimateTursoFirstLoopIndexScan(
+                source,
+                plan.Index,
+                select.Where,
+                usedColumns,
+                IsOrderedByIndexPrefix(select, source, plan.Table, plan.Index),
+                context);
+    }
+
+    /// <summary>Attaches <paramref name="estimate"/> to a single-table scan or search op.</summary>
+    private static EqpJsonOp WithEqpEstimate(EqpJsonOp op, EqpJsonEstimate? estimate)
+        => (op, estimate) switch
+        {
+            (_, null) => op,
+            (EqpJsonSearchOp search, _) => search with { Estimate = estimate },
+            (EqpJsonScanOp scan, _) => scan with { Estimate = estimate },
+            _ => op,
+        };
+
+    /// <summary>
+    /// The coroutine scan of a FROM-clause subquery that is the statement's only source
+    /// (access_method.rs find_best_access_method_for_subquery): <c>estimate_scan_cost</c> over
+    /// the body's estimated rows plus one run of the body. Only a body whose output rows are
+    /// its single table loop's rows (no grouping, DISTINCT, ordering, LIMIT or aggregate) and
+    /// an outer query that adds no filter are described.
+    /// </summary>
+    private EqpJsonEstimate? EstimateCoroutineSubqueryScan(
+        SelectStatement? outer,
+        SelectStatement body,
+        EqpJsonEstimate? bodyEstimate)
+    {
+        if (bodyEstimate is null
+            || outer is not { Where: null }
+            || body.GroupBy.Count != 0
+            || body.Distinct
+            || body.Having is not null
+            || body.OrderBy.Count != 0
+            || body.Limit is not null
+            || body.Offset is not null
+            || IsAggregateSelect(body))
+        {
+            return null;
+        }
+
+        var rows = Math.Max(bodyEstimate.OutputRows, 1.0);
+        var cost = TursoCostModel.EstimateScanCost(rows, 1.0) + bodyEstimate.TotalCost;
+        return new EqpJsonEstimate(1, rows, rows, cost, cost);
+    }
+
+    /// <summary>
+    /// The recursive step's read of the previous iteration's rows: a one-row full scan
+    /// (access_method.rs:790-804) kept by its filters, each a comparison of a CTE column with a
+    /// constant sized by Turso's column-constraint selectivity (no index, no statistics).
+    /// Returns <see langword="null"/> for any other step shape.
+    /// </summary>
+    private static EqpJsonEstimate? EstimateRecursiveCteInputScan(SelectStatement step, string cteName)
+    {
+        if (step.Source is not NamedTableSource input
+            || !string.Equals(input.Name, cteName, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var selectivity = 1.0;
+        var steps = 0;
+        var bounds = new Dictionary<string, (bool Lower, bool Upper)>(StringComparer.OrdinalIgnoreCase);
+        if (step.Where is not null)
+        {
+            foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(step.Where))
+            {
+                if (conjunct is not BinaryExpression binary
+                    || !(binary.Left is ColumnExpression { BooleanKeyword: null } && binary.Right is LiteralExpression
+                        || binary.Right is ColumnExpression { BooleanKeyword: null } && binary.Left is LiteralExpression))
+                {
+                    return null;
+                }
+
+                var column = (ColumnExpression)(binary.Left is ColumnExpression ? binary.Left : binary.Right);
+                var columnOnLeft = binary.Left is ColumnExpression;
+                var nullLiteral = (binary.Left is LiteralExpression left ? left : (LiteralExpression)binary.Right).Value.Kind == SqlValueKind.Null;
+                double termSelectivity;
+                bool isLower = false, isUpper = false;
+                switch (binary.Operator)
+                {
+                    case BinaryOperator.Equal:
+                        termSelectivity = JoinCostParams.SelectivityEqualityUnindexed;
+                        break;
+                    case BinaryOperator.Is:
+                        termSelectivity = nullLiteral ? TursoCostParams.SelectivityIsNull : JoinCostParams.SelectivityEqualityUnindexed;
+                        break;
+                    case BinaryOperator.IsNot:
+                        termSelectivity = TursoCostParams.SelectivityIsNotNull;
+                        break;
+                    case BinaryOperator.NotEqual:
+                        termSelectivity = JoinCostParams.SelectivityOther;
+                        break;
+                    case BinaryOperator.LessThan or BinaryOperator.LessThanOrEqual:
+                        termSelectivity = JoinCostParams.SelectivityRange;
+                        isUpper = columnOnLeft;
+                        isLower = !columnOnLeft;
+                        break;
+                    case BinaryOperator.GreaterThan or BinaryOperator.GreaterThanOrEqual:
+                        termSelectivity = JoinCostParams.SelectivityRange;
+                        isLower = columnOnLeft;
+                        isUpper = !columnOnLeft;
+                        break;
+                    default:
+                        return null;
+                }
+
+                selectivity *= termSelectivity;
+                steps += CountTursoWhereSteps(conjunct) - 1;
+                if (isLower || isUpper)
+                {
+                    var name = column.UnqualifiedName ?? column.Name;
+                    bounds.TryGetValue(name, out var bound);
+                    bounds[name] = (bound.Lower || isLower, bound.Upper || isUpper);
+                }
+            }
+        }
+
+        foreach (var bound in bounds.Values)
+        {
+            if (bound.Lower && bound.Upper)
+                selectivity *= TursoCostParams.ClosedRangeSelectivityFactor;
+        }
+
+        var cost = TursoCostModel.EstimateScanCost(1.0, 1.0)
+            + TursoCostModel.EstimateWhereWork(1.0, 1.0, consumedSteps: 0, steps);
+        return new EqpJsonEstimate(1, selectivity, selectivity, cost, cost);
+    }
+
+    /// <summary>
+    /// Whether the statement's ORDER BY (or, without one, its GROUP BY) starts with the index's
+    /// leading plain column, so reading the index in key order serves it (Turso's
+    /// <c>is_index_ordered</c>).
+    /// </summary>
+    private static bool IsOrderedByIndexPrefix(
+        SelectStatement select,
+        NamedTableSource source,
+        EmbeddedTable table,
+        EmbeddedIndex index)
+    {
+        var first = select.OrderBy.Count != 0
+            ? select.OrderBy[0].Expression
+            : select.GroupBy.Count != 0 ? select.GroupBy[0] : null;
+        return first is not null
+            && index.Columns.Count > 0
+            && !index.Columns[0].IsExpression
+            && TryResolvePlainTableColumn(first, source, table, out var ordinal)
+            && ordinal == index.Columns[0].ColumnIndex;
     }
 
     internal static string JsonEscape(string value)
@@ -29364,6 +29628,8 @@ out bool hasReturning)
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
             var indexPlanCovering = IndexCoversSelect(plannedSelect, indexPlan.Table, indexPlan.Index);
+            var indexPlanConstraint = indexPlan.SearchConstraint ?? $"{indexPlan.Index.Columns[0].Name}=?";
+            var indexPlanEstimate = EstimateSingleTableIndexPlan(plannedSelect, indexPlan, indexPlanConstraint, compilationContext);
             // The plan carries the exact leading-key predicate chosen by the planner, so JSON
             // can share TEXT's equality/range constraint without re-parsing rendered detail.
             ops = indexPlan.Search
@@ -29373,14 +29639,16 @@ out bool hasReturning)
                         indexPlan.Source.Alias,
                         indexPlan.Index.Name,
                         indexPlanCovering,
-                        [indexPlan.SearchConstraint ?? $"{indexPlan.Index.Columns[0].Name}=?"]),
+                        [indexPlanConstraint],
+                        Estimate: indexPlanEstimate),
                 ]
                 : [
                     new EqpJsonScanOp(
                         indexPlan.Table.Name,
                         indexPlan.Source.Alias,
                         indexPlan.Index.Name,
-                        indexPlanCovering),
+                        indexPlanCovering,
+                        Estimate: indexPlanEstimate),
                 ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -29409,10 +29677,15 @@ out bool hasReturning)
             }
             && TryPlanManagedIndexScan(derivedSelect, compilationContext) is { } derivedIndexPlan)
         {
+            var derivedEstimate = EstimateSingleTableIndexPlan(
+                derivedSelect,
+                derivedIndexPlan,
+                derivedIndexPlan.SearchConstraint ?? $"{derivedIndexPlan.Index.Columns[0].Name}=?",
+                compilationContext);
             ops =
             [
-                new EqpJsonSubqueryScanOp(0),
-                BuildIndexScanOp(derivedIndexPlan, derivedSelect),
+                new EqpJsonSubqueryScanOp(0, EstimateCoroutineSubqueryScan(statement.Inner as SelectStatement, derivedSelect, derivedEstimate)),
+                WithEqpEstimate(BuildIndexScanOp(derivedIndexPlan, derivedSelect), derivedEstimate),
                 new EqpJsonGroupByOp(),
                 new EqpJsonOrderByOp(),
             ];
@@ -29458,13 +29731,22 @@ out bool hasReturning)
             }
             && TryPlanManagedIndexScan(firstTerm, compilationContext) is { } firstIndexPlan)
         {
+            // Each arm is planned on its own, from one input row (optimizer/mod.rs).
+            var firstArmEstimate = EstimateSingleTableIndexPlan(
+                firstTerm,
+                firstIndexPlan,
+                firstIndexPlan.SearchConstraint ?? $"{firstIndexPlan.Index.Columns[0].Name}=?",
+                compilationContext);
+            var secondArmEstimate = secondTerm.Where is null
+                ? EstimateUnfilteredTableScan(secondSource.Name, compilationContext)
+                : EstimateFilteredTableScan(secondSource, secondTerm.Where, compilationContext);
             ops =
             [
                 new EqpJsonCompoundOp(),
                 new EqpJsonCompoundArmOp("left_most", TempBtree: false),
-                BuildIndexScanOp(firstIndexPlan, firstTerm),
+                WithEqpEstimate(BuildIndexScanOp(firstIndexPlan, firstTerm), firstArmEstimate),
                 new EqpJsonCompoundArmOp("union", TempBtree: true),
-                new EqpJsonScanOp(secondSource.Name, secondSource.Alias, IndexName: null, Covering: false),
+                new EqpJsonScanOp(secondSource.Name, secondSource.Alias, IndexName: null, Covering: false, Estimate: secondArmEstimate),
                 new EqpJsonOrderByOp(),
             ];
             return new ExecutionResult(
@@ -29555,19 +29837,31 @@ out bool hasReturning)
                         },
                     },
                 ],
-                Query: SelectStatement { Source: NamedTableSource { Name: var outerName } },
+                Query: SelectStatement { Source: NamedTableSource { Name: var outerName } } recursiveOuter,
             }
             && string.Equals(recursiveName, outerName, StringComparison.OrdinalIgnoreCase)
             && !SelectContainsRegisteredScalarFunction(anchor)
             && !SelectContainsRegisteredScalarFunction(recursiveStep))
         {
+            // A recursive CTE has no row estimate, so its coroutine scan is sized by Turso's
+            // 1,000,000-row fallback with no body cost (access_method.rs
+            // find_best_access_method_for_subquery); the recursive step reads a one-row input
+            // (access_method.rs:790-804).
+            var recursiveScanEstimate = recursiveOuter.Where is null
+                ? new EqpJsonEstimate(
+                    1,
+                    JoinCostParams.RowsPerTableFallback,
+                    JoinCostParams.RowsPerTableFallback,
+                    TursoCostModel.EstimateScanCost(JoinCostParams.RowsPerTableFallback, 1.0),
+                    TursoCostModel.EstimateScanCost(JoinCostParams.RowsPerTableFallback, 1.0))
+                : null;
             ops =
             [
-                new EqpJsonRecursiveCteScanOp(recursiveName),
+                new EqpJsonRecursiveCteScanOp(recursiveName, recursiveScanEstimate),
                 new EqpJsonRecursiveSetupOp(),
                 new EqpJsonConstantRowOp(),
                 new EqpJsonRecursiveStepOp(),
-                new EqpJsonRecursiveCteInputScanOp(recursiveName),
+                new EqpJsonRecursiveCteInputScanOp(recursiveName, EstimateRecursiveCteInputScan(recursiveStep, recursiveName)),
             ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -29631,7 +29925,15 @@ out bool hasReturning)
                 new EqpJsonMultiIndexOp(
                     orUnionPlan.Table.Name,
                     orUnionPlan.Branches.Select(static branch => branch.Name).ToArray(),
-                    Alias: orUnionPlan.Source.Alias),
+                    Alias: orUnionPlan.Source.Alias,
+                    Estimate: orUnionSelect.Where is { } orUnionWhere
+                        ? EstimateTursoMultiIndexOrUnion(
+                            orUnionPlan.Source,
+                            orUnionPlan.Table,
+                            orUnionWhere,
+                            orUnionPlan.Branches.Select(static branch => (branch.Index, branch.Predicate)).ToArray(),
+                            compilationContext)
+                        : null),
             ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),

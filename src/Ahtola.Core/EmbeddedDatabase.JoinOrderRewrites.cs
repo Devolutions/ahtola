@@ -1797,12 +1797,26 @@ public sealed partial class EmbeddedDatabase
                 localSelectivity = EstimateTursoLocalSelectivity(conjunct, named, table, context);
         }
 
+        var constantOrdinal = -1;
+        string? constantCollation = null;
+        if (!term.IsEquality
+            && !term.CostOnly
+            && System.Numerics.BitOperations.PopCount(term.TableMask) == 1
+            && TryDescribeConstantEquality(conjunct, infos, context, out var constantMember, out var ordinal, out var collation)
+            && term.TableMask == 1UL << constantMember)
+        {
+            constantOrdinal = ordinal;
+            constantCollation = collation;
+        }
+
         return term with
         {
             TursoLeftSelectivity = leftSelectivity,
             TursoRightSelectivity = rightSelectivity,
             TursoLocalSelectivity = localSelectivity,
             WhereExtraSteps = CountTursoWhereSteps(conjunct) - 1,
+            ConstantEqualityOrdinal = constantOrdinal,
+            ConstantEqualityCollation = constantCollation,
         };
 
         double MemberEqualitySelectivity(ulong mask, int ordinal)
@@ -1813,6 +1827,105 @@ public sealed partial class EmbeddedDatabase
             return infos[member].Table is { } table && ordinal < table.Columns.Length
                 ? EstimateTursoColumnSelectivity(table, ordinal, TursoConstraintOperator.Equal, context)
                 : double.NaN;
+        }
+    }
+
+    /// <summary>
+    /// Recognizes <c>column = literal</c> (either side; a numeric literal may carry a sign) on
+    /// one join member whose comparison needs no affinity conversion of the literal — a
+    /// numeric literal against a numeric-affinity column, a text literal against a TEXT column,
+    /// or any literal against a BLOB-affinity column — so an index seek can use the literal as
+    /// its key verbatim. The comparison collation is the column's declared collation.
+    /// </summary>
+    private static bool TryDescribeConstantEquality(
+        Expression conjunct,
+        JoinOrderMemberInfo[] infos,
+        QueryContext context,
+        out int member,
+        out int ordinal,
+        out string collation)
+    {
+        member = -1;
+        ordinal = -1;
+        collation = "BINARY";
+        if (!TryGetConstantEqualityOperands(conjunct, out var column, out var value)
+            || !TryResolveJoinOrderMember(column, infos, out member)
+            || infos[member].Table is not { } table
+            || TryResolveJoinOrderColumnDefinition(infos[member], column, context) is not { } definition
+            || !table.TryGetColumnIndex(definition.Name, out ordinal))
+        {
+            return false;
+        }
+
+        if (!IsVerbatimConstantSeekKey(definition, value))
+            return false;
+
+        collation = NormalizeDeclaredCollation(definition.Collation).ToUpperInvariant();
+        return true;
+    }
+
+    /// <summary>
+    /// Whether comparing <paramref name="definition"/>'s column with the literal
+    /// <paramref name="value"/> applies no affinity conversion to the literal, so the literal
+    /// can be an index seek key as written.
+    /// </summary>
+    private static bool IsVerbatimConstantSeekKey(EmbeddedColumn definition, SqlValue value)
+    {
+        var affinity = GetJoinKeyAffinity(definition);
+        return affinity is null or ColumnAffinity.Blob
+            || IsNumericAffinity(affinity) && value.Kind is SqlValueKind.Integer or SqlValueKind.Real
+            || affinity == ColumnAffinity.Text && value.Kind == SqlValueKind.Text;
+    }
+
+    /// <summary>
+    /// The bare column and literal value of <c>column = literal</c> / <c>literal = column</c>
+    /// with no explicit COLLATE; NULL and BLOB literals are not constant seek keys.
+    /// </summary>
+    private static bool TryGetConstantEqualityOperands(
+        Expression conjunct,
+        out ColumnExpression column,
+        out SqlValue value)
+    {
+        column = null!;
+        value = SqlValue.Null;
+        if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } binary)
+            return false;
+
+        if (binary.Left is ColumnExpression { BooleanKeyword: null } leftColumn && TryGetLiteral(binary.Right, out value))
+        {
+            column = leftColumn;
+            return true;
+        }
+
+        if (binary.Right is ColumnExpression { BooleanKeyword: null } rightColumn && TryGetLiteral(binary.Left, out value))
+        {
+            column = rightColumn;
+            return true;
+        }
+
+        return false;
+
+        static bool TryGetLiteral(Expression expression, out SqlValue literal)
+        {
+            literal = SqlValue.Null;
+            switch (expression)
+            {
+                case LiteralExpression { Value.Kind: SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Text } plain:
+                    literal = plain.Value;
+                    return true;
+                case UnaryExpression { Operator: UnaryOperator.Plus, Operand: LiteralExpression { Value.Kind: SqlValueKind.Integer or SqlValueKind.Real } positive }:
+                    literal = positive.Value;
+                    return true;
+                case UnaryExpression { Operator: UnaryOperator.Negate, Operand: LiteralExpression { Value.Kind: SqlValueKind.Real } negativeReal }:
+                    literal = SqlValue.Real(-negativeReal.Value.AsReal());
+                    return true;
+                case UnaryExpression { Operator: UnaryOperator.Negate, Operand: LiteralExpression { Value.Kind: SqlValueKind.Integer } negativeInteger }
+                    when negativeInteger.Value.AsInteger() != long.MinValue:
+                    literal = SqlValue.Integer(-negativeInteger.Value.AsInteger());
+                    return true;
+                default:
+                    return false;
+            }
         }
     }
 
