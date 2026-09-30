@@ -163,6 +163,9 @@ public class ExplainQueryPlanFormatJsonTests
             """);
         rows.Should().ContainSingle().Which.Should().Equal(SqlValue.Text("Ada"), SqlValue.Real(12.5));
 
+        // A cancellation-capable statement stays on the evaluator, whose LEFT JOIN seeks the
+        // declared indexes; EXPLAIN stepped the same way describes those paths.
+        using var cancellation = new CancellationTokenSource();
         using var document = JsonDocument.Parse(
             ReadAll(
                 connection,
@@ -173,7 +176,8 @@ public class ExplainQueryPlanFormatJsonTests
                 LEFT JOIN orders o ON o.user_id = u.id
                 WHERE u.age > 21
                 ORDER BY o.amount;
-                """).Single());
+                """,
+                cancellation.Token).Single());
         var nodes = document.RootElement.GetProperty("nodes");
         nodes[0].GetProperty("op").GetProperty("index").GetProperty("name").GetString().Should().Be("idx_users_age");
         nodes[0].GetProperty("op").GetProperty("constraints")[0].GetString().Should().Be("age>?");
@@ -714,12 +718,13 @@ public class ExplainQueryPlanFormatJsonTests
             """;
         ReadValues(connection, query).Should().HaveCount(2);
         var details = ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query);
-        details.Should().ContainSingle().Which.Should().Be("SEARCH items USING INDEX items_k (k=?)");
+        // Turso's SEARCH names the alias alone (core/translate/eqp.rs Display).
+        details.Should().Equal("SCAN items AS a", "SEARCH b USING INDEX items_k (k=?)");
 
         using var document = JsonDocument.Parse(
             ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
-        var node = document.RootElement.GetProperty("nodes")[0];
-        node.GetProperty("detail").GetString().Should().Be(details[0]);
+        var node = document.RootElement.GetProperty("nodes")[1];
+        node.GetProperty("detail").GetString().Should().Be(details[1]);
         var op = node.GetProperty("op");
         op.GetProperty("type").GetString().Should().Be("search");
         op.GetProperty("table").GetString().Should().Be("items");
@@ -731,7 +736,7 @@ public class ExplainQueryPlanFormatJsonTests
         op.GetProperty("index").GetProperty("ephemeral").GetBoolean().Should().BeFalse();
         op.GetProperty("constraints").EnumerateArray().Select(static value => value.GetString())
             .Should().Equal("k=?");
-        var outerScan = document.RootElement.GetProperty("nodes")[1];
+        var outerScan = document.RootElement.GetProperty("nodes")[0];
         outerScan.GetProperty("detail").GetString().Should().Be("SCAN items AS a");
         outerScan.GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
         outerScan.GetProperty("op").GetProperty("alias").GetString().Should().Be("a");
@@ -800,15 +805,15 @@ public class ExplainQueryPlanFormatJsonTests
         ReadValues(connection, "EXPLAIN " + query)
             .Should().Contain(row => row[1].AsText() == "OpenJoinCursor");
         ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
-            .Should().Equal("MANAGED COMPILED VDBE");
+            .Should().Equal("SCAN l AS a", "SCAN r AS b LEFT-JOIN", "USE SORTER FOR ORDER BY");
 
         using var document = JsonDocument.Parse(
             ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
         var nodes = document.RootElement.GetProperty("nodes");
-        nodes.GetArrayLength().Should().Be(2);
+        nodes.GetArrayLength().Should().Be(3);
         nodes[0].GetProperty("detail").GetString().Should().Be("SCAN l AS a");
         nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
-        nodes[1].GetProperty("detail").GetString().Should().Be("SCAN r AS b");
+        nodes[1].GetProperty("detail").GetString().Should().Be("SCAN r AS b LEFT-JOIN");
         nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
         nodes[1].GetProperty("op").GetProperty("join").GetString().Should().Be("left");
     }
@@ -847,7 +852,7 @@ public class ExplainQueryPlanFormatJsonTests
     }
 
     [Test]
-    public void CompiledHashBuildLeftUsesTheChosenSmallTable()
+    public void CompiledHashBuildLeftHashesTheTableTheCostModelPlacesFirst()
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
@@ -875,20 +880,24 @@ public class ExplainQueryPlanFormatJsonTests
             ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
         var nodes = document.RootElement.GetProperty("nodes");
         nodes.GetArrayLength().Should().Be(2);
+        // Turso's hash cost charges a build row (hash_cpu_cost + hash_insert_cost) less than a
+        // probe row (hash_cpu_cost + hash_lookup_cost), so the 40-row table is scanned first and
+        // hashed, and the 3-row table streams as the probe (access_method.rs
+        // estimate_hash_join_cost, cost_params.rs).
         nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_join");
-        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("big");
-        nodes[0].GetProperty("op").GetProperty("alias").GetString().Should().Be("b");
+        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("small");
+        nodes[0].GetProperty("op").GetProperty("alias").GetString().Should().Be("s");
         nodes[0].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
         nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
-        nodes[1].GetProperty("op").GetProperty("table").GetString().Should().Be("small");
-        nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("s");
+        nodes[1].GetProperty("op").GetProperty("table").GetString().Should().Be("big");
+        nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("b");
         nodes[1].GetProperty("op").TryGetProperty("join", out _).Should().BeFalse();
         nodes.EnumerateArray().Should().OnlyContain(static node =>
             node.GetProperty("parent").ValueKind == JsonValueKind.Null);
     }
 
     [Test]
-    public void CompiledThreeTableHashBuildLeftNestsTheActualJoinedPrefix()
+    public void CompiledThreeTableRowidEquijoinsSearchEachIntegerPrimaryKey()
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
@@ -902,6 +911,9 @@ public class ExplainQueryPlanFormatJsonTests
             string.Join(", ", Enumerable.Range(1, 40).Select(value => $"({value}, 'b{value}')")) +
             "; ANALYZE;");
 
+        // NOT INDEXED keeps the rowid candidate (optimizer/mod.rs enforce_indexed_by_hints), and a
+        // unique rowid seek per outer row beats any hash join (access_method.rs), so each later
+        // table is a rowid lookup keyed by the preceding row.
         const string query = """
             SELECT s.label, b.label
             FROM small AS s NOT INDEXED JOIN seed AS e NOT INDEXED ON s.id = e.x
@@ -910,43 +922,80 @@ public class ExplainQueryPlanFormatJsonTests
         ReadValues(connection, query).Should().HaveCount(3);
         var compiled = ReadValues(connection, "EXPLAIN " + query)
             .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText();
-        compiled.Should().Contain("hash-build left");
+        compiled.Should().Contain("hash-build right");
         compiled.Should().Contain("scan order: s, e, b");
-        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
-            .Should().Equal("MANAGED COMPILED VDBE");
+        ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query).Should().Equal(
+            "SCAN small AS s",
+            "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)",
+            "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)");
 
         using var document = JsonDocument.Parse(
             ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
         var nodes = document.RootElement.GetProperty("nodes");
-        nodes.GetArrayLength().Should().Be(4);
-        nodes.EnumerateArray().Select(static node => node.GetProperty("id").GetInt32())
-            .Should().Equal(1, 2, 3, 4);
-
-        nodes[0].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
-        nodes[0].GetProperty("detail").GetString().Should()
-            .Be("MATERIALIZE hash build input for small AS s");
-        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_build");
-        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("small");
+        nodes.GetArrayLength().Should().Be(3);
+        nodes.EnumerateArray().Should().OnlyContain(static node =>
+            node.GetProperty("parent").ValueKind == JsonValueKind.Null);
+        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
         nodes[0].GetProperty("op").GetProperty("alias").GetString().Should().Be("s");
+        foreach (var (node, alias) in new[] { (nodes[1], "e"), (nodes[2], "b") })
+        {
+            node.GetProperty("op").GetProperty("type").GetString().Should().Be("search");
+            node.GetProperty("op").GetProperty("alias").GetString().Should().Be(alias);
+            node.GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+            node.GetProperty("op").GetProperty("constraints")[0].GetString().Should().Be("rowid=?");
+        }
 
-        nodes[1].GetProperty("parent").GetInt32().Should().Be(1);
-        nodes[1].GetProperty("detail").GetString().Should().Be("HASH JOIN small AS s");
-        nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_join");
-        nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("s");
-        nodes[1].GetProperty("op").TryGetProperty("join", out _).Should().BeFalse();
-
-        nodes[2].GetProperty("parent").GetInt32().Should().Be(1);
-        nodes[2].GetProperty("detail").GetString().Should().Be("SCAN seed AS e");
-        nodes[2].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
-        nodes[2].GetProperty("op").GetProperty("alias").GetString().Should().Be("e");
-        nodes[2].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
-
-        nodes[3].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
-        nodes[3].GetProperty("detail").GetString().Should().Be("HASH JOIN big AS b");
-        nodes[3].GetProperty("op").GetProperty("table").GetString().Should().Be("big");
-        nodes[3].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+        document.RootElement.GetRawText().Should().NotContain("hash_build");
     }
 
+    [Test]
+    public void CompiledThreeTableHashBuildLeftMaterializesTheJoinedPrefix()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection,
+            "CREATE TABLE c(id INTEGER PRIMARY KEY); " +
+            "INSERT INTO c VALUES (1), (2), (3); " +
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, c_id INTEGER, k INTEGER); " +
+            "INSERT INTO a SELECT value, ((value - 1) % 3) + 1, (((value - 1) % 3) + 1) * 10 " +
+            "FROM generate_series(1, 30); " +
+            "CREATE INDEX a_c_id ON a(c_id); " +
+            "CREATE TABLE b(k INTEGER); " +
+            "INSERT INTO b VALUES (30), (10), (20); " +
+            "INSERT INTO b SELECT 1000 + value FROM generate_series(1, 997); " +
+            "ANALYZE;");
+
+        // join/hash_join_order_by.sqltest hash-join-materialized-prefix-uses-sorter: the c ⋈ a
+        // prefix is the hash build input for the probe of b, so EQP nests the prefix under
+        // Turso's MATERIALIZE node (EqpDetail::HashBuild).
+        const string query = """
+            SELECT c.id FROM c JOIN a ON a.c_id = c.id JOIN b ON b.k = a.k
+            WHERE c.id > 0 ORDER BY c.id;
+            """;
+        ReadValues(connection, query).Should().HaveCount(30);
+        ReadValues(connection, "EXPLAIN " + query)
+            .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText()
+            .Should().Contain("hash-build left");
+
+        using var document = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.EnumerateArray().Select(static node => node.GetProperty("id").GetInt32())
+            .Should().Equal(1, 2, 3, 4, 5);
+        nodes[0].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
+        nodes[0].GetProperty("detail").GetString().Should().Be("MATERIALIZE hash build input for a");
+        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_build");
+        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("a");
+        nodes[1].GetProperty("parent").GetInt32().Should().Be(1);
+        nodes[1].GetProperty("detail").GetString().Should().Be("SCAN c");
+        nodes[2].GetProperty("parent").GetInt32().Should().Be(1);
+        nodes[2].GetProperty("op").GetProperty("table").GetString().Should().Be("a");
+        nodes[3].GetProperty("parent").ValueKind.Should().Be(JsonValueKind.Null);
+        nodes[3].GetProperty("detail").GetString().Should().Be("HASH JOIN b");
+        nodes[3].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_join");
+        nodes[3].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+        nodes[4].GetProperty("detail").GetString().Should().Be("USE SORTER FOR ORDER BY");
+    }
     [Test]
     public void CompiledThreeTableHashBuildRightDoesNotInventPrefixMaterialization()
     {
@@ -977,7 +1026,7 @@ public class ExplainQueryPlanFormatJsonTests
     }
 
     [Test]
-    public void CompiledJoinAutomaticIndexIsAnEphemeralCoveringSearch()
+    public void CompiledAnalyzedEquijoinWithoutIndexesIsReportedAsItsHashJoin()
     {
         using var embedded = new EmbeddedDatabase();
         using var connection = embedded.Connect();
@@ -989,30 +1038,35 @@ public class ExplainQueryPlanFormatJsonTests
             "INSERT INTO inner_items VALUES " +
             string.Join(", ", Enumerable.Range(1, 100).Select(value => $"({value}, 'i{value}')")) + "; ANALYZE;");
 
+        // With no usable index Turso's cheapest step is the left-deep hash join that builds the
+        // first table and probes the second (access_method.rs try_hash_join_access_method); the
+        // compiled operator executes exactly that build-left shape.
         const string query = """
             SELECT o.k, i.payload
             FROM outer_items AS o JOIN inner_items AS i ON o.k = i.k
             ORDER BY o.k;
             """;
         ReadValues(connection, query).Should().HaveCount(100);
-        var detail = ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query).Single();
-        detail.Should().Be("SEARCH inner_items USING AUTOMATIC COVERING INDEX (k=?)");
+        ReadValues(connection, "EXPLAIN " + query)
+            .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText()
+            .Should().Contain("hash-build left");
+        var details = ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query);
+        details.Should().Equal("HASH JOIN inner_items AS i", "SCAN outer_items AS o", "USE SORTER FOR ORDER BY");
 
         using var document = JsonDocument.Parse(
             ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
-        var node = document.RootElement.GetProperty("nodes")[0];
-        node.GetProperty("detail").GetString().Should().Be(detail);
-        var op = node.GetProperty("op");
-        op.GetProperty("type").GetString().Should().Be("search");
-        op.GetProperty("table").GetString().Should().Be("inner_items");
-        op.GetProperty("alias").GetString().Should().Be("i");
-        op.GetProperty("join").GetString().Should().Be("inner");
-        op.GetProperty("index").GetProperty("name").GetString().Should().Be("automatic_inner_items");
-        op.GetProperty("index").GetProperty("covering").GetBoolean().Should().BeTrue();
-        op.GetProperty("index").GetProperty("ephemeral").GetBoolean().Should().BeTrue();
-        op.GetProperty("constraints")[0].GetString().Should().Be("k=?");
+        var nodes = document.RootElement.GetProperty("nodes");
+        nodes.GetArrayLength().Should().Be(3);
+        nodes[0].GetProperty("detail").GetString().Should().Be(details[0]);
+        nodes[0].GetProperty("op").GetProperty("type").GetString().Should().Be("hash_join");
+        nodes[0].GetProperty("op").GetProperty("table").GetString().Should().Be("inner_items");
+        nodes[0].GetProperty("op").GetProperty("alias").GetString().Should().Be("i");
+        nodes[0].GetProperty("op").GetProperty("join").GetString().Should().Be("inner");
+        nodes[1].GetProperty("detail").GetString().Should().Be(details[1]);
+        nodes[1].GetProperty("op").GetProperty("type").GetString().Should().Be("scan");
+        nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("o");
+        nodes[2].GetProperty("op").GetProperty("type").GetString().Should().Be("order_by");
     }
-
     [Test]
     public void CompiledJoinPagerSeekReportsTheDurableIndexRatherThanAnAutomaticIndex()
     {
@@ -1038,11 +1092,15 @@ public class ExplainQueryPlanFormatJsonTests
                 ON o.k = i.k
             ORDER BY o.k;
             """;
-        var detail = ReadPlanDetails(reopenedConnection, "EXPLAIN QUERY PLAN " + query).Single();
-        detail.Should().Be("SEARCH inner_items USING INDEX inner_items_k (k=?)");
+        var details = ReadPlanDetails(reopenedConnection, "EXPLAIN QUERY PLAN " + query);
+        details.Should().Equal(
+            "SCAN outer_items AS o",
+            "SEARCH i USING INDEX inner_items_k (k=?)",
+            "USE SORTER FOR ORDER BY");
+        var detail = details[1];
         using var document = JsonDocument.Parse(
             ReadAll(reopenedConnection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
-        var node = document.RootElement.GetProperty("nodes")[0];
+        var node = document.RootElement.GetProperty("nodes")[1];
         node.GetProperty("detail").GetString().Should().Be(detail);
         var op = node.GetProperty("op");
         op.GetProperty("type").GetString().Should().Be("search");
@@ -1101,14 +1159,17 @@ public class ExplainQueryPlanFormatJsonTests
         }
     }
 
-    private static List<string> ReadAll(EmbeddedConnection connection, string sql)
+    private static List<string> ReadAll(
+        EmbeddedConnection connection,
+        string sql,
+        CancellationToken cancellationToken = default)
     {
         var rows = new List<string>();
         foreach (var statement in connection.PrepareScript(sql))
         {
             using (statement)
             {
-                while (statement.Step(default) == StatementStepResult.Row)
+                while (statement.Step(cancellationToken) == StatementStepResult.Row)
                     rows.Add(statement.GetValue(0).Kind == SqlValueKind.Text
                         ? statement.GetValue(0).AsText()
                         : statement.GetValue(0).ToString() ?? "");

@@ -3,6 +3,14 @@ using System.Numerics;
 
 namespace Ahtola.Core.Compilation.JoinOrdering;
 
+/// <summary>The outer-join kind of a step costed by the Turso model.</summary>
+internal enum TursoOuterJoin
+{
+    None,
+    Left,
+    Full,
+}
+
 /// <summary>
 /// Arbitrary-N join-order enumeration for a single plain-INNER segment.
 /// </summary>
@@ -44,6 +52,9 @@ internal static class JoinOrderEnumerator
     public const int MaximumMembers = 64;
 
     private const double CostEpsilon = 1e-9;
+
+    /// <summary>join.rs:65-67 <c>MAX_MATERIALIZED_BUILD_ROWS</c>.</summary>
+    private const double MaximumMaterializedBuildRows = 200_000.0;
 
     /// <summary>
     /// Upper bound on how many mutually incomparable partial plans one DP state keeps. Reaching
@@ -91,16 +102,16 @@ internal static class JoinOrderEnumerator
         var shapes = new JoinStepShape[memberOrder.Length];
         var indexAccesses = new JoinIndexAccessChoice?[memberOrder.Length];
         var first = segment.Members[memberOrder[0]];
-        var cardinality = Math.Max(1.0, first.RowCount);
+        var (firstCost, cardinality) = EvaluateFirstStep(segment, memberOrder[0]);
         var cost = HasForcedIndexCandidate(first)
             ? double.PositiveInfinity
-            : JoinCostModel.EstimateFullScanCost(first.RowCount, scanCount: 1.0);
+            : firstCost;
         var placed = 1UL << memberOrder[0];
 
         for (var step = 1; step < memberOrder.Length; step++)
         {
             var member = memberOrder[step];
-            var evaluation = EvaluateStep(segment, placed, member, cardinality);
+            var evaluation = EvaluateStep(segment, placed, member, cardinality, memberOrder[step - 1]);
             shapes[step] = evaluation.Shape;
             indexAccesses[step] = evaluation.IndexAccess;
             cost += evaluation.StepCost;
@@ -135,11 +146,12 @@ internal static class JoinOrderEnumerator
                 continue;
 
             var state = ((1 << member) * count) + member;
+            var (memberCost, memberCardinality) = EvaluateFirstStep(segment, member);
             frontiers[state] =
             [
                 new JoinOrderDpEntry(
-                    JoinCostModel.EstimateFullScanCost(segment.Members[member].RowCount, scanCount: 1.0),
-                    Math.Max(1.0, segment.Members[member].RowCount),
+                    memberCost,
+                    memberCardinality,
                     [member],
                     [JoinStepShape.NestedLoop],
                     [null]),
@@ -175,7 +187,7 @@ internal static class JoinOrderEnumerator
                         if ((mask & (1 << next)) != 0)
                             continue;
 
-                        var evaluation = EvaluateStep(segment, (ulong)mask, next, entry.Cardinality);
+                        var evaluation = EvaluateStep(segment, (ulong)mask, next, entry.Cardinality, entry.Order[^1]);
                         var nextCost = entry.Cost + evaluation.StepCost;
                         if (nextCost >= upperBound + CostEpsilon)
                             continue;
@@ -299,7 +311,7 @@ internal static class JoinOrderEnumerator
             if (HasForcedIndexCandidate(segment.Members[member]))
                 continue;
 
-            var candidate = JoinCostModel.EstimateFullScanCost(segment.Members[member].RowCount, scanCount: 1.0);
+            var candidate = EvaluateFirstStep(segment, member).Cost;
             if (candidate >= firstCost - CostEpsilon)
                 continue;
 
@@ -314,7 +326,7 @@ internal static class JoinOrderEnumerator
         shapes[0] = JoinStepShape.NestedLoop;
         used[firstMember] = true;
         var placed = 1UL << firstMember;
-        var cardinality = Math.Max(1.0, segment.Members[firstMember].RowCount);
+        var cardinality = EvaluateFirstStep(segment, firstMember).Cardinality;
         var cost = firstCost;
 
         for (var step = 1; step < count; step++)
@@ -329,7 +341,7 @@ internal static class JoinOrderEnumerator
                 if (used[member])
                     continue;
 
-                var evaluation = EvaluateStep(segment, placed, member, cardinality);
+                var evaluation = EvaluateStep(segment, placed, member, cardinality, order[step - 1]);
                 // Strict improvement only, so the lowest member index wins every tie.
                 if (bestMember >= 0 && evaluation.StepCost >= bestCost - CostEpsilon)
                     continue;
@@ -386,6 +398,34 @@ internal static class JoinOrderEnumerator
     }
 
     /// <summary>
+    /// The cost and output cardinality of the plan's first (outer-most) member: a full scan.
+    /// Under the Turso model this is <c>estimate_scan_cost</c> plus the WHERE work of the
+    /// member's own ready filters, producing the rows those filters keep
+    /// (join.rs:156-190 rows_after_join, access_method.rs:687-707).
+    /// </summary>
+    internal static (double Cost, double Cardinality) EvaluateFirstStep(JoinSegment segment, int member)
+    {
+        var rows = Math.Max(1.0, segment.Members[member].RowCount);
+        if (!segment.UseTursoCostModel)
+            return (JoinCostModel.EstimateFullScanCost(segment.Members[member].RowCount, scanCount: 1.0), rows);
+
+        var memberBit = 1UL << member;
+        var extraSteps = 0;
+        var selectivity = 1.0;
+        foreach (var term in segment.Terms)
+        {
+            if (term.TableMask != memberBit)
+                continue;
+            extraSteps += term.WhereExtraSteps;
+            selectivity *= term.TursoLocalSelectivity;
+        }
+
+        var cost = TursoCostModel.EstimateScanCost(rows, 1.0)
+            + TursoCostModel.EstimateWhereWork(1.0, rows, consumedSteps: 0, extraSteps);
+        return (cost, rows * selectivity);
+    }
+
+    /// <summary>
     /// Scores adding <paramref name="member"/> onto a partial plan covering
     /// <paramref name="placedMask"/> with cardinality <paramref name="leftCardinality"/>.
     /// </summary>
@@ -393,8 +433,12 @@ internal static class JoinOrderEnumerator
         JoinSegment segment,
         ulong placedMask,
         int member,
-        double leftCardinality)
+        double leftCardinality,
+        int lastMember = -1)
     {
+        if (segment.UseTursoCostModel)
+            return EvaluateTursoStep(segment, placedMask, member, leftCardinality, lastMember: lastMember);
+
         var memberBit = 1UL << member;
         var candidateMask = placedMask | memberBit;
         var rightRows = Math.Max(1.0, segment.Members[member].RowCount);
@@ -675,7 +719,347 @@ internal static class JoinOrderEnumerator
         return false;
     }
 
-    private readonly record struct StepEvaluation(
+    /// <summary>
+    /// One left-deep step costed with the ported Turso v0.8.1 join planner
+    /// (optimizer/join.rs <c>join_lhs_and_rhs</c>, access_method.rs
+    /// <c>find_best_access_method_for_btree</c> and <c>try_hash_join_access_method</c>), mapped
+    /// onto the shapes the managed operator executes:
+    /// <list type="bullet">
+    /// <item>a full scan of the member per outer row (<c>estimate_scan_cost</c> with the outer
+    /// cardinality as the scan count) → <see cref="JoinStepShape.NestedLoop"/>;</item>
+    /// <item>a declared index seek on an outer-bound equality prefix
+    /// (<c>estimate_index_cost</c>) → <see cref="JoinStepShape.IndexSeekRight"/>;</item>
+    /// <item>Turso's temporary index when the best B-tree access is a full scan
+    /// (scan + <c>estimate_ephemeral_index_build_cost</c> + per-seek work) → the operator's hash
+    /// of the right input, <see cref="JoinStepShape.HashBuildRight"/>;</item>
+    /// <item>a hash join building the previous table and probing this one
+    /// (<c>estimate_hash_join_cost</c>, only while the outer side is that single table, the
+    /// left-deep build Turso allows without materialization) →
+    /// <see cref="JoinStepShape.HashBuildLeft"/>.</item>
+    /// </list>
+    /// Every alternative carries the WHERE work of the terms that become ready at this step
+    /// (<c>cost_with_where_work</c>), and a step with no join term pays Turso's cross-product
+    /// penalty.
+    /// </summary>
+    internal static StepEvaluation EvaluateTursoStep(
+        JoinSegment segment,
+        ulong placedMask,
+        int member,
+        double inputCardinality,
+        TursoOuterJoin outerJoin = TursoOuterJoin.None,
+        int lastMember = -1)
+    {
+        var memberBit = 1UL << member;
+        var candidateMask = placedMask | memberBit;
+        var target = segment.Members[member];
+        var rows = Math.Max(1.0, target.RowCount);
+
+        // Terms that become ready at this step, and the constraints they put on the member.
+        var ready = new List<int>();
+        var joinEqualities = new List<(int Term, int Ordinal, double Selectivity, bool Hashable)>();
+        var hasJoinTerm = false;
+        var memberLocalSelectivity = 1.0;
+        for (var index = 0; index < segment.Terms.Count; index++)
+        {
+            var term = segment.Terms[index];
+            if ((term.TableMask & memberBit) == 0 || (term.TableMask & ~candidateMask) != 0)
+                continue;
+            ready.Add(index);
+            if ((term.TableMask & placedMask) != 0)
+                hasJoinTerm = true;
+            if (term.TableMask == memberBit)
+                memberLocalSelectivity *= term.TursoLocalSelectivity;
+
+            if (!term.IsEquality || term.CostOnly)
+                continue;
+            if (term.EqualityRightMask == memberBit && (term.EqualityLeftMask & ~placedMask) == 0 && term.EqualityLeftMask != 0)
+            {
+                joinEqualities.Add((index, term.EqualityRightColumnOrdinal, Sanitize(term.TursoRightSelectivity), term.EqualityCollation is not null));
+            }
+            else if (term.EqualityLeftMask == memberBit && (term.EqualityRightMask & ~placedMask) == 0 && term.EqualityRightMask != 0)
+            {
+                joinEqualities.Add((index, term.EqualityLeftColumnOrdinal, Sanitize(term.TursoLeftSelectivity), term.EqualityCollation is not null));
+            }
+        }
+
+        // The selectivity of the ready constraints an access path does not consume
+        // (constraint_output_multipliers, join.rs:94-152).
+        double RemainingSelectivity(IReadOnlyCollection<int> consumed)
+        {
+            var selectivity = memberLocalSelectivity;
+            foreach (var equality in joinEqualities)
+            {
+                if (!consumed.Contains(equality.Term))
+                    selectivity *= equality.Selectivity;
+            }
+
+            return selectivity;
+        }
+
+        double WhereWork(IReadOnlyCollection<int> consumed, double rowsPerOuterRow)
+        {
+            var consumedSteps = 0;
+            var remainingSteps = 0;
+            foreach (var index in ready)
+            {
+                if (consumed.Contains(index))
+                    consumedSteps += segment.Terms[index].WhereExtraSteps;
+                else
+                    remainingSteps += segment.Terms[index].WhereExtraSteps;
+            }
+
+            return TursoCostModel.EstimateWhereWork(inputCardinality, rowsPerOuterRow, consumedSteps, remainingSteps);
+        }
+
+        var crossPenalty = hasJoinTerm ? 0.0 : inputCardinality * rows * memberLocalSelectivity;
+
+        // An outer join emits every outer row at least once: the Poisson estimate of
+        // rows_after_join (join.rs:192-248) keeps a row whose matches all miss.
+        double OuterRows(double rowsPerOuterRow, double remainingSelectivity)
+            => outerJoin == TursoOuterJoin.None
+                ? inputCardinality * rowsPerOuterRow * remainingSelectivity
+                : inputCardinality * (rowsPerOuterRow * remainingSelectivity + Math.Exp(-(rowsPerOuterRow * remainingSelectivity)));
+
+        // choose_best_btree_candidate: the plain scan, then each declared index seek.
+        IReadOnlyCollection<int> noTerms = [];
+        var bestShape = JoinStepShape.NestedLoop;
+        JoinIndexAccessChoice? bestIndex = null;
+        var bestBtreeCost = TursoCostModel.EstimateScanCost(rows, inputCardinality);
+        var bestRowsPerOuter = rows;
+        IReadOnlyCollection<int> bestConsumed = noTerms;
+        var forcedOnly = HasForcedIndexCandidate(target);
+        if (forcedOnly)
+            bestBtreeCost = double.PositiveInfinity;
+
+        var candidates = target.IndexCandidates ?? [];
+        for (var candidateIndex = 0; candidateIndex < candidates.Count; candidateIndex++)
+        {
+            var candidate = candidates[candidateIndex];
+            if (candidate.Automatic)
+                continue;
+
+            var termIndices = new List<int>(candidate.Columns.Count);
+            var selectivityProduct = 1.0;
+            foreach (var column in candidate.Columns)
+            {
+                var bound = -1;
+                foreach (var equality in joinEqualities)
+                {
+                    if (!termIndices.Contains(equality.Term)
+                        && CanBindIndexColumn(segment.Terms[equality.Term], placedMask, memberBit, column))
+                    {
+                        bound = equality.Term;
+                        selectivityProduct *= equality.Selectivity;
+                        break;
+                    }
+                }
+
+                if (bound < 0)
+                    break;
+                termIndices.Add(bound);
+            }
+
+            if (termIndices.Count == 0)
+                continue;
+
+            var unique = candidate.Unique && termIndices.Count >= candidate.Columns.Count;
+            var rowsPerSeek = unique
+                ? 1.0
+                : termIndices.Count <= candidate.RowsPerPrefix.Count
+                    ? Math.Max(candidate.RowsPerPrefix[termIndices.Count - 1], 1.0)
+                    : Math.Max(selectivityProduct * rows, 1.0);
+            var info = new TursoIndexInfo(
+                candidate.Unique,
+                candidate.Columns.Count,
+                candidate.Covering,
+                TursoCostModel.IndexLeafRowsPerPage(candidate.Columns.Count, candidate.TableColumnCount, candidate.HasRowIdAlias));
+            var cost = TursoCostModel.EstimateIndexCost(
+                rows,
+                TursoCostModel.EstimateBtreeDepth(rows, JoinCostParams.RowsPerTablePage),
+                info,
+                inputCardinality,
+                rowsPerSeek);
+            if (cost < bestBtreeCost || candidate.Forced && bestShape != JoinStepShape.IndexSeekRight)
+            {
+                bestBtreeCost = cost;
+                bestShape = JoinStepShape.IndexSeekRight;
+                bestIndex = new JoinIndexAccessChoice(candidateIndex, [.. termIndices], rowsPerSeek);
+                bestRowsPerOuter = rowsPerSeek;
+                bestConsumed = termIndices;
+            }
+        }
+
+        // The rowid candidate: an outer-bound equality on the INTEGER PRIMARY KEY is a unique
+        // point lookup (estimate_cost_for_scan_or_seek with the rowid IndexInfo). The operator
+        // serves it by hashing the right input on that key once, i.e. a rowid-keyed lookup.
+        var rowidSeek = false;
+        if (!forcedOnly && target.RowidAliasOrdinal >= 0)
+        {
+            foreach (var equality in joinEqualities)
+            {
+                if (equality.Ordinal != target.RowidAliasOrdinal || !equality.Hashable)
+                    continue;
+
+                var cost = TursoCostModel.EstimateIndexCost(
+                    rows,
+                    TursoCostModel.EstimateBtreeDepth(rows, JoinCostParams.RowsPerTablePage),
+                    new TursoIndexInfo(Unique: true, ColumnCount: 1, Covering: true, JoinCostParams.RowsPerTablePage),
+                    inputCardinality,
+                    1.0);
+                if (cost < bestBtreeCost)
+                {
+                    bestBtreeCost = cost;
+                    bestShape = JoinStepShape.HashBuildRight;
+                    bestIndex = null;
+                    bestRowsPerOuter = 1.0;
+                    bestConsumed = [equality.Term];
+                    rowidSeek = true;
+                }
+
+                break;
+            }
+        }
+
+        if (double.IsPositiveInfinity(bestBtreeCost))
+        {
+            return new StepEvaluation(JoinStepShape.NestedLoop, double.PositiveInfinity, inputCardinality * rows, null);
+        }
+
+        var bestCost = bestBtreeCost + WhereWork(bestConsumed, bestRowsPerOuter) + crossPenalty;
+        var bestOutput = OuterRows(bestRowsPerOuter, RemainingSelectivity(bestConsumed));
+
+        // The temporary index is only considered over a plain full scan and never for a FULL
+        // join, which has no nested-loop form (access_method.rs:903-987).
+        var hashableKeys = joinEqualities.Where(static equality => equality.Hashable).ToArray();
+        if (bestShape == JoinStepShape.NestedLoop && !forcedOnly && hashableKeys.Length != 0
+            && outerJoin != TursoOuterJoin.Full)
+        {
+            var consumed = hashableKeys.Select(static equality => equality.Term).ToArray();
+            var rowsPerSeek = Math.Max(
+                hashableKeys.Aggregate(1.0, static (product, equality) => product * equality.Selectivity) * rows,
+                1.0);
+            var cost = TursoCostModel.EstimateScanCost(rows, 1.0)
+                + TursoCostModel.EstimateEphemeralIndexBuildCost(rows)
+                + inputCardinality * JoinCostParams.CpuCostPerSeek
+                + inputCardinality * rowsPerSeek * JoinCostParams.CpuCostPerRow
+                + WhereWork(consumed, rowsPerSeek)
+                + crossPenalty;
+            if (cost < bestCost)
+            {
+                bestCost = cost;
+                bestShape = JoinStepShape.HashBuildRight;
+                bestIndex = null;
+                bestOutput = OuterRows(rowsPerSeek, RemainingSelectivity(consumed));
+            }
+        }
+
+        // The left-deep hash join builds the last placed table and probes this one
+        // (join.rs:586-1000). With one placed table the build reads it directly; behind a longer
+        // prefix Turso materializes the build input from the prefix's rows (the operator hashes
+        // that joined prefix), which is only allowed up to MAX_MATERIALIZED_BUILD_ROWS. An index
+        // that can seek the probe key keeps the index path (probe_index_can_seek_join_key), and
+        // so does a selective declared-index or rowid probe seek.
+        var placedCount = BitOperations.PopCount(placedMask);
+        var buildMember = placedCount == 1 ? BitOperations.TrailingZeroCount(placedMask) : lastMember;
+        var materialize = placedCount > 1;
+        var buildKeys = buildMember < 0
+            ? []
+            : hashableKeys
+                .Where(key =>
+                {
+                    var term = segment.Terms[key.Term];
+                    var otherMask = term.EqualityLeftMask == memberBit ? term.EqualityRightMask : term.EqualityLeftMask;
+                    return otherMask == 1UL << buildMember;
+                })
+                .ToArray();
+        if (buildMember >= 0
+            && buildKeys.Length != 0
+            && bestShape != JoinStepShape.IndexSeekRight
+            && !rowidSeek
+            && !forcedOnly
+            && !buildKeys.Any(key => target.IndexLeadingColumnOrdinals.Contains(key.Ordinal))
+            && (!materialize || inputCardinality <= MaximumMaterializedBuildRows || outerJoin == TursoOuterJoin.Full))
+        {
+            var build = segment.Members[buildMember];
+            var buildRows = Math.Max(1.0, build.RowCount);
+            var buildBit = 1UL << buildMember;
+            var buildSelectivity = 1.0;
+            foreach (var term in segment.Terms)
+            {
+                if (term.TableMask == buildBit)
+                    buildSelectivity *= term.TursoLocalSelectivity;
+            }
+
+            // A plain build column that an index could seek keeps the index path unless the
+            // probe side has no constant filter (can_replace_build_index_with_hash).
+            var hashCanReplaceBuildIndex = segment.Terms.All(term => term.TableMask != memberBit);
+            var buildKeyIndexed = false;
+            var buildKeyUnique = false;
+            foreach (var key in buildKeys)
+            {
+                var term = segment.Terms[key.Term];
+                var buildOrdinal = term.EqualityLeftMask == buildBit
+                    ? term.EqualityLeftColumnOrdinal
+                    : term.EqualityRightColumnOrdinal;
+                if (buildOrdinal == build.RowidAliasOrdinal && buildOrdinal >= 0)
+                {
+                    buildKeyIndexed = true;
+                    buildKeyUnique = true;
+                }
+                else if (build.IndexedColumnOrdinals.Contains(buildOrdinal))
+                {
+                    buildKeyIndexed = true;
+                }
+            }
+
+            if (hashCanReplaceBuildIndex || !buildKeyIndexed)
+            {
+                var consumed = buildKeys.Select(static equality => equality.Term).ToArray();
+                // should_materialize: the build is the prefix's estimated rows.
+                var buildCardinality = materialize
+                    ? inputCardinality
+                    : buildRows * Math.Clamp(buildSelectivity, 0.0, 1.0);
+                var probeSelectivity = buildKeys.Aggregate(1.0, static (product, equality) => product * equality.Selectivity);
+                var distinctBuildKeys = materialize ? Math.Min(inputCardinality, buildRows) : buildRows;
+                var rowsPerBuildRow = buildKeyUnique
+                    ? rows / Math.Max(distinctBuildKeys, 1.0)
+                    : rows * probeSelectivity;
+                // HashJoinType estimates (access_method.rs:1413-1420): an outer join emits each
+                // build row at least once, a FULL join also every unmatched probe row.
+                var rowsPerOuterRow = outerJoin switch
+                {
+                    TursoOuterJoin.Left => Math.Max(rowsPerBuildRow, 1.0),
+                    TursoOuterJoin.Full => Math.Max(Math.Max(rowsPerBuildRow, 1.0), rows / Math.Max(buildCardinality, 1.0)),
+                    _ => rowsPerBuildRow,
+                };
+                var cost = TursoCostModel.EstimateHashJoinCost(
+                        buildCardinality,
+                        rows,
+                        buildCardinality * rowsPerOuterRow,
+                        keepsUnmatchedBuildRows: outerJoin != TursoOuterJoin.None,
+                        probeMultiplier: 1.0)
+                    + (materialize ? buildCardinality * JoinCostParams.CpuCostPerRow : 0.0)
+                    + WhereWork(consumed, rowsPerOuterRow)
+                    + crossPenalty;
+                // FULL OUTER requires the hash join for its unmatched-probe scan.
+                if (cost < bestCost || outerJoin == TursoOuterJoin.Full)
+                {
+                    bestCost = cost;
+                    bestShape = JoinStepShape.HashBuildLeft;
+                    bestIndex = null;
+                    bestOutput = outerJoin == TursoOuterJoin.None
+                        ? inputCardinality * rowsPerBuildRow * RemainingSelectivity(consumed)
+                        : inputCardinality * rowsPerOuterRow;
+                }
+            }
+        }
+        return new StepEvaluation(bestShape, bestCost, bestOutput, bestIndex);
+
+        static double Sanitize(double selectivity)
+            => double.IsNaN(selectivity) ? JoinCostParams.SelectivityEqualityUnindexed : selectivity;
+    }
+
+    internal readonly record struct StepEvaluation(
         JoinStepShape Shape,
         double StepCost,
         double OutputCardinality,

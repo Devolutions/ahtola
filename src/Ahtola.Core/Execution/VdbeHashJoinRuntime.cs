@@ -229,7 +229,7 @@ internal static class VdbeHashJoinRuntime
     {
         HashSpill? spill = null;
         var residency = new PartitionResidencyCache();
-        var trackUnmatchedBuild = buildIsRight && plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full;
+        var trackUnmatchedBuild = KeepsUnmatchedBuild(plan, buildIsRight);
         var spillInfrastructureBytes = VdbeManagedFootprint.EstimateHashSpillInfrastructure(
             context.Options.TemporaryDirectory,
             PartitionCount,
@@ -403,9 +403,9 @@ internal static class VdbeHashJoinRuntime
                         }
                     }
 
-                    if (!matchedProbe && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                    if (!matchedProbe && KeepsUnmatchedProbe(plan, buildIsRight))
                     {
-                        yield return Combine(probe, NullRow(buildNode));
+                        yield return NullExtendProbe(probe, buildNode, buildIsRight);
                         if (maximumRows is { } maximum && ++emitted >= maximum)
                             yield break;
                     }
@@ -500,7 +500,7 @@ internal static class VdbeHashJoinRuntime
                         context.ThrowIfCancellationRequested();
                         if (matched![index])
                             continue;
-                        yield return Combine(nullProbe, buffered[index].Row);
+                        yield return NullExtendBuild(buffered[index].Row, nullProbe, buildIsRight);
                         if (maximumRows is { } maximum && ++emitted >= maximum)
                             yield break;
                     }
@@ -516,7 +516,7 @@ internal static class VdbeHashJoinRuntime
                             var build = lease.Entry;
                             if (spill.IsMatched(build.Ordinal, context))
                                 continue;
-                            combined = Combine(nullProbe, build.Row);
+                            combined = NullExtendBuild(build.Row, nullProbe, buildIsRight);
                         }
                         yield return combined;
                         if (maximumRows is { } maximum && ++emitted >= maximum)
@@ -673,9 +673,9 @@ internal static class VdbeHashJoinRuntime
                         outputRetainedBytes[localIndex] = 0;
                     }
                 }
-                else if (buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                else if (KeepsUnmatchedProbe(plan, buildIsRight))
                 {
-                    yield return Combine(batch[localIndex].Probe!, NullRow(buildNode));
+                    yield return NullExtendProbe(batch[localIndex].Probe!, buildNode, buildIsRight);
                 }
             }
             else
@@ -706,8 +706,8 @@ internal static class VdbeHashJoinRuntime
                     }
                 }
 
-                if (!matchedProbe && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
-                    yield return Combine(probe, NullRow(buildNode));
+                if (!matchedProbe && KeepsUnmatchedProbe(plan, buildIsRight))
+                    yield return NullExtendProbe(probe, buildNode, buildIsRight);
             }
 
             ReleaseInput(localIndex);
@@ -777,7 +777,7 @@ internal static class VdbeHashJoinRuntime
                     var localIndex = localIndices[slot];
                     var key = batch[localIndex].Key!;
                     var probe = batch[localIndex].Probe!;
-                    var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                    var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                     if (!ReserveSlot(key, probe, resolution.Loaded.CountFor(key), needsNullExtension, out var reserved))
                         continue; // Deferred whole to individual streaming; nothing evaluated.
 
@@ -795,7 +795,7 @@ internal static class VdbeHashJoinRuntime
                             matchedOrdinals?.Add(build.Ordinal);
                         }
                         if (matches is null && needsNullExtension)
-                            (matches ??= []).Add(Combine(probe, NullRow(buildNode)));
+                            (matches ??= []).Add(NullExtendProbe(probe, buildNode, buildIsRight));
                     }
                     catch
                     {
@@ -812,7 +812,7 @@ internal static class VdbeHashJoinRuntime
                     var localIndex = localIndices[slot];
                     var key = batch[localIndex].Key!;
                     var probe = batch[localIndex].Probe!;
-                    var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                    var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                     if (!ReserveSlot(key, probe, resolution.Index.Find(key).Count, needsNullExtension, out var reserved))
                         continue;
 
@@ -844,7 +844,7 @@ internal static class VdbeHashJoinRuntime
                                 matchedOrdinals?.Add(ordinal);
                         }
                         if (matches is null && needsNullExtension)
-                            (matches ??= []).Add(Combine(probe, NullRow(buildNode)));
+                            (matches ??= []).Add(NullExtendProbe(probe, buildNode, buildIsRight));
                     }
                     catch
                     {
@@ -879,7 +879,7 @@ internal static class VdbeHashJoinRuntime
                         var localIndex = localIndices[slot];
                         var key = batch[localIndex].Key!;
                         var probe = batch[localIndex].Probe!;
-                        var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                        var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                         if (!ReserveSlot(key, probe, partitionEntryCount, needsNullExtension, out var reserved))
                             continue;
 
@@ -922,11 +922,11 @@ internal static class VdbeHashJoinRuntime
                         if (reservedBySlot[slot] == 0)
                             continue;
                         var localIndex = localIndices[slot];
-                        var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                        var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                         var matches = matchesBySlot[slot];
                         if (matches is null && needsNullExtension)
                         {
-                            (matches ??= []).Add(Combine(batch[localIndex].Probe!, NullRow(buildNode)));
+                            (matches ??= []).Add(NullExtendProbe(batch[localIndex].Probe!, buildNode, buildIsRight));
                             matchesBySlot[slot] = matches;
                         }
                     }
@@ -1215,6 +1215,27 @@ internal static class VdbeHashJoinRuntime
             ? plan.Condition(probe, build, combined)
             : plan.Condition(build, probe, combined);
     }
+
+    /// <summary>
+    /// Whether the preserved side of an outer join is the build input, whose unmatched rows are
+    /// emitted after the probe scan (Turso <c>HashJoinType::keeps_unmatched_build_rows</c>).
+    /// </summary>
+    private static bool KeepsUnmatchedBuild(VdbeJoinOperatorPlan plan, bool buildIsRight)
+        => buildIsRight
+            ? plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full
+            : plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+
+    /// <summary>Whether an unmatched probe row is emitted null-extended as it streams.</summary>
+    private static bool KeepsUnmatchedProbe(VdbeJoinOperatorPlan plan, bool buildIsRight)
+        => buildIsRight
+            ? plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full
+            : plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full;
+
+    private static VdbeJoinRow NullExtendProbe(VdbeJoinRow probe, VdbeJoinPlanNode buildNode, bool buildIsRight)
+        => buildIsRight ? Combine(probe, NullRow(buildNode)) : Combine(NullRow(buildNode), probe);
+
+    private static VdbeJoinRow NullExtendBuild(VdbeJoinRow build, VdbeJoinRow nullProbe, bool buildIsRight)
+        => buildIsRight ? Combine(nullProbe, build) : Combine(build, nullProbe);
 
     private static VdbeJoinRow Combine(VdbeJoinRow build, VdbeJoinRow probe, bool buildIsRight) =>
         buildIsRight

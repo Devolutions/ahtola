@@ -22508,7 +22508,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (indexSelection is not null)
         {
-            if (kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Semi or VdbeJoinKind.Anti)
+            if (kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Left or VdbeJoinKind.Semi or VdbeJoinKind.Anti)
                 || !TryCreateCompiledJoinIndexScanPlan(
                     join,
                     indexSelection,
@@ -22544,7 +22544,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // INNER equijoin: hash-build the smaller estimated side (default still right).
         // OUTER joins keep hash-build-right so unmatched-side semantics stay correct.
         var hashBuildRight = true;
-        if (kind is VdbeJoinKind.Inner && equiProbe is not null)
+        if (kind is VdbeJoinKind.Left or VdbeJoinKind.Full
+            && equiProbe is not null
+            && hashBuildRightOverrides is not null
+            && hashBuildRightOverrides.TryGetValue(join, out var outerChoice))
+        {
+            // The cost-based stage chose to hash the preserved left input and probe the right
+            // (Turso's LeftOuter/FullOuter hash join); VdbeHashJoinRuntime emits the unmatched
+            // build rows after the probe scan.
+            hashBuildRight = outerChoice;
+        }
+        else if (kind is VdbeJoinKind.Inner && equiProbe is not null)
         {
             // A node the cost-based join-order stage synthesized carries its own build-side
             // decision, scored against the executable shapes in JoinCostModel.EstimateStepCost.
@@ -23478,6 +23488,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var leftColumns = GetOutputColumns(join.Left, context);
         var rightColumns = GetOutputColumns(join.Right, context);
         var keys = new List<CompiledJoinHashKey>();
+        List<(int Ordinal, string Name)>? rightKeyColumns = [];
         var pending = new Stack<Expression>();
         pending.Push(join.Condition);
         while (pending.Count > 0)
@@ -23500,6 +23511,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     key.RightConvertsTextToNumeric,
                     key.RightConvertsNumericToText,
                     key.Collation));
+                rightKeyColumns?.Add((key.RightColumn.Index, key.RightColumn.Name));
                 continue;
             }
 
@@ -23539,6 +23551,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RightConvertsTextToNumeric: false,
                 RightConvertsNumericToText: false,
                 Collation: "BINARY"));
+            rightKeyColumns = null;
         }
 
         if (keys.Count == 0)
@@ -23567,7 +23580,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         return new VdbeJoinEquiProbe(
             left => BuildKey(left, leftSide: true),
-            right => BuildKey(right, leftSide: false));
+            right => BuildKey(right, leftSide: false))
+        {
+            // Turso orders a temporary index's key columns by table position.
+            RightKeyColumns = rightKeyColumns?.OrderBy(static column => column.Ordinal).Select(static column => column.Name).ToArray(),
+            RightKeyIsRowid = rightKeyColumns is [var onlyKey]
+                && join.Right is NamedTableSource rightNamed
+                && context.Tables.TryGetValue(rightNamed.Name, out var rightTable)
+                && rightTable.RowidAliasColumnIndex >= 0
+                && rightTable.RowidAliasColumnIndex == onlyKey.Ordinal,
+        };
 
         static bool ExpressionBelongsToSource(
             Expression expression,
@@ -29696,6 +29718,20 @@ out bool hasReturning)
             compiledJoinCandidate = compiledJoinProgram.Program.Instructions
                 .OfType<OpenJoinCursorInstruction>()
                 .FirstOrDefault()?.Plan.Root;
+            if (compiledJoinCandidate is not null
+                && TryDescribeCompiledJoinPlan(
+                    compiledJoinCandidate,
+                    compiledJoinSelect,
+                    compiledJoinProgram.Program,
+                    out var describedJoin))
+            {
+                ops = describedJoin.Select(static node => (EqpJsonOp?)node.Op).ToArray();
+                return new ExecutionResult(
+                    ExplainQueryPlanColumns(),
+                    describedJoin.Select((node, index) => PlanRow(index + 1, node.Parent + 1, node.Detail)).ToArray(),
+                    0);
+            }
+
             var searches = GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program);
             if (searches.Count > 0)
             {
@@ -29889,6 +29925,204 @@ out bool hasReturning)
         return nodes;
     }
 
+    /// <summary>
+    /// Describes a compiled <c>OpenJoinCursor</c> plan tree step by step in its left-deep
+    /// execution order, formatted like Turso's <c>EqpDetail</c> (core/translate/eqp.rs Display):
+    /// the outer leaf as <c>SCAN</c>; an index seek as <c>SEARCH id USING [COVERING ]INDEX name
+    /// (a=? AND b=?)</c>; a right input the operator hashes once and probes per outer row as
+    /// the automatic index it is (<c>SEARCH id USING COVERING INDEX ephemeral_table_tN (…)</c>,
+    /// Turso's temporary-index access, N being the table's FROM position); a left input it
+    /// hashes before streaming the right as <c>HASH JOIN right</c> followed by the build's
+    /// <c>SCAN</c>, or behind a longer prefix as <c>MATERIALIZE hash build input</c> over that
+    /// prefix; a keyless right input as a nested <c>SCAN</c>. LEFT and FULL joins carry
+    /// <c>LEFT-JOIN</c>. Any node or shape outside that set (derived rows, RIGHT joins, a FULL
+    /// join that is not a hash join, a hash or automatic index Turso would not build for a table
+    /// with an index directive, grouping or DISTINCT) returns <see langword="false"/> so the
+    /// caller keeps its narrower description rather than guess.
+    /// </summary>
+    private static bool TryDescribeCompiledJoinPlan(
+        VdbeJoinPlanNode root,
+        SelectStatement select,
+        VdbeProgram program,
+        out List<(string Detail, EqpJsonOp Op, int Parent)> nodes)
+    {
+        nodes = [];
+        if (select.GroupBy.Count != 0 || select.Distinct || select.Having is not null
+            || !TryGetNamedJoinLeaves(select.Source, out var leaves))
+        {
+            return false;
+        }
+
+        var described = new List<(string Detail, EqpJsonOp Op, int Parent)>();
+        if (!Describe(root, parent: -1))
+            return false;
+
+        if (select.OrderBy.Count != 0)
+        {
+            if (!program.Instructions.OfType<OpenSorterInstruction>().Any())
+                return false;
+            described.Add(("USE SORTER FOR ORDER BY", new EqpJsonOrderByOp(), -1));
+        }
+
+        nodes = described;
+        return true;
+
+        bool Describe(VdbeJoinPlanNode node, int parent)
+        {
+            if (node is VdbeJoinScanPlan outer)
+            {
+                described.Add((
+                    $"SCAN {outer.TableName}" + (outer.Alias is null ? string.Empty : $" AS {outer.Alias}"),
+                    new EqpJsonScanOp(outer.TableName, outer.Alias, IndexName: null, Covering: false),
+                    parent));
+                return true;
+            }
+
+            if (node is not VdbeJoinOperatorPlan
+                {
+                    Kind: VdbeJoinKind.Inner or VdbeJoinKind.Left or VdbeJoinKind.Full,
+                } join)
+            {
+                return false;
+            }
+
+            var marker = GetCompiledJoinMarker(join.Kind);
+            var suffix = join.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full ? " LEFT-JOIN" : string.Empty;
+            // A FULL join is only modelled as the hash join that builds its left input.
+            if (join.Kind == VdbeJoinKind.Full && (join.EquiProbe is null || join.HashBuildRight))
+                return false;
+            if (join.Right is IVdbeJoinSeekPlan && join.Right.SearchMetadata is { } seek)
+            {
+                if (!Describe(join.Left, parent))
+                    return false;
+                var identifier = seek.Alias ?? seek.TableName;
+                var indexName = seek.Ephemeral
+                    ? EphemeralIndexName(seek.TableName, seek.Alias)
+                    : seek.IndexName;
+                if (indexName is null)
+                    return false;
+                var covering = seek.Ephemeral || seek.Covering;
+                described.Add((
+                    $"SEARCH {identifier} USING {(covering ? "COVERING " : string.Empty)}INDEX {indexName} ({string.Join(" AND ", seek.Constraints)}){suffix}",
+                    new EqpJsonSearchOp(seek.TableName, seek.Alias, indexName, covering, seek.Constraints, marker, seek.Ephemeral),
+                    parent));
+                return true;
+            }
+
+            if (join.Right is not VdbeJoinScanPlan right)
+                return false;
+
+            var rightWithAlias = right.TableName + (right.Alias is null ? string.Empty : $" AS {right.Alias}");
+            if (join.EquiProbe is null)
+            {
+                if (!Describe(join.Left, parent))
+                    return false;
+                described.Add(($"SCAN {rightWithAlias}{suffix}", new EqpJsonScanOp(right.TableName, right.Alias, IndexName: null, Covering: false, marker), parent));
+                return true;
+            }
+
+            if (join.HashBuildRight)
+            {
+                if (!Describe(join.Left, parent))
+                    return false;
+
+                // Hashing the right input once on its INTEGER PRIMARY KEY is a rowid lookup.
+                if (join.EquiProbe.RightKeyIsRowid)
+                {
+                    described.Add((
+                        $"SEARCH {right.Alias ?? right.TableName} USING INTEGER PRIMARY KEY (rowid=?){suffix}",
+                        new EqpJsonSearchOp(right.TableName, right.Alias, IndexName: null, Covering: false, ["rowid=?"], marker, IsIntegerPrimaryKey: true),
+                        parent));
+                    return true;
+                }
+
+                // Otherwise the right rows hashed once on the join key and probed per outer row
+                // are an automatic index over the right input. Turso never builds one for a table
+                // carrying INDEXED BY / NOT INDEXED (access_method.rs:916), so that shape has no
+                // Turso description.
+                if (HasIndexDirective(right.TableName, right.Alias)
+                    || join.EquiProbe.RightKeyColumns is not { Count: > 0 } keyColumns
+                    || EphemeralIndexName(right.TableName, right.Alias) is not { } indexName)
+                {
+                    return false;
+                }
+
+                var constraints = keyColumns.Select(static column => $"{column}=?").ToArray();
+                described.Add((
+                    $"SEARCH {right.Alias ?? right.TableName} USING COVERING INDEX {indexName} ({string.Join(" AND ", constraints)}){suffix}",
+                    new EqpJsonSearchOp(right.TableName, right.Alias, indexName, Covering: true, constraints, marker, Ephemeral: true),
+                    parent));
+                return true;
+            }
+
+            // Hash-build-left: the left input is hashed once and the right streams as the probe
+            // (Turso's left-deep hash join builds the previous table and probes the new one).
+            // Turso rejects a hash join whose build or probe table carries INDEXED BY / NOT
+            // INDEXED (access_method.rs:1474-1479 has_indexed_by_directives).
+            if (HasIndexDirective(right.TableName, right.Alias))
+                return false;
+            if (join.Left is VdbeJoinScanPlan build)
+            {
+                if (HasIndexDirective(build.TableName, build.Alias))
+                    return false;
+                described.Add(($"HASH JOIN {rightWithAlias}", new EqpJsonHashJoinOp(right.TableName, right.Alias, marker), parent));
+                described.Add((
+                    $"SCAN {build.TableName}" + (build.Alias is null ? string.Empty : $" AS {build.Alias}"),
+                    new EqpJsonScanOp(build.TableName, build.Alias, IndexName: null, Covering: false),
+                    parent));
+                return true;
+            }
+
+            // Behind a longer prefix the build input is the prefix's joined rows, materialized
+            // before the probe (Turso's materialize_build_input, EqpDetail::HashBuild), named
+            // after the prefix's last table.
+            if (join.Left is not VdbeJoinOperatorPlan prefix
+                || LastTable(prefix) is not { } last
+                || HasIndexDirective(last.Table, last.Alias))
+            {
+                return false;
+            }
+
+            var materializeIndex = described.Count;
+            described.Add((
+                $"MATERIALIZE hash build input for {last.Table}" + (last.Alias is null ? string.Empty : $" AS {last.Alias}"),
+                new EqpJsonCompiledJoinHashBuildOp(last.Table, last.Alias),
+                parent));
+            if (!Describe(prefix, materializeIndex))
+                return false;
+            described.Add(($"HASH JOIN {rightWithAlias}", new EqpJsonHashJoinOp(right.TableName, right.Alias, marker), parent));
+            return true;
+        }
+
+        static (string Table, string? Alias)? LastTable(VdbeJoinOperatorPlan prefix)
+            => prefix.Right switch
+            {
+                VdbeJoinScanPlan scan => (scan.TableName, scan.Alias),
+                { SearchMetadata: { } metadata } => (metadata.TableName, metadata.Alias),
+                _ => null,
+            };
+
+        bool HasIndexDirective(string tableName, string? alias)
+        {
+            var qualifier = alias ?? tableName;
+            return leaves.Any(leaf => leaf.IndexDirective is not null
+                && string.Equals(leaf.Alias ?? leaf.Name, qualifier, StringComparison.OrdinalIgnoreCase));
+        }
+
+        string? EphemeralIndexName(string tableName, string? alias)
+        {
+            // Turso names a temporary index ephemeral_{table}_{internal id}; a FROM table's
+            // internal id is its 1-based position in the statement's FROM list.
+            var qualifier = alias ?? tableName;
+            for (var position = 0; position < leaves.Count; position++)
+            {
+                if (string.Equals(leaves[position].Alias ?? leaves[position].Name, qualifier, StringComparison.OrdinalIgnoreCase))
+                    return $"ephemeral_{tableName}_t{position + 1}";
+            }
+
+            return null;
+        }
+    }
     private static string? GetCompiledJoinMarker(VdbeJoinKind kind) => kind switch
     {
         VdbeJoinKind.Inner => "inner",
