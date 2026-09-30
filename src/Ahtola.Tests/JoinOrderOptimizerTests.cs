@@ -354,6 +354,61 @@ public sealed class JoinOrderOptimizerTests
     }
 
     [Test]
+    public void ExplicitCrossJoinKeepsTheFromOrder()
+    {
+        var setup =
+            $"""
+            CREATE TABLE c1(a INTEGER);
+            CREATE TABLE c2(b INTEGER);
+            CREATE TABLE c3(c INTEGER);
+            {Singles("c1", 20)}
+            {Singles("c2", 4)}
+            {Singles("c3", 2)}
+            ANALYZE;
+            """;
+        // The comma spelling of this query is reordered (see above); CROSS JOIN is SQLite's
+        // manual join-order control, so the same three tables stay in FROM order, and the
+        // unordered result follows that nested-loop order exactly like SQLite.
+        const string query = "SELECT a, b, c FROM c1 CROSS JOIN c2 CROSS JOIN c3;";
+
+        AssertMatchesSqlite(setup, query);
+
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, setup);
+        Rows(connection, query).Should().HaveCount(160);
+        ScanOrder(JoinDescription(connection, "EXPLAIN " + query)).Should().Equal("c1", "c2", "c3");
+        database.JoinOrderDiagnostics.SegmentsReordered.Should().Be(0);
+    }
+
+    [TestCase("SELECT p.id, c.k FROM p CROSS JOIN c ON c.pid = p.id ORDER BY p.id, c.k;")]
+    [TestCase("SELECT p.id, c.k FROM p, c ON c.pid = p.id ORDER BY p.id, c.k;")]
+    [TestCase("SELECT p.id, c.k FROM p, c ON c.pid = p.id WHERE c.k > 1 ORDER BY p.id, c.k;")]
+    [TestCase("SELECT * FROM p CROSS JOIN q USING (id) ORDER BY id;")]
+    [TestCase("SELECT * FROM p, q USING (id) ORDER BY id;")]
+    [TestCase("SELECT * FROM p NATURAL CROSS JOIN q ORDER BY id;")]
+    [TestCase("SELECT p.id, c.k, q.w FROM p CROSS JOIN c ON c.pid = p.id CROSS JOIN q ON q.id = c.k;")]
+    [TestCase("SELECT count(*) FROM p CROSS JOIN c ON c.pid = p.id CROSS JOIN q ON q.id = c.k WHERE p.v = 'x';")]
+    [TestCase("SELECT p.id, c.k FROM p CROSS JOIN c ON c.pid = p.id LEFT JOIN q ON q.id = c.k ORDER BY 1, 2;")]
+    // Unordered: CROSS JOIN keeps q as the outer loop even though ANALYZE shows it is the
+    // smaller input a plain equijoin would hash-build, so rows follow q's order like SQLite.
+    [TestCase("SELECT q.id, c.pid FROM q CROSS JOIN c ON c.k = q.id;")]
+    public void JoinConstraintsOnCommaAndCrossJoinsMatchSqlite(string query)
+    {
+        var setup =
+            """
+            CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT);
+            CREATE TABLE c(pid INTEGER, k INTEGER);
+            CREATE TABLE q(id INTEGER PRIMARY KEY, w TEXT);
+            INSERT INTO p VALUES (1, 'x'), (2, 'y'), (3, 'x');
+            INSERT INTO c VALUES (1, 1), (1, 2), (2, 3), (NULL, 1), (3, 9);
+            INSERT INTO q VALUES (1, 'q1'), (3, 'q3'), (9, 'q9');
+            ANALYZE;
+            """;
+        AssertMatchesSqlite(setup, query);
+    }
+
+    [Test]
     public void SelfJoinAliasesStayDistinctMembers()
     {
         var setup =

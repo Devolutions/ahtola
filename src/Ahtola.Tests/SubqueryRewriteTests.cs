@@ -910,6 +910,88 @@ public sealed class SubqueryRewriteTests
         AssertRewrites(wellFormed, query, semiJoins: 0);
     }
 
+    private const string ErrorRowsSetup =
+        """
+        CREATE TABLE error_outer(id INTEGER, wanted INTEGER, limit_value INTEGER, text_value TEXT);
+        CREATE TABLE error_inner(value INTEGER, json_value TEXT);
+        INSERT INTO error_outer VALUES (1, 1, 10, '1'), (2, 1, 0, 'bad JSON');
+        INSERT INTO error_inner VALUES (1, '1'), (2, 'bad JSON');
+        """;
+
+    [TestCase("json_extract(i.json_value, '$') < o.limit_value AND i.value = o.wanted")]
+    [TestCase("o.limit_value > json_extract(i.json_value, '$') AND i.value = o.wanted")]
+    public void NotExistsKeepsTheErrorOfARowTheEqualityWouldPrune(string innerWhere)
+    {
+        // NOT EXISTS stays a correlated subquery that scans every inner row, evaluating its
+        // WHERE left to right. For outer row 2 the malformed row's key does not match, but its
+        // json_extract runs first and raises. The transient equality probe must not prune that
+        // row away (unnest-correlated.sqltest correlated-exists-inequality-expression-errors).
+        var query =
+            $"SELECT o.id FROM error_outer AS o WHERE NOT EXISTS (SELECT 1 FROM error_inner AS i WHERE {innerWhere}) ORDER BY o.id;";
+        AssertFailsLikeSqlite(ErrorRowsSetup, query, "malformed JSON");
+    }
+
+    [TestCase("json_extract(i.json_value, '$') < o.limit_value AND i.value = o.wanted")]
+    [TestCase("o.limit_value > json_extract(i.json_value, '$') AND i.value = o.wanted")]
+    public void PositiveExistsProbesTheEqualityLikeSqlitesExistsJoin(string innerWhere)
+    {
+        // SQLite runs a positive EXISTS over one plain table as a join of the outer query
+        // (select.c existsToJoin) whose automatic index on i.value never visits the malformed
+        // row, so it answers instead of raising; the managed probe keeps doing the same.
+        AssertMatchesSqlite(
+            ErrorRowsSetup,
+            $"SELECT o.id FROM error_outer AS o WHERE EXISTS (SELECT 1 FROM error_inner AS i WHERE {innerWhere}) ORDER BY o.id;");
+    }
+
+    [Test]
+    public void EqualityProbeStillPrunesWhenNothingBeforeItCanFail()
+    {
+        // The equality comes first, so a SQLite scan rejects the malformed row before its
+        // json_extract runs: pruning it through the probe changes nothing.
+        AssertMatchesSqlite(
+            ErrorRowsSetup,
+            "SELECT o.id FROM error_outer AS o WHERE NOT EXISTS (SELECT 1 FROM error_inner AS i WHERE i.value = o.wanted AND json_extract(i.json_value, '$') < o.limit_value) ORDER BY o.id;");
+        AssertFailsLikeSqlite(
+            ErrorRowsSetup,
+            "SELECT 1 FROM error_inner AS i WHERE json_extract(i.json_value, '$') < 0 AND i.value = 1;",
+            "malformed JSON");
+    }
+
+    private const string FullJoinSetup =
+        """
+        CREATE TABLE outer_rows(id INTEGER PRIMARY KEY, key1 INTEGER, key2 INTEGER, amount INTEGER);
+        CREATE TABLE inner_rows(key1 INTEGER, key2 INTEGER, amount INTEGER);
+        CREATE TABLE outer_key2(id INTEGER PRIMARY KEY, key2 INTEGER);
+        INSERT INTO outer_rows VALUES (1, 1, 10, 5), (2, 1, 10, 15), (3, 2, 20, 7), (4, 3, 30, 9), (5, NULL, 40, 4), (6, 2, NULL, NULL);
+        INSERT INTO inner_rows VALUES (1, 10, 10), (1, 10, 20), (1, 99, 100), (2, 20, 6), (2, 20, NULL), (2, NULL, 7), (NULL, 40, 99);
+        INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
+        """;
+
+    [TestCase("i.amount IN (SELECT s.amount FROM outer_rows AS s WHERE s.amount < i.amount)")]
+    [TestCase("i.amount IN (SELECT s.amount FROM outer_rows AS s WHERE s.amount IS NOT i.amount)")]
+    [TestCase("EXISTS (SELECT 1 FROM outer_rows AS s WHERE s.amount < i.amount)")]
+    [TestCase("EXISTS (SELECT 1 FROM outer_rows AS s WHERE s.amount IS NOT i.amount)")]
+    [TestCase("NOT EXISTS (SELECT 1 FROM outer_rows AS s WHERE s.amount < i.amount)")]
+    [TestCase("NOT EXISTS (SELECT 1 FROM outer_rows AS s WHERE s.amount IS NOT i.amount)")]
+    [TestCase("EXISTS (SELECT 1 FROM outer_rows AS s WHERE s.id = k.id)")]
+    [TestCase("(SELECT count(*) FROM outer_rows AS s WHERE s.amount < i.amount) > 1")]
+    public void CorrelatedSubqueryOverAFullJoinSeesTheNullExtendedRows(string predicate)
+    {
+        // The subquery references the FULL JOIN's null-supplying side, so it must run against
+        // every joined row, NULL-padded ones included, exactly like SQLite (and Turso v0.8.1,
+        // which now plans these as semi/anti joins placed after the FULL JOIN).
+        AssertMatchesSqlite(
+            FullJoinSetup,
+            $"""
+            SELECT o.id, k.id, i.key1, i.amount
+            FROM outer_rows AS o
+            JOIN outer_key2 AS k ON o.id = k.id
+            FULL JOIN inner_rows AS i ON k.key2 = i.key2
+            WHERE {predicate}
+            ORDER BY o.id, k.id, i.key1, i.amount;
+            """);
+    }
+
     [Test]
     public void SemiJoinProbePreservesComparisonAffinity()
     {

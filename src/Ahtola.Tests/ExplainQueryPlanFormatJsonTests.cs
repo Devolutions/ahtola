@@ -327,6 +327,47 @@ public class ExplainQueryPlanFormatJsonTests
     }
 
     [Test]
+    public void UnfilteredTableScanReportsThePlannersCurrentRowEstimate()
+    {
+        using var embedded = new EmbeddedDatabase();
+        using var connection = embedded.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);");
+
+        JsonElement Estimate(string query)
+        {
+            using var document = JsonDocument.Parse(
+                ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
+            return document.RootElement.GetProperty("nodes")[0].GetProperty("op").GetProperty("estimate").Clone();
+        }
+
+        // No statistics: Turso's 1,000,000-row default, priced by estimate_scan_cost
+        // (1,000,000 / 50 pages + 1,000,000 * 0.003 CPU).
+        var unanalyzed = Estimate("SELECT * FROM t;");
+        unanalyzed.GetProperty("input_rows").GetDouble().Should().Be(1);
+        unanalyzed.GetProperty("rows_per_input").GetDouble().Should().Be(1_000_000);
+        unanalyzed.GetProperty("output_rows").GetDouble().Should().Be(1_000_000);
+        unanalyzed.GetProperty("access_cost").GetDouble().Should().Be(23_000);
+        unanalyzed.GetProperty("total_cost").GetDouble().Should().Be(23_000);
+
+        // The next plan after ANALYZE uses the fresh sqlite_stat1 count
+        // (mvcc-analyze-refreshes-planner-stats.sqltest).
+        Execute(connection, "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 100) INSERT INTO t SELECT n, n FROM seq;");
+        Execute(connection, "ANALYZE;");
+        var analyzed = Estimate("SELECT * FROM t;");
+        analyzed.GetProperty("rows_per_input").GetDouble().Should().Be(100);
+        analyzed.GetProperty("output_rows").GetDouble().Should().Be(100);
+        analyzed.GetProperty("access_cost").GetDouble().Should().BeApproximately(2.3, 1e-12);
+        ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t;").Single()
+            .Should().Contain("\"rows_per_input\":100,\"output_rows\":100,");
+
+        // A filtered scan needs the unported selectivity model, so it reports no estimate.
+        using var filtered = JsonDocument.Parse(
+            ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE value > 3;").Single());
+        foreach (var node in filtered.RootElement.GetProperty("nodes").EnumerateArray())
+            node.GetProperty("op").TryGetProperty("estimate", out _).Should().BeFalse();
+    }
+
+    [Test]
     public void DerivedSourceNestsItsIndexScanUnderTheCoroutineNode()
     {
         using var embedded = new EmbeddedDatabase();

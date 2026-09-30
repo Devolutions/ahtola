@@ -186,10 +186,11 @@ public sealed partial class EmbeddedDatabase
     /// A join node whose members may be freely permuted: plain INNER, no coalesced columns.
     /// NATURAL and USING are excluded because <c>BuildJoinPairs</c>/<c>JoinPairMatches</c> resolve
     /// their columns from the specific left/right pair, so changing which tables are adjacent
-    /// changes what the join means.
+    /// changes what the join means. CROSS JOIN is excluded because SQLite and Turso keep its
+    /// operands in FROM order (Turso <c>JoinInfo::is_ordering_constrained</c>, plan.rs).
     /// </summary>
     private static bool IsReorderableInnerJoin(JoinTableSource join)
-        => join.Kind == JoinKind.Inner && join.UsingColumns is null && !join.Natural;
+        => join.Kind == JoinKind.Inner && join.UsingColumns is null && !join.Natural && !join.Cross;
 
     private bool TryRewriteJoinOrderNode(
         TableSource node,

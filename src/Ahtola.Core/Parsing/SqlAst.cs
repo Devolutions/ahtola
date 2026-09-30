@@ -627,7 +627,10 @@ internal sealed record JoinTableSource(
     Expression? Condition,
     JoinKind Kind,
     IReadOnlyList<string>? UsingColumns = null,
-    bool Natural = false) : TableSource;
+    bool Natural = false,
+    // Spelled CROSS JOIN: an INNER join whose operands keep their FROM order (SQLite
+    // JT_CROSS; Turso JoinInfo::no_reorder).
+    bool Cross = false) : TableSource;
 
 internal enum JoinKind
 {

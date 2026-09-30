@@ -35,6 +35,14 @@ namespace Ahtola.Core;
 /// </summary>
 public sealed partial class EmbeddedDatabase
 {
+    /// <summary>A FROM name bound to an ordinary base table rather than a CTE, view or module.</summary>
+    private static bool IsPlainEqpBaseTable(NamedTableSource source, QueryContext context)
+        => !IsSchemaTable(source.Name)
+            && context.Tables.ContainsKey(source.Name)
+            && !context.CommonTableExpressions.ContainsKey(source.Name)
+            && context.Views?.ContainsKey(source.Name) != true
+            && context.VirtualTables?.ContainsKey(source.Name) != true;
+
     private bool TryDescribeCorrelatedAggregateSubqueryPlan(
         SelectStatement statement,
         SqlValue[] parameters,
@@ -277,6 +285,69 @@ public sealed partial class EmbeddedDatabase
                 new EqpJsonScanOp(limitedOuter.Name, limitedOuter.Alias, IndexName: null, Covering: false),
                 new EqpJsonListSubqueryOp(1, Correlated: true),
                 new EqpJsonScanOp(limitedInner.Name, limitedInner.Alias, IndexName: null, Covering: false),
+            ];
+            return true;
+        }
+
+        // A correlated IN the semi-join rewrite declined - an operand or inner filter that can
+        // raise, or a link that is not a plain equality - stays in WHERE, so the evaluator scans
+        // the outer table and re-runs the list for every outer row (unnest.rs keeps the same
+        // failing shapes as correlated subqueries). Only the plain-scan shape is described: the
+        // outer table has no usable index plan, and the inner WHERE has no index plan and no
+        // equality the transient hash probe could narrow the per-row scan with.
+        if (statement is
+            {
+                Source: NamedTableSource listScanOuter,
+                Where: InSubqueryExpression
+                {
+                    Query: SelectStatement
+                    {
+                        Source: NamedTableSource listScanInner,
+                        GroupBy.Count: 0,
+                        Having: null,
+                        Limit: null,
+                    } listScanQuery,
+                } listScanIn,
+                GroupBy.Count: 0,
+                Having: null,
+                OrderBy.Count: 0,
+                Limit: null,
+            }
+            && rewritten is { Source: NamedTableSource, Where: InSubqueryExpression }
+            && listScanOuter.IndexDirective is null
+            && listScanInner.IndexDirective is null
+            && IsPlainEqpBaseTable(listScanOuter, context)
+            && IsPlainEqpBaseTable(listScanInner, context)
+            && !statement.Projections.Any(projection =>
+                ContainsAggregate(projection.Expression) || ContainsSubqueryExpression(projection.Expression))
+            && !ContainsSubqueryExpression(listScanIn.Value)
+            && !listScanQuery.Projections.Any(projection => ContainsSubqueryExpression(projection.Expression))
+            && !ContainsSubqueryExpression(listScanQuery.Where)
+            && QueryReferencesFromNames(
+                listScanQuery,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    listScanOuter.Alias ?? listScanOuter.Name,
+                })
+            && (listScanQuery.Where is null
+                || !IndexExpressionSemantics.SplitConjuncts(listScanQuery.Where).Any(static conjunct =>
+                    conjunct is BinaryExpression { Operator: BinaryOperator.Equal or BinaryOperator.Is }))
+            && TryPlanManagedIndexScan(statement, context) is null
+            && TryPlanManagedIndexScan(listScanQuery, context) is null)
+        {
+            result = new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    PlanRow(1, 0, $"SCAN {listScanOuter.Name}" + (listScanOuter.Alias is null ? string.Empty : $" AS {listScanOuter.Alias}")),
+                    PlanRow(6, 0, "CORRELATED LIST SUBQUERY 1"),
+                    PlanRow(8, 6, $"SCAN {listScanInner.Name}" + (listScanInner.Alias is null ? string.Empty : $" AS {listScanInner.Alias}")),
+                ],
+                0);
+            ops =
+            [
+                new EqpJsonScanOp(listScanOuter.Name, listScanOuter.Alias, IndexName: null, Covering: false),
+                new EqpJsonListSubqueryOp(1, Correlated: true),
+                new EqpJsonScanOp(listScanInner.Name, listScanInner.Alias, IndexName: null, Covering: false),
             ];
             return true;
         }
@@ -758,7 +829,8 @@ internal sealed record EqpJsonScanOp(
     string? IndexName,
     bool Covering,
     string? Join = null,
-    bool Ephemeral = false) : EqpJsonOp
+    bool Ephemeral = false,
+    EqpJsonEstimate? Estimate = null) : EqpJsonOp
 {
     public override string ToJson()
     {
@@ -766,7 +838,43 @@ internal sealed record EqpJsonScanOp(
         AppendTableFields(json, Table, Alias, Join);
         json.Append(",\"source\":\"table\"");
         AppendIndexField(json, IndexName, Covering, Ephemeral);
+        Estimate?.AppendTo(json);
         return json.Append('}').ToString();
+    }
+}
+
+/// <summary>
+/// The cost-model estimate Turso attaches to a table access node
+/// (<c>core/translate/eqp.rs</c> <c>estimate</c>): rows entering the loop, rows produced per
+/// input row, their product, the access method's own cost and the running plan cost.
+/// </summary>
+internal sealed record EqpJsonEstimate(
+    double InputRows,
+    double RowsPerInput,
+    double OutputRows,
+    double AccessCost,
+    double TotalCost)
+{
+    public void AppendTo(System.Text.StringBuilder json)
+        => json.Append(",\"estimate\":{\"input_rows\":").Append(Format(InputRows))
+            .Append(",\"rows_per_input\":").Append(Format(RowsPerInput))
+            .Append(",\"output_rows\":").Append(Format(OutputRows))
+            .Append(",\"access_cost\":").Append(Format(AccessCost))
+            .Append(",\"total_cost\":").Append(Format(TotalCost))
+            .Append('}');
+
+    // Rust's f64 Display, which Turso's writer uses: the shortest round-trip digits, integral
+    // values without a fraction, and never an exponent.
+    private static string Format(double value)
+    {
+        var culture = System.Globalization.CultureInfo.InvariantCulture;
+        if (value == Math.Floor(value) && Math.Abs(value) < 9e18)
+            return ((long)value).ToString(culture);
+
+        var text = value.ToString("R", culture);
+        return text.Contains('E', StringComparison.Ordinal) && Math.Abs(value) < 7.9e28
+            ? ((decimal)value).ToString(culture)
+            : text;
     }
 }
 

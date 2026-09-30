@@ -478,12 +478,23 @@ internal static class IndexExpressionSemantics
         {
             if (!queryConjuncts.Any(candidate =>
                     UsesOnlySourceColumns(candidate, tableName, alias)
-                    && PredicateTermsEqual(candidate, required)))
+                    && QueryTermImpliesPredicate(candidate, required)))
                 return false;
         }
 
         return true;
     }
+
+    /// <summary>
+    /// A query conjunct proves a partial-index conjunct it equals, or any disjunct of an OR
+    /// conjunct: a row satisfying <c>b &lt; 5</c> satisfies <c>b &lt; 5 OR a &gt; 5</c>
+    /// (Turso <c>query_term_implies_predicate</c>, optimizer/constraints.rs).
+    /// </summary>
+    private static bool QueryTermImpliesPredicate(Expression candidate, Expression required)
+        => PredicateTermsEqual(candidate, required)
+            || required is BinaryExpression { Operator: BinaryOperator.Or } disjunction
+                && (QueryTermImpliesPredicate(candidate, disjunction.Left)
+                    || QueryTermImpliesPredicate(candidate, disjunction.Right));
 
     private static bool UsesOnlySourceColumns(
         Expression expression,
