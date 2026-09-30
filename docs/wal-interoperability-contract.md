@@ -504,7 +504,10 @@ readers coexist on the same mark.
 validated WAL-index accessor, and shared byte-range lease primitive into a
 detached read-snapshot coordinator. It opens only existing `-wal` and `-shm`
 artifacts, validates a stable header against an independent WAL checksum scan,
-uses `WAL_READ_LOCK(0)` for an already-backfilled database-only view, otherwise
+uses `WAL_READ_LOCK(0)` for an already-backfilled database-only view (while a
+checkpoint holds read-mark 0 it instead pins that backfilled boundary with a
+current or newly advanced mark 1..4, as SQLite's `walTryBeginRead` and Turso
+`74eb80c83` do, rather than waiting; an empty WAL still waits), otherwise
 shares an existing current mark, advances any exclusively acquired idle mark to
 the current committed boundary, or falls back to the greatest usable existing
 mark. An advanced mark is exclusively held while changed and then reacquired
