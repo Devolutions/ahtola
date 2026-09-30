@@ -38,6 +38,35 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
         ["ReadYourWrites"] = "Read Your Writes",
         ["Sync Interval"] = "Sync Interval",
         ["SyncInterval"] = "Sync Interval",
+        // Advanced embedded-replica options, named as in Turso's TursoConnectionStringBuilder.
+        ["Sync Client Name"] = "Sync Client Name",
+        ["SyncClientName"] = "Sync Client Name",
+        ["Sync Long Poll Timeout"] = "Sync Long Poll Timeout",
+        ["SyncLongPollTimeout"] = "Sync Long Poll Timeout",
+        ["Bootstrap If Empty"] = "Bootstrap If Empty",
+        ["BootstrapIfEmpty"] = "Bootstrap If Empty",
+        ["Partial Bootstrap Prefix"] = "Partial Bootstrap Prefix",
+        ["PartialBootstrapPrefix"] = "Partial Bootstrap Prefix",
+        ["Partial Bootstrap Query"] = "Partial Bootstrap Query",
+        ["PartialBootstrapQuery"] = "Partial Bootstrap Query",
+        ["Partial Sync Segment Size"] = "Partial Sync Segment Size",
+        ["PartialSyncSegmentSize"] = "Partial Sync Segment Size",
+        ["Partial Sync Prefetch"] = "Partial Sync Prefetch",
+        ["PartialSyncPrefetch"] = "Partial Sync Prefetch",
+        ["Remote Encryption Cipher"] = "Remote Encryption Cipher",
+        ["RemoteEncryptionCipher"] = "Remote Encryption Cipher",
+        ["Remote Encryption Key"] = "Remote Encryption Key",
+        ["RemoteEncryptionKey"] = "Remote Encryption Key",
+        ["Push Operations Threshold"] = "Push Operations Threshold",
+        ["PushOperationsThreshold"] = "Push Operations Threshold",
+        ["Pull Bytes Threshold"] = "Pull Bytes Threshold",
+        ["PullBytesThreshold"] = "Pull Bytes Threshold",
+        ["Force Logical MVCC Pull"] = "Force Logical MVCC Pull",
+        ["ForceLogicalMvccPull"] = "Force Logical MVCC Pull",
+        ["Sync Experimental Features"] = "Sync Experimental Features",
+        ["SyncExperimentalFeatures"] = "Sync Experimental Features",
+        ["Automatic Sync Mode"] = "Automatic Sync Mode",
+        ["AutomaticSyncMode"] = "Automatic Sync Mode",
         ["Tls"] = "Tls",
         ["TLS"] = "Tls",
         ["Local Provider"] = "Local Provider",
@@ -173,6 +202,170 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
             ArgumentOutOfRangeException.ThrowIfNegative(value);
             this["Sync Interval"] = value;
         }
+    }
+
+    /// <summary>
+    /// Gets or sets the client name that prefixes the sync client identifier of a newly
+    /// bootstrapped embedded replica (<see cref="AhtolaReplicaOptions.ClientName"/>).
+    /// </summary>
+    public string SyncClientName
+    {
+        get => GetString("Sync Client Name");
+        set => SetString("Sync Client Name", value);
+    }
+
+    /// <summary>
+    /// Gets or sets the embedded-replica pull long-poll timeout in milliseconds; 0 (the default)
+    /// disables long polling (<see cref="AhtolaReplicaOptions.LongPollTimeout"/>).
+    /// </summary>
+    public int SyncLongPollTimeout
+    {
+        get => GetInt("Sync Long Poll Timeout", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Sync Long Poll Timeout"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets whether a missing embedded replica is bootstrapped from the remote database
+    /// (default <see langword="true"/>; <see cref="AhtolaReplicaOptions.BootstrapIfEmpty"/>).
+    /// </summary>
+    public bool BootstrapIfEmpty
+    {
+        get => GetBool("Bootstrap If Empty", defaultValue: true);
+        set => this["Bootstrap If Empty"] = value;
+    }
+
+    /// <summary>
+    /// Gets or sets the byte prefix of a partial bootstrap
+    /// (<see cref="AhtolaPartialBootstrapOptions.Prefix"/>); 0 disables it.
+    /// </summary>
+    public int PartialBootstrapPrefix
+    {
+        get => GetInt("Partial Bootstrap Prefix", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Partial Bootstrap Prefix"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the server-side query of a partial bootstrap
+    /// (<see cref="AhtolaPartialBootstrapOptions.QueryPages"/>).
+    /// </summary>
+    public string PartialBootstrapQuery
+    {
+        get => GetString("Partial Bootstrap Query");
+        set => SetString("Partial Bootstrap Query", value);
+    }
+
+    /// <summary>
+    /// Gets or sets the lazy-loading segment size in bytes of a partial bootstrap; 0 uses the
+    /// default (<see cref="AhtolaPartialBootstrapOptions.SegmentSize"/>).
+    /// </summary>
+    public long PartialSyncSegmentSize
+    {
+        get => GetLong("Partial Sync Segment Size", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Partial Sync Segment Size"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets whether a partial bootstrap prefetches adjacent pages
+    /// (<see cref="AhtolaPartialBootstrapOptions.Prefetch"/>).
+    /// </summary>
+    public bool PartialSyncPrefetch
+    {
+        get => GetBool("Partial Sync Prefetch");
+        set => this["Partial Sync Prefetch"] = value;
+    }
+
+    /// <summary>
+    /// Gets or sets the cipher of an encrypted remote database used by an embedded replica
+    /// (for example <c>aes256gcm</c> or <c>aegis256</c>; <see cref="AhtolaRemoteEncryptionCipher"/>).
+    /// </summary>
+    public string RemoteEncryptionCipher
+    {
+        get => GetString("Remote Encryption Cipher");
+        set => SetString("Remote Encryption Cipher", value);
+    }
+
+    /// <summary>
+    /// Gets or sets the base64-encoded key of an encrypted remote database used by an embedded
+    /// replica (<see cref="AhtolaRemoteEncryptionOptions.Base64Key"/>).
+    /// </summary>
+    public string RemoteEncryptionKey
+    {
+        get => GetString("Remote Encryption Key");
+        set => SetString("Remote Encryption Key", value);
+    }
+
+    /// <summary>
+    /// Gets or sets the maximum number of change operations per push batch; 0 uses the default
+    /// (<see cref="AhtolaReplicaOptions.PushOperationsThreshold"/>).
+    /// </summary>
+    public long PushOperationsThreshold
+    {
+        get => GetLong("Push Operations Threshold", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Push Operations Threshold"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the target size in bytes of each initial bootstrap pull; 0 pulls the whole
+    /// image at once (<see cref="AhtolaReplicaOptions.PullBytesThreshold"/>).
+    /// </summary>
+    public long PullBytesThreshold
+    {
+        get => GetLong("Pull Bytes Threshold", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Pull Bytes Threshold"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets Turso's escape hatch that forces MVCC logical-log pulls. The managed provider
+    /// always auto-detects the pull protocol from the remote and persists it, so only
+    /// <see langword="false"/> is supported; <see langword="true"/> fails closed when the
+    /// connection opens.
+    /// </summary>
+    public bool ForceLogicalMvccPull
+    {
+        get => GetBool("Force Logical MVCC Pull");
+        set => this["Force Logical MVCC Pull"] = value;
+    }
+
+    /// <summary>
+    /// Gets or sets Turso's comma-separated experimental-feature list for the replica's local
+    /// database. Accepted for connection-string compatibility: the managed engine does not gate
+    /// features behind these names, so the value is validated but has no effect.
+    /// </summary>
+    public string SyncExperimentalFeatures
+    {
+        get => GetString("Sync Experimental Features");
+        set => SetString("Sync Experimental Features", value);
+    }
+
+    /// <summary>
+    /// Gets or sets what each automatic synchronization tick (<see cref="SyncInterval"/>) does.
+    /// The default, <see cref="AhtolaAutomaticSyncMode.PushAndPull"/>, keeps Ahtola's full sync;
+    /// <see cref="AhtolaAutomaticSyncMode.PullOnly"/> matches Turso's pull-only loop.
+    /// </summary>
+    public AhtolaAutomaticSyncMode AutomaticSyncMode
+    {
+        get => GetEnum("Automatic Sync Mode", AhtolaAutomaticSyncMode.PushAndPull);
+        set => this["Automatic Sync Mode"] = value;
     }
 
     public bool? Tls
@@ -383,6 +576,13 @@ public sealed class AhtolaConnectionStringBuilder : DbConnectionStringBuilder
     {
         return TryGetValue(keyword, out var value)
             ? Convert.ToInt32(value, CultureInfo.InvariantCulture)
+            : defaultValue;
+    }
+
+    private long GetLong(string keyword, long defaultValue)
+    {
+        return TryGetValue(keyword, out var value)
+            ? Convert.ToInt64(value, CultureInfo.InvariantCulture)
             : defaultValue;
     }
 

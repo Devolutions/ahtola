@@ -134,17 +134,98 @@ public sealed class AhtolaReplicaOptions
     public int SyncInterval { get; init; }
 
     /// <summary>
+    /// Gets or initializes what each automatic synchronization tick does. The default,
+    /// <see cref="AhtolaAutomaticSyncMode.PushAndPull"/>, keeps Ahtola's historical full sync;
+    /// <see cref="AhtolaAutomaticSyncMode.PullOnly"/> matches Turso's pull-only loop.
+    /// </summary>
+    public AhtolaAutomaticSyncMode AutomaticSyncMode { get; init; }
+
+    /// <summary>
+    /// Gets or initializes a client name used as the prefix of the sync client identifier that a
+    /// newly bootstrapped replica records (<c>&lt;name&gt;-&lt;guid&gt;</c>), mirroring Turso's
+    /// <c>client_name</c>. <see langword="null"/> keeps the plain GUID identifier. An already
+    /// bootstrapped replica keeps the identifier it was created with. Allowed characters are ASCII
+    /// letters, digits, <c>.</c>, <c>_</c> and <c>-</c>, up to 64 characters.
+    /// </summary>
+    public string? ClientName { get; init; }
+
+    /// <summary>
+    /// Gets or initializes an optional bearer-token provider. When set it takes precedence over
+    /// <see cref="AuthToken"/> and is invoked before every sync HTTP request (bootstrap, pull,
+    /// lazy page fetch and push), so a rotated token takes effect without reopening the
+    /// connection. A <see langword="null"/> or blank result sends no token. The provider must not
+    /// call back into the replica connection.
+    /// </summary>
+    public Func<CancellationToken, ValueTask<string?>>? AuthTokenProvider { get; init; }
+
+    /// <summary>
     /// Gets or initializes the HTTP transport policy.
     /// </summary>
     public AhtolaSyncHttpPolicy HttpPolicy { get; init; } = new();
+
+    /// <summary>Resolves the bearer token for one sync HTTP request.</summary>
+    internal ValueTask<string?> ResolveAuthTokenAsync(CancellationToken cancellationToken)
+        => AhtolaRemoteClient.ResolveAuthTokenAsync(AuthToken, AuthTokenProvider, cancellationToken);
+
+    /// <summary>
+    /// Returns the sync client identifier for a new bootstrap: a GUID, prefixed by
+    /// <see cref="ClientName"/> when one is configured.
+    /// </summary>
+    internal string CreateClientId()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        return string.IsNullOrEmpty(ClientName) ? id : string.Concat(ClientName, "-", id);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="clientId"/> is a valid persisted sync client identifier: a
+    /// 32-digit GUID, optionally prefixed by a valid client name and <c>-</c>.
+    /// </summary>
+    internal static bool IsValidClientId(string clientId)
+    {
+        if (Guid.TryParseExact(clientId, "N", out _))
+            return true;
+
+        var separator = clientId.LastIndexOf('-');
+        return separator > 0
+               && IsValidClientName(clientId[..separator])
+               && Guid.TryParseExact(clientId[(separator + 1)..], "N", out _);
+    }
+
+    internal static bool IsValidClientName(string name)
+    {
+        if (name.Length is 0 or > 64)
+            return false;
+
+        foreach (var character in name)
+        {
+            if (!char.IsAsciiLetterOrDigit(character) && character is not ('.' or '_' or '-'))
+                return false;
+        }
+
+        return true;
+    }
 
     internal void Validate()
     {
         ArgumentNullException.ThrowIfNull(HttpPolicy);
         AhtolaRemoteTransportSecurity.Validate(
             RemoteUri,
-            AuthToken,
+            AuthTokenProvider is null ? AuthToken : AhtolaRemoteClient.AuthTokenProviderPlaceholder,
             remoteEncryptionConfigured: RemoteEncryption is not null);
+        if (!Enum.IsDefined(AutomaticSyncMode))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(AutomaticSyncMode),
+                AutomaticSyncMode,
+                "Unknown automatic synchronization mode.");
+        }
+        if (ClientName is not null && !IsValidClientName(ClientName))
+        {
+            throw new ArgumentException(
+                "Sync client names must be 1 to 64 ASCII letters, digits, '.', '_' or '-'.",
+                nameof(ClientName));
+        }
         AhtolaRemoteTransportSecurity.ValidateRedirectContract(
             HttpPolicy.MessageHandler is null || HttpPolicy.MessageHandlerDisablesAutomaticRedirects,
             remoteEncryptionConfigured: RemoteEncryption is not null);
@@ -233,6 +314,9 @@ public sealed class AhtolaReplicaOptions
             PushOperationsThreshold = PushOperationsThreshold,
             PullBytesThreshold = PullBytesThreshold,
             SyncInterval = SyncInterval,
+            AutomaticSyncMode = AutomaticSyncMode,
+            ClientName = ClientName,
+            AuthTokenProvider = AuthTokenProvider,
             HttpPolicy = HttpPolicy,
         };
     }
@@ -260,6 +344,9 @@ public sealed class AhtolaReplicaOptions
             PushOperationsThreshold = PushOperationsThreshold,
             PullBytesThreshold = PullBytesThreshold,
             SyncInterval = SyncInterval,
+            AutomaticSyncMode = AutomaticSyncMode,
+            ClientName = ClientName,
+            AuthTokenProvider = AuthTokenProvider,
             HttpPolicy = HttpPolicy,
         };
         clone._applicationHttpScope = _applicationHttpScope;
@@ -349,6 +436,46 @@ public abstract class AhtolaReplicaDatabase : AhtolaNativeDatabase
     {
         throw new NotSupportedException(
             "This embedded replica provider does not support result-bearing synchronization.");
+    }
+
+    /// <summary>
+    /// Pulls and applies remote changes without pushing local changes.
+    /// </summary>
+    public virtual Task<AhtolaSyncResult> PullAsync(
+        AhtolaSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException(
+            "This embedded replica provider does not support pull-only synchronization.");
+    }
+
+    /// <summary>
+    /// Pushes local changes without pulling remote changes.
+    /// </summary>
+    public virtual Task<AhtolaSyncResult> PushAsync(
+        AhtolaSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException(
+            "This embedded replica provider does not support push-only synchronization.");
+    }
+
+    /// <summary>
+    /// Checkpoints the local replica's write-ahead log into its main database file.
+    /// </summary>
+    public virtual Task CheckpointAsync(CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException(
+            "This embedded replica provider does not support explicit checkpoints.");
+    }
+
+    /// <summary>
+    /// Returns a snapshot of the replica's synchronization statistics.
+    /// </summary>
+    public virtual Task<AhtolaSyncStatistics> GetSyncStatisticsAsync(CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException(
+            "This embedded replica provider does not report synchronization statistics.");
     }
 
     internal virtual void EnsureCanClose()

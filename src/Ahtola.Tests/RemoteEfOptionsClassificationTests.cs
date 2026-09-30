@@ -38,6 +38,9 @@ public sealed class RemoteEfOptionsClassificationTests
 
     [TestCase("Data Source=libsql://database.example;Replica Path=replica.db;Auth Token=token")]
     [TestCase("Data Source=turso://database.example;Replica Path=replica.db;Auth Token=token")]
+    [TestCase("Data Source=libsql://database.example;Replica Path=replica.db;Auth Token=token;"
+              + "Sync Client Name=ef;Sync Long Poll Timeout=1000;Bootstrap If Empty=True;"
+              + "Partial Bootstrap Prefix=4096;Push Operations Threshold=5;Automatic Sync Mode=PullOnly")]
     public void UseAhtola_ClassifiesEmbeddedReplicaAsReplicaServices(string connectionString)
     {
         using var context = CreateContext(connectionString);

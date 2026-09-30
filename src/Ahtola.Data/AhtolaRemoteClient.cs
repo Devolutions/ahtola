@@ -19,6 +19,7 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
 
     private readonly HttpClient? _httpClient;
     private readonly string? _authToken;
+    private readonly Func<CancellationToken, ValueTask<string?>>? _authTokenProvider;
     private readonly string? _remoteEncryptionKey;
     private readonly bool _disposeHttpClient;
     private Uri _pipelineUri;
@@ -33,24 +34,38 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     public AhtolaRemoteClient(
         Uri endpoint,
         string? authToken,
-        AhtolaRemoteEncryptionOptions? remoteEncryption = null)
+        AhtolaRemoteEncryptionOptions? remoteEncryption = null,
+        Func<CancellationToken, ValueTask<string?>>? authTokenProvider = null)
         : this(
             AhtolaRemoteTransportSecurity.CreateRedirectSafeHttpClient(),
             endpoint,
             authToken,
             remoteEncryption,
             disposeHttpClient: true,
-            automaticRedirectsDisabled: true)
+            automaticRedirectsDisabled: true,
+            authTokenProvider)
     {
     }
 
+    /// <param name="httpClient">The HTTP transport.</param>
+    /// <param name="endpoint">The Hrana endpoint.</param>
+    /// <param name="authToken">A static bearer token, used when no provider is configured.</param>
+    /// <param name="remoteEncryption">Optional remote encryption configuration.</param>
+    /// <param name="disposeHttpClient">Whether this client owns <paramref name="httpClient"/>.</param>
+    /// <param name="automaticRedirectsDisabled">Whether the transport never follows redirects itself.</param>
+    /// <param name="authTokenProvider">
+    /// Optional bearer-token provider. When set it takes precedence over
+    /// <paramref name="authToken"/> and is invoked once per HTTP request, so a rotated token is
+    /// picked up by the next request without reopening the connection.
+    /// </param>
     internal AhtolaRemoteClient(
         HttpClient httpClient,
         Uri endpoint,
         string? authToken,
         AhtolaRemoteEncryptionOptions? remoteEncryption = null,
         bool disposeHttpClient = false,
-        bool automaticRedirectsDisabled = false)
+        bool automaticRedirectsDisabled = false,
+        Func<CancellationToken, ValueTask<string?>>? authTokenProvider = null)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         ArgumentNullException.ThrowIfNull(endpoint);
@@ -62,10 +77,11 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             _protocolVersion == RemoteProtocolVersion.V2 ? "/v2/pipeline" : "/v3/pipeline");
         _cursorUri = CreateProtocolUri(endpoint, "/v3/cursor");
         _authToken = string.IsNullOrWhiteSpace(authToken) ? null : authToken;
+        _authTokenProvider = authTokenProvider;
         _remoteEncryptionKey = remoteEncryption?.Base64Key;
         AhtolaRemoteTransportSecurity.Validate(
             _pipelineUri,
-            _authToken,
+            CredentialValidationToken,
             remoteEncryptionConfigured: _remoteEncryptionKey is not null);
         AhtolaRemoteTransportSecurity.ValidateRedirectContract(
             automaticRedirectsDisabled,
@@ -74,6 +90,32 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
     }
 
     public bool HasOpenSession => _webSocketTransport?.HasOpenSession ?? _baton is not null;
+
+    /// <summary>
+    /// A non-null stand-in whenever a bearer credential is configured (statically or through a
+    /// provider), used only for the up-front HTTPS and redirect-origin credential policy checks.
+    /// </summary>
+    private string? CredentialValidationToken
+        => _authToken ?? (_authTokenProvider is null ? null : AuthTokenProviderPlaceholder);
+
+    /// <summary>Stand-in credential used for transport policy checks when only a provider is set.</summary>
+    internal const string AuthTokenProviderPlaceholder = "<auth-token-provider>";
+
+    /// <summary>
+    /// Resolves the bearer token for one request: the provider when configured (a blank result
+    /// means "send no token"), otherwise the static token.
+    /// </summary>
+    internal static async ValueTask<string?> ResolveAuthTokenAsync(
+        string? staticToken,
+        Func<CancellationToken, ValueTask<string?>>? provider,
+        CancellationToken cancellationToken)
+    {
+        if (provider is null)
+            return string.IsNullOrWhiteSpace(staticToken) ? null : staticToken;
+
+        var token = await provider(cancellationToken).ConfigureAwait(false);
+        return string.IsNullOrWhiteSpace(token) ? null : token;
+    }
 
     public void ResetSession()
     {
@@ -643,17 +685,22 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         Uri requestUri,
         string json,
         CancellationToken cancellationToken)
-        => await AhtolaRemoteTransportSecurity
+    {
+        var httpClient = _httpClient ?? throw new InvalidOperationException(
+            "This remote client uses the Hrana WebSocket transport and has no HTTP pipeline.");
+        var authToken = await ResolveAuthTokenAsync(_authToken, _authTokenProvider, cancellationToken)
+            .ConfigureAwait(false);
+        return await AhtolaRemoteTransportSecurity
             .SendAsync(
-                _httpClient ?? throw new InvalidOperationException(
-                    "This remote client uses the Hrana WebSocket transport and has no HTTP pipeline."),
+                httpClient,
                 requestUri,
-                uri => CreateProtocolHttpRequest(uri, json),
-                _authToken,
+                uri => CreateProtocolHttpRequest(uri, json, authToken),
+                authToken ?? CredentialValidationToken,
                 remoteEncryptionConfigured: _remoteEncryptionKey is not null,
                 HttpCompletionOption.ResponseHeadersRead,
                 cancellationToken)
             .ConfigureAwait(false);
+    }
 
     private static async Task<string> ReadResponseBodyAsync(
         HttpResponseMessage response,
@@ -715,15 +762,15 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         return timeout;
     }
 
-    private HttpRequestMessage CreateProtocolHttpRequest(Uri requestUri, string json)
+    private HttpRequestMessage CreateProtocolHttpRequest(Uri requestUri, string json, string? authToken)
     {
         var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json"),
         };
 
-        if (_authToken is not null)
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
+        if (authToken is not null)
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
         if (_remoteEncryptionKey is not null)
             request.Headers.TryAddWithoutValidation(EncryptionKeyHeaderName, _remoteEncryptionKey);
         return request;
@@ -928,32 +975,30 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
             replayedChangeContexts);
     }
 
+    /// <summary>
+    /// Tracks the highest batch/step <c>replication_index</c> watermark a libSQL (sqld) server
+    /// reported, so later batches can ask a replica-backed server to serve reads at least that
+    /// fresh. The pinned Hrana spec (<c>turso-src/serverless/PROTOCOL.md</c> section 7.2.6) now
+    /// says clients MUST NOT interpret the value and Turso servers send <see langword="null"/>, so
+    /// this is best-effort: a value that is not a non-negative integer (string or legacy number)
+    /// is ignored rather than failing the request, and the previously tracked watermark is kept.
+    /// </summary>
     private void UpdateReplicationIndex(JsonElement encodedIndex)
     {
-        if (encodedIndex.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
-            return;
-
-        ulong index;
-        if (encodedIndex.ValueKind == JsonValueKind.String)
+        var parsed = encodedIndex.ValueKind switch
         {
-            if (!ulong.TryParse(
+            JsonValueKind.String => ulong.TryParse(
                 encodedIndex.GetString(),
                 NumberStyles.None,
                 CultureInfo.InvariantCulture,
-                out index))
-            {
-                throw new AhtolaException("Remote response returned an invalid replication_index.");
-            }
-        }
-        else if (encodedIndex.ValueKind == JsonValueKind.Number)
-        {
-            if (!encodedIndex.TryGetUInt64(out index))
-                throw new AhtolaException("Remote response returned an invalid replication_index.");
-        }
-        else
-        {
-            throw new AhtolaException("Remote response returned an invalid replication_index.");
-        }
+                out var text)
+                ? text
+                : (ulong?)null,
+            JsonValueKind.Number => encodedIndex.TryGetUInt64(out var number) ? number : (ulong?)null,
+            _ => (ulong?)null,
+        };
+        if (parsed is not { } index)
+            return;
 
         if (_replicationIndex is null || index > _replicationIndex.Value)
             _replicationIndex = index;
@@ -1113,10 +1158,10 @@ internal sealed partial class AhtolaRemoteClient : IDisposable
         AhtolaRemoteTransportSecurity.ValidateRedirectOrigin(
             _pipelineUri,
             pipelineUri,
-            credentialsConfigured: _authToken is not null || _remoteEncryptionKey is not null);
+            credentialsConfigured: CredentialValidationToken is not null || _remoteEncryptionKey is not null);
         AhtolaRemoteTransportSecurity.Validate(
             pipelineUri,
-            _authToken,
+            CredentialValidationToken,
             remoteEncryptionConfigured: _remoteEncryptionKey is not null);
         _pipelineUri = pipelineUri;
         _cursorUri = cursorUri;

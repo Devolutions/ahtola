@@ -45,7 +45,136 @@ public class AhtolaConnectionOptions
 
     public int SyncInterval => _builder.SyncInterval;
 
+    /// <summary>Gets what each automatic synchronization tick does.</summary>
+    public AhtolaAutomaticSyncMode AutomaticSyncMode => _builder.AutomaticSyncMode;
+
     public bool? Tls => _builder.Tls;
+
+    private static readonly string[] AdvancedReplicaKeywords =
+    [
+        "Sync Client Name",
+        "Sync Long Poll Timeout",
+        "Bootstrap If Empty",
+        "Partial Bootstrap Prefix",
+        "Partial Bootstrap Query",
+        "Partial Sync Segment Size",
+        "Partial Sync Prefetch",
+        "Remote Encryption Cipher",
+        "Remote Encryption Key",
+        "Push Operations Threshold",
+        "Pull Bytes Threshold",
+        "Force Logical MVCC Pull",
+        "Sync Experimental Features",
+        "Automatic Sync Mode",
+    ];
+
+    /// <summary>
+    /// True when any embedded-replica-only keyword (beyond <c>Replica Path</c> and
+    /// <c>Sync Interval</c>) is present, matching Turso's <c>HasAdvancedReplicaOptions</c>.
+    /// </summary>
+    internal bool HasAdvancedReplicaOptions
+        => Array.Exists(AdvancedReplicaKeywords, _builder.ContainsKey);
+
+    /// <summary>
+    /// Maps the embedded-replica keywords of this connection string onto
+    /// <see cref="AhtolaReplicaOptions"/>, mirroring Turso's <c>CreateReplicaOptions</c>
+    /// (<c>turso-src/bindings/dotnet/src/Turso.Data/TursoConnection.cs</c>).
+    /// </summary>
+    internal AhtolaReplicaOptions CreateReplicaOptions(
+        HttpMessageHandler? messageHandler,
+        Func<CancellationToken, ValueTask<string?>>? authTokenProvider)
+    {
+        if (_builder.ForceLogicalMvccPull)
+        {
+            throw new NotSupportedException(
+                "Force Logical MVCC Pull=True is not supported by the managed embedded replica: the pull "
+                + "protocol is always auto-detected from the remote and persisted in the replica metadata.");
+        }
+
+        ValidateExperimentalFeatures(_builder.SyncExperimentalFeatures);
+        var clientName = _builder.SyncClientName;
+        var longPollMilliseconds = _builder.SyncLongPollTimeout;
+        var pushOperationsThreshold = _builder.PushOperationsThreshold;
+        var pullBytesThreshold = _builder.PullBytesThreshold;
+        return new AhtolaReplicaOptions(
+            ReplicaPath,
+            GetRemoteUri(),
+            AuthToken,
+            _builder.BootstrapIfEmpty)
+        {
+            SyncInterval = SyncInterval,
+            AutomaticSyncMode = AutomaticSyncMode,
+            ClientName = string.IsNullOrWhiteSpace(clientName) ? null : clientName,
+            LongPollTimeout = longPollMilliseconds == 0 ? null : TimeSpan.FromMilliseconds(longPollMilliseconds),
+            PartialBootstrap = GetPartialBootstrapOptions(),
+            RemoteEncryption = GetReplicaRemoteEncryptionOptions(),
+            PushOperationsThreshold = pushOperationsThreshold == 0 ? null : pushOperationsThreshold,
+            PullBytesThreshold = pullBytesThreshold == 0 ? null : pullBytesThreshold,
+            AuthTokenProvider = authTokenProvider,
+            HttpPolicy = new AhtolaSyncHttpPolicy(messageHandler),
+        };
+    }
+
+    private AhtolaPartialBootstrapOptions? GetPartialBootstrapOptions()
+    {
+        var prefix = _builder.PartialBootstrapPrefix;
+        var query = _builder.PartialBootstrapQuery;
+        var segmentSize = _builder.PartialSyncSegmentSize;
+        var prefetch = _builder.PartialSyncPrefetch;
+        var hasQuery = !string.IsNullOrWhiteSpace(query);
+        if (prefix != 0 && hasQuery)
+        {
+            throw new InvalidOperationException(
+                "Partial Bootstrap Prefix and Partial Bootstrap Query cannot be combined.");
+        }
+
+        if (prefix == 0 && !hasQuery)
+        {
+            if (segmentSize != 0 || prefetch)
+            {
+                throw new InvalidOperationException(
+                    "Partial Sync Segment Size and Partial Sync Prefetch require Partial Bootstrap Prefix or Partial Bootstrap Query.");
+            }
+
+            return null;
+        }
+
+        long? segment = segmentSize == 0 ? null : segmentSize;
+        return hasQuery
+            ? AhtolaPartialBootstrapOptions.QueryPages(query, segment, prefetch)
+            : AhtolaPartialBootstrapOptions.Prefix(prefix, segment, prefetch);
+    }
+
+    private AhtolaRemoteEncryptionOptions? GetReplicaRemoteEncryptionOptions()
+    {
+        var cipher = _builder.RemoteEncryptionCipher;
+        var key = _builder.RemoteEncryptionKey;
+        if (string.IsNullOrWhiteSpace(cipher) && string.IsNullOrWhiteSpace(key))
+            return null;
+        if (string.IsNullOrWhiteSpace(cipher) || string.IsNullOrWhiteSpace(key))
+        {
+            throw new InvalidOperationException(
+                "Remote Encryption Cipher and Remote Encryption Key must be specified together.");
+        }
+
+        return new AhtolaRemoteEncryptionOptions(key, AhtolaRemoteEncryptionOptions.ParseCipher(cipher));
+    }
+
+    private static void ValidateExperimentalFeatures(string features)
+    {
+        if (string.IsNullOrWhiteSpace(features))
+            return;
+
+        foreach (var feature in features.Split(','))
+        {
+            var name = feature.Trim();
+            if (name.Length == 0 || !name.All(static c => char.IsAsciiLetterOrDigit(c) || c == '_'))
+            {
+                throw new ArgumentException(
+                    $"Sync Experimental Features must be a comma-separated list of feature names: {features}");
+            }
+        }
+    }
 
     public AhtolaLocalProvider LocalProvider => _builder.IsLocalProviderConfigured
         ? _builder.LocalProvider
@@ -331,6 +460,8 @@ public class AhtolaConnectionOptions
         if (!string.IsNullOrWhiteSpace(options.AuthToken))
             builder.AuthToken = options.AuthToken;
         builder.SyncInterval = options.SyncInterval;
+        if (options.AutomaticSyncMode != AhtolaAutomaticSyncMode.PushAndPull)
+            builder.AutomaticSyncMode = options.AutomaticSyncMode;
         return new AhtolaConnectionOptions(builder);
     }
 
