@@ -20,9 +20,16 @@ internal sealed class GenerateSeriesModule : TableValuedFunctionModule
     public override IReadOnlyList<SqlValue[]> Enumerate(TableValuedFunctionCall call)
     {
         // SQLite's series module produces no rows when the mandatory first argument is
-        // absent or NULL, and reports an error for a non-integer bound.
-        if (!call.HasArgument(0) || call.Arguments[0].Kind == SqlValueKind.Null)
+        // absent or when any supplied bound is NULL (core/series.rs filter), and reports an
+        // error for a non-integer bound.
+        if (!call.HasArgument(0))
             return [];
+
+        for (var index = 0; index < 3; index++)
+        {
+            if (call.HasArgument(index) && call.Arguments[index].Kind == SqlValueKind.Null)
+                return [];
+        }
 
         var start = RequireInteger(call.Arguments[0]);
         var stop = call.HasArgument(1) ? RequireInteger(call.Arguments[1]) : 0xffffffffL;
@@ -71,6 +78,12 @@ internal sealed class GenerateSeriesModule : TableValuedFunctionModule
             }
         }
     }
+
+    /// <summary>
+    /// SQLite's series cursor (and Turso's core/series.rs) reports each generated value as
+    /// its rowid, so a value keeps its identity across scans with different bounds.
+    /// </summary>
+    public override long GetRowId(long ordinal, SqlValue[] row) => row[0].AsInteger();
 
     private static SqlValue[] BuildRow(long value, SqlValue[] bounds)
         => [SqlValue.Integer(value), bounds[0], bounds[1], bounds[2]];
@@ -141,6 +154,13 @@ internal sealed class JsonTraversalModule(bool recursive) : TableValuedFunctionM
 
         return result;
     }
+
+    /// <summary>
+    /// SQLite's json_each/json_tree cursor numbers rows from zero in emission order, and
+    /// Turso's core/json/vtab.rs does the same; <c>rowid</c> became selectable in Turso with
+    /// 16a02b139 ("core/translate: bind rowid on virtual tables").
+    /// </summary>
+    public override long GetRowId(long ordinal, SqlValue[] row) => ordinal - 1;
 }
 
 /// <summary>

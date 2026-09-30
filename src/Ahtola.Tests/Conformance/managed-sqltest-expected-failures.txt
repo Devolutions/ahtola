@@ -163,9 +163,6 @@ turso/mvcc_sequence.sqltest::mvcc-wal-mvcc-roundtrip-autoincrement | intentional
 # v0.8.1 corpus adoption (2026-09-30): the vendored corpus was refreshed from the
 # pinned turso-src v0.8.1 (8549c1659): 33 new files and 41 refreshed files. The
 # entries below are the differences that refresh exposed, pending closure.
-agg-functions/json-group-object-null-label.sqltest::json_group_object_null_label_only | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{}/{}/{"a":null}/[null]' but was '{"":1}/{"":1}/{"a":null}/[null]'
-agg-functions/json-group-object-null-label.sqltest::json_group_object_skips_null_label | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"a":1,"b":3}' but was '{"a":1,"":2,"b":3}'
-agg-functions/json-group-object-null-label.sqltest::jsonb_group_object_skips_null_label | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"a":1,"b":3}' but was '{"a":1,"":2,"b":3}'
 alter_table.sqltest::alter-table-add-column-preserve-schema-collate-locale | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)' but was 'CREATE TABLE tbl (c TEXT COLLATE 'fr-FR', d)'
 alter_table.sqltest::fail-alter-table-rename-to-existing-view | database variant 1/1 (:memory:): error 'there is already a view named y' does not match pattern 'there is already another table or index with this name: y'
 alter_table.sqltest::fail-alter-table-rename-to-existing-view-different-case | database variant 1/1 (:memory:): error 'there is already a view named Y' does not match pattern 'there is already another table or index with this name: Y'
@@ -177,8 +174,7 @@ gencol.sqltest::gencol_issue7068_check_sees_recomputed_value | database variant 
 gencol.sqltest::gencol_issue7068_multiple_defaults_before_generated_notnull | database variant 1/1 (:memory:): expected success but got error: NOT NULL constraint failed: t.b
 gencol.sqltest::gencol_issue7068_returning_recomputed_after_default | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '5/6' but was '5/'
 gencol.sqltest::gencol_issue7068_unique_index_uses_recomputed_value | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '1/5/6' but was '1/5/'
-generate_series.sqltest::generate-series-null-arguments-return-no-rows | database variant 1/1 (:memory:): expected success but got error: generate_series() requires integer arguments
-integrity_check/memory.sqltest::integrity-check-qualified-corrupt-attached-database | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+integrity_check/memory.sqltest::integrity-check-qualified-corrupt-attached-database | intentional managed-ATTACH policy: a file ATTACH needs a file-backed managed primary whose IFileSystem the attachment shares (a :memory: primary has none), and the corrupt fixture is independently rejected at open (see the parity_corrupt_index entries)
 join/hash.sqltest::hash-join-result-matrix-full-join-uses-a-hash-join | database variant 1/1 (:memory:): output does not match pattern 'HASH JOIN matrix_right AS r'
 join/hash.sqltest::hash-join-result-matrix-left-join-uses-a-hash-join | database variant 1/1 (:memory:): output does not match pattern 'HASH JOIN matrix_right AS r'
 join/hash.sqltest::hash-join-result-matrix-uses-a-hash-join | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN matrix_right AS r.*SCAN matrix_left AS l'
@@ -201,10 +197,6 @@ join/memory.sqltest::partial-stats-hash-join-uses-known-unique-key-count | datab
 join/memory.sqltest::range-prefix-still-allows-hash-join | database variant 1/1 (:memory:): output does not match pattern 'HASH JOIN prefix_child AS child'
 join/memory.sqltest::unique-composite-hash-key-uses-one-key-estimate | database variant 1/1 (:memory:): output does not match pattern '(?s)"detail":"HASH JOIN composite_hash_child AS child".*"rows_per_input":5'
 join/memory.sqltest::unique-hash-key-does-not-apply-to-a-different-collation | database variant 1/1 (:memory:): expected success but got error: Expected End. At SQL offset 127.
-json/default.sqltest::jsonb_null_is_sql_null | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected 'null/1' but was 'blob/0'
-json/json_tree_columns.sqltest::json-tree-rowid-into-table | database variant 1/1 (:memory:): expected success but got error: no such column: rt.rowid
-json/json_tree_columns.sqltest::json-tree-rowid-is-selectable | database variant 1/1 (:memory:): expected success but got error: no such column: rt.rowid
-json/json_tree_columns.sqltest::json-tree-rowid-unqualified | database variant 1/1 (:memory:): expected success but got error: no such column: rowid
 multi_index_or_compound.sqltest::compound-or-keeps-correlated-index-columns-together | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/MULTI-INDEX OR t (txy, txy)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 multi_index_or_compound.sqltest::derived-or-filter-skips-correlated-columns | database variant 1/1 (:memory:): output does not match pattern '"rows_per_input":1000'
 multi_index_or_compound.sqltest::implied-or-filter-accepts-negative-numbers | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN b' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
@@ -220,17 +212,6 @@ partial_idx.sqltest::partial-index-or-term-with-covering-scan | database variant
 partial_idx.sqltest::partial-index-or-term-with-equality-search | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '1/0/0/SEARCH t USING INDEX idx (a=?)' but was '1/0/0/SCAN t'
 partial_idx.sqltest::partial-index-or-term-with-order | database variant 1/1 (:memory:): expected 3 row(s), got 4 row(s); row 0 expected '1/0/0/SCAN t USING INDEX idx' but was '1/0/0/SCAN t'
 pragma/memory.sqltest::pragma-temp-synchronous-stays-off | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '0' but was '2'
-scalar-functions-datetime.sqltest::date-blob-modifier | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2024-06-16' but was ''
-scalar-functions-datetime.sqltest::date-blob-time-value | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2024-01-01' but was ''
-scalar-functions-datetime.sqltest::date-unixepoch-at-1-millisecond-before-epochtime | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1969-12-31' but was '1970-01-01'
-scalar-functions-datetime.sqltest::strftime-at-1-millisecond-before-epochtime | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-1' but was '0'
-scalar-functions-datetime.sqltest::strftime-blob-time-value | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2024-01-01' but was ''
-scalar-functions-datetime.sqltest::timediff-blob-time-values | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '+0000-00-01 00:00:00.000' but was ''
-scalar-functions-datetime.sqltest::unixepoch-at-1-millisecond-before-epochtime | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '-1' but was '0'
-scalar-functions-datetime.sqltest::unixepoch-blob-time-value | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1704067200' but was ''
-scalar-functions.sqltest::min-float-equals-int | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
-scalar-functions.sqltest::min-int-equals-float | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1.0' but was '1'
-simple-count-optimization.sqltest::simple-count-unusable-partial-index-column-correctness | database variant 1/1 (:memory:): expected success but got error: no query solution
 sql-error-message-prefix.sqltest::database-full-error-has-no-prefix | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded

@@ -9962,6 +9962,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 rowId = 0;
                 rowIdQualifier = named.Alias ?? named.Name;
             }
+            else if (source is TableValuedFunctionSource function)
+            {
+                // Turso 16a02b139 binds rowid on every virtual table, table-valued functions
+                // included, so json_tree(...) AS rt exposes rt.rowid and a bare rowid.
+                rowId = 0;
+                rowIdQualifier = function.Alias ?? function.Name;
+            }
         }
 
         return new SourceRow(
@@ -9994,6 +10001,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 qualifiedColumns.TryAdd($"{qualifier}.rowid", rowIdIndex);
                 qualifiedColumns.TryAdd($"{qualifier}._rowid_", rowIdIndex);
                 qualifiedColumns.TryAdd($"{qualifier}.oid", rowIdIndex);
+                return;
+            case TableValuedFunctionSource function:
+                var functionRowIdIndex = values.Count;
+                values.Add(SqlValue.Integer(0));
+                var functionQualifier = function.Alias ?? function.Name;
+                qualifiedColumns.TryAdd($"{functionQualifier}.rowid", functionRowIdIndex);
+                qualifiedColumns.TryAdd($"{functionQualifier}._rowid_", functionRowIdIndex);
+                qualifiedColumns.TryAdd($"{functionQualifier}.oid", functionRowIdIndex);
                 return;
             case JoinTableSource join:
                 AppendSchemaRowidBindings(join.Left, context, values, qualifiedColumns);
@@ -30396,7 +30411,7 @@ out bool hasReturning)
             inheritedJoinConstraints: [],
             nullSupplying: false,
             allowUnqualified: CountTableSourceLeaves(statement.Source) <= 1,
-            simpleCountStar: IsSimpleCountStarSelect(statement),
+            simpleCountStar: IsSimpleCountStarSelect(statement, context),
             context);
         foreach (var projection in statement.Projections)
             ValidateExpressionIndexDirectives(projection.Expression, context);
@@ -30663,28 +30678,60 @@ out bool hasReturning)
         }
     }
 
-    // Mirrors Turso's `simple_aggregate == SimpleAggregate::Count` check: no WHERE/GROUP BY/
-    // HAVING, a single COUNT(*) projection over a single table source.
-    private static bool IsSimpleCountStarSelect(SelectStatement statement)
+    // Mirrors Turso's `simple_aggregate == SimpleAggregate::Count` check (detect_simple_aggregate):
+    // no WHERE/GROUP BY/HAVING, a single COUNT(*) projection - or a non-DISTINCT
+    // COUNT(col) whose argument is provably non-NULL (`Expr::is_nonnull`) - over a single table
+    // source. Both count every row, so the whole-table fast path is exact for either.
+    private static bool IsSimpleCountStarSelect(SelectStatement statement, QueryContext context)
     {
-        return statement.Where is null
-            && statement.Having is null
-            && statement.GroupBy.Count == 0
-            && statement.Projections.Count == 1
-            && statement.Source is NamedTableSource
-            && statement.Projections[0].Expression is FunctionExpression
+        if (statement.Where is not null
+            || statement.Having is not null
+            || statement.GroupBy.Count != 0
+            || statement.Projections.Count != 1
+            || statement.Source is not NamedTableSource source
+            || statement.Projections[0].Expression is not FunctionExpression
             {
-                CountStar: true,
                 Distinct: false,
                 Filter: null,
                 Window: null,
             } function
-            && string.Equals(function.Name, "count", StringComparison.OrdinalIgnoreCase);
+            || !string.Equals(function.Name, "count", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (function.CountStar)
+            return true;
+
+        return function.Arguments.Count == 1
+            && context.Tables.TryGetValue(source.Name, out var table)
+            && IsSimpleCountArgumentNonNull(function.Arguments[0], source, table);
+    }
+
+    // The conservative column subset of Turso's `Expr::is_nonnull`: a NOT NULL column, the
+    // INTEGER PRIMARY KEY rowid alias, or the rowid itself of the counted table.
+    private static bool IsSimpleCountArgumentNonNull(Expression argument, NamedTableSource source, EmbeddedTable table)
+    {
+        while (argument is CollationExpression collate)
+            argument = collate.Expression;
+        if (argument is not ColumnExpression column
+            || column.Schema is not null
+            || column.Qualifier is { } qualifier
+                && !string.Equals(qualifier, source.Alias ?? source.Name, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var name = column.UnqualifiedName ?? column.Name;
+        if (table.TryGetColumnIndex(name, out var index))
+            return table.ColumnDefinitions[index].NotNull || index == table.RowidAliasColumnIndex;
+        return table.HasRowid && EmbeddedTable.IsRowidAliasName(name);
     }
 
     // Mirrors Turso's enforce_indexed_by_hints simple-COUNT exemption: SQLite's whole-table
     // OP_Count fast path skips the WHERE machinery, so an unusable forced partial index is
-    // ignored for `SELECT COUNT(*) FROM t INDEXED BY idx` and the count must come from the
+    // ignored for `SELECT COUNT(*) FROM t INDEXED BY idx` (and Turso's non-NULL `COUNT(col)`
+    // extension of that fast path) and the count must come from the
     // table rather than the (smaller) index entries. A simple count-star select has no WHERE,
     // so every partial index is unusable there; drop the directive for the rest of execution
     // so every planning/evaluation route table-scans. Existence of the named index was already
@@ -30693,7 +30740,7 @@ out bool hasReturning)
         SelectStatement statement,
         QueryContext context)
     {
-        if (!IsSimpleCountStarSelect(statement)
+        if (!IsSimpleCountStarSelect(statement, context)
             || statement.Source is not NamedTableSource { IndexDirective: IndexedByDirective indexedBy } source
             || !context.Tables.TryGetValue(source.Name, out var table))
         {
@@ -48661,9 +48708,13 @@ out bool hasReturning)
         {
             if (result.Kind == SqlValueKind.Null || value.Kind == SqlValueKind.Null)
                 return SqlValue.Null;
+
+            // SQLite's minmaxFunc lets min() move to a later argument on a tie and keeps
+            // max() on the earlier one, so min(1, 1.0) is 1.0 while max(1, 1.0) is 1. Turso
+            // matches it since 78b1ac633 ("make scalar min keep the last of two tied args").
             if (maximum
                     ? Compare(value, result, collation) > 0
-                    : Compare(value, result, collation) < 0)
+                    : Compare(value, result, collation) <= 0)
                 result = value;
         }
 
@@ -53172,10 +53223,9 @@ out bool hasReturning)
                 for (int i = 1; i < args.Count; i++)
                 {
                     hasModifier = true;
-                    var v = args[i];
-                    if (v.Kind != SqlValueKind.Text)
+                    if (!TryReadDateTimeText(args[i], out var modifier))
                         return SqlValue.Null;
-                    if (!ParseModifier(p, v.AsText(), i - 1))
+                    if (!ParseModifier(p, modifier, i - 1))
                         return SqlValue.Null;
                 }
             }
@@ -53194,7 +53244,7 @@ out bool hasReturning)
                 case Func.UnixEpoch:
                     if (p.UseSubsec)
                         return SqlValue.Real((double)(p.IJd - UnixEpochIJd) / 1000.0);
-                    return SqlValue.Integer((p.IJd - UnixEpochIJd) / 1000);
+                    return SqlValue.Integer(UnixSeconds(p.IJd));
                 default:
                     p.ComputeYmdHms();
                     if (p.IsError)
@@ -53244,10 +53294,9 @@ out bool hasReturning)
 
                 for (int i = 2; i < args.Count; i++)
                 {
-                    var v = args[i];
-                    if (v.Kind != SqlValueKind.Text)
+                    if (!TryReadDateTimeText(args[i], out var modifier))
                         return SqlValue.Null;
-                    if (!ParseModifier(p, v.AsText(), i - 2))
+                    if (!ParseModifier(p, modifier, i - 2))
                         return SqlValue.Null;
                 }
             }
@@ -53260,12 +53309,54 @@ out bool hasReturning)
             return FormatStrftime(fmt, p);
         }
 
+        /// <summary>
+        /// Whole Unix seconds for a julian-day millisecond count, rounded toward negative
+        /// infinity like SQLite's <c>iJD/1000 - 21086676*10000</c> (iJD is never negative
+        /// there), so 1969-12-31 23:59:59.999 is -1 rather than 0. Turso matches it since
+        /// 535f684f1 ("core/functions: fix datetime rounding").
+        /// </summary>
+        private static long UnixSeconds(long iJd)
+            => Math.DivRem(iJd - UnixEpochIJd, 1000L, out var remainder) - (remainder < 0 ? 1 : 0);
+
+        /// <summary>
+        /// Reads a date/time argument or modifier the way SQLite's sqlite3_value_text() does:
+        /// text as-is and a BLOB's bytes as UTF-8 text. Bytes that are not UTF-8 are left
+        /// unread and the caller reports NULL (Turso b2512eb71, "read a BLOB date/time
+        /// argument as text").
+        /// </summary>
+        private static bool TryReadDateTimeText(SqlValue value, out string text)
+        {
+            switch (value.Kind)
+            {
+                case SqlValueKind.Text:
+                    text = value.AsText();
+                    return true;
+                case SqlValueKind.Blob:
+                    try
+                    {
+                        text = StrictUtf8.GetString(value.AsBlob().Span);
+                        return true;
+                    }
+                    catch (DecoderFallbackException)
+                    {
+                        break;
+                    }
+            }
+
+            text = string.Empty;
+            return false;
+        }
+
+        private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
         private static bool InitTimeValue(Dt p, SqlValue value)
         {
             switch (value.Kind)
             {
                 case SqlValueKind.Text:
                     return ParseDateOrTime(value.AsText(), p);
+                case SqlValueKind.Blob:
+                    return TryReadDateTimeText(value, out var blobText) && ParseDateOrTime(blobText, p);
                 case SqlValueKind.Integer:
                     SetRawNumber(p, value.AsInteger());
                     return true;
@@ -53430,7 +53521,7 @@ out bool hasReturning)
                         if (p.UseSubsec)
                             res.Append(((double)(p.IJd - UnixEpochIJd) / 1000.0).ToString("F3", CultureInfo.InvariantCulture));
                         else
-                            res.Append(((p.IJd - UnixEpochIJd) / 1000).ToString(CultureInfo.InvariantCulture));
+                            res.Append(UnixSeconds(p.IJd).ToString(CultureInfo.InvariantCulture));
                         break;
                     case 'S':
                         res.Append(((int)p.S).ToString("D2", CultureInfo.InvariantCulture));
@@ -54229,8 +54320,10 @@ out bool hasReturning)
         internal static SqlValue Jsonb(IReadOnlyList<SqlValue> args)
         {
             RequireArgumentCount("jsonb", args, 1);
+            // jsonb(NULL) is SQL NULL like SQLite's jsonb(); Turso matches it since 5775d5337
+            // ("json: preserve SQL NULL in jsonb()").
             return args[0].Kind == SqlValueKind.Null
-                ? SqlValue.Blob([0])
+                ? SqlValue.Null
                 : ToJsonb(args[0]);
         }
 

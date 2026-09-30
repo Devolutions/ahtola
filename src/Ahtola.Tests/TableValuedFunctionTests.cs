@@ -422,6 +422,13 @@ public class TableValuedFunctionTests
         Rows(connection, "SELECT count(*) FROM pragma_table_info;").Should().Equal(["0"]);
         Rows(connection, "SELECT count(*) FROM generate_series(NULL, 5);").Should().Equal(["0"]);
 
+        // Any supplied NULL bound - stop or step included - yields no rows rather than an
+        // integer-argument error (core/series.rs filter, like SQLite's series module).
+        Rows(connection, "SELECT count(*) FROM generate_series(1, NULL);").Should().Equal(["0"]);
+        Rows(connection, "SELECT count(*) FROM generate_series(1, 3, NULL);").Should().Equal(["0"]);
+        Rows(connection, "SELECT count(*) FROM generate_series WHERE start = 1 AND stop = NULL;")
+            .Should().Equal(["0"]);
+
         Rows(connection, "SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list WHERE name = 'child';")
             .Should().Equal(["main|child|table|2|0|0"]);
     }
