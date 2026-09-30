@@ -9957,7 +9957,11 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 var columns = definition.Index.Columns.Select(
                     column => $"{definition.TableName}.{column.Name}");
-                throw new EmbeddedSqlException($"UNIQUE constraint failed: {string.Join(", ", columns)}");
+                throw new EmbeddedSqlException(
+                    $"UNIQUE constraint failed: {string.Join(", ", columns)}",
+                    definition.Index.Origin == EmbeddedIndexOrigin.PrimaryKey
+                        ? Execution.SqliteResultCode.ConstraintPrimaryKey
+                        : Execution.SqliteResultCode.ConstraintUnique);
             }
 
             previousNonNullKey = key;

@@ -80,6 +80,67 @@ public sealed class MvccCheckpointStateMachineTests
         }
     }
 
+    // Turso a95d01284 / 7ad5d9de4: an explicit checkpoint must not overlap another root
+    // statement on the same connection, so a suspended reader keeps its cursors intact.
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ExplicitCheckpointIsRefusedWhileAnotherStatementOnTheConnectionIsActive(bool mvcc)
+    {
+        using var db = new CheckpointFileDatabase();
+        using var connection = db.Connect();
+        if (mvcc)
+            connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("INSERT INTO t VALUES (1), (2), (3);");
+
+        using (var select = connection.CreateCommand())
+        {
+            select.CommandText = "SELECT v FROM t ORDER BY v;";
+            using var reader = select.ExecuteReader();
+            reader.Read().Should().BeTrue();
+
+            foreach (var mode in new[] { "PASSIVE", "TRUNCATE" })
+            {
+                var checkpoint = () => connection.ExecuteNonQuery($"PRAGMA wal_checkpoint({mode});");
+                var failure = checkpoint.Should().Throw<SqliteException>().Which;
+                failure.SqliteErrorCode.Should().Be(5);
+                failure.SqliteExtendedErrorCode.Should().Be(5);
+                failure.Message.Should().Contain(
+                    "cannot checkpoint while another statement is active - SQL statements in progress");
+            }
+
+            var remaining = new List<long>();
+            while (reader.Read())
+                remaining.Add(reader.GetInt64(0));
+            remaining.Should().Equal(2, 3);
+        }
+
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+            using var reader = cmd.ExecuteReader();
+            reader.Read().Should().BeTrue();
+            Convert.ToInt64(reader.GetValue(0)).Should().Be(0L);
+        }
+
+        Convert.ToInt64(Scalar(connection, "SELECT SUM(v) FROM t;")).Should().Be(6L);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void OpenBlobHandleDoesNotBlockExplicitCheckpoints(bool mvcc)
+    {
+        using var db = new CheckpointFileDatabase();
+        using var connection = db.Connect();
+        if (mvcc)
+            connection.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        connection.ExecuteNonQuery("CREATE TABLE b(x BLOB);");
+        connection.ExecuteNonQuery("INSERT INTO b VALUES (x'00112233');");
+
+        using var blob = new SqliteBlob(connection, "b", "x", 1, readOnly: true);
+        var checkpoint = () => connection.ExecuteNonQuery("PRAGMA wal_checkpoint(PASSIVE);");
+        checkpoint.Should().NotThrow();
+    }
+
     [Test]
     public void TruncateAfterDeletesLeavesCatalogEmptyOnReopen()
     {

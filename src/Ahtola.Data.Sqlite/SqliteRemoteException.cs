@@ -21,9 +21,10 @@ public sealed class SqliteRemoteException : SqliteException
     internal SqliteRemoteException(
         string message,
         int errorCode,
+        int extendedErrorCode,
         SqliteRemoteErrorClassification classification,
         HttpStatusCode? httpStatusCode)
-        : base(message, errorCode)
+        : base(message, errorCode, extendedErrorCode)
     {
         Classification = classification;
         HttpStatusCode = httpStatusCode;
@@ -77,6 +78,11 @@ public static class SqliteRemoteExceptionClassifier
     {
         var statusCode = source is AhtolaException ahtola ? ahtola.RemoteStatusCode : null;
         var classification = Classify(source);
-        return new SqliteRemoteException(mapped.Message, mapped.SqliteErrorCode, classification, statusCode);
+        return new SqliteRemoteException(
+            mapped.Message,
+            mapped.SqliteErrorCode,
+            mapped.SqliteExtendedErrorCode,
+            classification,
+            statusCode);
     }
 }

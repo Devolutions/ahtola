@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using Ahtola;
 using Ahtola.Core;
+using Ahtola.Core.Execution;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Data.Sqlite;
@@ -343,6 +344,15 @@ public partial class SqliteConnection :
         {
             CleanupFailedOpen(sharedMemoryPath);
             throw MapManagedEncryptionOpenFailure(ex, managedEncryption is not null || useManaged);
+        }
+        catch (InvalidDataException ex) when (managedEncryption is null && PageCodec is null && IsPlainNotADatabase(ex))
+        {
+            // An unkeyed, codec-less open of a garbage plain header is SQLite's SQLITE_NOTADB.
+            // A configured key or codec keeps the encrypted-or-not-a-database phrase below.
+            CleanupFailedOpen(sharedMemoryPath);
+            throw SqliteCommand.CreateSqliteException(
+                SqliteResultCode.NotADatabase,
+                SqliteNotADatabaseException.SqliteMessage);
         }
         catch (InvalidDataException ex)
         {
@@ -1932,6 +1942,17 @@ public partial class SqliteConnection :
             if (File.Exists(candidate))
                 File.Delete(candidate);
         }
+    }
+
+    private static bool IsPlainNotADatabase(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is SqliteNotADatabaseException)
+                return true;
+        }
+
+        return false;
     }
 
     private static SqliteException ToSqliteException(AhtolaException exception)

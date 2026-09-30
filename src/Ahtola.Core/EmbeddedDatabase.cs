@@ -28,13 +28,15 @@ internal readonly record struct TransactionSnapshot(
 
 public class EmbeddedSqlException : Exception
 {
+    private readonly int? _explicitSqliteErrorCode;
+
     public EmbeddedSqlException(string message) : base(message)
     {
     }
 
     public EmbeddedSqlException(string message, int sqliteErrorCode) : base(message)
     {
-        SqliteErrorCode = sqliteErrorCode;
+        _explicitSqliteErrorCode = sqliteErrorCode;
     }
 
     internal EmbeddedSqlException(string message, InsertConflictAlgorithm conflictAlgorithm) : base(message)
@@ -45,9 +47,11 @@ public class EmbeddedSqlException : Exception
     internal EmbeddedSqlException(
         string message,
         InsertConflictAlgorithm? conflictAlgorithm,
-        bool constraintViolation = true) : base(message)
+        bool constraintViolation = true,
+        int? sqliteErrorCode = null) : base(message)
     {
         ConflictAlgorithm = conflictAlgorithm ?? InsertConflictAlgorithm.Abort;
+        _explicitSqliteErrorCode = sqliteErrorCode;
     }
 
     internal EmbeddedSqlException(
@@ -55,18 +59,30 @@ public class EmbeddedSqlException : Exception
         int sqliteErrorCode,
         InsertConflictAlgorithm? conflictAlgorithm) : base(message)
     {
-        SqliteErrorCode = sqliteErrorCode;
+        _explicitSqliteErrorCode = sqliteErrorCode;
         ConflictAlgorithm = conflictAlgorithm;
     }
 
     public EmbeddedSqlException(string message, Exception innerException) : base(message, innerException)
     {
+        // A wrapper that re-raises the same failure (conflict rollback/fail, statement abort)
+        // keeps the wrapped failure's result code, so a primary-key conflict stays 1555 rather
+        // than being re-derived from its "UNIQUE constraint failed" text.
+        if (innerException is EmbeddedSqlException { _explicitSqliteErrorCode: { } innerCode } inner
+            && string.Equals(inner.Message, message, StringComparison.Ordinal))
+        {
+            _explicitSqliteErrorCode = innerCode;
+        }
     }
 
     /// <summary>
-    /// Optional SQLite result code (e.g. 19 CONSTRAINT) when raised from Halt / HaltIfNull.
+    /// The SQLite result code for this failure, possibly an extended code (e.g. 2067
+    /// <c>SQLITE_CONSTRAINT_UNIQUE</c>, whose primary code is <c>code &amp; 0xFF</c> = 19).
+    /// Explicit when the raise site knows it (Halt / HaltIfNull, primary-key conflicts);
+    /// otherwise derived from SQLite's own error text for the classic failure classes.
+    /// <see langword="null"/> means a plain <c>SQLITE_ERROR</c>.
     /// </summary>
-    public int? SqliteErrorCode { get; }
+    public int? SqliteErrorCode => _explicitSqliteErrorCode ?? SqliteResultCode.InferFromMessage(Message);
 
     internal InsertConflictAlgorithm? ConflictAlgorithm { get; }
 }
@@ -201,7 +217,7 @@ internal sealed class EmbeddedStatementFailureException : Exception
 internal sealed class EmbeddedTriggerRaiseException : EmbeddedSqlException
 {
     public EmbeddedTriggerRaiseException(string message, InsertConflictAlgorithm algorithm)
-        : base(message, algorithm)
+        : base(message, algorithm, constraintViolation: true, SqliteResultCode.ConstraintTrigger)
     {
         Algorithm = algorithm;
     }
@@ -12333,7 +12349,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (Add(
                         rowPosition,
                         $"UNIQUE constraint failed: {tableName}.{column}",
-                        aliasIndex >= 0 ? table.RowidAliasConflictAlgorithm : null))
+                        aliasIndex >= 0 ? table.RowidAliasConflictAlgorithm : null,
+                        RowidConflictCode(aliasIndex)))
                 {
                     return conflicts;
                 }
@@ -12372,7 +12389,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? $"UNIQUE constraint failed: index '{index.Name}'"
                 : "UNIQUE constraint failed: "
                     + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
-            if (Add(rowPosition, message, index.ConflictAlgorithm))
+            if (Add(rowPosition, message, index.ConflictAlgorithm, UniqueIndexConflictCode(index)))
                 return conflicts;
         }
         if (!primaryKeyAdded && table.WithoutRowid && AddWithoutRowidPrimaryKeyConflict())
@@ -12400,17 +12417,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 rowPosition,
                 "UNIQUE constraint failed: "
                     + string.Join(", ", primaryKey.Select(column => $"{tableName}.{column.Name}")),
-                table.PrimaryKeyConflictAlgorithm);
+                table.PrimaryKeyConflictAlgorithm,
+                SqliteResultCode.ConstraintPrimaryKey);
         }
 
         bool Add(
             int rowPosition,
             string message,
-            InsertConflictAlgorithm? algorithm)
+            InsertConflictAlgorithm? algorithm,
+            int sqliteErrorCode)
         {
             conflicts.Add(new InsertUniqueConflict(
                 rowPosition,
-                new EmbeddedSqlException(message, algorithm, constraintViolation: true)));
+                new EmbeddedSqlException(message, algorithm, constraintViolation: true, sqliteErrorCode)));
             return shouldStop?.Invoke(conflicts) ?? false;
         }
     }
@@ -13885,7 +13904,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             var columns = primaryKey.Select(entry => $"{tableName}.{table.Columns[entry.Index]}");
                             throw new EmbeddedSqlException(
                                 $"UNIQUE constraint failed: {string.Join(", ", columns)}",
-                                table.PrimaryKeyConflictAlgorithm);
+                                table.PrimaryKeyConflictAlgorithm,
+                                constraintViolation: true,
+                                SqliteResultCode.ConstraintPrimaryKey);
                         }
                     }
 
@@ -13939,7 +13960,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var columns = primaryKey.Select(entry => $"{tableName}.{table.Columns[entry.Index]}");
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {string.Join(", ", columns)}",
-                        table.PrimaryKeyConflictAlgorithm);
+                        table.PrimaryKeyConflictAlgorithm,
+                        constraintViolation: true,
+                        SqliteResultCode.ConstraintPrimaryKey);
                 }
             }
 
@@ -14433,7 +14456,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             $"UNIQUE constraint failed: {statement.TableName}.{conflictColumn}",
                             plan.AliasIndex >= 0
                                 ? table.RowidAliasConflictAlgorithm
-                                : null);
+                                : null,
+                            constraintViolation: true,
+                            RowidConflictCode(plan.AliasIndex));
                     }
                 }
             }
@@ -14578,9 +14603,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 $"UNIQUE constraint failed: {tableName}.{conflictColumn}",
                 aliasIndex >= 0
                     ? table.RowidAliasConflictAlgorithm
-                    : null);
+                    : null,
+                constraintViolation: true,
+                RowidConflictCode(aliasIndex));
         }
     }
+
+    /// <summary>
+    /// SQLite's <c>sqlite3RowidConstraint</c> code: an INTEGER PRIMARY KEY alias collision is
+    /// <c>SQLITE_CONSTRAINT_PRIMARYKEY</c>, a hidden-rowid collision <c>SQLITE_CONSTRAINT_ROWID</c>.
+    /// </summary>
+    private static int RowidConflictCode(int aliasIndex)
+        => aliasIndex >= 0 ? SqliteResultCode.ConstraintPrimaryKey : SqliteResultCode.ConstraintRowId;
 
     // Mutable per-statement INSERT plan: the resolved column targets plus the rowid
     // allocation state threaded across value rows.
@@ -17068,7 +17102,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     : null;
                 throw new EmbeddedSqlException(
                     $"UNIQUE constraint failed: {tableName}.{column}",
-                    conflictAlgorithm);
+                    conflictAlgorithm,
+                    constraintViolation: true,
+                    RowidConflictCode(aliasIndex));
             }
         }
     }
@@ -17128,7 +17164,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             {
                                 throw new EmbeddedSqlException(
                                     $"UNIQUE constraint failed: {table.Name}.{column.Name}",
-                                    column.PrimaryKeyConflictAlgorithm);
+                                    column.PrimaryKeyConflictAlgorithm,
+                                    constraintViolation: true,
+                                    SqliteResultCode.ConstraintPrimaryKey);
                             }
                         }
 
@@ -17153,7 +17191,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (values.Any(existing => Compare(existing, value, column.Collation) == 0))
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {table.Name}.{column.Name}",
-                        column.PrimaryKeyConflictAlgorithm);
+                        column.PrimaryKeyConflictAlgorithm,
+                        constraintViolation: true,
+                        SqliteResultCode.ConstraintPrimaryKey);
 
                 values.Add(value);
             }
@@ -17269,7 +17309,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                     + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
                             throw new EmbeddedSqlException(
                                 message,
-                                index.ConflictAlgorithm);
+                                index.ConflictAlgorithm,
+                                constraintViolation: true,
+                                UniqueIndexConflictCode(index));
                         }
                     }
 
@@ -17331,13 +17373,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
                     throw new EmbeddedSqlException(
                         message,
-                        index.ConflictAlgorithm);
+                        index.ConflictAlgorithm,
+                        constraintViolation: true,
+                        UniqueIndexConflictCode(index));
                 }
             }
 
             seenKeys.Add(key);
         }
     }
+
+    /// <summary>
+    /// SQLite's <c>sqlite3UniqueConstraint</c> code: a PRIMARY KEY's automatic index reports
+    /// <c>SQLITE_CONSTRAINT_PRIMARYKEY</c>, every other unique index <c>SQLITE_CONSTRAINT_UNIQUE</c>.
+    /// </summary>
+    private static int UniqueIndexConflictCode(EmbeddedIndex index)
+        => index.Origin == EmbeddedIndexOrigin.PrimaryKey
+            ? SqliteResultCode.ConstraintPrimaryKey
+            : SqliteResultCode.ConstraintUnique;
 
     private bool RowsConflictOnIndex(
         EmbeddedTable table,
@@ -41765,7 +41818,7 @@ out bool hasReturning)
         QueryContext context)
     {
         var message = ResolveRaiseMessage(expression.Message, parameters, row, context);
-        var error = new EmbeddedSqlException(message);
+        var error = new EmbeddedSqlException(message, SqliteResultCode.ConstraintTrigger);
         throw expression.Action switch
         {
             RaiseAction.Ignore => new TriggerIgnoreException(),
@@ -65053,6 +65106,26 @@ Func<string, ParsedStatement> rewrite)
         return ExecutionResult.Empty;
     }
 
+    /// <summary>
+    /// Turso's explicit-checkpoint guard (<c>Connection::begin_explicit_checkpoint</c>): an explicit
+    /// checkpoint must not overlap another root statement on the same connection, because it
+    /// resets pager state under that statement's cursors. The pragma runs outside its own reader
+    /// lease, so any registered reader is another active or suspended statement. Incremental
+    /// blob handles hold no statement reader and never block it, as upstream.
+    /// </summary>
+    private void ThrowIfStatementsActiveForCheckpoint()
+    {
+        lock (_statementReaderGate)
+        {
+            if (_statementReaders.Count == 0)
+                return;
+        }
+
+        throw new EmbeddedSqlException(
+            "cannot checkpoint while another statement is active - SQL statements in progress",
+            SqliteResultCode.Busy);
+    }
+
     private ExecutionResult ExecutePragmaWalCheckpoint(PragmaWalCheckpointStatement statement)
     {
         if (statement.Mode is { } mode)
@@ -65075,6 +65148,7 @@ Func<string, ParsedStatement> rewrite)
 
         ValidatePragmaSchema(statement.Schema);
         var database = ResolvePragmaDatabase(statement.Schema);
+        ThrowIfStatementsActiveForCheckpoint();
         if (database.IsMvccEnabled)
         {
             // Managed MVCC checkpoint: materialize WAL pages -> backfill/flush
@@ -66223,7 +66297,7 @@ public sealed class EmbeddedStatement : IDisposable
 
         var mayMutate = _connection.StatementMayMutate(_statement);
         IDisposable? executionLease = _statement is
-            VacuumStatement or PragmaJournalModeStatement or PragmaPageSizeStatement
+            VacuumStatement or PragmaJournalModeStatement or PragmaPageSizeStatement or PragmaWalCheckpointStatement
             ? null
             : _connection.OpenStatementReaderLease();
         try
@@ -69416,7 +69490,9 @@ internal sealed class EmbeddedTable
                 {
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {tableName}.{column.Name}",
-                        column.PrimaryKeyConflictAlgorithm);
+                        column.PrimaryKeyConflictAlgorithm,
+                        constraintViolation: true,
+                        SqliteResultCode.ConstraintPrimaryKey);
                 }
             }
         }

@@ -906,9 +906,8 @@ internal static class ManagedFtsFunctions
         var query = arguments[^1];
         if (query.Kind == SqlValueKind.Null)
             return (arguments.Take(arguments.Count - 1).ToArray(), null);
-        if (query.Kind != SqlValueKind.Text)
-            throw new EmbeddedSqlException($"{function}() requires a text query");
 
-        return (arguments.Take(arguments.Count - 1).ToArray(), query.AsText());
+        // Turso converts a non-text query with Value::to_string rather than rejecting it.
+        return (arguments.Take(arguments.Count - 1).ToArray(), ManagedFtsPlannerAdapter.RequireQueryText(query));
     }
 }
