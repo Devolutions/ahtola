@@ -1028,6 +1028,9 @@ internal static class ManagedSnapshot
         IManagedConnectionAdapter destination,
         bool sourceTransactionActive = false)
     {
+        // The copy replays sequence backing tables through ordinary DML, which user statements
+        // may not do (RejectInternalTableDml).
+        using var internalTableWrites = EmbeddedDatabase.AllowInternalTableDml();
         var sourceTransactionStarted = false;
         var destinationTransactionStarted = false;
         var destinationForeignKeysDisabled = false;

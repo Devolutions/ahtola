@@ -127,9 +127,10 @@ public sealed class SqlParameterMap
         List<bool> referenced,
         Dictionary<string, int> indices)
     {
-        var end = ScanNamedParameterEnd(sql, cursor);
+        // The lexer rejects an invalid marker as an unrecognized token; the map just skips it.
+        var end = SqlLexer.ScanNamedParameter(sql, cursor, out var valid);
 
-        if (end == cursor + 1)
+        if (!valid)
             return end;
 
         var name = sql[cursor..end];
@@ -140,34 +141,6 @@ public sealed class SqlParameterMap
             names.Add(name);
             referenced.Add(true);
             indices.Add(name, index);
-        }
-
-        return end;
-    }
-
-    private static int ScanNamedParameterEnd(string sql, int cursor)
-    {
-        var end = cursor + 1;
-        while (end < sql.Length && IsParameterIdentifierCharacter(sql[end]))
-            end++;
-
-        if (sql[cursor] != '$')
-            return end;
-
-        while (end + 1 < sql.Length && sql[end] == ':' && sql[end + 1] == ':')
-        {
-            end += 2;
-            while (end < sql.Length && IsParameterIdentifierCharacter(sql[end]))
-                end++;
-        }
-
-        if (end < sql.Length && sql[end] == '(')
-        {
-            end++;
-            while (end < sql.Length && IsParameterIdentifierCharacter(sql[end]))
-                end++;
-            if (end < sql.Length && sql[end] == ')')
-                end++;
         }
 
         return end;
@@ -190,9 +163,6 @@ public sealed class SqlParameterMap
                 $"variable number must be between ?1 and ?{MaximumParameterCount}");
         }
     }
-
-    private static bool IsParameterIdentifierCharacter(char value)
-        => char.IsAsciiLetterOrDigit(value) || value is '_' or '$';
 
     private static int SkipQuoted(string sql, int cursor, char delimiter, char escapedDelimiter)
     {
