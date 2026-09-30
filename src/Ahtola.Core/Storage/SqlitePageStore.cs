@@ -117,7 +117,15 @@ public sealed class SqlitePageStore : IDisposable
         {
             var length = file.Length;
             if (length < SqliteDatabaseHeader.Size)
-                throw new InvalidDataException("File is too small to contain a SQLite database header.");
+            {
+                // SQLite zero-fills a short page 1 and then applies its header rules, so a file
+                // too short for a plain header is "not a database". A page codec may transform
+                // the magic, so it keeps the short-read diagnostic and judges the header itself.
+                const string tooSmall = "File is too small to contain a SQLite database header.";
+                throw pageCodec is null && encryption is null
+                    ? SqliteNotADatabaseException.Create(tooSmall)
+                    : new InvalidDataException(tooSmall);
+            }
 
             Span<byte> rawHeader = stackalloc byte[SqliteDatabaseHeader.Size];
             if (file.Read(0, rawHeader) != SqliteDatabaseHeader.Size)

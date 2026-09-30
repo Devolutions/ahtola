@@ -259,6 +259,18 @@ public sealed class SqliteWalReadSnapshotCoordinator : IDisposable
 
                     readMarkLease?.Dispose();
                 }
+
+                // SQLite's walTryBeginRead and Turso 74eb80c83: a checkpoint holds read-mark 0
+                // exclusively for as long as it runs, and a reader must not wait for it. Every
+                // frame this reader could want is already in the database file, so it pins the
+                // committed boundary with one of read-marks 1..4 instead; that mark only keeps
+                // a later checkpoint from restarting the WAL underneath it. An empty WAL has no
+                // commit frame to pin, so it still waits for read-mark 0.
+                if (region.Header.MaximumFrame != 0
+                    && TryPinBackfilledBoundary(region, cancellationToken, out var backfilled))
+                {
+                    return backfilled;
+                }
             }
             else
             {
@@ -299,11 +311,40 @@ public sealed class SqliteWalReadSnapshotCoordinator : IDisposable
         }
     }
 
+    /// <summary>
+    /// Pins a fully backfilled boundary with read-marks 1..4 while read-mark 0 is busy: share a
+    /// mark already at <c>mxFrame</c>, or advance an idle one to it.
+    /// </summary>
+    private bool TryPinBackfilledBoundary(
+        SqliteWalIndexHeaderRegion region,
+        CancellationToken cancellationToken,
+        out SqliteWalReadSnapshot snapshot)
+    {
+        foreach (var candidate in SelectExistingReadMarks(region))
+        {
+            if (candidate.Frame != region.Header.MaximumFrame)
+                break;
+
+            if (TryAcquireExistingReadMark(
+                    candidate.Index,
+                    candidate.Frame,
+                    cancellationToken,
+                    out snapshot,
+                    allowBackfilled: true))
+            {
+                return true;
+            }
+        }
+
+        return TryAdvanceReadMark(cancellationToken, out snapshot, allowBackfilled: true);
+    }
+
     private bool TryAcquireExistingReadMark(
         int readMarkIndex,
         uint maximumFrame,
         CancellationToken cancellationToken,
-        out SqliteWalReadSnapshot snapshot)
+        out SqliteWalReadSnapshot snapshot,
+        bool allowBackfilled = false)
     {
         snapshot = null!;
         if (!_locks.TryAcquireShared(GetReadMarkLockOffset(readMarkIndex), length: 1, out var readMarkLease))
@@ -313,7 +354,7 @@ public sealed class SqliteWalReadSnapshotCoordinator : IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             var confirmation = _index.ReadValidatedHeader(_wal);
-            if (IsDatabaseOnlySnapshot(confirmation)
+            if ((!allowBackfilled && IsDatabaseOnlySnapshot(confirmation))
                 || confirmation.Header.MaximumFrame < maximumFrame
                 || confirmation.CheckpointInfo.GetReadMark(readMarkIndex) != maximumFrame)
             {
@@ -338,7 +379,8 @@ public sealed class SqliteWalReadSnapshotCoordinator : IDisposable
 
     private bool TryAdvanceReadMark(
         CancellationToken cancellationToken,
-        out SqliteWalReadSnapshot snapshot)
+        out SqliteWalReadSnapshot snapshot,
+        bool allowBackfilled = false)
     {
         snapshot = null!;
         for (var readMarkIndex = 1; readMarkIndex < ReadMarkCount; readMarkIndex++)
@@ -350,7 +392,7 @@ public sealed class SqliteWalReadSnapshotCoordinator : IDisposable
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var region = _index.ReadValidatedHeader(_wal);
-                if (IsDatabaseOnlySnapshot(region))
+                if (region.Header.MaximumFrame == 0 || (!allowBackfilled && IsDatabaseOnlySnapshot(region)))
                     return false;
 
                 _index.PublishReadMark(readMarkIndex, region.Header.MaximumFrame);
@@ -365,7 +407,8 @@ public sealed class SqliteWalReadSnapshotCoordinator : IDisposable
                         readMarkIndex,
                         maximumFrame,
                         cancellationToken,
-                        out snapshot))
+                        out snapshot,
+                        allowBackfilled))
                 {
                     return true;
                 }

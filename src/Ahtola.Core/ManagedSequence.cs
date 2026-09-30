@@ -90,8 +90,10 @@ internal sealed class ManagedSequence
             if (Cycle)
                 return Ascending ? MinValue : MaxValue;
 
+            // Upstream's SequenceExhausted: its own text, but SQLITE_FULL (13) like DatabaseFull.
             throw new EmbeddedSqlException(
-                $"nextval: reached {(Ascending ? "maximum" : "minimum")} value of sequence \"{Name}\"");
+                $"nextval: reached {(Ascending ? "maximum" : "minimum")} value of sequence \"{Name}\"",
+                Execution.SqliteResultCode.Full);
         }
 
         return checked(current + IncrementBy);

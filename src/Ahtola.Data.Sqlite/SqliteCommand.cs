@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Ahtola;
 using Ahtola.Core;
+using Ahtola.Core.Execution;
 using Ahtola.Core.Parsing;
 
 namespace Ahtola.Data.Sqlite;
@@ -1761,12 +1762,7 @@ public class SqliteCommand : DbCommand
             return new SqliteException(Properties.Resources.SqliteNativeError(5, ex.Message), 5);
 
         if (TryGetSqliteErrorCode(ex) is { } sqliteErrorCode)
-        {
-            var codedMessage = UnwrapMessage(ex);
-            return new SqliteException(
-                Properties.Resources.SqliteNativeError(sqliteErrorCode, codedMessage),
-                sqliteErrorCode);
-        }
+            return CreateSqliteException(sqliteErrorCode, UnwrapMessage(ex));
 
         var message = ex.Message;
         foreach (var prefix in new[] { "Unable to prepare statement: Parse error: ", "Parse error: " })
@@ -1789,14 +1785,57 @@ public class SqliteCommand : DbCommand
                 && int.TryParse(message[sqliteErrorPrefix.Length..codeEnd], NumberStyles.Integer, CultureInfo.InvariantCulture, out var errorCode))
             {
                 var sqliteMessage = message[(codeEnd + 1)..];
-                return new SqliteException(Properties.Resources.SqliteNativeError(errorCode, sqliteMessage), errorCode);
+                return CreateSqliteException(errorCode, sqliteMessage);
             }
         }
 
         if (sql is not null)
             message = PreserveNoSuchTableCase(message, sql);
 
-        return new SqliteException(Properties.Resources.SqliteNativeError(1, message), 1);
+        return CreateSqliteException(TryGetRemoteSqliteErrorCode(ex) ?? SqliteResultCode.Error, message);
+    }
+
+    /// <summary>
+    /// Maps a remote (Hrana) failure's symbolic <c>error.code</c> to SQLite's numeric result
+    /// code. A bare primary <c>SQLITE_CONSTRAINT</c> is refined from the remote message the
+    /// way a local failure is, so a server that reports only the primary family still yields
+    /// the extended constraint kind.
+    /// </summary>
+    private static int? TryGetRemoteSqliteErrorCode(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is not AhtolaRemoteSqlException remote
+                || !SqliteResultCode.TryParseName(remote.RemoteErrorCode, out var code))
+            {
+                continue;
+            }
+
+            if (code == SqliteResultCode.Constraint
+                && SqliteResultCode.InferFromMessage(remote.RemoteErrorMessage) is { } inferred
+                && SqliteResultCode.Primary(inferred) == SqliteResultCode.Constraint)
+            {
+                return inferred;
+            }
+
+            return code;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Builds the facade exception the way <c>Microsoft.Data.Sqlite</c> does for a failed step:
+    /// <c>SqliteErrorCode</c> and the "SQLite Error N" text carry the primary result code, and
+    /// <c>SqliteExtendedErrorCode</c> the extended one (e.g. 19 / 2067 for a UNIQUE violation).
+    /// </summary>
+    internal static SqliteException CreateSqliteException(int resultCode, string message)
+    {
+        var primary = SqliteResultCode.Primary(resultCode);
+        return new SqliteException(
+            Properties.Resources.SqliteNativeError(primary, message),
+            primary,
+            resultCode);
     }
 
     private static int? TryGetSqliteErrorCode(Exception ex)

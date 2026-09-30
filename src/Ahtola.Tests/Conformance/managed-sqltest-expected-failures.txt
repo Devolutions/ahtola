@@ -78,8 +78,8 @@ turso/without_rowid.sqltest::without-rowid-foreign-keys-rejected | intentional e
 # through the managed harness -- SqltestManagedRunner.RunVariant converts the resulting
 # open-time EmbeddedSqlException/InvalidDataException into a plain SqltestOutcome instead of
 # letting it escape as an unhandled test exception, so each case is compared and recorded like
-# any other. All 18 cases below are real observed engine behavior:
-# EmbeddedFileStore.Load() validates b-tree/index/allocation-map/generated-column structural
+# any other. All 16 cases below are real observed engine behavior:
+# EmbeddedFileStore.Load() validates b-tree/index/allocation-map structural
 # integrity eagerly at file-open time, where Turso/SQLite open the file unconditionally and
 # defer to PRAGMA integrity_check/quick_check to report the same defect as row output (the
 # same class of pre-existing divergence already exercised by
@@ -87,11 +87,12 @@ turso/without_rowid.sqltest::without-rowid-foreign-keys-rejected | intentional e
 # The separate legacy-view loader gap is closed: malformed stored views no longer prevent
 # unrelated operations, and resolving a broken view for queries or trigger DML fails closed.
 # The other
-# 3 files this generator builds (parity_check_constraint, parity_quick_check_constraint,
-# parity_not_null_violation) are NOT listed here: ordinary column CHECK/NOT NULL values are not
-# re-validated on load, only generated-column values are recomputed (and their NOT NULL
-# rechecked), so those 3 open successfully and PRAGMA integrity_check/quick_check see the
-# corruption exactly as the pinned corpus expects.
+# 8 files this generator builds (parity_check_constraint, parity_quick_check_constraint,
+# parity_not_null_violation, parity_gencol_not_null_violation and the four parity_strict_*
+# files) are NOT listed here: stored values are not re-validated on load (VIRTUAL generated
+# columns are recomputed with affinity only, like a SQLite column read, without NOT NULL or
+# STRICT enforcement), so those files open successfully and PRAGMA integrity_check/quick_check
+# report the NULL, STRICT storage-class and CHECK violations exactly as the pinned corpus expects.
 integrity_check/parity_corrupt_index.sqltest::integrity-check-corrupt-missing-index-entry | database variant 1/1 (database/integrity_missing_index_entry.db): database failed to open: Stored index 'idx_b' is not a valid supported SQLite index b-tree.
 integrity_check/parity_corrupt_index.sqltest::quick-check-corrupt-missing-index-entry | database variant 1/1 (database/integrity_missing_index_entry.db): database failed to open: Stored index 'idx_b' is not a valid supported SQLite index b-tree.
 integrity_check/parity_corrupt_expression_index.sqltest::integrity-check-corrupt-missing-expression-index-entry | database variant 1/1 (database/integrity_missing_expression_index_entry.db): database failed to open: Stored index 'idx_expr' is not a valid supported SQLite index b-tree.
@@ -102,8 +103,6 @@ integrity_check/parity_freelist_count_mismatch.sqltest::integrity-check-freelist
 integrity_check/parity_freelist_count_mismatch.sqltest::quick-check-freelist-count-mismatch | open-time validation: SQLite freelist header declares 202 pages but its trunks contain 201.
 integrity_check/parity_freelist_trunk_corrupt.sqltest::integrity-check-freelist-trunk-corrupt | open-time validation: SQLite freelist trunk page 2 declares 1023 leaves, exceeding capacity 1022.
 integrity_check/parity_freelist_trunk_corrupt.sqltest::quick-check-freelist-trunk-corrupt | open-time validation: SQLite freelist trunk page 2 declares 1023 leaves, exceeding capacity 1022.
-integrity_check/parity_gencol_not_null_violation.sqltest::integrity-check-gencol-not-null-violation | database variant 1/1 (database/integrity_gencol_not_null_violation.db): database failed to open: NOT NULL constraint failed: t.b
-integrity_check/parity_gencol_not_null_violation.sqltest::quick-check-gencol-not-null-violation | database variant 1/1 (database/integrity_gencol_not_null_violation.db): database failed to open: NOT NULL constraint failed: t.b
 integrity_check/parity_missing_unique_index.sqltest::integrity-check-missing-unique-index-entry | database variant 1/1 (database/integrity_missing_unique_index_entry.db): database failed to open: Stored index 'idx_u_missing' does not match table 't' at record 1.
 integrity_check/parity_missing_unique_index.sqltest::quick-check-missing-unique-index-entry | database variant 1/1 (database/integrity_missing_unique_index_entry.db): database failed to open: Stored index 'idx_u_missing' does not match table 't' at record 1.
 integrity_check/parity_non_unique_index.sqltest::integrity-check-non-unique-index-entry | database variant 1/1 (database/integrity_non_unique_index_entry.db): database failed to open: Stored unique index 'idx_u' on table 't' contains duplicate non-NULL keys.
@@ -195,8 +194,8 @@ multi_index_or_compound.sqltest::implied-or-filter-uses-only-indexed-column | da
 multi_index_or_compound.sqltest::nested-and-branches-use-one-index-search | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH t USING INDEX tx (x=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 multi_index_or_compound.sqltest::nested-or-branches-use-one-index-search | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH t USING COVERING INDEX tx (x=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 sql-error-message-prefix.sqltest::database-full-error-has-no-prefix | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded
+turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
+turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
 turso/alter_column.sqltest::alter-column-rewrites-expression-index-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'
 turso/alter_column.sqltest::alter-column-rewrites-generated-index-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'
 turso/alter_column.sqltest::alter-column-rewrites-indexed-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'

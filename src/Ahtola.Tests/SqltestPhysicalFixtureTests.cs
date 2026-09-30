@@ -14,7 +14,6 @@ public class SqltestPhysicalFixtureTests
     [TestCase("integrity_check/parity_freelist_count_mismatch.sqltest", "freelist header declares")]
     [TestCase("integrity_check/parity_freelist_trunk_corrupt.sqltest", "exceeding capacity")]
     [TestCase("integrity_check/parity_overflow_list_length_mismatch.sqltest", "overflow chain ends")]
-    [TestCase("integrity_check/parity_gencol_not_null_violation.sqltest", "NOT NULL constraint failed", false)]
     public void FixtureConstructionSucceedsBeforeExpectedEngineRejection(
         string relativePath, string diagnostic, bool duringOpen = true)
     {
@@ -34,5 +33,27 @@ public class SqltestPhysicalFixtureTests
         outcome.Detail.Should().Contain(duringOpen
             ? "database failed to open:"
             : "expected success but got error:");
+    }
+
+    // Turso "report STRICT type violations from integrity_check": each fixture is a real
+    // managed-written STRICT (or generated-column) table with one first-row serial type
+    // swapped, and PRAGMA integrity_check/quick_check must report exactly upstream's rows.
+    [TestCase("integrity_check/parity_strict_type_violation.sqltest", "non-TEXT value in t.b")]
+    [TestCase("integrity_check/parity_strict_gencol_type_violation.sqltest", "non-INT value in t.b")]
+    [TestCase("integrity_check/parity_strict_not_null_violation.sqltest", "NULL value in t.b")]
+    [TestCase("integrity_check/parity_strict_real_integer_serial.sqltest", "ok")]
+    [TestCase("integrity_check/parity_gencol_not_null_violation.sqltest", "NULL value in t.b")]
+    public void StoredValueViolationsAreReportedByIntegrityCheck(string relativePath, string expected)
+    {
+        var discovered = SqltestCorpus.Cases.Where(candidate => candidate.RelativePath == relativePath).ToList();
+        discovered.Should().NotBeEmpty();
+        discovered.Should().OnlyContain(candidate => candidate.Status == SqltestCaseStatus.Runnable);
+        var file = SqltestCorpus.LoadFile(relativePath, discovered[0].FullPath);
+        foreach (var candidate in discovered)
+        {
+            var test = file.Tests.Single(entry => entry.Name == candidate.TestName);
+            var outcome = SqltestManagedRunner.Run(file, test);
+            outcome.Matched.Should().BeTrue($"{candidate.Id} expects '{expected}': {outcome.Detail}");
+        }
     }
 }

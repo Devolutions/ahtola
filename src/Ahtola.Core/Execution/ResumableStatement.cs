@@ -1673,7 +1673,7 @@ public sealed class ResumableStatement : IDisposable
                         {
                             throw new EmbeddedSqlException(
                                 "datatype mismatch",
-                                SqliteResultCode.Constraint,
+                                SqliteResultCode.Mismatch,
                                 InsertConflictAlgorithm.Abort);
                         }
 
@@ -1704,7 +1704,7 @@ public sealed class ResumableStatement : IDisposable
                         {
                             throw new EmbeddedSqlException(
                                 "datatype mismatch",
-                                SqliteResultCode.Constraint,
+                                SqliteResultCode.Mismatch,
                                 InsertConflictAlgorithm.Abort);
                         }
 

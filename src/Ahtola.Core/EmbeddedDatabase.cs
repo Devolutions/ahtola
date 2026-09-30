@@ -28,13 +28,15 @@ internal readonly record struct TransactionSnapshot(
 
 public class EmbeddedSqlException : Exception
 {
+    private readonly int? _explicitSqliteErrorCode;
+
     public EmbeddedSqlException(string message) : base(message)
     {
     }
 
     public EmbeddedSqlException(string message, int sqliteErrorCode) : base(message)
     {
-        SqliteErrorCode = sqliteErrorCode;
+        _explicitSqliteErrorCode = sqliteErrorCode;
     }
 
     internal EmbeddedSqlException(string message, InsertConflictAlgorithm conflictAlgorithm) : base(message)
@@ -45,9 +47,11 @@ public class EmbeddedSqlException : Exception
     internal EmbeddedSqlException(
         string message,
         InsertConflictAlgorithm? conflictAlgorithm,
-        bool constraintViolation = true) : base(message)
+        bool constraintViolation = true,
+        int? sqliteErrorCode = null) : base(message)
     {
         ConflictAlgorithm = conflictAlgorithm ?? InsertConflictAlgorithm.Abort;
+        _explicitSqliteErrorCode = sqliteErrorCode;
     }
 
     internal EmbeddedSqlException(
@@ -55,18 +59,30 @@ public class EmbeddedSqlException : Exception
         int sqliteErrorCode,
         InsertConflictAlgorithm? conflictAlgorithm) : base(message)
     {
-        SqliteErrorCode = sqliteErrorCode;
+        _explicitSqliteErrorCode = sqliteErrorCode;
         ConflictAlgorithm = conflictAlgorithm;
     }
 
     public EmbeddedSqlException(string message, Exception innerException) : base(message, innerException)
     {
+        // A wrapper that re-raises the same failure (conflict rollback/fail, statement abort)
+        // keeps the wrapped failure's result code, so a primary-key conflict stays 1555 rather
+        // than being re-derived from its "UNIQUE constraint failed" text.
+        if (innerException is EmbeddedSqlException { _explicitSqliteErrorCode: { } innerCode } inner
+            && string.Equals(inner.Message, message, StringComparison.Ordinal))
+        {
+            _explicitSqliteErrorCode = innerCode;
+        }
     }
 
     /// <summary>
-    /// Optional SQLite result code (e.g. 19 CONSTRAINT) when raised from Halt / HaltIfNull.
+    /// The SQLite result code for this failure, possibly an extended code (e.g. 2067
+    /// <c>SQLITE_CONSTRAINT_UNIQUE</c>, whose primary code is <c>code &amp; 0xFF</c> = 19).
+    /// Explicit when the raise site knows it (Halt / HaltIfNull, primary-key conflicts);
+    /// otherwise derived from SQLite's own error text for the classic failure classes.
+    /// <see langword="null"/> means a plain <c>SQLITE_ERROR</c>.
     /// </summary>
-    public int? SqliteErrorCode { get; }
+    public int? SqliteErrorCode => _explicitSqliteErrorCode ?? SqliteResultCode.InferFromMessage(Message);
 
     internal InsertConflictAlgorithm? ConflictAlgorithm { get; }
 }
@@ -201,7 +217,7 @@ internal sealed class EmbeddedStatementFailureException : Exception
 internal sealed class EmbeddedTriggerRaiseException : EmbeddedSqlException
 {
     public EmbeddedTriggerRaiseException(string message, InsertConflictAlgorithm algorithm)
-        : base(message, algorithm)
+        : base(message, algorithm, constraintViolation: true, SqliteResultCode.ConstraintTrigger)
     {
         Algorithm = algorithm;
     }
@@ -4088,6 +4104,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException("database or disk is full");
     }
 
+    /// <summary>SQLite's auto-vacuum mode from page 1: 0 NONE, 1 FULL, 2 INCREMENTAL.</summary>
+    internal int GetAutoVacuumMode()
+    {
+        lock (_gate)
+            return _fileStore?.AutoVacuumMode ?? 0;
+    }
+
     internal uint GetFreelistCount()
     {
         lock (_gate)
@@ -6381,7 +6404,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     /// <summary>
     /// Reports the SQLite integrity problems the managed catalog can actually
-    /// prove: declared NOT NULL and CHECK constraints that stored rows violate.
+    /// prove: STRICT storage-class and declared NOT NULL violations (in Turso's
+    /// per-column order, type first) and CHECK constraints that stored rows violate.
     /// </summary>
     /// <remarks>
     /// Index and page-structure problems are unreachable here. The managed file
@@ -6456,15 +6480,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         int maxErrors,
         List<string> problems)
     {
+        var rowidAliasColumnIndex = table.HasRowid ? table.RowidAliasColumnIndex : -1;
         for (var rowIndex = 0; rowIndex < table.Rows.Count && problems.Count < maxErrors; rowIndex++)
         {
             var row = table.Rows[rowIndex];
             for (var columnIndex = 0;
-                 columnIndex < table.ColumnDefinitions.Length && problems.Count < maxErrors;
+                 columnIndex < table.ColumnDefinitions.Length && columnIndex < row.Length && problems.Count < maxErrors;
                  columnIndex++)
             {
+                // Turso's integrity_check skips the INTEGER PRIMARY KEY: the rowid is its value.
+                if (columnIndex == rowidAliasColumnIndex)
+                    continue;
+
                 var column = table.ColumnDefinitions[columnIndex];
-                if (column.NotNull && columnIndex < row.Length && row[columnIndex].Kind == SqlValueKind.Null)
+                var value = row[columnIndex];
+                if (table.Strict && StrictIntegrityTypeName(column) is { } typeName && !SatisfiesStrictIntegrityType(typeName, value))
+                {
+                    problems.Add($"non-{typeName} value in {tableName}.{column.Name}");
+                    if (problems.Count >= maxErrors)
+                        break;
+                }
+
+                if (column.NotNull && value.Kind == SqlValueKind.Null)
                     problems.Add($"NULL value in {tableName}.{column.Name}");
             }
 
@@ -6476,6 +6513,34 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 problems.Add($"CHECK constraint failed in {tableName}");
         }
     }
+
+    /// <summary>
+    /// Turso's <c>Column::strict_value_type</c>: the STRICT declared types integrity_check can
+    /// test (ANY and custom/domain types have no storage-class constraint).
+    /// </summary>
+    private static string? StrictIntegrityTypeName(EmbeddedColumn column)
+    {
+        if (column.Domain is not null || column.IdentityType is not null || column.DeclaredType is null)
+            return null;
+
+        var declared = column.DeclaredType.Trim().ToUpperInvariant();
+        return declared is "INT" or "INTEGER" or "REAL" or "TEXT" or "BLOB" ? declared : null;
+    }
+
+    /// <summary>
+    /// SQLite's <c>OP_IsType</c> masks for STRICT integrity checking: NULL always passes, and a
+    /// REAL column accepts the integer storage class SQLite uses for integral reals.
+    /// </summary>
+    private static bool SatisfiesStrictIntegrityType(string typeName, SqlValue value)
+        => value.Kind == SqlValueKind.Null
+            || typeName switch
+            {
+                "INT" or "INTEGER" => value.Kind == SqlValueKind.Integer,
+                "REAL" => value.Kind is SqlValueKind.Real or SqlValueKind.Integer,
+                "TEXT" => value.Kind == SqlValueKind.Text,
+                "BLOB" => value.Kind == SqlValueKind.Blob,
+                _ => true,
+            };
 
     private bool SatisfiesCheckConstraints(
         string tableName,
@@ -9087,6 +9152,77 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// Decides whether an <c>ALTER COLUMN</c> is legal and computes the rows the program rewrites, the
     /// dependent definitions its <c>ParseSchema</c> adopts, and the AUTOINCREMENT state it retires.
     /// </summary>
+    /// <summary>
+    /// Turso's <c>validate_indexes_can_be_rewritten</c> MVCC arm (translate/alter.rs): an ALTER
+    /// COLUMN whose rewrite changes a stored value (becoming generated, toggling VIRTUAL, or an
+    /// affinity change) or may change a VIRTUAL generated value must rebuild every index that
+    /// observes the column or a generated column derived from it, which MVCC mode does not
+    /// support.
+    /// </summary>
+    private void ThrowIfMvccAlterColumnRebuildsIndexes(
+        string columnName,
+        EmbeddedTable original,
+        EmbeddedTable replacement,
+        int columnIndex)
+    {
+        if (!IsMvccEnabled || original.Indexes.Count == 0)
+            return;
+
+        var oldColumn = original.ColumnDefinitions[columnIndex];
+        var newColumn = replacement.ColumnDefinitions[columnIndex];
+        var oldVirtual = oldColumn.IsGenerated && !oldColumn.GeneratedStored;
+        var newVirtual = newColumn.IsGenerated && !newColumn.GeneratedStored;
+        var rewritesPhysicalLayout = (!oldColumn.IsGenerated && newColumn.IsGenerated)
+            || oldVirtual != newVirtual
+            || original.GetColumnAffinity(oldColumn) != replacement.GetColumnAffinity(newColumn);
+        if (!rewritesPhysicalLayout && !oldVirtual && !newVirtual)
+            return;
+
+        var affected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectColumnsAffectedByUpdate(original, columnIndex, affected);
+        CollectColumnsAffectedByUpdate(replacement, columnIndex, affected);
+        if (!original.Indexes.Any(index => IndexObservesAnyColumn(index, affected)))
+            return;
+
+        throw new EmbeddedSqlException(
+            $"cannot ALTER COLUMN \"{columnName}\": rebuilding affected indexes is not supported in MVCC mode");
+
+        static void CollectColumnsAffectedByUpdate(EmbeddedTable table, int columnIndex, HashSet<string> names)
+        {
+            names.Add(table.Columns[columnIndex]);
+            for (var changed = true; changed;)
+            {
+                changed = false;
+                foreach (var column in table.ColumnDefinitions)
+                {
+                    if (column.GenerationExpression is not { } expression || names.Contains(column.Name))
+                        continue;
+
+                    var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    EmbeddedTable.CollectColumnReferences(expression, references);
+                    if (references.Overlaps(names))
+                        changed |= names.Add(column.Name);
+                }
+            }
+        }
+
+        static bool IndexObservesAnyColumn(EmbeddedIndex index, HashSet<string> names)
+        {
+            var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var column in index.Columns)
+            {
+                if (column.Expression is { } expression)
+                    EmbeddedTable.CollectColumnReferences(expression, references);
+                else
+                    references.Add(column.Name);
+            }
+
+            if (index.Where is { } where)
+                EmbeddedTable.CollectColumnReferences(where, references);
+            return references.Overlaps(names);
+        }
+    }
+
     private (string CurrentName, int ColumnIndex, CompiledAlterTablePlan Plan) PlanAlterTableAlterColumn(
         AlterTableAlterColumnStatement statement,
         SchemaCatalog catalog,
@@ -9113,6 +9249,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             statement.ColumnName,
             statement.Column,
             context.CancellationToken);
+        ThrowIfMvccAlterColumnRebuildsIndexes(statement.ColumnName, table, replacement, columnIndex);
         var candidateTables = new Dictionary<string, EmbeddedTable>(
             catalog.Tables,
             StringComparer.OrdinalIgnoreCase)
@@ -12383,7 +12520,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (Add(
                         rowPosition,
                         $"UNIQUE constraint failed: {tableName}.{column}",
-                        aliasIndex >= 0 ? table.RowidAliasConflictAlgorithm : null))
+                        aliasIndex >= 0 ? table.RowidAliasConflictAlgorithm : null,
+                        RowidConflictCode(aliasIndex)))
                 {
                     return conflicts;
                 }
@@ -12422,7 +12560,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? $"UNIQUE constraint failed: index '{index.Name}'"
                 : "UNIQUE constraint failed: "
                     + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
-            if (Add(rowPosition, message, index.ConflictAlgorithm))
+            if (Add(rowPosition, message, index.ConflictAlgorithm, UniqueIndexConflictCode(index)))
                 return conflicts;
         }
         if (!primaryKeyAdded && table.WithoutRowid && AddWithoutRowidPrimaryKeyConflict())
@@ -12450,17 +12588,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 rowPosition,
                 "UNIQUE constraint failed: "
                     + string.Join(", ", primaryKey.Select(column => $"{tableName}.{column.Name}")),
-                table.PrimaryKeyConflictAlgorithm);
+                table.PrimaryKeyConflictAlgorithm,
+                SqliteResultCode.ConstraintPrimaryKey);
         }
 
         bool Add(
             int rowPosition,
             string message,
-            InsertConflictAlgorithm? algorithm)
+            InsertConflictAlgorithm? algorithm,
+            int sqliteErrorCode)
         {
             conflicts.Add(new InsertUniqueConflict(
                 rowPosition,
-                new EmbeddedSqlException(message, algorithm, constraintViolation: true)));
+                new EmbeddedSqlException(message, algorithm, constraintViolation: true, sqliteErrorCode)));
             return shouldStop?.Invoke(conflicts) ?? false;
         }
     }
@@ -13734,7 +13874,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context,
         bool virtualOnly = false,
-        bool enforceNotNull = true)
+        bool enforceNotNull = true,
+        bool validateStrict = true)
     {
         if (!table.HasGeneratedColumns)
             return;
@@ -13749,9 +13890,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (virtualOnly && column.GeneratedStored)
                 continue;
 
-            var value = table.ApplyColumnAffinity(
-                column,
-                Evaluate(column.GenerationExpression!, parameters, source, context));
+            var computed = Evaluate(column.GenerationExpression!, parameters, source, context);
+            var value = validateStrict
+                ? table.ApplyColumnAffinity(column, computed)
+                : table.CoerceColumnAffinity(column, computed);
             row[columnIndex] = value;
             if (enforceNotNull && column.NotNull && value.Kind == SqlValueKind.Null)
             {
@@ -13786,6 +13928,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Recomputes a stored row's VIRTUAL generated columns as it is read. Like SQLite's and
+    /// Turso's column read, this applies the declared affinity but enforces neither NOT NULL nor
+    /// the STRICT storage class: those are write-time constraints, and a stored row that no
+    /// longer satisfies them must stay readable so <c>PRAGMA integrity_check</c> can report it
+    /// ("NULL value in t.b", "non-INT value in t.b") instead of the database failing to load.
+    /// </summary>
     internal static void RecomputeVirtualGeneratedColumns(
         EmbeddedTable table,
         string tableName,
@@ -13806,7 +13955,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     [tableName] = table,
                 },
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase)),
-            virtualOnly: true);
+            virtualOnly: true,
+            enforceNotNull: false,
+            validateStrict: false);
     }
 
     // Materializes generated columns for a pre-existing row right after ALTER TABLE ADD COLUMN
@@ -13947,7 +14098,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             var columns = primaryKey.Select(entry => $"{tableName}.{table.Columns[entry.Index]}");
                             throw new EmbeddedSqlException(
                                 $"UNIQUE constraint failed: {string.Join(", ", columns)}",
-                                table.PrimaryKeyConflictAlgorithm);
+                                table.PrimaryKeyConflictAlgorithm,
+                                constraintViolation: true,
+                                SqliteResultCode.ConstraintPrimaryKey);
                         }
                     }
 
@@ -14001,7 +14154,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var columns = primaryKey.Select(entry => $"{tableName}.{table.Columns[entry.Index]}");
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {string.Join(", ", columns)}",
-                        table.PrimaryKeyConflictAlgorithm);
+                        table.PrimaryKeyConflictAlgorithm,
+                        constraintViolation: true,
+                        SqliteResultCode.ConstraintPrimaryKey);
                 }
             }
 
@@ -14496,7 +14651,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             $"UNIQUE constraint failed: {statement.TableName}.{conflictColumn}",
                             plan.AliasIndex >= 0
                                 ? table.RowidAliasConflictAlgorithm
-                                : null);
+                                : null,
+                            constraintViolation: true,
+                            RowidConflictCode(plan.AliasIndex));
                     }
                 }
             }
@@ -14656,9 +14813,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 $"UNIQUE constraint failed: {tableName}.{conflictColumn}",
                 aliasIndex >= 0
                     ? table.RowidAliasConflictAlgorithm
-                    : null);
+                    : null,
+                constraintViolation: true,
+                RowidConflictCode(aliasIndex));
         }
     }
+
+    /// <summary>
+    /// SQLite's <c>sqlite3RowidConstraint</c> code: an INTEGER PRIMARY KEY alias collision is
+    /// <c>SQLITE_CONSTRAINT_PRIMARYKEY</c>, a hidden-rowid collision <c>SQLITE_CONSTRAINT_ROWID</c>.
+    /// </summary>
+    private static int RowidConflictCode(int aliasIndex)
+        => aliasIndex >= 0 ? SqliteResultCode.ConstraintPrimaryKey : SqliteResultCode.ConstraintRowId;
 
     // Mutable per-statement INSERT plan: the resolved column targets plus the rowid
     // allocation state threaded across value rows.
@@ -17146,7 +17312,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     : null;
                 throw new EmbeddedSqlException(
                     $"UNIQUE constraint failed: {tableName}.{column}",
-                    conflictAlgorithm);
+                    conflictAlgorithm,
+                    constraintViolation: true,
+                    RowidConflictCode(aliasIndex));
             }
         }
     }
@@ -17206,7 +17374,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             {
                                 throw new EmbeddedSqlException(
                                     $"UNIQUE constraint failed: {table.Name}.{column.Name}",
-                                    column.PrimaryKeyConflictAlgorithm);
+                                    column.PrimaryKeyConflictAlgorithm,
+                                    constraintViolation: true,
+                                    SqliteResultCode.ConstraintPrimaryKey);
                             }
                         }
 
@@ -17231,7 +17401,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (values.Any(existing => Compare(existing, value, column.Collation) == 0))
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {table.Name}.{column.Name}",
-                        column.PrimaryKeyConflictAlgorithm);
+                        column.PrimaryKeyConflictAlgorithm,
+                        constraintViolation: true,
+                        SqliteResultCode.ConstraintPrimaryKey);
 
                 values.Add(value);
             }
@@ -17347,7 +17519,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                     + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
                             throw new EmbeddedSqlException(
                                 message,
-                                index.ConflictAlgorithm);
+                                index.ConflictAlgorithm,
+                                constraintViolation: true,
+                                UniqueIndexConflictCode(index));
                         }
                     }
 
@@ -17409,13 +17583,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
                     throw new EmbeddedSqlException(
                         message,
-                        index.ConflictAlgorithm);
+                        index.ConflictAlgorithm,
+                        constraintViolation: true,
+                        UniqueIndexConflictCode(index));
                 }
             }
 
             seenKeys.Add(key);
         }
     }
+
+    /// <summary>
+    /// SQLite's <c>sqlite3UniqueConstraint</c> code: a PRIMARY KEY's automatic index reports
+    /// <c>SQLITE_CONSTRAINT_PRIMARYKEY</c>, every other unique index <c>SQLITE_CONSTRAINT_UNIQUE</c>.
+    /// </summary>
+    private static int UniqueIndexConflictCode(EmbeddedIndex index)
+        => index.Origin == EmbeddedIndexOrigin.PrimaryKey
+            ? SqliteResultCode.ConstraintPrimaryKey
+            : SqliteResultCode.ConstraintUnique;
 
     private bool RowsConflictOnIndex(
         EmbeddedTable table,
@@ -41966,7 +42151,7 @@ out bool hasReturning)
         QueryContext context)
     {
         var message = ResolveRaiseMessage(expression.Message, parameters, row, context);
-        var error = new EmbeddedSqlException(message);
+        var error = new EmbeddedSqlException(message, SqliteResultCode.ConstraintTrigger);
         throw expression.Action switch
         {
             RaiseAction.Ignore => new TriggerIgnoreException(),
@@ -65252,6 +65437,26 @@ Func<string, ParsedStatement> rewrite)
         return ExecutionResult.Empty;
     }
 
+    /// <summary>
+    /// Turso's explicit-checkpoint guard (<c>Connection::begin_explicit_checkpoint</c>): an explicit
+    /// checkpoint must not overlap another root statement on the same connection, because it
+    /// resets pager state under that statement's cursors. The pragma runs outside its own reader
+    /// lease, so any registered reader is another active or suspended statement. Incremental
+    /// blob handles hold no statement reader and never block it, as upstream.
+    /// </summary>
+    private void ThrowIfStatementsActiveForCheckpoint()
+    {
+        lock (_statementReaderGate)
+        {
+            if (_statementReaders.Count == 0)
+                return;
+        }
+
+        throw new EmbeddedSqlException(
+            "cannot checkpoint while another statement is active - SQL statements in progress",
+            SqliteResultCode.Busy);
+    }
+
     private ExecutionResult ExecutePragmaWalCheckpoint(PragmaWalCheckpointStatement statement)
     {
         if (statement.Mode is { } mode)
@@ -65274,6 +65479,7 @@ Func<string, ParsedStatement> rewrite)
 
         ValidatePragmaSchema(statement.Schema);
         var database = ResolvePragmaDatabase(statement.Schema);
+        ThrowIfStatementsActiveForCheckpoint();
         if (database.IsMvccEnabled)
         {
             // Managed MVCC checkpoint: materialize WAL pages -> backfill/flush
@@ -65399,22 +65605,46 @@ Func<string, ParsedStatement> rewrite)
     {
         ValidatePragmaSchema(statement.Schema);
         if (statement.Value is null)
-            return new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(0)]], 0);
+        {
+            // Turso reports the mode the pager read from page 1 (largest-root-page and
+            // incremental-vacuum header fields), so an auto-vacuum database SQLite created
+            // reports FULL (1) or INCREMENTAL (2) even though this engine never enables it.
+            var database = ResolvePragmaDatabase(statement.Schema);
+            return new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(database.GetAutoVacuumMode())]], 0);
+        }
 
-        // Auto-vacuum is always off: Ahtola has no `--experimental-autovacuum` flag/engine
-        // support to turn it on. SQLite spells the mode either by name or by number (0/NONE,
-        // 1/FULL, 2/INCREMENTAL); requesting NONE only restates the state the database is
-        // already in, so it is always accepted, while requesting FULL/INCREMENTAL (or any
-        // unrecognized value) fails the same way it would if the flag existed but was unset.
-        var isNone = string.Equals(statement.Value, "none", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(statement.Value, "0", StringComparison.Ordinal);
-        if (!isNone)
+        // Turso v0.8.1 translate/pragma.rs without the experimental autovacuum feature, which
+        // Ahtola does not have: SQLite spells the mode by name or by number (0/NONE, 1/FULL,
+        // 2/INCREMENTAL) and treats both the same; NONE only restates the state the database
+        // is already in, so it is accepted (and, like SQLite once page 1 exists, has no effect),
+        // while FULL, INCREMENTAL and any unrecognized value fail with the flag diagnostic.
+        if (ParseAutoVacuumMode(statement.Value) != 0)
         {
             throw new EmbeddedSqlException(
                 "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.");
         }
 
         return ExecutionResult.Empty;
+    }
+
+    /// <summary>
+    /// Upstream's <c>requested_mode</c>: a mode name (any case), or a numeric literal whose value
+    /// is 0, 1 or 2 (so <c>00</c> and <c>0x0</c> are NONE). Anything else is <see langword="null"/>.
+    /// </summary>
+    private static int? ParseAutoVacuumMode(string value)
+    {
+        if (value.Equals("none", StringComparison.OrdinalIgnoreCase))
+            return 0;
+        if (value.Equals("full", StringComparison.OrdinalIgnoreCase))
+            return 1;
+        if (value.Equals("incremental", StringComparison.OrdinalIgnoreCase))
+            return 2;
+
+        long number;
+        var parsed = value.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+            ? long.TryParse(value.AsSpan(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out number)
+            : long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out number);
+        return parsed && number is >= 0 and <= 2 ? (int)number : null;
     }
 
     private ExecutionResult ExecutePragmaDataSyncRetry(PragmaDataSyncRetryStatement statement)
@@ -66445,7 +66675,7 @@ public sealed class EmbeddedStatement : IDisposable
 
         var mayMutate = _connection.StatementMayMutate(_statement);
         IDisposable? executionLease = _statement is
-            VacuumStatement or PragmaJournalModeStatement or PragmaPageSizeStatement
+            VacuumStatement or PragmaJournalModeStatement or PragmaPageSizeStatement or PragmaWalCheckpointStatement
             ? null
             : _connection.OpenStatementReaderLease();
         try
@@ -69638,7 +69868,9 @@ internal sealed class EmbeddedTable
                 {
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {tableName}.{column.Name}",
-                        column.PrimaryKeyConflictAlgorithm);
+                        column.PrimaryKeyConflictAlgorithm,
+                        constraintViolation: true,
+                        SqliteResultCode.ConstraintPrimaryKey);
                 }
             }
         }

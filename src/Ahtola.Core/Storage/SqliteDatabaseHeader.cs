@@ -70,14 +70,25 @@ public sealed record SqliteDatabaseHeader(
     {
         if (source.Length < Size)
             throw new InvalidDataException("SQLite database header is truncated.");
+        // SQLite's lockBtree "not a database" rules (bad magic, invalid page size, fewer than
+        // 480 usable bytes per page) report SQLITE_NOTADB rather than the field that tripped.
         if (!source[..Magic.Length].SequenceEqual(Magic))
-            throw new InvalidDataException("Database does not contain an SQLite format 3 header.");
+            throw SqliteNotADatabaseException.Create("Database does not contain an SQLite format 3 header.");
 
-        var pageSize = SqlitePageSize.Decode(BinaryPrimitives.ReadUInt16BigEndian(source[16..]));
+        int pageSize;
+        try
+        {
+            pageSize = SqlitePageSize.Decode(BinaryPrimitives.ReadUInt16BigEndian(source[16..]));
+        }
+        catch (InvalidDataException exception)
+        {
+            throw SqliteNotADatabaseException.Create(exception.Message);
+        }
+
         var writeVersion = ParseFileFormatVersion(source[18], "write");
         var readVersion = ParseFileFormatVersion(source[19], "read");
         var reservedSpace = source[20];
-        ValidateUsableSpace(pageSize, reservedSpace, static message => new InvalidDataException(message));
+        ValidateUsableSpace(pageSize, reservedSpace, static message => SqliteNotADatabaseException.Create(message));
         if (source[21] != 64 || source[22] != 32 || source[23] != 32)
             throw new InvalidDataException("SQLite payload-fraction fields are invalid.");
 
@@ -335,4 +346,26 @@ public sealed record SqliteDatabaseHeader(
                 $"SQLite reserved page space must leave at least {MinimumUsableSpace} usable bytes.");
         }
     }
+}
+
+/// <summary>
+/// Marks a file whose plain SQLite header fails SQLite's "not a database" rules: bad magic,
+/// an invalid page size, too few usable bytes per page, or a file too short to hold a header.
+/// SQLite reports these as <c>SQLITE_NOTADB</c> ("file is not a database"). The engine still
+/// raises an <see cref="InvalidDataException"/> naming the specific rule; this marker rides as
+/// its inner exception so the SQLite facade can report the result code.
+/// </summary>
+public sealed class SqliteNotADatabaseException : Exception
+{
+    /// <summary>SQLite's text for <c>SQLITE_NOTADB</c>.</summary>
+    public const string SqliteMessage = "file is not a database";
+
+    public SqliteNotADatabaseException()
+        : base(SqliteMessage)
+    {
+    }
+
+    /// <summary>Creates the header-validation failure for <paramref name="detail"/>.</summary>
+    internal static InvalidDataException Create(string detail)
+        => new(detail, new SqliteNotADatabaseException());
 }
