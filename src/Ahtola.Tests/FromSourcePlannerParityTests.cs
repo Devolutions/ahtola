@@ -198,6 +198,51 @@ public sealed class FromSourcePlannerParityTests
     }
 
     [Test]
+    public void SimpleCountIgnoresAnUnusableForcedPartialIndexForNonNullArguments()
+    {
+        // Turso's detect_simple_aggregate treats COUNT(col) over a provably non-NULL column as
+        // the simple count, so enforce_indexed_by_hints ignores an unusable forced partial
+        // index there instead of failing with "no query solution". SQLite only does this for
+        // COUNT(*), and the corpus deliberately follows Turso for the column form
+        // (simple-count-unusable-partial-index-column-correctness, @skip-if sqlite).
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(
+            connection,
+            """
+            CREATE TABLE t(id INTEGER PRIMARY KEY, x NOT NULL, y);
+            CREATE INDEX pi ON t(x) WHERE x > 5;
+            INSERT INTO t VALUES (1, 9, NULL), (2, 1, 1), (3, 2, NULL);
+            """);
+
+        foreach (var query in new[]
+        {
+            "SELECT count(*) FROM t INDEXED BY pi;",
+            "SELECT count(x) FROM t INDEXED BY pi;",
+            "SELECT count(t.x) FROM t INDEXED BY pi;",
+            "SELECT count(x COLLATE NOCASE) FROM t INDEXED BY pi;",
+            "SELECT count(id) FROM t INDEXED BY pi;",
+            "SELECT count(rowid) FROM t INDEXED BY pi;",
+        })
+        {
+            Query(connection, query).Should().ContainSingle()
+                .Which.Should().Equal([SqlValue.Integer(3)], because: query);
+        }
+
+        // A nullable argument, DISTINCT, or a filter is not a simple count and keeps the error.
+        foreach (var query in new[]
+        {
+            "SELECT count(y) FROM t INDEXED BY pi;",
+            "SELECT count(DISTINCT x) FROM t INDEXED BY pi;",
+            "SELECT count(x) FROM t INDEXED BY pi WHERE y IS NULL;",
+        })
+        {
+            var error = Assert.Throws<EmbeddedSqlException>(() => Query(connection, query));
+            error!.Message.Should().Be("no query solution", because: query);
+        }
+    }
+
+    [Test]
     public void JoinHintsUseOnlyPredicatesThatAreSafeForEachOuterJoinSide()
     {
         const string setup =

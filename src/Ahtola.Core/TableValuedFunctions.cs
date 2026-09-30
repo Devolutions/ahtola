@@ -85,6 +85,13 @@ internal abstract class TableValuedFunctionModule
     public virtual int? SchemaNameArgumentIndex => null;
 
     public abstract IReadOnlyList<SqlValue[]> Enumerate(TableValuedFunctionCall call);
+
+    /// <summary>
+    /// The rowid the module's cursor reports for an enumerated row. <paramref name="ordinal"/>
+    /// counts rows from one within the current filter, which is what SQLite's pragma virtual
+    /// tables report; modules whose SQLite/Turso cursor numbers rows differently override it.
+    /// </summary>
+    public virtual long GetRowId(long ordinal, SqlValue[] row) => ordinal;
 }
 
 /// <summary>
@@ -251,7 +258,7 @@ internal sealed class TableValuedFunctionVirtualTable(
 
         public override long RowId => Eof
             ? throw new InvalidOperationException("Table-valued function cursor is not positioned.")
-            : _rowId;
+            : module.GetRowId(_rowId, _current!);
 
         public override void Dispose() => DisposeEnumeration();
 
