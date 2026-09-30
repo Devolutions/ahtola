@@ -277,7 +277,7 @@ public sealed class AlterTableMigrationReviewRegressionTests
         Execute(connection, "CREATE VIEW v AS SELECT 1 AS x;");
 
         ShouldThrow(connection, "ALTER TABLE t RENAME TO v;")
-            .Message.Should().Be("there is already a view named v");
+            .Message.Should().Be("there is already another table or index with this name: v");
         ReadRows(connection, SchemaQuery).Should().Equal("table|t|t", "view|v|v");
     }
 
@@ -329,7 +329,7 @@ public sealed class AlterTableMigrationReviewRegressionTests
         }
     }
 
-    [TestCase("v", "there is already a view named v")]
+    [TestCase("v", "there is already another table or index with this name: v")]
     [TestCase("tr", "there is already a trigger named tr")]
     [TestCase("occupied", "table occupied already exists")]
     [TestCase("ix", "there is already an index named ix")]

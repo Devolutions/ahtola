@@ -167,16 +167,6 @@ agg-functions/json-group-object-null-label.sqltest::json_group_object_null_label
 agg-functions/json-group-object-null-label.sqltest::json_group_object_skips_null_label | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"a":1,"b":3}' but was '{"a":1,"":2,"b":3}'
 agg-functions/json-group-object-null-label.sqltest::jsonb_group_object_skips_null_label | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"a":1,"b":3}' but was '{"a":1,"":2,"b":3}'
 alter_table.sqltest::alter-table-add-column-preserve-schema-collate-locale | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)' but was 'CREATE TABLE tbl (c TEXT COLLATE 'fr-FR', d)'
-alter_table.sqltest::fail-alter-table-rename-to-existing-view | database variant 1/1 (:memory:): error 'there is already a view named y' does not match pattern 'there is already another table or index with this name: y'
-alter_table.sqltest::fail-alter-table-rename-to-existing-view-different-case | database variant 1/1 (:memory:): error 'there is already a view named Y' does not match pattern 'there is already another table or index with this name: Y'
-gencol.sqltest::gencol_issue6161_strict_compute_after_replace_default | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '42/42/integer' but was '42//null'
-gencol.sqltest::gencol_issue7058_alter_add_default_on_gencol | database variant 1/1 (:memory:): error 'cannot use DEFAULT on a generated column' does not match pattern 'error in generated column "b"'
-gencol.sqltest::gencol_issue7059_unknown_type_token_rejected | database variant 1/1 (:memory:): error 'Unsupported column constraint 'WAT'. At SQL offset 27.' does not match pattern 'error in generated column "b"'
-gencol.sqltest::gencol_issue7060_multiple_generated_clauses_rejected | database variant 1/1 (:memory:): expected an error but the statement succeeded
-gencol.sqltest::gencol_issue7068_check_sees_recomputed_value | database variant 1/1 (:memory:): expected success but got error: CHECK constraint failed: b IS 6
-gencol.sqltest::gencol_issue7068_multiple_defaults_before_generated_notnull | database variant 1/1 (:memory:): expected success but got error: NOT NULL constraint failed: t.b
-gencol.sqltest::gencol_issue7068_returning_recomputed_after_default | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '5/6' but was '5/'
-gencol.sqltest::gencol_issue7068_unique_index_uses_recomputed_value | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '1/5/6' but was '1/5/'
 generate_series.sqltest::generate-series-null-arguments-return-no-rows | database variant 1/1 (:memory:): expected success but got error: generate_series() requires integer arguments
 integrity_check/memory.sqltest::integrity-check-qualified-corrupt-attached-database | database variant 1/1 (:memory:): expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 join/hash.sqltest::hash-join-result-matrix-full-join-uses-a-hash-join | database variant 1/1 (:memory:): output does not match pattern 'HASH JOIN matrix_right AS r'
@@ -219,7 +209,6 @@ partial_idx.sqltest::partial-index-or-right-term-with-range-search | database va
 partial_idx.sqltest::partial-index-or-term-with-covering-scan | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '1/0/0/SCAN t USING COVERING INDEX idx' but was '1/0/0/SCAN t'
 partial_idx.sqltest::partial-index-or-term-with-equality-search | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '1/0/0/SEARCH t USING INDEX idx (a=?)' but was '1/0/0/SCAN t'
 partial_idx.sqltest::partial-index-or-term-with-order | database variant 1/1 (:memory:): expected 3 row(s), got 4 row(s); row 0 expected '1/0/0/SCAN t USING INDEX idx' but was '1/0/0/SCAN t'
-pragma/memory.sqltest::pragma-temp-synchronous-stays-off | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '0' but was '2'
 scalar-functions-datetime.sqltest::date-blob-modifier | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2024-06-16' but was ''
 scalar-functions-datetime.sqltest::date-blob-time-value | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '2024-01-01' but was ''
 scalar-functions-datetime.sqltest::date-unixepoch-at-1-millisecond-before-epochtime | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1969-12-31' but was '1970-01-01'
@@ -253,13 +242,6 @@ turso/explain-query-plan-json.sqltest::not-exists-is-reported-as-an-anti-join | 
 turso/explain-query-plan-json.sqltest::quotes-in-the-statement-are-escaped-in-the-echo | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name\n    FROM users u\n    WHERE u.name = 'a \"quote
 turso/explain-query-plan-json.sqltest::search-nodes-name-the-index-the-constraints-and-the-join | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name, o.amount\n    FROM users u\n    LEFT JOIN order
 turso/explain-query-plan-json.sqltest::the-json-tree-matches-the-text-rows | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 4 expected '{"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT u.name\n    FROM users u\n    WHERE u.age IN (SELECT ag
-turso/sequence.sqltest::sequence-backing-table-rejects-mixed-case-insert | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/sequence.sqltest::sequence-backing-table-rejects-mixed-case-update | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/sequence.sqltest::sequence-backing-table-rejects-uppercase-insert | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/sequence.sqltest::sequence-backing-table-rejects-uppercase-update | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/upsert-target-alias.sqltest::upsert-base-name-is-out-of-scope-when-aliased | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/upsert-target-alias.sqltest::upsert-target-alias-is-only-target-name | database variant 1/1 (:memory:): expected success but got error: no such column: x.n
-turso/upsert-target-alias.sqltest::upsert-target-alias-shadows-excluded | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '10' but was '99'
 turso/vacuum.sqltest::vacuum-rejects-query-only | database variant 1/1 (:temp:): error 'attempt to write a readonly database' does not match pattern 'Cannot execute VACUUM in query_only mode'
 unnest-correlated.sqltest::correlated-comparison-after-full-join[exists][s-amount-i-amount] | database variant 1/1 (:memory:): managed errored ('FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables') but SQLite returned 6 row(s)
 unnest-correlated.sqltest::correlated-comparison-after-full-join[exists][s-amount-is-not-i-amount] | database variant 1/1 (:memory:): managed errored ('FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables') but SQLite returned 7 row(s)
@@ -275,4 +257,3 @@ unnest-correlated.sqltest::correlated-in-error-expressions-stay-subqueries | dat
 unnest-correlated.sqltest::correlated-in-inequality-uses-indexed-semi-join | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN outer_rows AS o.*SEARCH i USING COVERING INDEX inner_key_amount'
 unnest-correlated.sqltest::correlated-in-with-only-inequality-uses-indexed-semi-join | database variant 1/1 (:memory:): output does not match pattern '(?s)SCAN outer_rows AS o.*SEARCH i USING COVERING INDEX inner_key_amount \(key1<\?\)'
 unnest-correlated.sqltest::not-exists-can-use-hash-anti-join | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN hash_anti_inner AS i.*SCAN hash_anti_outer AS o'
-upsert.sqltest::upsert-before-update-trigger-changes-non-set-column | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '1/6/11' but was '1/6/1'

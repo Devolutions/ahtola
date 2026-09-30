@@ -2172,7 +2172,7 @@ public sealed partial class EmbeddedDatabase
                         TriggerMutationKind.Update,
                         plan);
                     ValidateUpsertUpdateExpressions(
-                        statement.TableName,
+                        statement.TargetAlias ?? statement.TableName,
                         update.Assignments,
                         update.Where,
                         allowTriggerQualifiers: context.InsideTrigger);
@@ -2237,6 +2237,7 @@ public sealed partial class EmbeddedDatabase
         var returningRows = new List<SqlValue[]>();
         string[]? returningColumns = null;
         var rowsAffected = 0;
+        var rowsInserted = 0;
         long? lastInsertRowId = null;
 
         foreach (var values in inputRows)
@@ -2356,6 +2357,7 @@ public sealed partial class EmbeddedDatabase
                 if (!inserted)
                     continue;
                 rowsAffected++;
+                rowsInserted++;
                 context.TriggerState!.Changed = true;
                 if (table.HasRowid)
                 {
@@ -2406,7 +2408,7 @@ public sealed partial class EmbeddedDatabase
             var original = table.Rows[conflictPosition].ToArray();
             var originalRowId = table.HasRowid ? table.RowIds[conflictPosition] : conflictPosition + 1;
             var source = CreateUpsertSourceRow(
-                statement.TableName,
+                statement.TargetAlias ?? statement.TableName,
                 table,
                 original,
                 originalRowId,
@@ -2437,6 +2439,16 @@ public sealed partial class EmbeddedDatabase
             conflictPosition = FindTriggerRowPosition(table, identity);
             if (conflictPosition < 0)
                 continue;
+            // A BEFORE UPDATE trigger may have rewritten the conflicting row. Like a plain
+            // UPDATE (and Turso's "refresh index deletion values after BEFORE UPDATE trigger by
+            // UPSERT"), keep the trigger's values for every column DO UPDATE does not SET, then
+            // recompute generated columns from the refreshed row.
+            updated = ReloadColumnsTheUpdateDoesNotAssign(
+                table,
+                updatePlan!,
+                updated,
+                table.Rows[conflictPosition]);
+            ComputeGeneratedColumns(table, statement.TableName, updated, parameters, doUpdateContext);
             ValidateCheckConstraints(
                 statement.TableName,
                 table,
@@ -2498,6 +2510,7 @@ public sealed partial class EmbeddedDatabase
             rowsAffected > 0 || context.TriggerState!.Changed)
         {
             LastInsertRowId = lastInsertRowId,
+            CountChangesRows = rowsInserted,
         };
     }
 

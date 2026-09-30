@@ -339,34 +339,70 @@ internal sealed class SqlLexer
 
     private SqlToken ReadParameter(int start)
     {
-        ConsumeParameterIdentifier();
-        if (_sql[start] == '$')
+        if (_sql[start] == '?')
         {
-            while (_offset + 1 < _sql.Length && _sql[_offset] == ':' && _sql[_offset + 1] == ':')
-            {
-                _offset += 2;
-                ConsumeParameterIdentifier();
-            }
-
-            if (_offset < _sql.Length && _sql[_offset] == '(')
-            {
+            // CC_QUESTION: `?` takes only the digits of a `?NNN` index.
+            while (_offset < _sql.Length && char.IsAsciiDigit(_sql[_offset]))
                 _offset++;
-                ConsumeParameterIdentifier();
-                if (_offset < _sql.Length && _sql[_offset] == ')')
-                    _offset++;
-            }
+        }
+        else
+        {
+            _offset = ScanNamedParameter(_sql, start, out var valid);
+            if (!valid)
+                throw new EmbeddedSqlException($"unrecognized token: \"{_sql[start.._offset]}\"");
         }
 
         return new SqlToken(TokenKind.Parameter, _sql[start.._offset], start);
     }
 
-    private void ConsumeParameterIdentifier()
+    /// <summary>
+    /// Scans a <c>$</c>/<c>@</c>/<c>:</c> named parameter starting at <paramref name="start"/> with
+    /// SQLite's tokenizer rule (sqlite3GetToken, CC_VARALPHA): the name is identifier characters, a
+    /// <c>::</c> pair anywhere in it belongs to the name (TCL <c>$::var</c>, <c>$ns::var</c>), and once
+    /// at least one identifier character was read a <c>(...)</c> suffix without whitespace ends it (TCL
+    /// <c>$arr(elem)</c>). A marker with no identifier character, or with an unclosed suffix, is
+    /// SQLite's TK_ILLEGAL, which it reports as an unrecognized token (Turso's "report bad parameter
+    /// names as unrecognized tokens" and "accept namespace-qualified and array-element parameter
+    /// names").
+    /// </summary>
+    /// <returns>The offset just past the scanned token.</returns>
+    internal static int ScanNamedParameter(string sql, int start, out bool valid)
     {
-        while (_offset < _sql.Length
-               && (char.IsAsciiLetterOrDigit(_sql[_offset]) || _sql[_offset] is '_' or '$'))
+        var offset = start + 1;
+        var identifierCharacters = 0;
+        valid = true;
+        while (offset < sql.Length)
         {
-            _offset++;
+            var current = sql[offset];
+            if (IsIdentifierContinue(current))
+            {
+                identifierCharacters++;
+                offset++;
+            }
+            else if (current == '(' && identifierCharacters > 0)
+            {
+                offset++;
+                while (offset < sql.Length && sql[offset] is not (')' or ' ' or '\t' or '\n' or '\v' or '\f' or '\r'))
+                    offset++;
+                if (offset < sql.Length && sql[offset] == ')')
+                    offset++;
+                else
+                    valid = false;
+                break;
+            }
+            else if (current == ':' && offset + 1 < sql.Length && sql[offset + 1] == ':')
+            {
+                offset += 2;
+            }
+            else
+            {
+                break;
+            }
         }
+
+        if (identifierCharacters == 0)
+            valid = false;
+        return offset;
     }
 
     private SqlToken ReadNumber(int start, bool startsWithDecimalPoint = false)

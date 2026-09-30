@@ -7966,6 +7966,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException("virtual tables may not be altered");
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+        // sqlite3AddColumn enforces SQLITE_MAX_COLUMN against the scratch copy that
+        // sqlite3AlterBeginAddColumn names "sqlite_altertab_<table>", so SQLite's message
+        // carries that name (Turso's "enforce 2,000 max columns limit on tables").
+        if (table.Columns.Length >= SqlParser.MaxColumns)
+            throw new EmbeddedSqlException($"too many columns on sqlite_altertab_{table.Name}");
         if (statement.Column.GeneratedStored)
             throw new EmbeddedSqlException("cannot add a STORED column");
 
@@ -9723,7 +9728,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (upsert.Action is DoUpdateUpsertAction update)
             {
                 var upsertRow = CreateUpsertSourceRow(
-                    statement.TableName,
+                    statement.TargetAlias ?? statement.TableName,
                     table,
                     Enumerable.Repeat(SqlValue.Null, table.Columns.Length).ToArray(),
                     targetRowId: 0,
@@ -11234,7 +11239,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
-        RejectInternalTypeTableMutation(statement.TableName);
+        RejectInternalTableDml(statement.TableName);
         if (context.InsideTrigger && context.TriggerConflictAlgorithm is { } triggerConflictAlgorithm)
             statement = statement with { ConflictAlgorithm = triggerConflictAlgorithm };
         else if (context.InsideTrigger
@@ -11870,6 +11875,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     return;
 
                 ResolveNotNullReplaceDefaults(statement, table, row, triggerContext);
+                EnforceGeneratedNotNullConstraints(table, statement.TableName, row);
                 if (deferredRowId is not null)
                 {
                     rowId = FinalizeAutomaticRowId(
@@ -12508,7 +12514,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         Where: null);
                     plan = PrepareUpdate(updateStatement, table, context);
                     ValidateUpsertUpdateExpressions(
-                        statement.TableName,
+                        statement.TargetAlias ?? statement.TableName,
                         update.Assignments,
                         update.Where,
                         allowTriggerQualifiers: context.InsideTrigger);
@@ -12558,6 +12564,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var affectedRows = new List<SqlValue[]>();
         var affectedRowIds = new List<long>();
         var affectedLastInsertRowIds = new List<long?>();
+        // PRAGMA count_changes reports "rows inserted": SQLite's insert counter never
+        // counts a row DO UPDATE changed instead of inserting.
+        var insertedRowCount = 0;
         var insertTriggers = GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert);
         var deleteTriggers = context.RecursiveTriggersEnabled
             ? GetMatchingTriggers(context, statement.TableName, TriggerEvent.Delete)
@@ -12699,6 +12708,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 affectedRows.Add(candidate);
                 affectedRowIds.Add(candidateRowId);
+                insertedRowCount++;
                 if (table.HasRowid)
                 {
                     lastInsertRowId = candidateRowId;
@@ -12726,7 +12736,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 var original = table.Rows[conflictPosition];
                 var originalRowId = table.RowIds[conflictPosition];
                 var source = CreateUpsertSourceRow(
-                    statement.TableName,
+                    statement.TargetAlias ?? statement.TableName,
                     table,
                     original,
                     originalRowId,
@@ -12870,7 +12880,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 rowsAffected: affectedRows.Count,
                 changed: affectedRows.Count > 0,
                 lastInsertRowId: lastInsertRowId,
-                affectedLastInsertRowIds: affectedLastInsertRowIds);
+                affectedLastInsertRowIds: affectedLastInsertRowIds) with
+            {
+                CountChangesRows = insertedRowCount,
+            };
         }
         catch (EmbeddedSqlException exception) when (
             lastInsertRowId.HasValue
@@ -13451,8 +13464,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return (updated, updatedRowId);
     }
 
+    // targetName is the INSERT target alias when one is written, else the table name: an
+    // alias hides the base table name, and an alias spelled `excluded` shadows the pseudo-row
+    // (SQLite name resolution; Turso's "honor INSERT target aliases in UPSERT").
     private static SourceRow CreateUpsertSourceRow(
-        string tableName,
+        string targetName,
         EmbeddedTable table,
         SqlValue[] target,
         long targetRowId,
@@ -13462,10 +13478,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Array.Copy(target, values, target.Length);
         Array.Copy(excluded, 0, values, target.Length, excluded.Length);
         var qualified = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var targetShadowsExcluded = targetName.Equals("excluded", StringComparison.OrdinalIgnoreCase);
         for (var index = 0; index < table.Columns.Length; index++)
         {
-            qualified.Add($"{tableName}.{table.Columns[index]}", index);
-            qualified.Add($"excluded.{table.Columns[index]}", table.Columns.Length + index);
+            qualified.Add($"{targetName}.{table.Columns[index]}", index);
+            if (!targetShadowsExcluded)
+                qualified.Add($"excluded.{table.Columns[index]}", table.Columns.Length + index);
         }
 
         return new SourceRow(
@@ -13473,7 +13491,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             values,
             qualified,
             RowId: table.HasRowid ? targetRowId : null,
-            RowIdQualifier: tableName,
+            RowIdQualifier: targetName,
             ColumnDefinitions: table.ColumnDefinitions
                 .Cast<EmbeddedColumn?>()
                 .Concat(table.ColumnDefinitions)
@@ -14455,8 +14473,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
             row[plan.AliasIndex] = SqlValue.Integer(rowid);
 
         // Generated columns are computed after the base columns (and any rowid alias)
-        // are final, so they can reference every stored column value.
-        ComputeGeneratedColumns(table, statement.TableName, row, parameters, context);
+        // are final, so they can reference every stored column value. When REPLACE default
+        // substitution is deferred past BEFORE triggers, so is generated-column NOT NULL
+        // enforcement: the caller recomputes once the defaults land (SQLite's constraint pass).
+        ComputeGeneratedColumns(
+            table,
+            statement.TableName,
+            row,
+            parameters,
+            context,
+            enforceNotNull: resolveNotNullReplace);
         if (validateCheckConstraints)
             ValidateCheckConstraints(statement.TableName, table, row, rowid, parameters, context);
 
@@ -14500,8 +14526,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
             changed = true;
         }
 
-        if (changed)
-            table.ApplyAffinities(row);
+        if (!changed)
+            return;
+
+        table.ApplyAffinities(row);
+        // Virtual generated columns were computed from the NULL the default replaced; like
+        // SQLite (and Turso's "apply REPLACE defaults before computing virtual generated
+        // columns"), recompute them so CHECK, unique keys, NOT NULL and RETURNING see the
+        // substituted value. Callers enforce generated-column NOT NULL afterwards.
+        ComputeGeneratedColumns(table, table.Name, row, EmptyParameters, context, enforceNotNull: false);
     }
 
     // Validates the pending inserts against the whole table, then appends them and
@@ -14966,7 +14999,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        RejectInternalTypeTableMutation(statement.TableName);
+        RejectInternalTableDml(statement.TableName);
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
             return ExecuteVirtualTableUpdate(statement, virtualTable, parameters, context);
 
@@ -17583,7 +17616,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        RejectInternalTypeTableMutation(statement.TableName);
+        RejectInternalTableDml(statement.TableName);
         if (TryGetVirtualTable(context, new NamedTableSource(statement.TableName, statement.Alias), out var virtualTable))
             return ExecuteVirtualTableDelete(statement, virtualTable, parameters, context);
 
@@ -28530,8 +28563,11 @@ out bool hasReturning)
             throw new EmbeddedSqlException($"object name reserved for internal use: {statement.NewName}");
         if (tables.ContainsKey(statement.NewName) || virtualTables?.ContainsKey(statement.NewName) == true)
             throw new EmbeddedSqlException($"table {statement.NewName} already exists");
+        // sqlite3AlterRenameTable finds views through sqlite3FindTable, so a view name collision
+        // reports the table-or-index message (Turso's "refuse ALTER TABLE RENAME onto an
+        // existing view name").
         if (views?.ContainsKey(statement.NewName) == true)
-            throw new EmbeddedSqlException($"there is already a view named {statement.NewName}");
+            throw new EmbeddedSqlException($"there is already another table or index with this name: {statement.NewName}");
         if (triggers?.ContainsKey(statement.NewName) == true)
             throw new EmbeddedSqlException($"there is already a trigger named {statement.NewName}");
         if (TryFindIndex(tables, statement.NewName, out _, out _))
@@ -39365,12 +39401,46 @@ out bool hasReturning)
             || IsAutoIncrementSequenceBackingTable(name)
             || Indexing.ManagedIndexMethodNames.IsReserved(name);
 
+    private static readonly AsyncLocal<int> s_internalTableDmlScopes = new();
+
+    /// <summary>
+    /// Lets engine-internal statements on the current flow write the reserved
+    /// <c>__turso_internal_</c> tables (Turso's nested-statement exemption) until disposed.
+    /// </summary>
+    internal static InternalTableDmlScope AllowInternalTableDml()
+    {
+        s_internalTableDmlScopes.Value++;
+        return default;
+    }
+
+    internal readonly struct InternalTableDmlScope : IDisposable
+    {
+        public void Dispose() => s_internalTableDmlScopes.Value--;
+    }
+
     private static void RejectInternalTypeTableMutation(string name)
     {
         if (ManagedSchemaName.TrySplit(name, out _, out var localName))
             name = localName;
         if (name.Equals(ManagedTypeRegistry.TableName, StringComparison.OrdinalIgnoreCase))
             throw new EmbeddedSqlException("The internal type registry cannot be modified directly.");
+    }
+
+    // Mirrors Turso's allow_user_dml: user INSERT/UPDATE/DELETE may not target the reserved
+    // __turso_internal_ namespace (sequence backing tables, ...), matched ASCII
+    // case-insensitively like every other identifier lookup ("protect internal tables
+    // regardless of identifier case"). Engine-internal statements that replay a whole image
+    // (managed backup/snapshot copy) run inside AllowInternalTableDml, upstream's
+    // is_nested_stmt exemption.
+    private static void RejectInternalTableDml(string name)
+    {
+        RejectInternalTypeTableMutation(name);
+        if (s_internalTableDmlScopes.Value > 0)
+            return;
+        if (ManagedSchemaName.TrySplit(name, out _, out var localName))
+            name = localName;
+        if (name.StartsWith(TursoInternalReservedPrefix, StringComparison.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException($"table {name} may not be modified");
     }
 
     private static SourceData GetNamedTableRows(
@@ -59777,9 +59847,19 @@ public sealed partial class EmbeddedConnection : IDisposable
                     tempTriggerSession?.Commit();
 
                     // PRAGMA count_changes: each INSERT/UPDATE/DELETE returns one row with
-                    // the number of rows it changed (SQLite's deprecated count_changes).
-                    if (_countChanges && result.Changed && statement is InsertStatement or UpdateStatement or DeleteStatement)
-                        return new ExecutionResult(["changes"], [[SqlValue.Integer(result.RowsAffected)]], 0, result.Changed);
+                    // the number of rows it changed (SQLite's deprecated count_changes), even
+                    // when that is zero. A RETURNING statement returns its own rows instead.
+                    if (GetCountChangesColumn(statement) is { } countChangesColumn)
+                    {
+                        return new ExecutionResult(
+                            [countChangesColumn],
+                            [[SqlValue.Integer(result.CountChangesRows ?? result.RowsAffected)]],
+                            result.RowsAffected,
+                            result.Changed)
+                        {
+                            LastInsertRowId = result.LastInsertRowId,
+                        };
+                    }
 
                     return result;
                 }
@@ -65114,16 +65194,21 @@ Func<string, ParsedStatement> rewrite)
     private ExecutionResult ExecutePragmaSynchronous(PragmaSynchronousStatement statement)
     {
         var database = ResolvePragmaDatabase(statement.Schema);
+        // The temp database is never synced: SQLite reports its safety level as OFF and its
+        // pragma.c skips the assignment for iDb 1, so a write leaves it OFF.
+        var isTemp = ReferenceEquals(database, _tempDatabase);
         if (statement.Value is null)
         {
             return new ExecutionResult(
                 ["synchronous"],
-                [[SqlValue.Integer((int)GetSynchronousMode(database))]],
+                [[SqlValue.Integer((int)(isTemp ? SqliteSynchronousMode.Off : GetSynchronousMode(database)))]],
                 0);
         }
 
         if (HasActiveTransaction)
             throw new EmbeddedSqlException("Safety level may not be changed inside a transaction");
+        if (isTemp)
+            return ExecutionResult.Empty;
 
         var current = GetSynchronousMode(database);
         _synchronousModes[database] = statement.Value.ToUpperInvariant() switch
@@ -65426,6 +65511,22 @@ Func<string, ParsedStatement> rewrite)
     /// </summary>
     public long LastInsertRowId => _lastInsertRowId;
 
+    // SQLite's count_changes result column for a top-level INSERT/UPDATE/DELETE, or null when the
+    // pragma is off or the statement has RETURNING (which returns its own rows instead).
+    private string? GetCountChangesColumn(ParsedStatement statement)
+    {
+        if (!_countChanges || EmbeddedDatabase.TryGetReturning(statement, out _, out _))
+            return null;
+
+        return (statement is WithDmlStatement with ? with.Dml : statement) switch
+        {
+            InsertStatement => "rows inserted",
+            UpdateStatement => "rows updated",
+            DeleteStatement => "rows deleted",
+            _ => null,
+        };
+    }
+
     internal string[] DescribeColumns(ParsedStatement statement)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -65463,6 +65564,8 @@ Func<string, ParsedStatement> rewrite)
             return ["query_only"];
         if (statement is PragmaCountChangesStatement { Enabled: null })
             return ["count_changes"];
+        if (GetCountChangesColumn(statement) is { } countChangesColumn)
+            return [countChangesColumn];
         if (statement is PragmaForeignKeysStatement { Enabled: null })
             return ["foreign_keys"];
         if (statement is PragmaDeferForeignKeysStatement { Enabled: null })
@@ -69664,6 +69767,10 @@ internal sealed record ExecutionResult(
     // the owning connection can answer last_insert_rowid(). Null for statements that did
     // not insert a row.
     public long? LastInsertRowId { get; init; }
+
+    // The count PRAGMA count_changes reports when it differs from RowsAffected: an UPSERT
+    // counts only the rows it inserted, not the ones DO UPDATE changed. Null means RowsAffected.
+    public int? CountChangesRows { get; init; }
 }
 
 internal sealed class StreamingProjectionRows(
