@@ -194,6 +194,26 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 Remote keywords accepted by both facades (see the Turso Cloud sections below):
 `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`, `Tls`.
 
+Embedded-replica keywords (each also accepts its space-free alias, e.g.
+`SyncClientName`), named as in Turso's `TursoConnectionStringBuilder` so EF Core
+`UseAhtola(...)` and the SQLite facade can reach every replica option. They
+require `Replica Path`; on a local data source they throw
+`InvalidOperationException`, on a direct remote connection `NotSupportedException`:
+
+| Keyword | Maps to | Notes |
+| --- | --- | --- |
+| `Sync Client Name` | `AhtolaReplicaOptions.ClientName` | Prefix of the sync client id recorded at bootstrap (`<name>-<guid>`); 1–64 of `A-Z a-z 0-9 . _ -` |
+| `Sync Long Poll Timeout` | `LongPollTimeout` | Milliseconds; `0` (default) disables long polling |
+| `Bootstrap If Empty` | `BootstrapIfEmpty` | Default `true` |
+| `Partial Bootstrap Prefix` / `Partial Bootstrap Query` | `PartialBootstrap` | Mutually exclusive; bytes / server-side SQL |
+| `Partial Sync Segment Size` / `Partial Sync Prefetch` | `PartialBootstrap.SegmentSize` / `.Prefetch` | Require one of the two keywords above |
+| `Remote Encryption Cipher` / `Remote Encryption Key` | `RemoteEncryption` | Turso cipher names (`aes256gcm`, `aegis256`, …) and a base64 key; both or neither |
+| `Push Operations Threshold` | `PushOperationsThreshold` | `0` uses the default |
+| `Pull Bytes Threshold` | `PullBytesThreshold` | `0` pulls the bootstrap image in one request |
+| `Automatic Sync Mode` | `AutomaticSyncMode` | Ahtola-specific: `PushAndPull` (default) or `PullOnly` (Turso's behavior) |
+| `Force Logical MVCC Pull` | — | Only `False` is supported; `True` fails closed because the managed provider always auto-detects the pull protocol |
+| `Sync Experimental Features` | — | Validated comma-separated names; no effect on the managed engine, which does not gate features behind them |
+
 Hrana WebSocket keywords, used only by `ws://`/`wss://` data sources (see
 [Hrana over WebSocket](#hrana-over-websocket-wswss)):
 
@@ -436,6 +456,27 @@ policy. The native facade exposes `AhtolaException` /
 (`Data Source=...;Auth Token=***`) — it is never exposed in diagnostics. Never
 hardcode the token; read it from a secret manager or environment variable.
 
+To rotate credentials without reopening, set `AuthTokenProvider` (on
+`AhtolaConnection`, `SqliteConnection`, or `AhtolaReplicaOptions`) before
+opening — the counterpart of Turso's serverless `with_auth_token_fn`. It takes
+precedence over `Auth Token` and is awaited before every HTTP request (bootstrap,
+pull, lazy page fetch, push, and each Hrana pipeline/cursor request) and before
+every Hrana WebSocket (re)connect handshake; a `null` or blank result sends no
+token. The HTTPS-only credential policy applies as if a token were configured.
+
+```csharp
+using var cloud = new AhtolaConnection("Data Source=libsql://my-db.turso.io")
+{
+    AuthTokenProvider = async cancellationToken => await tokenCache.GetAsync(cancellationToken),
+};
+```
+
+Batch and step `replication_index` values are treated as opaque, per the
+pinned Hrana spec (`turso-src/serverless/PROTOCOL.md` §7.2.6): the highest
+non-negative integer watermark a libSQL server reports is still echoed on later
+batches for read-your-writes against replica-backed servers, but any other
+value is ignored instead of failing the request.
+
 Expired Hrana streams are retried once automatically only for stateless
 commands. An active transaction is never replayed: it becomes unusable and
 commit/rollback preserves the original stream failure instead of masking it
@@ -606,6 +647,38 @@ using var replica = new AhtolaConnection(
     "Data Source=libsql://my-db.turso.io;Auth Token=" + authToken +
     ";Replica Path=./replica.db;Sync Interval=30");
 ```
+
+Each tick runs a full push-then-pull `Sync` by default. Turso's .NET binding
+instead runs a **pull-only** loop; add `Automatic Sync Mode=PullOnly` (or set
+`AhtolaReplicaOptions.AutomaticSyncMode`) to match it and push explicitly. The
+default is unchanged. Background failures are observable through
+`AutomaticSyncStatus` (`Stopped`/`Waiting`/`Running`/`Retrying`/`Faulted`, with
+`LastAttempt`, `LastSuccess`, `LastPullAppliedChanges`, `LastException`,
+`NextAttempt`) and the `AutomaticSyncStatusChanged` event, raised on a
+thread-pool thread in publication order. Transient transport failures are
+retried up to three attempts per tick; anything else (for example a push
+conflict) moves the loop to `Faulted`, stops it, and is rethrown by `Close`.
+
+The explicit operations mirror Turso's `TursoSyncDatabase` and exist on both
+`AhtolaConnection` and `SqliteConnection` (sync and async):
+
+```csharp
+AhtolaSyncResult pulled = replica.Pull();      // pull + apply only; pending local changes stay journaled
+AhtolaSyncResult pushed = replica.Push();      // push every change pending at the call; no pull
+replica.Checkpoint();                          // fold the local WAL into the database file
+AhtolaSyncStatistics stats = replica.GetSyncStatistics();
+Console.WriteLine(stats.CdcOperations);        // local changes still waiting to be pushed
+Console.WriteLine(stats.MainWalSize);          // current -wal size; RevertWalSize for the recovery WAL
+```
+
+`Push` sends several batches when `Push Operations Threshold` caps them and
+reports the pushed count in `Statistics.CdcOperations`. `Checkpoint` never
+discards unpushed changes, and fails closed while a checkpoint-recovery bundle,
+unknown push outcome, or unresolved conflict is pending, or while a partial
+replica is still lazily materializing pages (`Sync` resolves the first two;
+`Pull` fails closed on them too). `GetSyncStatistics` is a pure local read;
+`LastPull`, `LastPush` and the pull-updates byte counters are tracked per replica
+file within the current process and reset when every connection to it closes.
 
 Bootstrap is a validated raw-page snapshot. For protocol-2 databases,
 incremental pull is Turso's MVCC logical stream: Ahtola validates the complete

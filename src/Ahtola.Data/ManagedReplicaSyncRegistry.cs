@@ -7,6 +7,16 @@ namespace Ahtola;
 /// Local work holds a shared lease; publication waits for those leases and then closes
 /// and reopens every registered host while no local work can begin.
 /// </summary>
+/// <summary>
+/// The kinds of network synchronization a managed embedded replica coalesces independently.
+/// </summary>
+internal enum ManagedReplicaSyncKind
+{
+    PushAndPull = 0,
+    PullOnly = 1,
+    PushOnly = 2,
+}
+
 internal static class ManagedReplicaSyncRegistry
 {
     private static readonly ConcurrentDictionary<string, Entry> Entries =
@@ -38,7 +48,14 @@ internal static class ManagedReplicaSyncRegistry
         private readonly string _path;
         private readonly HashSet<ManagedReplicaConnectionHost> _hosts = [];
         private TaskCompletionSource _stateChanged = NewStateChangedSource();
-        private Task<AhtolaSyncResult>? _inFlightSync;
+        // One coalescing slot per ManagedReplicaSyncKind: concurrent callers of the SAME kind share
+        // one in-flight operation, while a pull-only or push-only request never joins (and so never
+        // silently reports the result of) an operation of a different kind.
+        private readonly Task<AhtolaSyncResult>?[] _inFlightSyncs = new Task<AhtolaSyncResult>?[3];
+        private DateTimeOffset? _lastPull;
+        private DateTimeOffset? _lastPush;
+        private long _networkSentBytes;
+        private long _networkReceivedBytes;
         private int _references;
         private int _activeLocalOperations;
         private bool _publicationPending;
@@ -118,6 +135,13 @@ internal static class ManagedReplicaSyncRegistry
             ManagedReplicaConnectionHost initiator,
             Func<CancellationToken, Task<AhtolaSyncResult>> stagedOperation,
             CancellationToken cancellationToken)
+            => SynchronizeAsync(initiator, ManagedReplicaSyncKind.PushAndPull, stagedOperation, cancellationToken);
+
+        public Task<AhtolaSyncResult> SynchronizeAsync(
+            ManagedReplicaConnectionHost initiator,
+            ManagedReplicaSyncKind kind,
+            Func<CancellationToken, Task<AhtolaSyncResult>> stagedOperation,
+            CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(initiator);
             ArgumentNullException.ThrowIfNull(stagedOperation);
@@ -125,21 +149,53 @@ internal static class ManagedReplicaSyncRegistry
             Task<AhtolaSyncResult> syncTask;
             lock (_gate)
             {
-                if (_inFlightSync is null)
+                if (_inFlightSyncs[(int)kind] is not { } inFlight)
                 {
                     var completion = new TaskCompletionSource<AhtolaSyncResult>(
                         TaskCreationOptions.RunContinuationsAsynchronously);
-                    _inFlightSync = completion.Task;
+                    _inFlightSyncs[(int)kind] = completion.Task;
                     syncTask = completion.Task;
-                    _ = CompleteSyncAsync(completion, stagedOperation, cancellationToken);
+                    _ = CompleteSyncAsync(kind, completion, stagedOperation, cancellationToken);
                 }
                 else
                 {
-                    syncTask = _inFlightSync;
+                    syncTask = inFlight;
                 }
             }
 
             return WaitForSynchronizationAsync(syncTask, cancellationToken);
+        }
+
+        /// <summary>
+        /// Records the outcome of a completed pull and/or push so
+        /// <see cref="GetStatistics"/> can report it to every connection of this replica.
+        /// </summary>
+        public void RecordCompletedOperation(
+            DateTimeOffset? pulledAt,
+            DateTimeOffset? pushedAt,
+            long networkSentBytes,
+            long networkReceivedBytes)
+        {
+            lock (_gate)
+            {
+                if (pulledAt is { } pull)
+                    _lastPull = pull;
+                if (pushedAt is { } push)
+                    _lastPush = push;
+                _networkSentBytes = checked(_networkSentBytes + Math.Max(0, networkSentBytes));
+                _networkReceivedBytes = checked(_networkReceivedBytes + Math.Max(0, networkReceivedBytes));
+            }
+        }
+
+        /// <summary>
+        /// Returns the in-process synchronization history of this replica: last successful pull
+        /// and push times and the cumulative pull-updates traffic.
+        /// </summary>
+        public (DateTimeOffset? LastPull, DateTimeOffset? LastPush, long NetworkSentBytes, long NetworkReceivedBytes)
+            GetStatistics()
+        {
+            lock (_gate)
+                return (_lastPull, _lastPush, _networkSentBytes, _networkReceivedBytes);
         }
 
         private static async Task<AhtolaSyncResult> WaitForSynchronizationAsync(
@@ -169,6 +225,7 @@ internal static class ManagedReplicaSyncRegistry
         }
 
         private async Task CompleteSyncAsync(
+            ManagedReplicaSyncKind kind,
             TaskCompletionSource<AhtolaSyncResult> completion,
             Func<CancellationToken, Task<AhtolaSyncResult>> stagedOperation,
             CancellationToken cancellationToken)
@@ -211,8 +268,8 @@ internal static class ManagedReplicaSyncRegistry
             // condition standing between an already-unreferenced entry and retirement.
             lock (_gate)
             {
-                if (ReferenceEquals(_inFlightSync, completion.Task))
-                    _inFlightSync = null;
+                if (ReferenceEquals(_inFlightSyncs[(int)kind], completion.Task))
+                    _inFlightSyncs[(int)kind] = null;
                 SignalStateChangedNoLock();
                 RetireIfUnusedNoLock();
             }
@@ -241,7 +298,8 @@ internal static class ManagedReplicaSyncRegistry
 
         /// <summary>
         /// Runs <paramref name="stagedOperation"/> as one exclusive publication unit and returns its
-        /// result. Unlike <see cref="SynchronizeAsync"/> this never coalesces with an in-flight sync:
+        /// result. Unlike <see cref="SynchronizeAsync(ManagedReplicaConnectionHost, ManagedReplicaSyncKind, Func{CancellationToken, Task{AhtolaSyncResult}}, CancellationToken)"/>
+        /// this never coalesces with an in-flight sync:
         /// callers such as explicit conflict resolution choose a specific action, so joining someone
         /// else's already-running operation and reporting its result would be wrong.
         /// </summary>
@@ -382,7 +440,7 @@ internal static class ManagedReplicaSyncRegistry
                 || _activeLocalOperations != 0
                 || _publicationPending
                 || _publicationActive
-                || _inFlightSync is not null)
+                || Array.Exists(_inFlightSyncs, static inFlight => inFlight is not null))
             {
                 return;
             }

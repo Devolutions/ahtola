@@ -156,6 +156,32 @@ public sealed class AhtolaRemoteEncryptionOptions
     public AhtolaRemoteEncryptionCipher Cipher { get; }
 
     /// <summary>
+    /// Parses a <c>Remote Encryption Cipher</c> connection-string value using Turso's names
+    /// (<c>aes256gcm</c>, <c>aes128gcm</c>, <c>chacha20poly1305</c>, <c>aegis128l</c>,
+    /// <c>aegis128x2</c>, <c>aegis128x4</c>, <c>aegis256</c>, <c>aegis256x2</c>,
+    /// <c>aegis256x4</c>); <c>-</c> and <c>_</c> separators are also accepted.
+    /// </summary>
+    internal static AhtolaRemoteEncryptionCipher ParseCipher(string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        return value.Trim().Replace("-", string.Empty, StringComparison.Ordinal)
+                .Replace("_", string.Empty, StringComparison.Ordinal)
+                .ToLowerInvariant() switch
+        {
+            "aes256gcm" => AhtolaRemoteEncryptionCipher.Aes256Gcm,
+            "aes128gcm" => AhtolaRemoteEncryptionCipher.Aes128Gcm,
+            "chacha20poly1305" => AhtolaRemoteEncryptionCipher.ChaCha20Poly1305,
+            "aegis128l" => AhtolaRemoteEncryptionCipher.Aegis128L,
+            "aegis128x2" => AhtolaRemoteEncryptionCipher.Aegis128X2,
+            "aegis128x4" => AhtolaRemoteEncryptionCipher.Aegis128X4,
+            "aegis256" => AhtolaRemoteEncryptionCipher.Aegis256,
+            "aegis256x2" => AhtolaRemoteEncryptionCipher.Aegis256X2,
+            "aegis256x4" => AhtolaRemoteEncryptionCipher.Aegis256X4,
+            _ => throw new InvalidOperationException($"Unknown remote encryption cipher: {value}"),
+        };
+    }
+
+    /// <summary>
     /// SQLite reserved bytes per page for this cipher: the 16-byte tag plus the
     /// cipher's nonce. Kept in agreement with the storage layer's own table by
     /// <c>RemoteEncryptionContractTests</c>, which asserts this equals
@@ -327,8 +353,22 @@ public enum AhtolaSyncOutcome
 }
 
 /// <summary>
-/// Contains a snapshot of native sync-engine statistics.
+/// Contains a snapshot of embedded-replica synchronization statistics.
 /// </summary>
+/// <param name="CdcOperations">
+/// In an operation result: the number of change operations the operation pushed and/or applied.
+/// From <see cref="AhtolaConnection.GetSyncStatistics"/>: the number of local changes still
+/// waiting to be pushed.
+/// </param>
+/// <param name="MainWalSize">Current size in bytes of the replica's main write-ahead log.</param>
+/// <param name="RevertWalSize">
+/// Current size in bytes of the replica's pending checkpoint-recovery (revert) WAL, or 0.
+/// </param>
+/// <param name="LastPull">When the last successful pull completed.</param>
+/// <param name="LastPush">When the last successful push completed.</param>
+/// <param name="NetworkSentBytes">Bytes sent in pull-updates requests.</param>
+/// <param name="NetworkReceivedBytes">Bytes received in pull-updates responses.</param>
+/// <param name="Revision">The opaque server revision the replica is synchronized to.</param>
 public sealed record AhtolaSyncStatistics(
     long CdcOperations,
     long MainWalSize,

@@ -32,8 +32,11 @@ public class AhtolaConnection :
     private AhtolaReplicaOptions? _replicaOptions;
     private HttpMessageHandler? _ownedReplicaHttpHandler;
     private readonly object _automaticSyncLock = new();
-    private CancellationTokenSource? _automaticSyncCancellation;
-    private Task? _automaticSyncTask;
+    private ManagedReplicaAutomaticSyncCoordinator? _automaticSyncCoordinator;
+    private AhtolaAutomaticSyncStatus _automaticSyncStatus = AhtolaAutomaticSyncStatus.Stopped;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<AhtolaAutomaticSyncStatus> _automaticSyncNotifications = new();
+    private int _automaticSyncNotificationDrainScheduled;
+    private Func<CancellationToken, ValueTask<string?>>? _authTokenProvider;
     private AhtolaEncryptionFileSystem? _managedEncryptionFileSystem;
     private AhtolaPageCodecFileSystem? _managedPageCodecFileSystem;
     private IPageCodec? _pageCodec;
@@ -107,6 +110,52 @@ public class AhtolaConnection :
             _pageCodec = value;
         }
     }
+
+    /// <summary>
+    /// Optional bearer-token provider for remote Hrana and embedded-replica connections, the
+    /// counterpart of Turso's serverless <c>Builder::with_auth_token_fn</c>. When set it takes
+    /// precedence over the <c>Auth Token</c> keyword and is invoked before every HTTP request
+    /// (and before every Hrana WebSocket connection handshake), so a rotated token takes effect
+    /// on the next request without reopening the connection. A <see langword="null"/> or blank
+    /// result sends no token. Must be set before <see cref="Open"/>; the provider must not call
+    /// back into this connection.
+    /// </summary>
+    /// <remarks>
+    /// For a connection created by <see cref="CreateReplica"/>, configure
+    /// <see cref="AhtolaReplicaOptions.AuthTokenProvider"/> instead.
+    /// </remarks>
+    public Func<CancellationToken, ValueTask<string?>>? AuthTokenProvider
+    {
+        get => _authTokenProvider ?? _replicaOptions?.AuthTokenProvider;
+        set
+        {
+            if (State == ConnectionState.Open)
+                throw new InvalidOperationException("AuthTokenProvider cannot be set while the connection is open.");
+            if (_replicaOptions is not null)
+            {
+                throw new InvalidOperationException(
+                    "Connections created by CreateReplica take their token provider from AhtolaReplicaOptions.AuthTokenProvider.");
+            }
+
+            _authTokenProvider = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets the current status of the managed embedded-replica automatic synchronization loop
+    /// started by <c>Sync Interval</c>. <see cref="AhtolaAutomaticSyncStatus.Stopped"/> when no
+    /// loop runs; after the loop stops, the last success/failure details are preserved.
+    /// </summary>
+    public AhtolaAutomaticSyncStatus AutomaticSyncStatus
+        => Volatile.Read(ref _automaticSyncCoordinator)?.Status ?? Volatile.Read(ref _automaticSyncStatus);
+
+    /// <summary>
+    /// Raised, on a thread-pool thread and in publication order, whenever
+    /// <see cref="AutomaticSyncStatus"/> changes, so background synchronization failures are
+    /// observable before <see cref="Close"/> rethrows them. Exceptions thrown by handlers are
+    /// ignored and never stop synchronization.
+    /// </summary>
+    public event EventHandler<AhtolaAutomaticSyncStatusChangedEventArgs>? AutomaticSyncStatusChanged;
 
     protected override DbProviderFactory DbProviderFactory => AhtolaFactory.Instance;
 
@@ -601,6 +650,169 @@ public class AhtolaConnection :
     }
 
     /// <summary>
+    /// Pulls and applies remote changes without pushing local changes (Turso's
+    /// <c>TursoSyncDatabase.Pull</c>). Local changes that are still pending are preserved and
+    /// pushed by a later <see cref="Push()"/> or <see cref="Sync()"/>.
+    /// </summary>
+    /// <returns>
+    /// The outcome; <see cref="AhtolaSyncOutcome.RemoteChangesApplied"/> when remote changes were
+    /// applied.
+    /// </returns>
+    public AhtolaSyncResult Pull()
+        => PullAsync(new AhtolaSyncOptions(), CancellationToken.None).GetAwaiter().GetResult();
+
+    /// <inheritdoc cref="Pull()"/>
+    /// <param name="options">Per-call synchronization options.</param>
+    public AhtolaSyncResult Pull(AhtolaSyncOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return PullAsync(options, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    /// <inheritdoc cref="Pull()"/>
+    /// <param name="cancellationToken">Cancels the pull.</param>
+    public Task<AhtolaSyncResult> PullAsync(CancellationToken cancellationToken = default)
+        => PullAsync(new AhtolaSyncOptions(), cancellationToken);
+
+    /// <inheritdoc cref="Pull()"/>
+    /// <param name="options">Per-call synchronization options.</param>
+    /// <param name="cancellationToken">Cancels the pull.</param>
+    public Task<AhtolaSyncResult> PullAsync(AhtolaSyncOptions options, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ThrowIfCannotSynchronize();
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<AhtolaSyncResult>(cancellationToken);
+        if (_managedReplicaHost is { } managedReplicaHost)
+        {
+            return RunManagedReplicaSyncOperationAsync(
+                managedReplicaHost,
+                (host, token) => host.PullAsync(options, token),
+                cancellationToken);
+        }
+
+        return GetRegisteredReplicaDatabase().PullAsync(options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Pushes every local change that is pending when the call starts, without pulling remote
+    /// changes (Turso's <c>TursoSyncDatabase.Push</c>). Batches stay bounded by
+    /// <c>Push Operations Threshold</c>; several are sent when needed.
+    /// </summary>
+    /// <returns>
+    /// A result whose <see cref="AhtolaSyncStatistics.CdcOperations"/> is the number of changes
+    /// pushed. Its outcome is always <see cref="AhtolaSyncOutcome.UpToDate"/> because a push never
+    /// applies remote changes.
+    /// </returns>
+    public AhtolaSyncResult Push()
+        => PushAsync(new AhtolaSyncOptions(), CancellationToken.None).GetAwaiter().GetResult();
+
+    /// <inheritdoc cref="Push()"/>
+    /// <param name="options">Per-call synchronization options.</param>
+    public AhtolaSyncResult Push(AhtolaSyncOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return PushAsync(options, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    /// <inheritdoc cref="Push()"/>
+    /// <param name="cancellationToken">Cancels the push.</param>
+    public Task<AhtolaSyncResult> PushAsync(CancellationToken cancellationToken = default)
+        => PushAsync(new AhtolaSyncOptions(), cancellationToken);
+
+    /// <inheritdoc cref="Push()"/>
+    /// <param name="options">Per-call synchronization options.</param>
+    /// <param name="cancellationToken">Cancels the push.</param>
+    public Task<AhtolaSyncResult> PushAsync(AhtolaSyncOptions options, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ThrowIfCannotSynchronize();
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<AhtolaSyncResult>(cancellationToken);
+        if (_managedReplicaHost is { } managedReplicaHost)
+        {
+            return RunManagedReplicaSyncOperationAsync(
+                managedReplicaHost,
+                (host, token) => host.PushAsync(options, token),
+                cancellationToken);
+        }
+
+        return GetRegisteredReplicaDatabase().PushAsync(options, cancellationToken);
+    }
+
+    /// <summary>
+    /// Checkpoints the embedded replica's local write-ahead log into its main database file
+    /// (Turso's <c>TursoSyncDatabase.Checkpoint</c>). Unpushed local changes stay journaled and
+    /// are pushed by the next push or sync. A pending checkpoint-recovery bundle, an unknown push
+    /// outcome, an unresolved push conflict, or a partial replica that is still lazily loading
+    /// pages makes the call fail closed; synchronize first.
+    /// </summary>
+    public void Checkpoint()
+        => CheckpointAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    /// <inheritdoc cref="Checkpoint()"/>
+    /// <param name="cancellationToken">Cancels the checkpoint.</param>
+    public Task CheckpointAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfCannotSynchronize();
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled(cancellationToken);
+        if (_managedReplicaHost is { } managedReplicaHost)
+        {
+            return RunManagedReplicaSyncOperationAsync(
+                managedReplicaHost,
+                async (host, token) =>
+                {
+                    await host.CheckpointAsync(token).ConfigureAwait(false);
+                    return true;
+                },
+                cancellationToken);
+        }
+
+        return GetRegisteredReplicaDatabase().CheckpointAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns a snapshot of the embedded replica's synchronization statistics (Turso's
+    /// <c>TursoSyncDatabase.GetStats</c>): pending unpushed local changes, current main and revert
+    /// WAL sizes, the synchronized server revision, and -- for the managed provider, tracked per
+    /// replica file within this process -- the last successful pull and push times and the
+    /// cumulative pull-updates traffic. Pure read: no network access and no local mutation.
+    /// </summary>
+    public AhtolaSyncStatistics GetSyncStatistics()
+    {
+        ThrowIfCannotSynchronize();
+        return _managedReplicaHost is { } managedReplicaHost
+            ? managedReplicaHost.GetSyncStatistics()
+            : GetRegisteredReplicaDatabase().GetSyncStatisticsAsync(CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    /// <inheritdoc cref="GetSyncStatistics()"/>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    public Task<AhtolaSyncStatistics> GetSyncStatisticsAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfCannotSynchronize();
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<AhtolaSyncStatistics>(cancellationToken);
+        return _managedReplicaHost is { } managedReplicaHost
+            ? Task.FromResult(managedReplicaHost.GetSyncStatistics())
+            : GetRegisteredReplicaDatabase().GetSyncStatisticsAsync(cancellationToken);
+    }
+
+    private void ThrowIfCannotSynchronize()
+    {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException("Ahtola database is closed.");
+        if (_managedReplicaHost is null && !Capabilities.SupportsSync)
+            throw new NotSupportedException("Sync requires an embedded replica connection.");
+    }
+
+    private AhtolaReplicaDatabase GetRegisteredReplicaDatabase()
+        => _replicaDatabase ?? throw new InvalidOperationException("Ahtola database is closed.");
+
+    /// <summary>
     /// Returns an immutable classification of the managed embedded replica's open push conflict,
     /// or <see langword="null"/> when no conflict is recorded. Pure read: no network access and no
     /// local mutation, so it is safe to call at any time, including while synchronization is
@@ -713,9 +925,18 @@ public class AhtolaConnection :
         _managedDatabase = host.Database;
     }
 
-    private async Task<AhtolaSyncResult> SyncManagedReplicaAsync(
+    private Task<AhtolaSyncResult> SyncManagedReplicaAsync(
         ManagedReplicaConnectionHost host,
         AhtolaSyncOptions options,
+        CancellationToken cancellationToken)
+        => RunManagedReplicaSyncOperationAsync(
+            host,
+            (replicaHost, token) => replicaHost.SyncAsync(options, token),
+            cancellationToken);
+
+    private async Task<T> RunManagedReplicaSyncOperationAsync<T>(
+        ManagedReplicaConnectionHost host,
+        Func<ManagedReplicaConnectionHost, CancellationToken, Task<T>> operation,
         CancellationToken cancellationToken)
     {
         if (_transaction is not null)
@@ -728,7 +949,7 @@ public class AhtolaConnection :
 
         try
         {
-            return await host.SyncAsync(options, cancellationToken).ConfigureAwait(false);
+            return await operation(host, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -1493,6 +1714,8 @@ public class AhtolaConnection :
         }
 
         ValidateDirectRemoteLocalProvider();
+        if (_connectionOptions.HasAdvancedReplicaOptions)
+            throw new NotSupportedException("Advanced sync options require an embedded replica connection.");
         var remoteEncryption = _connectionOptions.GetRemoteEncryptionOptions();
         if (_connectionOptions.IsWebSocketRemote)
         {
@@ -1503,20 +1726,22 @@ public class AhtolaConnection :
                 _connectionOptions.AuthToken,
                 _connectionOptions.GetWebSocketOptions(),
                 remoteEncryption,
-                RemoteWebSocketConnectorFactory?.Invoke());
+                RemoteWebSocketConnectorFactory?.Invoke(),
+                _authTokenProvider);
             return;
         }
 
         var endpoint = _connectionOptions.GetRemoteUri();
         var handler = RemoteMessageHandlerFactory?.Invoke();
         _remoteClient = handler is null
-            ? new AhtolaRemoteClient(endpoint, _connectionOptions.AuthToken, remoteEncryption)
+            ? new AhtolaRemoteClient(endpoint, _connectionOptions.AuthToken, remoteEncryption, _authTokenProvider)
             : new AhtolaRemoteClient(
                 new HttpClient(handler, disposeHandler: false),
                 endpoint,
                 _connectionOptions.AuthToken,
                 remoteEncryption,
-                disposeHttpClient: true);
+                disposeHttpClient: true,
+                authTokenProvider: _authTokenProvider);
     }
 
     private async Task OpenRemoteReplicaAsync(
@@ -1597,21 +1822,16 @@ public class AhtolaConnection :
             || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
         {
             throw new InvalidOperationException(
-                "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Ahtola URLs.");
+                "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Ahtola URLs. "
+                + "Use Remote Encryption Cipher and Remote Encryption Key for embedded replicas.");
         }
 
         if (_replicaOptions is not null)
             return _replicaOptions;
 
-        var handler = RemoteMessageHandlerFactory?.Invoke();
-        return new AhtolaReplicaOptions(
-            _connectionOptions.ReplicaPath,
-            _connectionOptions.GetRemoteUri(),
-            _connectionOptions.AuthToken)
-        {
-            SyncInterval = _connectionOptions.SyncInterval,
-            HttpPolicy = new AhtolaSyncHttpPolicy(handler),
-        };
+        return _connectionOptions.CreateReplicaOptions(
+            RemoteMessageHandlerFactory?.Invoke(),
+            _authTokenProvider);
     }
 
     private void SetReplicaDatabase(AhtolaReplicaDatabase replicaDatabase)
@@ -1705,51 +1925,75 @@ public class AhtolaConnection :
         if (syncInterval <= 0 || !replicaHost.SupportsSync)
             return;
 
-        var cancellation = new CancellationTokenSource();
+        var mode = _replicaOptions?.AutomaticSyncMode ?? _connectionOptions.AutomaticSyncMode;
+        Func<CancellationToken, Task<AhtolaSyncResult>> operation = mode == AhtolaAutomaticSyncMode.PullOnly
+            ? token => replicaHost.PullAsync(new AhtolaSyncOptions(), token)
+            : token => replicaHost.SyncAsync(new AhtolaSyncOptions(), token);
         lock (_automaticSyncLock)
         {
-            if (_automaticSyncTask is not null)
-            {
-                cancellation.Dispose();
+            if (_automaticSyncCoordinator is not null)
                 throw new InvalidOperationException("Automatic managed replica synchronization is already running.");
-            }
 
-            _automaticSyncCancellation = cancellation;
-            _automaticSyncTask = RunAutomaticManagedReplicaSyncAsync(
-                replicaHost,
+            var coordinator = new ManagedReplicaAutomaticSyncCoordinator(
+                operation,
                 TimeSpan.FromSeconds(syncInterval),
-                cancellation.Token);
+                Volatile.Read(ref _automaticSyncStatus),
+                PublishAutomaticSyncStatus);
+            Volatile.Write(ref _automaticSyncCoordinator, coordinator);
+            coordinator.Start();
         }
     }
 
-    private static async Task RunAutomaticManagedReplicaSyncAsync(
-        ManagedReplicaConnectionHost replicaHost,
-        TimeSpan interval,
-        CancellationToken cancellationToken)
+    private void PublishAutomaticSyncStatus(AhtolaAutomaticSyncStatus status)
     {
-        while (true)
-        {
-            await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
-            await SynchronizeManagedReplicaWithRetryAsync(replicaHost, cancellationToken).ConfigureAwait(false);
-        }
+        Volatile.Write(ref _automaticSyncStatus, status);
+        if (AutomaticSyncStatusChanged is null)
+            return;
+
+        _automaticSyncNotifications.Enqueue(status);
+        if (Interlocked.Exchange(ref _automaticSyncNotificationDrainScheduled, 1) != 0)
+            return;
+
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static connection => connection.DrainAutomaticSyncNotifications(),
+            this,
+            preferLocal: false);
     }
 
-    private static async Task SynchronizeManagedReplicaWithRetryAsync(
-        ManagedReplicaConnectionHost replicaHost,
-        CancellationToken cancellationToken)
+    private void DrainAutomaticSyncNotifications()
     {
-        for (var attempt = 1; ; attempt++)
+        try
         {
-            try
+            while (_automaticSyncNotifications.TryDequeue(out var status))
             {
-                _ = await replicaHost.SyncAsync(new AhtolaSyncOptions(), cancellationToken).ConfigureAwait(false);
-                return;
+                var handlers = AutomaticSyncStatusChanged;
+                if (handlers is null)
+                    continue;
+
+                var args = new AhtolaAutomaticSyncStatusChangedEventArgs(status);
+                foreach (var callback in handlers.GetInvocationList())
+                {
+                    try
+                    {
+                        ((EventHandler<AhtolaAutomaticSyncStatusChangedEventArgs>)callback)(this, args);
+                    }
+                    catch
+                    {
+                        // Observers cannot stop synchronization.
+                    }
+                }
             }
-            catch (Exception exception) when (
-                attempt < AutomaticSyncMaximumAttempts
-                && IsTransientAutomaticSyncFailure(exception, cancellationToken))
+        }
+        finally
+        {
+            Volatile.Write(ref _automaticSyncNotificationDrainScheduled, 0);
+            if (!_automaticSyncNotifications.IsEmpty
+                && Interlocked.Exchange(ref _automaticSyncNotificationDrainScheduled, 1) == 0)
             {
-                await Task.Delay(GetAutomaticSyncRetryDelay(attempt - 1), cancellationToken).ConfigureAwait(false);
+                ThreadPool.UnsafeQueueUserWorkItem(
+                    static connection => connection.DrainAutomaticSyncNotifications(),
+                    this,
+                    preferLocal: false);
             }
         }
     }
@@ -1777,37 +2021,25 @@ public class AhtolaConnection :
 
     private Exception? StopAutomaticManagedReplicaSync()
     {
-        CancellationTokenSource? cancellation;
-        Task? syncTask;
+        ManagedReplicaAutomaticSyncCoordinator? coordinator;
         lock (_automaticSyncLock)
-        {
-            cancellation = _automaticSyncCancellation;
-            syncTask = _automaticSyncTask;
-            _automaticSyncCancellation = null;
-            _automaticSyncTask = null;
-        }
+            coordinator = Volatile.Read(ref _automaticSyncCoordinator);
 
-        if (cancellation is null || syncTask is null)
+        if (coordinator is null)
             return null;
 
-        try
+        var failure = coordinator.Stop();
+        lock (_automaticSyncLock)
+            Volatile.Write(ref _automaticSyncCoordinator, null);
+
+        // Keep the last success/failure details so a faulted loop stays diagnosable after Close.
+        PublishAutomaticSyncStatus(coordinator.Status with
         {
-            cancellation.Cancel();
-            syncTask.GetAwaiter().GetResult();
-            return null;
-        }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
-        {
-            return null;
-        }
-        catch (Exception exception)
-        {
-            return exception;
-        }
-        finally
-        {
-            cancellation.Dispose();
-        }
+            State = AhtolaAutomaticSyncState.Stopped,
+            Attempt = 0,
+            NextAttempt = null,
+        });
+        return failure;
     }
 
     private void OpenCore()
@@ -1870,6 +2102,10 @@ public class AhtolaConnection :
             throw new InvalidOperationException("Auth Token requires a remote Ahtola URL Data Source.");
         if (!string.IsNullOrWhiteSpace(_connectionOptions.ReplicaPath))
             throw new InvalidOperationException("Replica Path requires a remote Ahtola URL Data Source.");
+        if (_connectionOptions.HasAdvancedReplicaOptions)
+            throw new InvalidOperationException("Advanced sync options require a remote embedded replica connection.");
+        if (_authTokenProvider is not null)
+            throw new InvalidOperationException("AuthTokenProvider requires a remote Ahtola URL Data Source.");
         if (_connectionOptions.Tls.HasValue)
             throw new InvalidOperationException("Tls requires a remote Ahtola URL Data Source.");
     }

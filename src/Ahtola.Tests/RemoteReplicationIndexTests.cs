@@ -40,28 +40,39 @@ public sealed class RemoteReplicationIndexTests
         handler.RequestReplicationIndexes.Should().Equal(null, "42");
     }
 
+    // turso-src/serverless/PROTOCOL.md (v0.8.1) section 7.2.6: clients MUST NOT interpret the
+    // replication_index value. An uninterpretable value is therefore ignored -- the request
+    // succeeds and the previously tracked watermark is kept -- instead of failing the batch.
     [TestCase("\"not-an-index\"")]
+    [TestCase("\"-1\"")]
     [TestCase("1.5")]
+    [TestCase("-3")]
     [TestCase("{}")]
-    public void RemoteBatchRejectsAnInvalidReplicationIndex(string encodedIndex)
+    [TestCase("[]")]
+    [TestCase("true")]
+    public async Task RemoteBatchIgnoresAnUninterpretableReplicationIndex(string encodedIndex)
     {
         using var handler = new ReplicationIndexHandler(
             """
-            {"results":[{"type":"ok","response":{"type":"batch","result":{"step_results":[{"cols":[],"rows":[],"affected_row_count":0}],"step_errors":[null],"replication_index":"__INDEX__"}}}]}
-            """.Replace("\"__INDEX__\"", encodedIndex, StringComparison.Ordinal));
+            {"results":[{"type":"ok","response":{"type":"batch","result":{"step_results":[{"cols":[],"rows":[],"affected_row_count":0}],"step_errors":[null],"replication_index":"5"}}}]}
+            """,
+            """
+            {"results":[{"type":"ok","response":{"type":"batch","result":{"step_results":[{"cols":[],"rows":[],"affected_row_count":0,"replication_index":__INDEX__}],"step_errors":[null],"replication_index":__INDEX__}}}]}
+            """.Replace("__INDEX__", encodedIndex, StringComparison.Ordinal),
+            """
+            {"results":[{"type":"ok","response":{"type":"batch","result":{"step_results":[{"cols":[],"rows":[],"affected_row_count":0}],"step_errors":[null]}}}]}
+            """);
         using var httpClient = new HttpClient(handler);
         using var client = new AhtolaRemoteClient(
             httpClient,
             new Uri("https://example.com"),
             authToken: null);
+        var commands = new[] { new AhtolaBatchCommand("SELECT 1") };
 
-        Assert.ThrowsAsync<AhtolaException>(() => client.ExecuteBatchAsync(
-            [new AhtolaBatchCommand("SELECT 1")],
-            commandTimeout: 30,
-            wantRows: true,
-            closeAfter: true,
-            CancellationToken.None))!
-            .Message.Should().Be("Remote response returned an invalid replication_index.");
+        for (var request = 0; request < 3; request++)
+            await client.ExecuteBatchAsync(commands, 30, wantRows: true, closeAfter: true, CancellationToken.None);
+
+        handler.RequestReplicationIndexes.Should().Equal(null, "5", "5");
     }
 
     [Test]
