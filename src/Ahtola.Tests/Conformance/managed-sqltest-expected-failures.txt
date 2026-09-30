@@ -201,7 +201,6 @@ partial_idx.sqltest::partial-index-or-right-term-with-range-search | database va
 partial_idx.sqltest::partial-index-or-term-with-covering-scan | database variant 1/1 (:memory:): expected 3 row(s), got 3 row(s); row 0 expected '1/0/0/SCAN t USING COVERING INDEX idx' but was '1/0/0/SCAN t'
 partial_idx.sqltest::partial-index-or-term-with-equality-search | database variant 1/1 (:memory:): expected 2 row(s), got 2 row(s); row 0 expected '1/0/0/SEARCH t USING INDEX idx (a=?)' but was '1/0/0/SCAN t'
 partial_idx.sqltest::partial-index-or-term-with-order | database variant 1/1 (:memory:): expected 3 row(s), got 4 row(s); row 0 expected '1/0/0/SCAN t USING INDEX idx' but was '1/0/0/SCAN t'
-sql-error-message-prefix.sqltest::database-full-error-has-no-prefix | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/alter_column.sqltest::alter-column-rewrites-expression-index-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'

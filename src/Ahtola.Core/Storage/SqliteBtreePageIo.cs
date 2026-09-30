@@ -215,8 +215,8 @@ public sealed class SqliteStagedBtreePageIo : ISqliteBtreePageIo
     {
         if (pageNumber > MaximumPageCount)
         {
-            throw new InvalidOperationException(
-                $"SQLite database is full: page {pageNumber} exceeds the maximum page count {MaximumPageCount}.");
+            // SQLITE_FULL: Turso Pager::allocate_page returns LimboError::DatabaseFull.
+            throw new EmbeddedDatabaseFullException();
         }
     }
 

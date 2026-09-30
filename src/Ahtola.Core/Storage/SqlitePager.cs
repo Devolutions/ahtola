@@ -267,6 +267,36 @@ public sealed class SqlitePager : IDisposable
     }
 
     /// <summary>
+    /// The growth ceiling a write transaction must respect: the owning connection's
+    /// <c>PRAGMA max_page_count</c> (Turso <c>Pager::max_page_count</c>). A transaction whose
+    /// target size exceeds both this ceiling and the committed size is rejected with
+    /// <c>SQLITE_FULL</c> before a single frame is written, mirroring Turso
+    /// <c>Pager::allocate_page</c> refusing the page that would cross the limit. A database
+    /// that is already larger than the ceiling (grown by another connection) may still be
+    /// rewritten in place; only growth is refused.
+    /// </summary>
+    internal uint MaximumPageCount { get; set; } = SqlitePageLimits.DefaultMaximumPageCount;
+
+    /// <summary>
+    /// When set, every write entry point reports the target size it was asked to reach by
+    /// throwing <see cref="SqlitePagerCommitPlannedException"/> instead of writing anything,
+    /// so a caller can learn how large a pending mutation would make the database without
+    /// committing it (statement-level <c>max_page_count</c> enforcement inside an explicit
+    /// transaction, where pages are only written at COMMIT).
+    /// </summary>
+    internal bool PlanCommitsOnly { get; set; }
+
+    private void ThrowIfCommitIsPlannedOrExceedsGrowthCeiling(uint targetDatabaseSizeInPages)
+    {
+        if (PlanCommitsOnly)
+            throw new SqlitePagerCommitPlannedException(targetDatabaseSizeInPages);
+
+        var ceiling = MaximumPageCount;
+        if (targetDatabaseSizeInPages > ceiling && targetDatabaseSizeInPages > CommittedPageCount)
+            throw new EmbeddedDatabaseFullException();
+    }
+
+    /// <summary>
     /// The maximum number of clean main-database page images this pager retains.
     /// WAL-overlay and transaction images are not part of this cache.
     /// </summary>
@@ -1410,6 +1440,7 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     public SqlitePagerTransaction BeginTransaction(uint targetDatabaseSizeInPages, TimeSpan? busyTimeout = null)
     {
+        ThrowIfCommitIsPlannedOrExceedsGrowthCeiling(targetDatabaseSizeInPages);
         var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
         var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
             ? null
@@ -1517,6 +1548,7 @@ public sealed class SqlitePager : IDisposable
         uint targetDatabaseSizeInPages,
         TimeSpan? busyTimeout = null)
     {
+        ThrowIfCommitIsPlannedOrExceedsGrowthCeiling(targetDatabaseSizeInPages);
         var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
         var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
             ? null
@@ -2193,6 +2225,7 @@ public sealed class SqlitePager : IDisposable
         Func<uint, ReadOnlyMemory<byte>> getPageImage)
     {
         ArgumentNullException.ThrowIfNull(getPageImage);
+        ThrowIfCommitIsPlannedOrExceedsGrowthCeiling(pageCount);
         using var checkpointLock = _lockManager.EnterCheckpoint(
             TimeSpan.Zero,
             useExternalCoordinator: false);

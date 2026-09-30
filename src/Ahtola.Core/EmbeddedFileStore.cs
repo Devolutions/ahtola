@@ -3031,24 +3031,33 @@ internal sealed class EmbeddedFileStore : IDisposable
         PragmaHeaderMetadata? pragmaHeader = null,
         bool forceFullRewrite = false,
         IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
-        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null)
-        => PersistCore(
-            tables,
-            views,
-            triggers,
-            virtualTables,
-            reclaimTrailingPages: false,
-            incrementSchemaCookie: false,
-            pragmaHeader,
-            forceFullRewrite,
-            previousTables,
-            targetedIndexRebuild: targetedIndexRebuild);
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null,
+        uint maximumPageCount = SqlitePageLimits.DefaultMaximumPageCount)
+        => WithGrowthCeiling(
+            maximumPageCount,
+            () => PersistCore(
+                tables,
+                views,
+                triggers,
+                virtualTables,
+                reclaimTrailingPages: false,
+                incrementSchemaCookie: false,
+                pragmaHeader,
+                forceFullRewrite,
+                previousTables,
+                targetedIndexRebuild: targetedIndexRebuild));
 
     /// <summary>
     /// Materializes an MVCC checkpoint into pager WAL pages without reclaiming
     /// those frames. The checkpoint state machine must first backfill the main
     /// store and retire the logical log before it resets the WAL.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="maximumPageCount"/> is the checkpointing connection's
+    /// <c>PRAGMA max_page_count</c>: MVCC keeps committed rows in the logical log, so the page
+    /// ceiling is only reached here, when they are materialized into b-tree pages (Turso's
+    /// checkpoint fails with <c>DatabaseFull</c> and leaves the log intact).
+    /// </remarks>
     internal FileCatalogVersion PersistForMvccCheckpoint(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
@@ -3056,18 +3065,100 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
         PragmaHeaderMetadata? pragmaHeader = null,
         bool forceFullRewrite = false,
-        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
-        => PersistCore(
-            tables,
-            views,
-            triggers,
-            virtualTables,
-            reclaimTrailingPages: false,
-            incrementSchemaCookie: false,
-            pragmaHeader,
-            forceFullRewrite,
-            previousTables,
-            checkpointAfterCommit: false);
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
+        uint maximumPageCount = SqlitePageLimits.DefaultMaximumPageCount)
+        => WithGrowthCeiling(
+            maximumPageCount,
+            () => PersistCore(
+                tables,
+                views,
+                triggers,
+                virtualTables,
+                reclaimTrailingPages: false,
+                incrementSchemaCookie: false,
+                pragmaHeader,
+                forceFullRewrite,
+                previousTables,
+                checkpointAfterCommit: false));
+
+    /// <summary>
+    /// Computes the database size, in pages, that persisting this catalog would publish,
+    /// without writing, locking or publishing anything: the exact persist path runs (the
+    /// incremental b-tree mutation, a bounded leaf rewrite, or the full catalog rewrite, whichever
+    /// the real commit would pick) and is stopped at the pager's write entry point. Returns the
+    /// committed size when the catalog needs no page write at all.
+    /// </summary>
+    /// <remarks>
+    /// This is how statement-level <c>PRAGMA max_page_count</c> enforcement sees the pages an
+    /// explicit transaction would need: the managed engine only writes pages at COMMIT, while
+    /// SQLite allocates them while the statement runs and fails that statement with
+    /// <c>SQLITE_FULL</c>.
+    /// </remarks>
+    internal uint PlanPersistedPageCount(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        PragmaHeaderMetadata? pragmaHeader,
+        bool forceFullRewrite,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        if (_pager.PlanCommitsOnly)
+            throw new InvalidOperationException("A managed persist plan is already in progress.");
+
+        // Every persist path stops at the pager before it publishes anything, but the plan must
+        // never be able to move this store's committed bookkeeping even if a future path learns
+        // to return without a page write.
+        var committedTables = _committedTables;
+        var header = _header;
+        var tableRootPages = _tableRootPages;
+        var indexRootPages = _indexRootPages;
+        var lastSchemaSignature = _lastSchemaSignature;
+        _pager.PlanCommitsOnly = true;
+        try
+        {
+            _ = PersistCore(
+                tables,
+                views,
+                triggers,
+                virtualTables,
+                reclaimTrailingPages: false,
+                incrementSchemaCookie: false,
+                pragmaHeader,
+                forceFullRewrite,
+                previousTables);
+            return _pager.CommittedPageCount;
+        }
+        catch (SqlitePagerCommitPlannedException planned)
+        {
+            return planned.TargetDatabaseSizeInPages;
+        }
+        finally
+        {
+            _pager.PlanCommitsOnly = false;
+            _committedTables = committedTables;
+            _header = header;
+            _tableRootPages = tableRootPages;
+            _indexRootPages = indexRootPages;
+            _lastSchemaSignature = lastSchemaSignature;
+        }
+    }
+
+    private T WithGrowthCeiling<T>(uint maximumPageCount, Func<T> persist)
+    {
+        var previous = _pager.MaximumPageCount;
+        _pager.MaximumPageCount = maximumPageCount;
+        try
+        {
+            return persist();
+        }
+        finally
+        {
+            _pager.MaximumPageCount = previous;
+        }
+    }
 
     /// <summary>
     /// Builds a private, not-yet-published VACUUM destination image in one
@@ -3107,19 +3198,26 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// the managed writer can represent, then checkpoints and physically removes
     /// its retired suffix.
     /// </summary>
-    internal void Compact()
+    internal void Compact() => CompactWithinPageLimit(SqlitePageLimits.DefaultMaximumPageCount);
+
+    /// <summary>
+    /// <see cref="Compact"/> held to the requesting connection's <c>PRAGMA max_page_count</c>.
+    /// </summary>
+    internal void CompactWithinPageLimit(uint maximumPageCount)
     {
         ThrowIfDisposed();
         var catalog = Load();
-        _ = PersistCore(
-            catalog.Tables,
-            catalog.Views,
-            catalog.Triggers,
-            catalog.VirtualTables,
-            reclaimTrailingPages: true,
-            incrementSchemaCookie: true,
-            pragmaHeader: null,
-            forceFullRewrite: true);
+        _ = WithGrowthCeiling(
+            maximumPageCount,
+            () => PersistCore(
+                catalog.Tables,
+                catalog.Views,
+                catalog.Triggers,
+                catalog.VirtualTables,
+                reclaimTrailingPages: true,
+                incrementSchemaCookie: true,
+                pragmaHeader: null,
+                forceFullRewrite: true));
     }
 
     internal FileCatalogVersion UpdatePragmaHeader(PragmaHeaderMetadata metadata)
@@ -3792,6 +3890,165 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         // Page one carries the authoritative size and catalog routing.
         image[SchemaRootPage] = schemaTree.RootPage;
+    }
+
+    /// <summary>
+    /// Counts the pages a complete, compacted image of this catalog occupies when this store
+    /// serializes it: page 1 (the sqlite_schema root), one root per table and index b-tree,
+    /// every interior, leaf and overflow page those trees need, and any extra sqlite_schema
+    /// pages. The trees are built by the same page builders a full rewrite (VACUUM, VACUUM INTO,
+    /// page-size migration) uses, so the result is exactly the size that rewrite would publish
+    /// for this store's page size, reserved space and text encoding.
+    /// </summary>
+    /// <remarks>
+    /// A <c>:memory:</c> database keeps its rows as heap objects and has no pager of its own, so
+    /// this is the honest source of its <c>PRAGMA page_count</c> and the size its
+    /// <c>max_page_count</c> ceiling is checked against. Per-tree counts are cached by row-store
+    /// lineage and revision, so a statement only re-serializes the trees it changed.
+    /// </remarks>
+    internal uint CountFreshImagePages(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
+        FreshImagePageCountCache cache)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(cache);
+
+        // Root pages are reserved exactly as PersistCore reserves them for a compacted rewrite
+        // (tables in name order, then each table's indexes), because sqlite_schema stores the
+        // root page numbers as varints and its own size depends on them.
+        var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+        var rootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        var indexRootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        var nextRootPage = SchemaRootPage + 1;
+        foreach (var name in tableNames)
+            rootPages[name] = nextRootPage++;
+        foreach (var name in tableNames)
+        {
+            foreach (var index in tables[name].Indexes)
+                indexRootPages.TryAdd(index.Name, nextRootPage++);
+        }
+
+        var livePages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        long total = nextRootPage - 1;
+        foreach (var name in tableNames)
+        {
+            var table = tables[name];
+            total += cache.GetTreePages(
+                FreshImagePageCountCache.TableKey(name, table),
+                livePages,
+                () => CountTableTreePages(name, table)) - 1;
+            foreach (var index in table.Indexes)
+            {
+                total += cache.GetTreePages(
+                    FreshImagePageCountCache.IndexKey(name, table, index),
+                    livePages,
+                    () => CountIndexTreePages(name, table, index)) - 1;
+            }
+        }
+
+        cache.RetainOnly(livePages);
+        var schemaAllocator = new CountingPageAllocator();
+        _ = BuildSchemaTree(
+            BuildSchemaEntries(tables, views, triggers, virtualTables, rootPages, indexRootPages),
+            schemaAllocator);
+        total += schemaAllocator.Count;
+        return total >= uint.MaxValue ? uint.MaxValue : (uint)total;
+    }
+
+    private uint CountTableTreePages(string name, EmbeddedTable table)
+    {
+        var allocator = new CountingPageAllocator();
+        _ = allocator.ReservePage();
+        _ = table.WithoutRowid
+            ? BuildWithoutRowidTableTree(name, table, allocator)
+            : BuildTableTree(name, table, allocator);
+        return allocator.Count;
+    }
+
+    private uint CountIndexTreePages(string tableName, EmbeddedTable table, EmbeddedIndex index)
+    {
+        var allocator = new CountingPageAllocator();
+        _ = allocator.ReservePage();
+        _ = BuildIndexTree(tableName, table, index, allocator);
+        return allocator.Count;
+    }
+
+    /// <summary>
+    /// Counts page reservations without assigning real page numbers. Every page-number field a
+    /// b-tree stores (child pointers, overflow links) is a fixed four bytes, so the number of
+    /// pages a tree needs does not depend on which numbers it is given.
+    /// </summary>
+    private sealed class CountingPageAllocator : IIndexRebuildPageAllocator
+    {
+        public uint Count { get; private set; }
+
+        public uint ReservePage()
+        {
+            Count = checked(Count + 1);
+            // Any non-zero number that is not page 1 is a valid placeholder.
+            return Count + SchemaRootPage;
+        }
+    }
+
+    /// <summary>
+    /// Per-tree page counts for <see cref="CountFreshImagePages"/>, keyed by the tree's name,
+    /// definition and the row-store lineage/revision that produced it. A statement's working
+    /// clone shares its source's lineage and revision until it mutates rows, so unchanged trees
+    /// are never re-serialized.
+    /// </summary>
+    internal sealed class FreshImagePageCountCache
+    {
+        private readonly Dictionary<string, (string Key, uint Pages)> _trees =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        internal static (string Slot, string Key) TableKey(string name, EmbeddedTable table)
+            => ("t\u0001" + name,
+                string.Join(
+                    '\u0001',
+                    table.Rows.LineageId,
+                    table.Rows.Revision,
+                    table.WithoutRowid,
+                    table.Strict,
+                    table.Sql,
+                    table.ColumnDefinitions.Length));
+
+        internal static (string Slot, string Key) IndexKey(string tableName, EmbeddedTable table, EmbeddedIndex index)
+            => ("i\u0001" + index.Name,
+                string.Join(
+                    '\u0001',
+                    tableName,
+                    table.Rows.LineageId,
+                    table.Rows.Revision,
+                    table.Sql,
+                    index.Unique,
+                    index.Origin,
+                    index.WhereSql,
+                    index.Sql,
+                    index.Method,
+                    string.Join(
+                        '\u0002',
+                        index.Columns.Select(column =>
+                            $"{column.Name}\u0003{column.ColumnIndex}\u0003{column.Collation}\u0003{column.Descending}\u0003{column.NullPlacement}\u0003{column.ExpressionSql}"))));
+
+        internal uint GetTreePages((string Slot, string Key) key, ISet<string> live, Func<uint> count)
+        {
+            live.Add(key.Slot);
+            if (_trees.TryGetValue(key.Slot, out var cached) && string.Equals(cached.Key, key.Key, StringComparison.Ordinal))
+                return cached.Pages;
+
+            var pages = count();
+            _trees[key.Slot] = (key.Key, pages);
+            return pages;
+        }
+
+        internal void RetainOnly(ISet<string> live)
+        {
+            foreach (var slot in _trees.Keys.Where(slot => !live.Contains(slot)).ToArray())
+                _trees.Remove(slot);
+        }
     }
 
     /// <summary>The number of changed rows above which a complete rewrite is preferred.</summary>
@@ -11137,7 +11394,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private PreparedTableTree BuildWithoutRowidTableTree(
         string name,
         EmbeddedTable table,
-        RebuildPageAllocator allocator)
+        IIndexRebuildPageAllocator allocator)
     {
         var primaryKeySchema = ValidateWithoutRowidTableRepresentable(name, table);
         var comparer = CreatePrimaryKeyComparer(primaryKeySchema);
@@ -11167,7 +11424,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private PreparedTableTree BuildTableTree(
         string name,
         EmbeddedTable table,
-        RebuildPageAllocator allocator)
+        IIndexRebuildPageAllocator allocator)
     {
         var leafGroups = PartitionTableLeafCells(name, table);
         var overflowPages = new List<PageImage>();
@@ -11389,7 +11646,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private byte[] BuildTableLeafPage(
         IReadOnlyList<PendingTableCell> cells,
-        RebuildPageAllocator allocator,
+        IIndexRebuildPageAllocator allocator,
         ICollection<PageImage> overflowPages)
     {
         var builder = new SqliteTableLeafPageBuilder(_pageSize, _usableSpace, isFirstPage: false);
@@ -12138,7 +12395,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private SqliteTableLeafCell CreateTableLeafCell(
         long rowId,
         byte[] record,
-        RebuildPageAllocator allocator,
+        IIndexRebuildPageAllocator allocator,
         ICollection<PageImage> overflowPages)
     {
         var layout = SqlitePayloadLayout.Calculate(
@@ -12796,7 +13053,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private PreparedSchemaTree BuildSchemaTree(
         IReadOnlyList<ManagedSchemaRow> entries,
-        RebuildPageAllocator allocator)
+        IIndexRebuildPageAllocator allocator)
     {
         var cells = new List<SqliteTableLeafCell>(entries.Count);
         var overflowPages = new List<PageImage>();

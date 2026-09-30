@@ -71,6 +71,24 @@ public class EmbeddedSqlException : Exception
     internal InsertConflictAlgorithm? ConflictAlgorithm { get; }
 }
 
+/// <summary>
+/// SQLite's <c>SQLITE_FULL</c> (result code 13): a write needed the database to grow past its
+/// <c>PRAGMA max_page_count</c> ceiling (Turso <c>LimboError::DatabaseFull</c>, raised by
+/// <c>Pager::allocate_page</c>). The message is exactly SQLite's <c>sqlite3_errmsg</c> text,
+/// with no "Database is full: " prefix. The failing statement is rolled back before the
+/// exception surfaces, so nothing it wrote reaches the database image.
+/// </summary>
+internal sealed class EmbeddedDatabaseFullException : EmbeddedSqlException
+{
+    internal const string DatabaseFullMessage = "database or disk is full";
+    internal const int SqliteFullResultCode = 13;
+
+    public EmbeddedDatabaseFullException()
+        : base(DatabaseFullMessage, SqliteFullResultCode)
+    {
+    }
+}
+
 internal readonly record struct PragmaHeaderMetadata(
     int SchemaVersion,
     int UserVersion,
@@ -360,18 +378,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private readonly Dictionary<BlobMutationIdentity, long> _blobMutationGenerations = new();
     private long _nextBlobMutationGeneration;
 
-    // Managed in-memory page model backing PRAGMA page_count / page_size /
-    // max_page_count on databases that have no file store. The memory database
-    // starts with zero pages (matching SQLite's empty pager) and materializes
-    // pages the way the pager would: the first header write creates the header
-    // page, and each table or index adds one page. Dropped b-trees move their
-    // pages onto the freelist rather than shrinking the database, so
-    // page_count is a high-water mark the way SQLite's header field is.
+    // Managed in-memory page model backing PRAGMA page_count / freelist_count /
+    // page_size / max_page_count on databases that have no file store. The memory
+    // database starts with zero pages (matching SQLite's empty pager); the first
+    // committed write materializes it, and from then on its size is the page image
+    // its catalog serializes to (counted by _inMemoryPagePlanner, the same page
+    // builders a persisted image uses). Released pages stay on the freelist rather
+    // than shrinking the database, so page_count is a high-water mark the way
+    // SQLite's header field is, until VACUUM compacts it.
     internal bool _inMemoryInitialized;
     internal int? _inMemoryPageSize;
-    private uint _inMemoryFreelistPages;
     private uint _inMemoryHighWaterPages;
-    private uint _maxPageCount = 4294967294;
+    private EmbeddedFileStore? _inMemoryPagePlanner;
+    private int _inMemoryPagePlannerPageSize;
+    private EmbeddedFileStore.FreshImagePageCountCache _inMemoryPageCountCache = new();
     private readonly EmbeddedTransactionLock _transactionLock;
     /// <summary>
     /// Opt-in Turso MVCC store. When non-null, <c>PRAGMA journal_mode</c> reports
@@ -500,6 +520,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             _fileStore?.Dispose();
+            _inMemoryPagePlanner?.Dispose();
+            _inMemoryPagePlanner = null;
         }
     }
 
@@ -691,12 +713,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
     internal bool IsReadOnly => _readOnly;
 
     internal string DatabasePath => _databasePath;
-
-    internal uint MaxPageCount
-    {
-        get => _maxPageCount;
-        set => _maxPageCount = value;
-    }
 
     internal IFileSystem FileSystem
         => _fileSystem ?? throw new InvalidOperationException("The managed database is not file-backed.");
@@ -2220,7 +2236,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
         ManagedSequenceSession? sequenceSession = null,
-        Func<string?, string>? describeJournalMode = null)
+        Func<string?, string>? describeJournalMode = null,
+        uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         var result = ExecuteCore(
             statement,
@@ -2242,7 +2259,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             synchronousMode,
             virtualTableTransaction,
             sequenceSession,
-            describeJournalMode);
+            describeJournalMode,
+            maxPageCount);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -2286,7 +2304,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
         ManagedSequenceSession? sequenceSession = null,
-        Func<string?, string>? describeJournalMode = null)
+        Func<string?, string>? describeJournalMode = null,
+        uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         synchronousMode.Validate(nameof(synchronousMode));
         ThrowIfRecursiveTriggerCallbackReentry();
@@ -2316,7 +2335,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 synchronousMode,
                 virtualTableTransaction,
                 sequenceSession,
-                describeJournalMode));
+                describeJournalMode,
+                maxPageCount));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -2346,9 +2366,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     var ownsVirtualTableTransaction = virtualTableTransaction is null;
                     var statementVirtualTableTransaction =
                         virtualTableTransaction ?? new ManagedVirtualTableTransaction();
+                    // A connection-level max_page_count ceiling on a :memory: database is checked
+                    // against the statement's finished catalog before it is published, which also
+                    // needs a discardable working clone. File-backed databases (MVCC autocommit
+                    // writes included) enforce it in the pager when the persist below writes.
+                    var enforceInMemoryPageLimit = _fileStore is null
+                        && _mvStore is null
+                        && maxPageCount < SqlitePageLimits.DefaultMaximumPageCount;
                     if ((cancellationToken.CanBeCanceled
                             || commitGate is not null
-                            || _virtualTables.Count != 0)
+                            || _virtualTables.Count != 0
+                            || enforceInMemoryPageLimit)
                         && statementMayMutate)
                     {
                         var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
@@ -2394,7 +2422,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 else
                                     PersistFileCatalog(
                                         cancellableWorking,
-                                        busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                                        busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline),
+                                        maxPageCount: maxPageCount);
                                 if (ownsVirtualTableTransaction)
                                     statementVirtualTableTransaction.Commit(cancellableWorking);
                                 virtualTableCommitCompleted = true;
@@ -2413,6 +2442,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 return cancellableResult;
                             }
 
+                            // SQLITE_FULL is raised while the statement allocates pages, before the
+                            // implicit commit (and its hooks) ever run.
+                            var inMemoryPublishedPages = enforceInMemoryPageLimit
+                                ? EnsureCatalogFitsPageLimit(cancellableWorking, maxPageCount)
+                                : null;
                             if (ownsVirtualTableTransaction)
                                 statementVirtualTableTransaction.Sync(cancellableWorking);
                             if (commitGate is not null && !commitGate())
@@ -2429,6 +2463,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 }
 
                                 PublishCatalog(cancellableWorking);
+                                RecordInMemoryPublishedPageCountLocked(inMemoryPublishedPages);
                             }
                             else
                             {
@@ -2436,7 +2471,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                     cancellableWorking,
                                     forceFullRewrite: cancellableResult.ForceFullCatalogRewrite,
                                     busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline),
-                                    targetedIndexRebuild: cancellableResult.TargetedIndexRebuild);
+                                    targetedIndexRebuild: cancellableResult.TargetedIndexRebuild,
+                                    maxPageCount: maxPageCount);
                             }
 
                             if (ownsVirtualTableTransaction)
@@ -2563,7 +2599,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         {
                             PersistFileCatalog(
                                 working,
-                                busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline));
+                                busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline),
+                                maxPageCount: maxPageCount);
                             throw;
                         }
                         if (result.Changed)
@@ -2572,7 +2609,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 working,
                                 forceFullRewrite: result.ForceFullCatalogRewrite,
                                 busyTimeout: GetRemainingBusyTimeout(busyRetryDeadline),
-                                targetedIndexRebuild: result.TargetedIndexRebuild);
+                                targetedIndexRebuild: result.TargetedIndexRebuild,
+                                maxPageCount: maxPageCount);
                         }
                         else if (!inTransaction)
                         {
@@ -3667,7 +3705,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool concurrent = false,
         bool containsSchemaChanges = false,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
-        IReadOnlySet<string>? targetedIndexRebuildNames = null)
+        IReadOnlySet<string>? targetedIndexRebuildNames = null,
+        uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         synchronousMode.Validate(nameof(synchronousMode));
 
@@ -3708,6 +3747,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     if (pragmaHeader is { } metadata)
                         _inMemoryPragmaHeader = metadata;
                     PublishCatalog(publishCatalog);
+                    // Each statement was already measured against the ceiling; recording the
+                    // exact size (a cache hit per tree) keeps the high-water mark honest.
+                    if (maxPageCount < SqlitePageLimits.DefaultMaximumPageCount && _mvStore is null)
+                        RecordInMemoryPublishedPageCountLocked(CountInMemoryLivePagesLocked(publishCatalog));
                     return;
                 }
 
@@ -3722,7 +3765,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 // schema-signature check, which safely widens to the full-catalog rewrite that
                 // forceFullRewrite already forces for any REINDEX.
                 var targetedIndexRebuild = ResolveTargetedIndexRebuild(targetedIndexRebuildNames, publishCatalog);
-                PersistFileCatalog(publishCatalog, pragmaHeader, forceFullRewrite, busyTimeout, targetedIndexRebuild: targetedIndexRebuild);
+                PersistFileCatalog(
+                    publishCatalog,
+                    pragmaHeader,
+                    forceFullRewrite,
+                    busyTimeout,
+                    targetedIndexRebuild: targetedIndexRebuild,
+                    maxPageCount: maxPageCount);
             }
             finally
             {
@@ -4026,77 +4075,241 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return _fileStore is null ? _inMemoryPageSize ?? SqlitePageSize.Default : _fileCatalogVersion.PageSize;
     }
 
-    internal uint GetPageCount()
+    /// <summary>
+    /// <c>PRAGMA page_count</c>: the pages the database occupies. A file-backed database reports
+    /// its committed header size; a <c>:memory:</c> database reports the high-water mark of the
+    /// page image its catalog serializes to (see <see cref="CountInMemoryLivePagesLocked"/>).
+    /// </summary>
+    /// <param name="pendingCatalog">
+    /// The asking connection's uncommitted write-transaction catalog, if any. SQLite reports the
+    /// pager's current size, which includes pages the open transaction has already allocated.
+    /// </param>
+    internal uint GetPageCount(SchemaCatalog? pendingCatalog = null)
     {
         lock (_gate)
         {
             if (_fileStore is null)
             {
                 // An uninitialized in-memory database has no pages yet (SQLite
-                // reports 0 until the first page is written). Once initialized,
-                // the count is the high-water mark of allocated pages — SQLite's
-                // header field only grows; drops move pages onto the freelist.
-                if (!_inMemoryInitialized)
+                // reports 0 until the first page is written).
+                if (!_inMemoryInitialized && pendingCatalog is null)
                     return 0;
 
+                var live = CountInMemoryLivePagesLocked(pendingCatalog ?? LiveCatalogLocked());
+                if (pendingCatalog is not null)
+                    return Math.Max(_inMemoryInitialized ? _inMemoryHighWaterPages : 0, live);
+
+                FoldInMemoryHighWaterLocked(live);
                 return _inMemoryHighWaterPages;
             }
 
-            return _fileCatalogVersion.DatabaseSizeInPages;
+            var committed = _fileCatalogVersion.DatabaseSizeInPages;
+            if (pendingCatalog is null || _mvStore is not null)
+                return committed;
+
+            return Math.Max(
+                committed,
+                TryPlanFilePersistedPageCountLocked(pendingCatalog, pragmaHeader: null, forceFullRewrite: false)
+                    ?? committed);
         }
     }
 
     /// <summary>
-    /// Reconciles the managed in-memory page model after a committed catalog change.
-    /// The model mirrors SQLite's pager: the header page count is a high-water mark
-    /// that only grows, and the freelist is the gap between the high-water mark and
-    /// the live b-tree count. Dropping a b-tree moves its pages onto the freelist
-    /// without shrinking <c>PRAGMA page_count</c>; creating one consumes freelist
-    /// pages first and only raises the mark beyond the previous peak. Callers must
-    /// hold <c>_gate</c>.
+    /// <c>PRAGMA freelist_count</c>. In memory this is the gap between the page high-water mark
+    /// and the pages the live image needs: SQLite never shrinks the database without VACUUM, so
+    /// pages a DROP or DELETE released stay allocated on the freelist.
     /// </summary>
-    private void ReconcileInMemoryPageModel()
-    {
-        var live = 1;
-        foreach (var table in _tables.Values)
-            live += 1 + table.Indexes.Count;
-
-        if (live > _inMemoryHighWaterPages)
-            _inMemoryHighWaterPages = (uint)live;
-
-        _inMemoryFreelistPages = _inMemoryHighWaterPages - (uint)live;
-    }
-
-    // An in-memory database models PRAGMA max_page_count at the catalog level: each new
-    // table or index b-tree needs one page (plus the header page while the database is
-    // still uninitialized), and SQLite fails the statement with "database or disk is
-    // full" when the allocation would exceed the limit. File-backed databases allocate
-    // real pages, so the pager owns enforcement there and the catalog check stays inert.
-    private void EnforceMaxPageCountForCatalogChange(int additionalPages)
-    {
-        if (_fileStore is not null)
-            return;
-
-        // Freelist pages satisfy new b-trees before the database grows (SQLite
-        // allocates from the freelist first), so only the growth beyond the current
-        // high-water mark counts against the limit.
-        var live = (long)_inMemoryHighWaterPages - _inMemoryFreelistPages;
-        var required = Math.Max((long)_inMemoryHighWaterPages, live + additionalPages)
-            + (_inMemoryInitialized ? 0 : 1);
-        if (required > MaxPageCount)
-            throw new EmbeddedSqlException("database or disk is full");
-    }
-
     internal uint GetFreelistCount()
     {
         lock (_gate)
         {
-            // In-memory drops move pages onto the freelist the way SQLite's pager does;
-            // the file-backed path reads the real header field.
             if (_fileStore is null)
-                return _inMemoryFreelistPages;
+            {
+                if (!_inMemoryInitialized)
+                    return 0;
+
+                var live = CountInMemoryLivePagesLocked(LiveCatalogLocked());
+                FoldInMemoryHighWaterLocked(live);
+                return _inMemoryHighWaterPages - live;
+            }
+
             return _fileCatalogVersion.FreelistPageCount;
         }
+    }
+
+    private SchemaCatalog LiveCatalogLocked() => new(_tables, _views, _triggers, _virtualTables);
+
+    /// <summary>
+    /// Folds a cheap, exact lower bound into the in-memory page high-water mark after a
+    /// committed catalog change: page 1 plus one root page per table and index b-tree (no real
+    /// image can need fewer). The exact size is only paid for when something asks for it
+    /// (<c>page_count</c>, <c>freelist_count</c>, a <c>max_page_count</c> ceiling), because it
+    /// re-serializes every changed tree. Callers must hold <c>_gate</c>.
+    /// </summary>
+    private void ReconcileInMemoryPageModel()
+    {
+        var live = 1u;
+        foreach (var table in _tables.Values)
+            live += 1 + (uint)table.Indexes.Count;
+
+        FoldInMemoryHighWaterLocked(live);
+    }
+
+    private void FoldInMemoryHighWaterLocked(uint livePages)
+    {
+        if (livePages > _inMemoryHighWaterPages)
+            _inMemoryHighWaterPages = livePages;
+    }
+
+    /// <summary>
+    /// The pages a <c>:memory:</c> catalog needs: the size of the complete SQLite image the
+    /// managed page writer would serialize it to (the same image <c>VACUUM INTO</c> or a backup
+    /// would persist), computed by a private page planner at this database's page size.
+    /// </summary>
+    /// <remarks>
+    /// The in-memory engine keeps rows as heap objects and never builds b-tree pages, so there is
+    /// no pager whose size could be read. Rather than estimate, this runs the real table, index
+    /// and sqlite_schema page builders (caching each tree's count by row-store revision). A
+    /// catalog the page writer cannot represent falls back to the one-root-per-tree lower bound.
+    /// Callers must hold <c>_gate</c>.
+    /// </remarks>
+    private uint CountInMemoryLivePagesLocked(SchemaCatalog catalog)
+    {
+        try
+        {
+            var planner = GetInMemoryPagePlannerLocked();
+            planner.SetCollationResolver(_hasCustomCollations ? BuildCollationResolver() : null);
+            return planner.CountFreshImagePages(
+                catalog.Tables,
+                catalog.Views,
+                catalog.Triggers,
+                catalog.VirtualTables,
+                _inMemoryPageCountCache);
+        }
+        catch (Exception exception) when (exception is EmbeddedSqlException
+            or InvalidOperationException
+            or ArgumentException
+            or InvalidDataException
+            or OverflowException
+            or NotSupportedException)
+        {
+            var live = 1u;
+            foreach (var table in catalog.Tables.Values)
+                live += 1 + (uint)table.Indexes.Count;
+            return live;
+        }
+    }
+
+    private EmbeddedFileStore GetInMemoryPagePlannerLocked()
+    {
+        var pageSize = _inMemoryPageSize ?? SqlitePageSize.Default;
+        if (_inMemoryPagePlanner is { } planner && _inMemoryPagePlannerPageSize == pageSize)
+            return planner;
+
+        _inMemoryPagePlanner?.Dispose();
+        _inMemoryPagePlanner = null;
+        _inMemoryPageCountCache = new EmbeddedFileStore.FreshImagePageCountCache();
+        // A private, empty rollback-journal image in its own in-memory file system: it is only
+        // ever asked to count pages, never to persist this database's catalog.
+        var created = EmbeddedFileStore.Open(
+            "ahtola-memory-page-accounting.db",
+            new InMemoryFileSystem(),
+            out _,
+            initialPageSize: pageSize,
+            initialTextEncoding: SqliteTextEncoding.Utf8,
+            createRollbackJournalMode: true);
+        _inMemoryPagePlanner = created;
+        _inMemoryPagePlannerPageSize = pageSize;
+        return created;
+    }
+
+    /// <summary>
+    /// Rejects a finished statement whose catalog would need the database to grow past the
+    /// connection's <c>PRAGMA max_page_count</c> ceiling, with SQLite's <c>SQLITE_FULL</c>. SQLite
+    /// (and Turso's <c>Pager::allocate_page</c>) refuse the page that would cross the ceiling
+    /// while the statement runs; the managed engine builds pages only when a catalog is
+    /// persisted, so the statement's complete result is measured before it is published. Pages
+    /// on the freelist are reused first: only growth beyond the current size counts.
+    /// </summary>
+    /// <returns>
+    /// The page count the catalog needs, or <see langword="null"/> when no ceiling applies (the
+    /// default ceiling, or MVCC, whose rows stay in the logical log until a checkpoint).
+    /// </returns>
+    internal uint? EnsureCatalogFitsPageLimit(
+        SchemaCatalog catalog,
+        uint maximumPageCount,
+        PragmaHeaderMetadata? pragmaHeader = null,
+        bool forceFullRewrite = false)
+    {
+        if (maximumPageCount >= SqlitePageLimits.DefaultMaximumPageCount)
+            return null;
+
+        lock (_gate)
+        {
+            if (_mvStore is not null)
+                return null;
+
+            uint current;
+            uint required;
+            if (_fileStore is null)
+            {
+                current = _inMemoryInitialized ? _inMemoryHighWaterPages : 0;
+                required = CountInMemoryLivePagesLocked(catalog);
+            }
+            else
+            {
+                current = _fileCatalogVersion.DatabaseSizeInPages;
+                if (TryPlanFilePersistedPageCountLocked(catalog, pragmaHeader, forceFullRewrite) is not { } planned)
+                    return null;
+                required = planned;
+            }
+
+            if (required > current && required > maximumPageCount)
+                throw new EmbeddedDatabaseFullException();
+            return required;
+        }
+    }
+
+    /// <summary>
+    /// The size, in pages, persisting <paramref name="catalog"/> would publish, or
+    /// <see langword="null"/> when the persist path cannot plan it (it would fail on its own at
+    /// COMMIT, with its own error). Callers must hold <c>_gate</c>.
+    /// </summary>
+    private uint? TryPlanFilePersistedPageCountLocked(
+        SchemaCatalog catalog,
+        PragmaHeaderMetadata? pragmaHeader,
+        bool forceFullRewrite)
+    {
+        try
+        {
+            return _fileStore!.PlanPersistedPageCount(
+                catalog.Tables,
+                catalog.Views,
+                catalog.Triggers,
+                catalog.VirtualTables,
+                pragmaHeader,
+                forceFullRewrite,
+                previousTables: _tables);
+        }
+        catch (Exception exception) when (exception is EmbeddedSqlException
+            or InvalidOperationException
+            or ArgumentException
+            or InvalidDataException
+            or OverflowException
+            or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Records the exact page count a just-published <c>:memory:</c> catalog was measured at, so
+    /// the high-water mark (and therefore the freelist) reflects pages it allocated.
+    /// </summary>
+    private void RecordInMemoryPublishedPageCountLocked(uint? livePages)
+    {
+        if (_fileStore is null && livePages is { } pages)
+            FoldInMemoryHighWaterLocked(pages);
     }
 
     internal SqliteTextEncoding GetTextEncoding()
@@ -4280,7 +4493,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         string? mode,
         TimeSpan busyTimeout = default,
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
-        MvccTxId? permittedTransaction = null)
+        MvccTxId? permittedTransaction = null,
+        uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
@@ -4333,12 +4547,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     }
                     else
                     {
+                        // MVCC keeps committed rows in the logical log, so this is where they first
+                        // need b-tree pages and where the checkpointing connection's
+                        // max_page_count applies (Turso fails the checkpoint with DatabaseFull and
+                        // keeps the log intact; nothing below has run yet).
                         PersistFileCatalog(
                             merged,
                             pragmaHeader: null,
                             forceFullRewrite: false,
                             busyTimeout,
-                            checkpointAfterCommit: false);
+                            checkpointAfterCommit: false,
+                            maxPageCount: maxPageCount);
                     }
 
                     stateMachine.Enter(MvccCheckpointPhase.PersistPageWal);
@@ -4526,7 +4745,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     internal void MigratePageSize(
         int pageSize,
         TimeSpan busyTimeout = default,
-        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full)
+        SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
+        uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         synchronousMode.Validate(nameof(synchronousMode));
         lock (_gate)
@@ -4559,13 +4779,29 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 foreach (var table in _tables.Values)
                     _ = table.Rows;
                 if (pageSize == _fileCatalogVersion.PageSize)
-                    _fileStore.Compact();
+                    _fileStore.CompactWithinPageLimit(maxPageCount);
                 else
                     _fileStore.MigratePageSize(pageSize, _tables, _views, _triggers, _virtualTables);
                 _fileStore.AdoptCommittedTables(_tables);
                 _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
                 _version++;
             }
+        }
+    }
+
+    /// <summary>
+    /// <c>VACUUM</c> on a <c>:memory:</c> database. The heap catalog is already compact, so the only
+    /// observable effect is SQLite's: the freelist is released and <c>PRAGMA page_count</c> drops
+    /// to the pages the live image needs.
+    /// </summary>
+    internal void CompactInMemoryPageModel()
+    {
+        lock (_gate)
+        {
+            if (_fileStore is not null || !_inMemoryInitialized)
+                return;
+
+            _inMemoryHighWaterPages = CountInMemoryLivePagesLocked(LiveCatalogLocked());
         }
     }
 
@@ -4723,7 +4959,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool forceFullRewrite = false,
         TimeSpan busyTimeout = default,
         bool checkpointAfterCommit = true,
-        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null)
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null,
+        uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -4744,7 +4981,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         pragmaHeader,
                         forceFullRewrite,
                         previousTables: _tables,
-                        targetedIndexRebuild: targetedIndexRebuild)
+                        targetedIndexRebuild: targetedIndexRebuild,
+                        maximumPageCount: maxPageCount)
                     : _fileStore.PersistForMvccCheckpoint(
                         catalog.Tables,
                         catalog.Views,
@@ -4752,7 +4990,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         catalog.VirtualTables,
                         pragmaHeader,
                         forceFullRewrite,
-                        previousTables: _tables);
+                        previousTables: _tables,
+                        maximumPageCount: maxPageCount);
                 PublishCatalog(catalog, committedVersion);
             }
             catch (EmbeddedPostCommitMaintenanceException)
@@ -6551,19 +6790,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// The connection-dependent facts and checks a DDL compilation needs.
     /// </summary>
     /// <param name="catalog">The schema the statement is resolved against.</param>
-    /// <param name="enforceMaxPageCount">
-    /// Whether the compilation enforces <c>PRAGMA max_page_count</c>. <c>EXPLAIN</c> passes
-    /// <see langword="false"/>: describing a program allocates no page and must not consult a runtime
-    /// storage limit.
-    /// </param>
-    private DdlCompilationContext CreateDdlCompilationContext(
-        SchemaCatalog catalog,
-        bool enforceMaxPageCount = true)
+    /// <remarks>
+    /// The compiler's page-reservation hook is inert here: <c>PRAGMA max_page_count</c> is a
+    /// per-connection ceiling enforced against the pages the statement's finished catalog
+    /// actually needs (see <see cref="EnsureCatalogFitsPageLimit"/> and the pager growth
+    /// ceiling), not against a per-object estimate made while compiling.
+    /// </remarks>
+    private DdlCompilationContext CreateDdlCompilationContext(SchemaCatalog catalog)
         => new(
             catalog,
             GetPragmaHeaderMetadata().SchemaVersion,
             ValidateCheckConstraintFunctions,
-            enforceMaxPageCount ? EnforceMaxPageCountForCatalogChange : static _ => { },
+            static _ => { },
             Database: 0,
             HasCollation,
             IsRegisteredScalarFunction,
@@ -7458,7 +7696,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteStat1TableName}");
         }
 
-        EnforceMaxPageCountForCatalogChange(1);
         var statistics = new EmbeddedTable(
             SqliteStat1TableName,
             [
@@ -28524,7 +28761,7 @@ out bool hasReturning)
 
     /// <summary>
     /// The compilation context <c>EXPLAIN</c> uses. It resolves names against the same schema execution
-    /// would see, but never enforces <c>PRAGMA max_page_count</c>: describing a program allocates no page.
+    /// would see; describing a program allocates no page.
     /// </summary>
     private DdlCompilationContext CreateExplainDdlCompilationContext(QueryContext context)
         => CreateDdlCompilationContext(
@@ -28540,8 +28777,7 @@ out bool hasReturning)
                     ? new Dictionary<string, VirtualTableDefinition>(StringComparer.OrdinalIgnoreCase)
                     : new Dictionary<string, VirtualTableDefinition>(
                         context.VirtualTables,
-                        StringComparer.OrdinalIgnoreCase)),
-            enforceMaxPageCount: false);
+                        StringComparer.OrdinalIgnoreCase)));
 
     /// <summary>
     /// The <c>CREATE TABLE</c> a <c>CREATE TABLE AS SELECT</c> lowers to, with its columns derived from the
@@ -57615,6 +57851,10 @@ public sealed partial class EmbeddedConnection : IDisposable
     private bool _deferForeignKeys;
     private bool _recursiveTriggers;
     private readonly Dictionary<EmbeddedDatabase, long> _cacheSizes = [];
+    // PRAGMA max_page_count is a property of this connection's pager for each schema, as in
+    // SQLite and Turso (Pager::max_page_count): never persisted, never shared with another
+    // connection on the same database, and back to the default for every new connection.
+    private readonly Dictionary<EmbeddedDatabase, uint> _maxPageCounts = [];
     private readonly Dictionary<EmbeddedDatabase, bool> _cacheSpills = [];
     private int _tempStore;
     private bool _ignoreCheckConstraints;
@@ -59105,6 +59345,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         _ignoreCheckConstraints = false;
         _requireWhere = false;
         _cacheSizes.Clear();
+        _maxPageCounts.Clear();
         _cacheSpills.Clear();
         _synchronousModes.Clear();
         ReleaseExclusiveLockingModes();
@@ -59536,6 +59777,7 @@ public sealed partial class EmbeddedConnection : IDisposable
     private void ResetTemporaryDatabase()
     {
         _cacheSizes.Remove(_tempDatabase);
+        _maxPageCounts.Remove(_tempDatabase);
         _cacheSpills.Remove(_tempDatabase);
         _synchronousModes.Remove(_tempDatabase);
         ReleaseExclusiveLockingMode(_tempDatabase);
@@ -59814,7 +60056,8 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     vdbeExecutionOptions: vdbeExecutionOptions,
                                     synchronousMode: GetSynchronousMode(routed.Database),
                                     sequenceSession: _sequenceSession,
-                                    describeJournalMode: DescribeJournalModeForSchema);
+                                    describeJournalMode: DescribeJournalModeForSchema,
+                                    maxPageCount: GetMaxPageCount(routed.Database));
                             }
                             catch (Exception failure)
                                 when (failure is not EmbeddedConflictFailException
@@ -59876,6 +60119,23 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 describeJournalMode: DescribeJournalModeForSchema);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
+                            // SQLite allocates a statement's pages while it runs and fails it with
+                            // SQLITE_FULL there; the managed engine writes pages only at COMMIT, so the
+                            // finished statement catalog is measured against this connection's
+                            // max_page_count before the transaction adopts it.
+                            if (routedMayMutate && result.Changed)
+                            {
+                                _ = routed.Database.EnsureCatalogFitsPageLimit(
+                                    statementCatalog,
+                                    GetMaxPageCount(routed.Database),
+                                    routed.Database.IsFileBacked
+                                        && !transactionState.HasSnapshotPragmaHeader
+                                        && !transactionState.HasSchemaChanges
+                                        && !EmbeddedDatabase.MayChangeSchema(routed.Statement)
+                                        ? null
+                                        : transactionState.PragmaHeader,
+                                    transactionState.ForceFullCatalogRewrite || result.ForceFullCatalogRewrite);
+                            }
                             // The catalog overload used for transactional statements does not
                             // record change counters itself, so mirror the autocommit path here:
                             // changes()/total_changes() must observe in-transaction writes.
@@ -60153,7 +60413,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                     ReleaseConcurrentSchemaGateIfUnused();
                     throw;
                 }
-                catch
+                catch (Exception failure)
                 {
                     if (changeDataCaptureSnapshot is { } snapshot)
                         changeDataCapture?.Restore(snapshot);
@@ -60166,6 +60426,16 @@ public sealed partial class EmbeddedConnection : IDisposable
                     if (statementOverlayCheckpoint is not null)
                         transactionState?.Overlay?.RestoreCheckpoint(statementOverlayCheckpoint);
                     ReleaseConcurrentSchemaGateIfUnused();
+                    // SQLITE_FULL without a statement journal rolls back the whole transaction
+                    // (sqlite3VdbeHalt); with one, only the statement.
+                    if (failure is EmbeddedDatabaseFullException
+                        && transactionState is not null
+                        && _transactionDatabases is not null
+                        && RollsBackTransactionOnDatabaseFull(routed.Statement, transactionState.Catalog))
+                    {
+                        ResetTransactionState();
+                        FireRollbackHook();
+                    }
                     throw;
                 }
                 finally
@@ -60453,6 +60723,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         _attachedDatabases.Remove(statement.Alias);
         _pendingPageSizes.Remove(attachment.Database);
         _cacheSizes.Remove(attachment.Database);
+        _maxPageCounts.Remove(attachment.Database);
         _cacheSpills.Remove(attachment.Database);
         _synchronousModes.Remove(attachment.Database);
         ReleaseExclusiveLockingMode(attachment.Database);
@@ -60512,7 +60783,7 @@ public sealed partial class EmbeddedConnection : IDisposable
     private ExecutionResult ExecutePragmaPageCount(PragmaPageCountStatement statement)
     {
         var database = ResolvePragmaDatabase(statement.Schema);
-        return new ExecutionResult(["page_count"], [[SqlValue.Integer(database.GetPageCount())]], 0);
+        return new ExecutionResult(["page_count"], [[SqlValue.Integer(GetConnectionVisiblePageCount(database))]], 0);
     }
 
     private ExecutionResult ExecutePragmaFreelistCount(PragmaFreelistCountStatement statement)
@@ -64538,7 +64809,8 @@ Func<string, ParsedStatement> rewrite)
                 "TRUNCATE",
                 BusyTimeout,
                 GetSynchronousMode(_database),
-                permittedTransaction: txId);
+                permittedTransaction: txId,
+                maxPageCount: GetMaxPageCount(_database));
             if (checkpoint.Busy)
                 throw new EmbeddedBusyException();
         }
@@ -64738,7 +65010,8 @@ Func<string, ParsedStatement> rewrite)
                         // coexisting change is persisted atomically alongside the rebuilt index.
                         targetedIndexRebuildNames: state.HasNonTargetedIndexRebuildChange
                             ? null
-                            : state.TargetedIndexRebuildNames);
+                            : state.TargetedIndexRebuildNames,
+                        maxPageCount: GetCommitPageLimit(database));
                 }
                 catch (EmbeddedPostCommitMaintenanceException failure)
                 {
@@ -65195,18 +65468,147 @@ Func<string, ParsedStatement> rewrite)
     private ExecutionResult ExecutePragmaMaxPageCount(PragmaMaxPageCountStatement statement)
     {
         var database = ResolvePragmaDatabase(statement.Schema);
-        if (statement.Value is null)
-            return new ExecutionResult(["max_page_count"], [[SqlValue.Integer(database.MaxPageCount)]], 0);
+        // SQLite's pragma.c clamps the argument to 0..0xfffffffe, and OP_MaxPgcnt (Turso
+        // op_max_pgcnt) treats 0 - so also any negative request - as a query. Any other request
+        // becomes the new ceiling, but never below the pages the database already occupies
+        // (Turso Pager::set_max_page_count; SQLite sqlite3BtreeLastPage), counting pages this
+        // connection's open transaction has already allocated.
+        var requested = statement.Value is { } value
+            ? value <= 0 ? 0u : (uint)Math.Min(value, (long)SqlitePageLimits.AbsoluteMaximumPageCount)
+            : 0u;
+        if (requested == 0)
+            return new ExecutionResult(["max_page_count"], [[SqlValue.Integer(GetMaxPageCount(database))]], 0);
 
-        // Turso treats 0 as a no-op query and clamps any other request to at
-        // least the current database size (set_max_page_count).
-        if (statement.Value.Value == 0)
-            return new ExecutionResult(["max_page_count"], [[SqlValue.Integer(database.MaxPageCount)]], 0);
-
-        var requested = statement.Value.Value < 0 ? 0 : (uint)statement.Value.Value;
-        var newMax = Math.Max(requested, database.GetPageCount());
-        database.MaxPageCount = newMax;
+        var newMax = Math.Max(requested, GetConnectionVisiblePageCount(database));
+        _maxPageCounts[database] = newMax;
         return new ExecutionResult(["max_page_count"], [[SqlValue.Integer(newMax)]], 0);
+    }
+
+    /// <summary>This connection's <c>PRAGMA max_page_count</c> ceiling for <paramref name="database"/>.</summary>
+    private uint GetMaxPageCount(EmbeddedDatabase database)
+        => _maxPageCounts.GetValueOrDefault(database, SqlitePageLimits.DefaultMaximumPageCount);
+
+    /// <summary>
+    /// The ceiling an explicit transaction's COMMIT is held to. An MVCC transaction publishes its
+    /// logical-log frame before the managed engine materializes its pages, so (as in Turso, where
+    /// the MVCC commit never touches the page ceiling) it must not fail on the ceiling after the
+    /// log already made it durable; its pages are held to the ceiling at checkpoint instead.
+    /// Autocommit MVCC writes build their pages directly, so they keep the ceiling.
+    /// </summary>
+    private uint GetCommitPageLimit(EmbeddedDatabase database)
+        => database.IsMvccEnabled ? SqlitePageLimits.DefaultMaximumPageCount : GetMaxPageCount(database);
+
+    /// <summary>
+    /// <c>PRAGMA page_count</c> as this connection sees it: the committed size, or, inside a write
+    /// transaction that changed <paramref name="database"/>, the size including the pages that
+    /// transaction has allocated (SQLite reports the pager's current size).
+    /// </summary>
+    private uint GetConnectionVisiblePageCount(EmbeddedDatabase database)
+    {
+        var state = GetTransactionState(database);
+        return database.GetPageCount(state is { HasChanges: true } ? state.Catalog : null);
+    }
+
+    /// <summary>
+    /// Whether SQLite would roll back the whole transaction, not just the statement, when this
+    /// statement hits <c>SQLITE_FULL</c> inside an explicit transaction.
+    /// </summary>
+    /// <remarks>
+    /// <c>sqlite3VdbeHalt</c> treats SQLITE_FULL as a special error: it rolls back only the
+    /// statement when the statement runs under a statement journal, and otherwise rolls back the
+    /// entire transaction. SQLite (and Turso's <c>translate/stmt_journal.rs</c>) skips the
+    /// statement journal for a write that can only touch a single row, because such a write is
+    /// atomic on its own: a one-row <c>INSERT ... VALUES</c> without triggers, REPLACE, UPSERT or
+    /// AUTOINCREMENT, and an <c>UPDATE</c>/<c>DELETE</c> addressed to one rowid without triggers,
+    /// REPLACE or foreign keys. Every other statement (multi-row DML, DDL, CREATE INDEX) keeps
+    /// the transaction open with only its own changes undone.
+    /// </remarks>
+    private bool RollsBackTransactionOnDatabaseFull(ParsedStatement statement, EmbeddedDatabase.SchemaCatalog catalog)
+    {
+        switch (statement)
+        {
+            case InsertStatement insert:
+            {
+                if (insert.Source is not null
+                    || insert.Rows.Count > 1
+                    || insert.Upsert is not null
+                    || insert.ConflictAlgorithm == InsertConflictAlgorithm.Replace
+                    || !catalog.Tables.TryGetValue(insert.TableName, out var table)
+                    || table.IsAutoIncrement
+                    || HasTriggers(catalog, insert.TableName)
+                    || UsesReplaceConstraint(table))
+                {
+                    return false;
+                }
+
+                return true;
+            }
+            case UpdateStatement update:
+                return update.From is null
+                    && update.ConflictAlgorithm != InsertConflictAlgorithm.Replace
+                    && catalog.Tables.TryGetValue(update.TableName, out var updated)
+                    && !UsesReplaceConstraint(updated)
+                    && !HasTriggers(catalog, update.TableName)
+                    && !HasForeignKeyRelationships(catalog, update.TableName, updated)
+                    && AddressesSingleRowid(update.Where, updated);
+            case DeleteStatement delete:
+                return catalog.Tables.TryGetValue(delete.TableName, out var deleted)
+                    && !HasTriggers(catalog, delete.TableName)
+                    && !HasForeignKeyRelationships(catalog, delete.TableName, deleted)
+                    && AddressesSingleRowid(delete.Where, deleted);
+            default:
+                return false;
+        }
+
+        bool HasTriggers(EmbeddedDatabase.SchemaCatalog schema, string tableName)
+            => schema.Triggers.Values.Any(trigger =>
+                   string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase))
+               || (_tempDatabase.HasTriggers
+                   && _tempDatabase.SnapshotTriggers().Any(trigger =>
+                       string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase)));
+
+        bool HasForeignKeyRelationships(EmbeddedDatabase.SchemaCatalog schema, string tableName, EmbeddedTable table)
+            => _foreignKeys
+               && (table.ForeignKeys.Count != 0
+                   || schema.Tables.Values.Any(other => other.ForeignKeys.Any(foreignKey =>
+                       string.Equals(foreignKey.ParentTable, tableName, StringComparison.OrdinalIgnoreCase))));
+
+        static bool UsesReplaceConstraint(EmbeddedTable table)
+            => table.TablePrimaryKeyConflictAlgorithm == InsertConflictAlgorithm.Replace
+               || table.Indexes.Any(index => index.ConflictAlgorithm == InsertConflictAlgorithm.Replace)
+               || table.ColumnDefinitions.Any(column =>
+                   column.PrimaryKeyConflictAlgorithm == InsertConflictAlgorithm.Replace
+                   || column.UniqueConflictAlgorithm == InsertConflictAlgorithm.Replace
+                   || column.NotNullConflictAlgorithm == InsertConflictAlgorithm.Replace);
+
+        static bool AddressesSingleRowid(Expression? where, EmbeddedTable table)
+        {
+            if (where is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+                return false;
+
+            return (IsRowidReference(equality.Left, table) && IsConstant(equality.Right))
+                || (IsRowidReference(equality.Right, table) && IsConstant(equality.Left));
+        }
+
+        static bool IsRowidReference(Expression expression, EmbeddedTable table)
+        {
+            if (expression is not ColumnExpression column || table.WithoutRowid)
+                return false;
+
+            var name = column.UnqualifiedName ?? column.Name;
+            if (name.Equals("rowid", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("_rowid_", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("oid", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return table.RowidAliasColumnIndex >= 0
+                && name.Equals(table.Columns[table.RowidAliasColumnIndex], StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool IsConstant(Expression expression)
+            => expression is LiteralExpression or ParameterExpression;
     }
 
     private ExecutionResult ExecutePragmaIgnoreCheckConstraints(PragmaIgnoreCheckConstraintsStatement statement)
@@ -65284,7 +65686,8 @@ Func<string, ParsedStatement> rewrite)
             var result = database.RunMvccCheckpoint(
                 statement.Mode,
                 BusyTimeout,
-                GetSynchronousMode(database));
+                GetSynchronousMode(database),
+                maxPageCount: GetMaxPageCount(database));
             return new ExecutionResult(
                 columns,
                 [[
@@ -65563,7 +65966,10 @@ Func<string, ParsedStatement> rewrite)
         if (database.IsReadOnly)
             throw new EmbeddedSqlException("attempt to write a readonly database");
         if (!database.IsFileBacked && statement.Into is null)
+        {
+            database.CompactInMemoryPageModel();
             return ExecutionResult.Empty;
+        }
 
         // VACUUM rewrites the whole database, so it has to lose to a connection
         // holding a write transaction just like any other write.
@@ -65583,7 +65989,8 @@ Func<string, ParsedStatement> rewrite)
             database.MigratePageSize(
                 targetPageSize,
                 busyTimeout: BusyTimeout,
-                synchronousMode: GetSynchronousMode(database));
+                synchronousMode: GetSynchronousMode(database),
+                maxPageCount: GetMaxPageCount(database));
         }
         else
         {
