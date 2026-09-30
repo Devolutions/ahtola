@@ -2024,6 +2024,7 @@ public sealed partial class EmbeddedDatabase
             ? plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1
             : plan.AutoIncrement.NextRowId(plan.AnyRow, plan.LargestRowId);
         plan.Used.Add(rowId);
+        context.ConcurrentMvccIdentityTracker?.MarkAutomaticRowId(tableName, rowId);
         plan.AnyRow = true;
         if (rowId > plan.LargestRowId)
             plan.LargestRowId = rowId;

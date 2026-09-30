@@ -1000,10 +1000,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 break;
 
                             var tableId = store.GetOrCreateTableId(txId, tableName);
-                            // Concurrent catalogs may both pick the same local rowid; promote
-                            // to a store-global id so first-committer-wins does not collapse
-                            // two inserts (Turso process-wide allocator).
-                            var allocated = store.AllocateRowId(tableId, minimumExclusive: rowId - 1);
+                            // Concurrent catalogs may both pick the same local automatic rowid;
+                            // promote it to a store-global id so first-committer-wins does not
+                            // collapse two inserts (Turso process-wide allocator). An explicit
+                            // rowid or INTEGER PRIMARY KEY value is kept as written: a clash with
+                            // a concurrent writer is a write-write conflict, not a new key.
+                            var automatic = ConcurrentMvccIdentityTracker?.TryConsumeAutomaticRowId(tableName, rowId)
+                                ?? true;
+                            var allocated = automatic
+                                ? store.AllocateRowId(tableId, minimumExclusive: rowId - 1)
+                                : rowId;
                             if (allocated != rowId)
                             {
                                 var promoted = table.Rows[index].ToArray();
@@ -1185,6 +1191,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (rows.Count == 0)
                 _keys.Remove(tableName);
         }
+
+        private readonly Dictionary<string, HashSet<long>> _automaticRowIds =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Records a rowid the statement allocated itself (no explicit rowid or INTEGER PRIMARY
+        /// KEY value). Only such rowids may be promoted to the store-global allocator; an
+        /// explicit key is the caller's data and must be kept as written.
+        /// </summary>
+        internal void MarkAutomaticRowId(string tableName, long rowId)
+        {
+            if (!_automaticRowIds.TryGetValue(tableName, out var rows))
+            {
+                rows = [];
+                _automaticRowIds.Add(tableName, rows);
+            }
+
+            rows.Add(rowId);
+        }
+
+        internal bool TryConsumeAutomaticRowId(string tableName, long rowId)
+            => _automaticRowIds.TryGetValue(tableName, out var rows) && rows.Remove(rowId);
     }
 
     /// <summary>
@@ -14417,6 +14445,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1
                 : plan.AutoIncrement.NextRowId(plan.AnyRow, plan.LargestRowId);
             plan.Used.Add(rowid);
+            context.ConcurrentMvccIdentityTracker?.MarkAutomaticRowId(statement.TableName, rowid);
         }
         else if (EmbeddedTable.TryCoerceRowid(rowidSource, out var explicitRowid))
         {

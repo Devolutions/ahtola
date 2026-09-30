@@ -118,6 +118,156 @@ public sealed class MvccSelectDualCursorRoutingTests
         a.ExecuteNonQuery("COMMIT;");
     }
 
+    // Turso 0f7f30eac: an older snapshot may still read a row a peer changed and
+    // committed, but writing that row again must raise a write-write conflict instead
+    // of overwriting the peer (lost update) or resurrecting a deleted row.
+    [TestCase("UPDATE t SET v = 10 WHERE rowid = 1;", "UPDATE t SET v = 20 WHERE rowid = 1;", true, "10")]
+    [TestCase("UPDATE t SET v = 10 WHERE rowid = 1;", "DELETE FROM t WHERE rowid = 1;", true, "10")]
+    [TestCase("DELETE FROM t WHERE rowid = 1;", "UPDATE t SET v = 20 WHERE rowid = 1;", true, "")]
+    [TestCase("DELETE FROM t WHERE rowid = 1;", "DELETE FROM t WHERE rowid = 1;", true, "")]
+    [TestCase("UPDATE t SET v = 10 WHERE rowid = 1;", "UPDATE t SET v = 20 WHERE rowid = 1;", false, "10")]
+    [TestCase("UPDATE t SET v = 10 WHERE rowid = 1;", "DELETE FROM t WHERE rowid = 1;", false, "10")]
+    [TestCase("DELETE FROM t WHERE rowid = 1;", "UPDATE t SET v = 20 WHERE rowid = 1;", false, "")]
+    [TestCase("DELETE FROM t WHERE rowid = 1;", "DELETE FROM t WHERE rowid = 1;", false, "")]
+    public void StaleWriteAfterPeerCommitRaisesWriteWriteConflict(
+        string peerWrite,
+        string staleWrite,
+        bool checkpointBaseRow,
+        string expectedAfter)
+    {
+        using var db = new RoutingFileDatabase();
+        using var seeder = db.Connect();
+        seeder.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        seeder.ExecuteNonQuery("BEGIN CONCURRENT;");
+        seeder.ExecuteNonQuery("INSERT INTO t(rowid, v) VALUES (1, 0);");
+        seeder.ExecuteNonQuery("COMMIT;");
+        if (checkpointBaseRow)
+            seeder.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+
+        using var a = db.Connect();
+        using var b = db.Connect();
+        b.ExecuteNonQuery("BEGIN CONCURRENT;");
+        Convert.ToInt64(Scalar(b, "SELECT v FROM t WHERE rowid = 1;")).Should().Be(0L);
+
+        a.ExecuteNonQuery("BEGIN CONCURRENT;");
+        a.ExecuteNonQuery(peerWrite);
+        a.ExecuteNonQuery("COMMIT;");
+
+        // B's snapshot still reads the pre-peer row.
+        Convert.ToInt64(Scalar(b, "SELECT v FROM t WHERE rowid = 1;")).Should().Be(0L);
+
+        var error = Capture(() => b.ExecuteNonQuery(staleWrite));
+        error.Should().NotBeNull("a write over a peer's post-snapshot commit must conflict");
+        error!.Message.Should().ContainEquivalentOf("write-write conflict");
+        b.ExecuteNonQuery("ROLLBACK;");
+
+        ReadValue(a, "SELECT group_concat(v) FROM t;").Should().Be(expectedAfter);
+    }
+
+    [Test]
+    public void StaleWriteAfterPeerCommitAndCheckpointRaisesWriteWriteConflict()
+    {
+        using var db = new RoutingFileDatabase();
+        using var seeder = db.Connect();
+        seeder.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        seeder.ExecuteNonQuery("INSERT INTO t(rowid, v) VALUES (1, 0);");
+        seeder.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+
+        using var a = db.Connect();
+        using var b = db.Connect();
+        b.ExecuteNonQuery("BEGIN CONCURRENT;");
+        Convert.ToInt64(Scalar(b, "SELECT v FROM t WHERE rowid = 1;")).Should().Be(0L);
+
+        a.ExecuteNonQuery("BEGIN CONCURRENT;");
+        a.ExecuteNonQuery("UPDATE t SET v = 10 WHERE rowid = 1;");
+        a.ExecuteNonQuery("COMMIT;");
+        // A checkpoint may or may not be admitted while B's snapshot is open; either way
+        // B must not be able to overwrite A's committed update.
+        Capture(() => seeder.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);"));
+
+        var error = Capture(() => b.ExecuteNonQuery("UPDATE t SET v = 20 WHERE rowid = 1;"));
+        error.Should().NotBeNull("a write over a peer's post-snapshot commit must conflict");
+        error!.Message.Should().ContainEquivalentOf("write-write conflict");
+        b.ExecuteNonQuery("ROLLBACK;");
+
+        Convert.ToInt64(Scalar(a, "SELECT v FROM t WHERE rowid = 1;")).Should().Be(10L);
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void WriteAfterPeerCommitThatPrecedesTheSnapshotDoesNotConflict(bool checkpointBaseRow)
+    {
+        using var db = new RoutingFileDatabase();
+        using var seeder = db.Connect();
+        seeder.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        seeder.ExecuteNonQuery("BEGIN CONCURRENT;");
+        seeder.ExecuteNonQuery("INSERT INTO t(rowid, v) VALUES (1, 0), (2, 0);");
+        seeder.ExecuteNonQuery("COMMIT;");
+        if (checkpointBaseRow)
+            seeder.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+
+        using var a = db.Connect();
+        using var b = db.Connect();
+        a.ExecuteNonQuery("BEGIN CONCURRENT;");
+        a.ExecuteNonQuery("UPDATE t SET v = 10 WHERE rowid = 1;");
+        a.ExecuteNonQuery("DELETE FROM t WHERE rowid = 2;");
+        a.ExecuteNonQuery("COMMIT;");
+
+        b.ExecuteNonQuery("BEGIN CONCURRENT;");
+        b.ExecuteNonQuery("UPDATE t SET v = v + 1 WHERE rowid = 1;");
+        b.ExecuteNonQuery("INSERT INTO t(rowid, v) VALUES (2, 5);");
+        b.ExecuteNonQuery("COMMIT;");
+
+        ReadValue(a, "SELECT group_concat(rowid || ':' || v, ',') FROM t;").Should().Be("1:11,2:5");
+    }
+
+    [TestCase("CREATE TABLE t(v INTEGER);", "INSERT INTO t(rowid, v) VALUES (2, 5);")]
+    [TestCase("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);", "INSERT INTO t(id, v) VALUES (2, 5);")]
+    public void ConcurrentInsertKeepsAnExplicitRowidAfterAPeerDelete(string schema, string insert)
+    {
+        using var db = new RoutingFileDatabase(schema);
+        using var seeder = db.Connect();
+        seeder.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+        seeder.ExecuteNonQuery("BEGIN CONCURRENT;");
+        seeder.ExecuteNonQuery("INSERT INTO t(rowid, v) VALUES (1, 0), (2, 0);");
+        seeder.ExecuteNonQuery("COMMIT;");
+
+        using var a = db.Connect();
+        using var b = db.Connect();
+        a.ExecuteNonQuery("BEGIN CONCURRENT;");
+        a.ExecuteNonQuery("DELETE FROM t WHERE rowid = 2;");
+        a.ExecuteNonQuery("COMMIT;");
+
+        b.ExecuteNonQuery("BEGIN CONCURRENT;");
+        b.ExecuteNonQuery(insert);
+        ReadValue(b, "SELECT group_concat(rowid || ':' || v, ',') FROM t;").Should().Be("1:0,2:5");
+        b.ExecuteNonQuery("COMMIT;");
+
+        ReadValue(a, "SELECT group_concat(rowid || ':' || v, ',') FROM t;").Should().Be("1:0,2:5");
+    }
+
+    [Test]
+    public void ConcurrentExplicitInsertsOfOneRowidRaiseWriteWriteConflict()
+    {
+        using var db = new RoutingFileDatabase();
+        using var seeder = db.Connect();
+        seeder.ExecuteNonQuery("PRAGMA journal_mode=mvcc;");
+
+        using var a = db.Connect();
+        using var b = db.Connect();
+        a.ExecuteNonQuery("BEGIN CONCURRENT;");
+        b.ExecuteNonQuery("BEGIN CONCURRENT;");
+        a.ExecuteNonQuery("INSERT INTO t(rowid, v) VALUES (7, 1);");
+
+        var error = Capture(() => b.ExecuteNonQuery("INSERT INTO t(rowid, v) VALUES (7, 2);"));
+        error.Should().NotBeNull("two writers must not both commit rowid 7");
+        error!.Message.Should().ContainEquivalentOf("write-write conflict");
+        b.ExecuteNonQuery("ROLLBACK;");
+        a.ExecuteNonQuery("COMMIT;");
+
+        ReadValue(a, "SELECT group_concat(rowid || ':' || v, ',') FROM t;").Should().Be("7:1");
+    }
+
     [Test]
     public void PostCommitSelectSeesPeerInsertAndUpdate()
     {
