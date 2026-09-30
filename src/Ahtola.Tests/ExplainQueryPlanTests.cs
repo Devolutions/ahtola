@@ -506,6 +506,68 @@ public sealed class ExplainQueryPlanTests
     }
 
     [Test]
+    public void PartialIndexWithAnOrPredicateIsProvenByEitherDisjunct()
+    {
+        // Turso v0.8.1 query_term_implies_predicate: a query conjunct implies an OR conjunct of
+        // the index predicate when it implies either side (partial_idx.sqltest
+        // partial-index-or-term-*). Every result must still match the table scan's answer.
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(a, b);");
+        Execute(connection, "CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;");
+        Execute(connection, "CREATE TABLE t2(a, b);");
+        Execute(connection, "CREATE INDEX idx2 ON t2(a, b) WHERE b < 5 OR a > 5;");
+        Execute(connection, "INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);");
+        Execute(connection, "INSERT INTO t2 SELECT * FROM t;");
+
+        string Detail(string sql) => ReadPlan(connection, "EXPLAIN QUERY PLAN " + sql).Rows.Single()[3].AsText();
+        List<long> Values(string sql) => ReadPlan(connection, sql).Rows.Select(static row => row[0].AsInteger()).ToList();
+
+        Detail("SELECT a FROM t WHERE b < 5 AND a = -3;").Should().Be("SEARCH t USING INDEX idx (a=?)");
+        Values("SELECT a FROM t WHERE b < 5 AND a = -3;").Should().Equal(-3);
+        Detail("SELECT a FROM t WHERE b < 5 ORDER BY a;").Should().Be("SCAN t USING INDEX idx");
+        Values("SELECT a FROM t WHERE b < 5 ORDER BY a;").Should().Equal(-3, -1);
+        Detail("SELECT a FROM t WHERE a > 5;").Should().Be("SEARCH t USING COVERING INDEX idx (a>?)");
+        Values("SELECT a FROM t WHERE a > 5;").Should().Equal(10);
+        Detail("SELECT a FROM t2 WHERE b < 5;").Should().Be("SCAN t2 USING COVERING INDEX idx2");
+        Values("SELECT a FROM t2 WHERE b < 5 ORDER BY a;").Should().Equal(-3, -1);
+
+        // A conjunct that implies neither disjunct still cannot use the index.
+        Detail("SELECT a FROM t WHERE b <= 5 AND a = -5;").Should().NotContain("idx");
+        Values("SELECT a FROM t WHERE b <= 5 AND a = -5;").Should().Equal(-5);
+    }
+
+    [Test]
+    public void UnrewrittenCorrelatedInDescribesItsPerRowListScan()
+    {
+        // A correlated IN the semi-join rewrite declines (a failing operand or filter, or a
+        // non-equality link) stays a list subquery the evaluator re-runs for each outer row
+        // (unnest-correlated.sqltest correlated-in-error-expressions-stay-subqueries).
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE error_outer(id INTEGER, wanted INTEGER, limit_value INTEGER, text_value TEXT);");
+        Execute(connection, "CREATE TABLE error_inner(value INTEGER, json_value TEXT);");
+
+        foreach (var sql in new[]
+        {
+            "SELECT o.id FROM error_outer AS o WHERE o.wanted IN (SELECT i.value FROM error_inner AS i WHERE json_extract(i.json_value, '$') < o.limit_value);",
+            "SELECT o.id FROM error_outer AS o WHERE o.wanted IN (SELECT json_extract(i.json_value, '$') FROM error_inner AS i WHERE i.value < o.limit_value);",
+            "SELECT o.id FROM error_outer AS o WHERE json_extract(o.text_value, '$') IN (SELECT i.value FROM error_inner AS i WHERE i.value < o.limit_value);",
+        })
+        {
+            ReadPlan(connection, "EXPLAIN QUERY PLAN " + sql).Rows.Select(static row => row[3].AsText())
+                .Should().Equal(
+                    new[] { "SCAN error_outer AS o", "CORRELATED LIST SUBQUERY 1", "SCAN error_inner AS i" },
+                    sql);
+        }
+
+        // An equality link is still unnested, so it is not described as a per-row list.
+        ReadPlan(
+                connection,
+                "EXPLAIN QUERY PLAN SELECT o.id FROM error_outer AS o WHERE o.wanted IN (SELECT i.value FROM error_inner AS i WHERE i.value = o.limit_value);")
+            .Rows.Select(static row => row[3].AsText())
+            .Should().NotContain("CORRELATED LIST SUBQUERY 1");
+    }
+
+    [Test]
     public void ReverseIndexScanReversesExplicitNullPlacement()
     {
         using var connection = new EmbeddedDatabase().Connect();

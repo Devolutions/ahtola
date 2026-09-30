@@ -3177,23 +3177,31 @@ internal sealed class SqlParser
         var source = ParseSimpleTableSource();
         while (true)
         {
+            // SQLite's join-constraint grammar attaches an optional ON/USING clause to every join
+            // operator, the comma and CROSS JOIN included (parse.y joinop/on_using), so
+            // `a, b ON ...` and `a CROSS JOIN b USING (...)` are ordinary inner joins.
+            Expression? condition = null;
+            IReadOnlyList<string>? usingColumns = null;
             if (Consume(TokenKind.Comma))
             {
-                source = new JoinTableSource(source, ParseSimpleTableSource(), null, JoinKind.Inner);
-                continue;
-            }
-
-            if (ConsumeKeyword("CROSS"))
-            {
-                ExpectKeyword("JOIN");
-                source = new JoinTableSource(source, ParseSimpleTableSource(), null, JoinKind.Inner);
+                var commaRight = ParseSimpleTableSource();
+                ParseJoinConstraint(ref condition, ref usingColumns);
+                source = new JoinTableSource(source, commaRight, condition, JoinKind.Inner, usingColumns);
                 continue;
             }
 
             var natural = ConsumeKeyword("NATURAL");
 
             JoinKind kind;
-            if (ConsumeKeyword("LEFT"))
+            var cross = false;
+            if (ConsumeKeyword("CROSS"))
+            {
+                // CROSS JOIN is an INNER join the planner must not reorder (SQLite JT_CROSS;
+                // Turso JoinInfo::no_reorder, planner.rs).
+                kind = JoinKind.Inner;
+                cross = true;
+            }
+            else if (ConsumeKeyword("LEFT"))
             {
                 ConsumeKeyword("OUTER");
                 kind = JoinKind.Left;
@@ -3216,30 +3224,33 @@ internal sealed class SqlParser
 
             if (!ConsumeKeyword("JOIN"))
             {
-                if (natural || kind != JoinKind.Inner)
+                if (natural || cross || kind != JoinKind.Inner)
                     throw Error("Expected JOIN.");
 
                 return source;
             }
 
             var right = ParseSimpleTableSource();
-            Expression? condition = null;
-            IReadOnlyList<string>? usingColumns = null;
-            if (ConsumeKeyword("ON"))
-            {
-                condition = ParseExpression();
-            }
-            else if (ConsumeKeyword("USING"))
-            {
-                Expect(TokenKind.LeftParen);
-                usingColumns = ParseIdentifierList();
-                Expect(TokenKind.RightParen);
-            }
+            ParseJoinConstraint(ref condition, ref usingColumns);
 
             if (natural && (condition is not null || usingColumns is not null))
                 throw Error("a NATURAL join may not have an ON or USING clause");
 
-            source = new JoinTableSource(source, right, condition, kind, usingColumns, natural);
+            source = new JoinTableSource(source, right, condition, kind, usingColumns, natural, cross);
+        }
+    }
+
+    private void ParseJoinConstraint(ref Expression? condition, ref IReadOnlyList<string>? usingColumns)
+    {
+        if (ConsumeKeyword("ON"))
+        {
+            condition = ParseExpression();
+        }
+        else if (ConsumeKeyword("USING"))
+        {
+            Expect(TokenKind.LeftParen);
+            usingColumns = ParseIdentifierList();
+            Expect(TokenKind.RightParen);
         }
     }
 

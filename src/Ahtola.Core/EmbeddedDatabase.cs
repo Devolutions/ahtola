@@ -896,7 +896,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ManagedSchemaRowSet? StagedSchemaRows = null,
         ManagedSequenceSession? SequenceSession = null,
         // Connection-scoped: several connections may share the same EmbeddedDatabase.
-        Func<string?, string>? DescribeJournalMode = null)
+        Func<string?, string>? DescribeJournalMode = null,
+        SelectStatement? ExistsJoinBody = null)
     {
         /// <summary>
         /// Per-statement cache of opened managed index-method scan state. Derived contexts created
@@ -22547,8 +22548,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 hashBuildRight = chosen;
             }
-            else
+            else if (!join.Cross)
             {
+                // CROSS JOIN pins its left operand as the outer loop (SQLite JT_CROSS), so it
+                // keeps the probe-left orientation whose output follows the left rows.
                 var leftEstimate = EstimateJoinNodeRows(left.Plan, context);
                 var rightEstimate = EstimateJoinNodeRows(right.Plan, context);
                 // Only flip when both sides have real sqlite_stat1 estimates (not the unknown sentinel).
@@ -29149,9 +29152,30 @@ out bool hasReturning)
                     && context.Views?.ContainsKey(source.Name) != true
                     && context.VirtualTables?.ContainsKey(source.Name) != true => (
                 $"SCAN {source.Name}" + (source.Alias is null ? string.Empty : $" AS {source.Alias}"),
-                new EqpJsonScanOp(source.Name, source.Alias, IndexName: null, Covering: false)),
+                new EqpJsonScanOp(
+                    source.Name,
+                    source.Alias,
+                    IndexName: null,
+                    Covering: false,
+                    Estimate: select.Where is null ? EstimateUnfilteredTableScan(source.Name, context) : null)),
             _ => null,
         };
+
+    /// <summary>
+    /// The estimate of a lone, unfiltered full table scan: one input row, every table row out,
+    /// priced by the ported Turso scan formula (optimizer/cost.rs estimate_scan_cost). The row
+    /// count is the planner's current <c>sqlite_stat1</c> figure, or Turso's 1,000,000-row
+    /// default for an unanalyzed table. A filtered scan needs Turso's per-constraint selectivity
+    /// model, which is not ported, so it reports no estimate rather than an invented one.
+    /// </summary>
+    private static EqpJsonEstimate EstimateUnfilteredTableScan(string tableName, QueryContext context)
+    {
+        var rows = TryGetSqliteStat1TableRowCount(context, tableName, out var analyzed)
+            ? analyzed
+            : JoinCostParams.RowsPerTableFallback;
+        var cost = JoinCostModel.EstimateFullScanCost(rows, scanCount: 1.0);
+        return new EqpJsonEstimate(1, rows, rows, cost, cost);
+    }
 
     internal static string JsonEscape(string value)
     {
@@ -31039,7 +31063,14 @@ out bool hasReturning)
             // Plain indexes also qualify when ORDER BY matches the index key order or the
             // WHERE probes the leading term (SEARCH).
             var aggregateOrGroupOrdered = AggregateOrGroupUsesIndex(statement, table, index);
-            if (!search && !ordered && !scansOnlyPartialPredicate && !aggregateOrGroupOrdered)
+            // A covering partial index whose predicate the WHERE implies holds every result row
+            // in fewer entries than the table, so scanning it without a key constraint and
+            // re-checking the WHERE beats a table scan (Turso discounts a partial index to at
+            // most half the table rows, optimizer/access_method.rs choose_best_btree_candidate).
+            var coveringPartialScan = index.IsPartial
+                && statement.OrderBy.Count == 0
+                && IndexCoversSelect(statement, table, index);
+            if (!search && !ordered && !scansOnlyPartialPredicate && !aggregateOrGroupOrdered && !coveringPartialScan)
                 continue;
 
             var plan = new ManagedIndexScanPlan(source, table, index, search, searchConstraint, reverse);
@@ -32718,7 +32749,8 @@ out bool hasReturning)
                     statement.Where,
                     parameters,
                     context,
-                    outerRow)
+                    outerRow,
+                    preserveErrors: !Equals(context.ExistsJoinBody, statement))
                 ?? (statement.Source is JoinTableSource joinSource && statement.Where is not null
                     ? GetJoinRowsWithPredicatePushdown(
                         joinSource,
@@ -37049,7 +37081,8 @@ out bool hasReturning)
         Expression? predicate,
         SqlValue[] parameters,
         QueryContext context,
-        SourceRow? outerRow)
+        SourceRow? outerRow,
+        bool preserveErrors = true)
     {
         if (source is not NamedTableSource named
             || predicate is null
@@ -37058,7 +37091,14 @@ out bool hasReturning)
             || IsCommonTableExpression(named, context)
             || context.Views?.ContainsKey(named.Name) == true
             || !context.Tables.TryGetValue(named.Name, out var table)
-            || !TryCreateTransientEqualityLookup(named, table, predicate, context, outerRow, out var lookup))
+            || !TryCreateTransientEqualityLookup(
+                named,
+                table,
+                predicate,
+                context,
+                outerRow,
+                out var lookup,
+                preserveErrors))
         {
             return null;
         }
@@ -37308,13 +37348,22 @@ out bool hasReturning)
     // comparison whose affinity conversions are known on both sides. A conjunct that fails any
     // of those checks is skipped rather than fatal: another conjunct may still be probeable,
     // and a predicate with none simply scans.
+    //
+    // With <paramref name="preserveErrors"/> the probe must also keep the statement's errors:
+    // unlike a real index seek it prunes rows a SQLite full scan still visits, and the WHERE
+    // evaluates its conjuncts left to right, so every conjunct ahead of the chosen equality
+    // runs on a pruned row there. The equality is therefore only probeable while no conjunct
+    // before it (nor its own value side, evaluated once per probe) can raise on its input;
+    // `json_extract(i.j, '$') < 0 AND i.k = o.k` must still report the malformed row whose key
+    // does not match (unnest-correlated.sqltest correlated-exists-inequality-expression-errors).
     private bool TryCreateTransientEqualityLookup(
         NamedTableSource source,
         EmbeddedTable table,
         Expression predicate,
         QueryContext context,
         SourceRow? outerRow,
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TransientEqualityLookup? lookup)
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TransientEqualityLookup? lookup,
+        bool preserveErrors = false)
     {
         var outputColumns = GetOutputColumns(source, context);
         var pending = new Stack<Expression>();
@@ -37324,12 +37373,14 @@ out bool hasReturning)
             var conjunct = pending.Pop();
             if (conjunct is BinaryExpression { Operator: BinaryOperator.And } and)
             {
-                pending.Push(and.Left);
+                // Right first so conjuncts pop in left-to-right evaluation order.
                 pending.Push(and.Right);
+                pending.Push(and.Left);
                 continue;
             }
 
             if (conjunct is BinaryExpression { Operator: BinaryOperator.Equal } equal
+                && (!preserveErrors || !ExpressionCanFailOnInput(equal))
                 && (TryMatchTransientEquality(
                         equal.Left,
                         equal.Right,
@@ -37351,6 +37402,10 @@ out bool hasReturning)
             {
                 return true;
             }
+
+            // This conjunct runs on every row a scan visits; a later equality may not prune.
+            if (preserveErrors && ExpressionCanFail(conjunct))
+                break;
         }
 
         lookup = null;
@@ -42340,13 +42395,35 @@ out bool hasReturning)
         // (exists-drops-order-by-distinct.sqltest). LIMIT and OFFSET stay: OFFSET
         // reduces visible rows (it decides whether a row comes out at all) and LIMIT 0
         // means no rows.
+        var body = DropExistsSuperfluities(expression.Query);
+
+        // SQLite (select.c existsToJoin) runs a positive EXISTS over one plain table with no
+        // aggregate or LIMIT as a join of the outer query, so an equality on that table probes
+        // an automatic index and never visits the rows the key rejects - including rows whose
+        // other WHERE terms would raise. NOT EXISTS stays a correlated subquery that scans every
+        // row. The flag lets the transient equality probe keep pruning for the join shape only.
+        var subqueryContext = !expression.Negated && IsSqliteExistsToJoinBody(body)
+            ? context with { ExistsJoinBody = (SelectStatement)body }
+            : context.ExistsJoinBody is null ? context : context with { ExistsJoinBody = null };
         var exists = ExecuteSubquery(
-            DropExistsSuperfluities(expression.Query),
+            body,
             parameters,
             row,
-            context).Rows.Count > 0;
+            subqueryContext).Rows.Count > 0;
         return SqlValue.Integer(exists == expression.Negated ? 0 : 1);
     }
+
+    private bool IsSqliteExistsToJoinBody(QueryStatement body)
+        => body is SelectStatement
+        {
+            Source: NamedTableSource,
+            Limit: null,
+            Offset: null,
+            GroupBy.Count: 0,
+            Having: null,
+        } select
+            && !select.Projections.Any(projection =>
+                ContainsAggregate(projection.Expression) || ContainsWindowFunction(projection.Expression));
 
     /// <summary>Removes ORDER BY and DISTINCT from an EXISTS subquery.</summary>
     private static QueryStatement DropExistsSuperfluities(QueryStatement query)
@@ -43559,12 +43636,12 @@ out bool hasReturning)
                 throw new EmbeddedSqlException("FULL OUTER JOIN chaining is not yet supported");
         }
 
-        if (ContainsCorrelatedSubqueryReferencingFullJoinNullSide(statement, fullOuterJoins))
-        {
-            throw new EmbeddedSqlException(
-                "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables");
-        }
-
+        // A correlated subquery over a FULL JOIN is not rejected: since v0.8.1 Turso plans it
+        // as a semi/anti join placed after the FULL JOIN (optimizer/unnest.rs keeps FULL joins
+        // out of its may-be-NULL link guard), which equals SQLite's per-row evaluation over
+        // the null-extended rows. RewriteCorrelatedSubqueriesAsJoins declines whenever an
+        // outer join is present, so the managed engine evaluates the subquery against each
+        // joined row, null-padded ones included.
         foreach (var fullOuterJoin in fullOuterJoins)
         {
             // Turso lowers NATURAL joins to INNER joins before the outer-join checks apply.
@@ -43629,86 +43706,6 @@ out bool hasReturning)
             && (join.Kind is JoinKind.Left or JoinKind.Right or JoinKind.Full
                 || ContainsOuterJoin(join.Left)
                 || ContainsOuterJoin(join.Right));
-    }
-
-    // A correlated subquery confined to a FULL JOIN's always-present side is evaluated as
-    // an ordinary per-row WHERE filter after the FULL JOIN materializes its null-padded
-    // rows: RewriteCorrelatedSubqueriesAsJoins already declines the semi/anti-join rewrite
-    // whenever any outer join is present (SourceContainsOuterJoin), so the correlated
-    // subquery keeps its normal three-valued evaluation against whatever row the FULL JOIN
-    // produced, including a null-padded one - the same answer a plain SQL WHERE clause
-    // gives. The chaining guard above (ContainsOuterJoin(fullOuterJoin.Left)) already
-    // proves that side holds no independent outer join of its own, so nothing there can be
-    // null-padded except by this same FULL JOIN, as a unit. Only a reference into a FULL
-    // JOIN's own right side - the side whose match-or-not decides the null padding, and
-    // whose planning Turso's join-order search cannot always complete
-    // (core/translate/optimizer/join.rs:1340-1365) - stays rejected.
-    private static bool ContainsCorrelatedSubqueryReferencingFullJoinNullSide(
-        SelectStatement statement,
-        IReadOnlyList<JoinTableSource> fullOuterJoins)
-    {
-        var unsafeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var fullOuterJoin in fullOuterJoins)
-            CollectFromSourceNames(fullOuterJoin.Right, unsafeNames);
-        if (unsafeNames.Count == 0)
-            return false;
-
-        return ContainsCorrelatedSubqueryReferencingFromSources(statement, unsafeNames);
-    }
-
-    private static bool ContainsCorrelatedSubqueryReferencingFromSources(
-        SelectStatement statement,
-        HashSet<string> fromNames)
-    {
-        if (fromNames.Count == 0)
-            return false;
-
-        foreach (var projection in statement.Projections)
-        {
-            if (ExpressionContainsCorrelatedSubquery(projection.Expression, fromNames))
-                return true;
-        }
-
-        if (ExpressionContainsCorrelatedSubquery(statement.Where, fromNames))
-            return true;
-
-        foreach (var expression in statement.GroupBy)
-        {
-            if (ExpressionContainsCorrelatedSubquery(expression, fromNames))
-                return true;
-        }
-
-        if (ExpressionContainsCorrelatedSubquery(statement.Having, fromNames))
-            return true;
-
-        foreach (var term in statement.OrderBy)
-        {
-            if (ExpressionContainsCorrelatedSubquery(term.Expression, fromNames))
-                return true;
-        }
-
-        if (ExpressionContainsCorrelatedSubquery(statement.Limit, fromNames)
-            || ExpressionContainsCorrelatedSubquery(statement.Offset, fromNames))
-            return true;
-
-        return TableSourceConditionsContainCorrelatedSubquery(statement.Source, fromNames);
-    }
-
-    private static bool TableSourceConditionsContainCorrelatedSubquery(
-        TableSource? source,
-        HashSet<string> fromNames)
-    {
-        switch (source)
-        {
-            case JoinTableSource join:
-                return ExpressionContainsCorrelatedSubquery(join.Condition, fromNames)
-                    || TableSourceConditionsContainCorrelatedSubquery(join.Left, fromNames)
-                    || TableSourceConditionsContainCorrelatedSubquery(join.Right, fromNames);
-            case TableValuedFunctionSource function:
-                return function.Arguments.Any(argument => ExpressionContainsCorrelatedSubquery(argument, fromNames));
-            default:
-                return false;
-        }
     }
 
     private static void CollectFromSourceNames(TableSource? source, HashSet<string> names)
