@@ -6375,7 +6375,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     /// <summary>
     /// Reports the SQLite integrity problems the managed catalog can actually
-    /// prove: declared NOT NULL and CHECK constraints that stored rows violate.
+    /// prove: STRICT storage-class and declared NOT NULL violations (in Turso's
+    /// per-column order, type first) and CHECK constraints that stored rows violate.
     /// </summary>
     /// <remarks>
     /// Index and page-structure problems are unreachable here. The managed file
@@ -6450,15 +6451,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         int maxErrors,
         List<string> problems)
     {
+        var rowidAliasColumnIndex = table.HasRowid ? table.RowidAliasColumnIndex : -1;
         for (var rowIndex = 0; rowIndex < table.Rows.Count && problems.Count < maxErrors; rowIndex++)
         {
             var row = table.Rows[rowIndex];
             for (var columnIndex = 0;
-                 columnIndex < table.ColumnDefinitions.Length && problems.Count < maxErrors;
+                 columnIndex < table.ColumnDefinitions.Length && columnIndex < row.Length && problems.Count < maxErrors;
                  columnIndex++)
             {
+                // Turso's integrity_check skips the INTEGER PRIMARY KEY: the rowid is its value.
+                if (columnIndex == rowidAliasColumnIndex)
+                    continue;
+
                 var column = table.ColumnDefinitions[columnIndex];
-                if (column.NotNull && columnIndex < row.Length && row[columnIndex].Kind == SqlValueKind.Null)
+                var value = row[columnIndex];
+                if (table.Strict && StrictIntegrityTypeName(column) is { } typeName && !SatisfiesStrictIntegrityType(typeName, value))
+                {
+                    problems.Add($"non-{typeName} value in {tableName}.{column.Name}");
+                    if (problems.Count >= maxErrors)
+                        break;
+                }
+
+                if (column.NotNull && value.Kind == SqlValueKind.Null)
                     problems.Add($"NULL value in {tableName}.{column.Name}");
             }
 
@@ -6470,6 +6484,34 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 problems.Add($"CHECK constraint failed in {tableName}");
         }
     }
+
+    /// <summary>
+    /// Turso's <c>Column::strict_value_type</c>: the STRICT declared types integrity_check can
+    /// test (ANY and custom/domain types have no storage-class constraint).
+    /// </summary>
+    private static string? StrictIntegrityTypeName(EmbeddedColumn column)
+    {
+        if (column.Domain is not null || column.IdentityType is not null || column.DeclaredType is null)
+            return null;
+
+        var declared = column.DeclaredType.Trim().ToUpperInvariant();
+        return declared is "INT" or "INTEGER" or "REAL" or "TEXT" or "BLOB" ? declared : null;
+    }
+
+    /// <summary>
+    /// SQLite's <c>OP_IsType</c> masks for STRICT integrity checking: NULL always passes, and a
+    /// REAL column accepts the integer storage class SQLite uses for integral reals.
+    /// </summary>
+    private static bool SatisfiesStrictIntegrityType(string typeName, SqlValue value)
+        => value.Kind == SqlValueKind.Null
+            || typeName switch
+            {
+                "INT" or "INTEGER" => value.Kind == SqlValueKind.Integer,
+                "REAL" => value.Kind is SqlValueKind.Real or SqlValueKind.Integer,
+                "TEXT" => value.Kind == SqlValueKind.Text,
+                "BLOB" => value.Kind == SqlValueKind.Blob,
+                _ => true,
+            };
 
     private bool SatisfiesCheckConstraints(
         string tableName,
@@ -13770,7 +13812,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context,
         bool virtualOnly = false,
-        bool enforceNotNull = true)
+        bool enforceNotNull = true,
+        bool validateStrict = true)
     {
         if (!table.HasGeneratedColumns)
             return;
@@ -13785,9 +13828,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (virtualOnly && column.GeneratedStored)
                 continue;
 
-            var value = table.ApplyColumnAffinity(
-                column,
-                Evaluate(column.GenerationExpression!, parameters, source, context));
+            var computed = Evaluate(column.GenerationExpression!, parameters, source, context);
+            var value = validateStrict
+                ? table.ApplyColumnAffinity(column, computed)
+                : table.CoerceColumnAffinity(column, computed);
             row[columnIndex] = value;
             if (enforceNotNull && column.NotNull && value.Kind == SqlValueKind.Null)
             {
@@ -13822,6 +13866,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Recomputes a stored row's VIRTUAL generated columns as it is read. Like SQLite's and
+    /// Turso's column read, this applies the declared affinity but enforces neither NOT NULL nor
+    /// the STRICT storage class: those are write-time constraints, and a stored row that no
+    /// longer satisfies them must stay readable so <c>PRAGMA integrity_check</c> can report it
+    /// ("NULL value in t.b", "non-INT value in t.b") instead of the database failing to load.
+    /// </summary>
     internal static void RecomputeVirtualGeneratedColumns(
         EmbeddedTable table,
         string tableName,
@@ -13842,7 +13893,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     [tableName] = table,
                 },
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase)),
-            virtualOnly: true);
+            virtualOnly: true,
+            enforceNotNull: false,
+            validateStrict: false);
     }
 
     // Materializes generated columns for a pre-existing row right after ALTER TABLE ADD COLUMN
