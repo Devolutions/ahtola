@@ -20902,6 +20902,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (outerTarget is null || innerTarget is null)
                 return false;
 
+            // This lowering builds an automatic index. When the ported cost model prefers
+            // another inner access (a declared index search, say), the evaluator runs that
+            // access instead, so EXPLAIN QUERY PLAN and execution stay the same plan.
+            if (PlanSemiOrAntiInnerAccess(join, leftPredicate: null, context) is { Kind: not SemiAntiInnerAccessKind.EphemeralIndex })
+                return false;
+
             var outerQualifier = outer.Alias ?? outer.Name;
             var innerQualifier = inner.Alias ?? inner.Name;
             var keyPairs = new List<(int Outer, int Inner)>();
@@ -38491,24 +38497,35 @@ out bool hasReturning)
         // declared collation it resolved before the rewrite.
         var innerContext = EnterCollationSource(context, source.Right);
 
+        // The inner access is chosen by the ported Turso join cost model (see
+        // EmbeddedDatabase.SemiAntiJoinAccess.cs); EXPLAIN QUERY PLAN describes the same choice.
+        var access = PlanSemiOrAntiInnerAccess(source, leftPredicate, context);
+        if (access is { Kind: SemiAntiInnerAccessKind.HashAnti })
+            return GetHashAntiJoinRows(source, access, left, parameters, innerContext, maximumRows, outerRow);
+
         // The un-rewritten correlated subquery reached its inner table through a cached
-        // transient hash probe. A matching declared index now takes precedence for the narrow
-        // conversion-free equality shape above; all other rewrites retain the hash probe.
+        // transient hash probe. A planned index search or automatic index is served by the same
+        // statement-cached equality probe (the full condition still decides every match); an
+        // unmodelled shape keeps the legacy declared-index-then-probe order.
         SourceData? materializedRight = null;
 
         var keepOnMatch = source.Kind == JoinKind.Semi;
+        var probeAccess = access is null
+            || access.Kind is SemiAntiInnerAccessKind.DeclaredIndexSearch or SemiAntiInnerAccessKind.EphemeralIndex;
         var rows = new List<SourceRow>();
         foreach (var leftRow in left.Rows)
         {
             context.CheckInterrupt();
-            var probed = source.Condition is null
+            var probed = source.Condition is null || !probeAccess
                 ? null
-                : TryGetDeclaredIndexLookupRows(
-                        source.Right,
-                        source.Condition,
-                        parameters,
-                        innerContext,
-                        leftRow)
+                : (access is null
+                        ? TryGetDeclaredIndexLookupRows(
+                            source.Right,
+                            source.Condition,
+                            parameters,
+                            innerContext,
+                            leftRow)
+                        : null)
                     ?? TryGetTransientLookupRows(
                         source.Right,
                         source.Condition,
@@ -38565,6 +38582,157 @@ out bool hasReturning)
             left.Collations,
             left.ColumnDefinitions,
             left.OmittedVirtualTablePredicates);
+    }
+
+    /// <summary>
+    /// Runs a left anti hash join (Turso <c>HashJoinType::LeftAnti</c>): the outer rows are the
+    /// build input, hashed on the outer side of every planned equality key; the inner table is
+    /// read once as the probe; a build row is marked when some probe row in its bucket satisfies
+    /// the complete join condition; and the build rows no probe row marked are emitted in
+    /// their original order. The hash only chooses which pairs are tested, so the result is the
+    /// row-for-row answer of the nested anti-join: SQL equality never holds for a NULL key, so
+    /// a build row with a NULL key cannot match and is kept, and a probe row with one is skipped.
+    /// </summary>
+    private SourceData GetHashAntiJoinRows(
+        JoinTableSource source,
+        SemiAntiInnerAccess access,
+        SourceData left,
+        SqlValue[] parameters,
+        QueryContext innerContext,
+        long? maximumRows,
+        SourceRow? outerRow)
+    {
+        SourceData Emit(IReadOnlyList<SourceRow> kept)
+            => new(left.Columns, kept, left.Collations, left.ColumnDefinitions, left.OmittedVirtualTablePredicates);
+
+        if (left.Rows.Count == 0)
+            return Emit([]);
+
+        var named = (NamedTableSource)source.Right;
+        var table = access.Table;
+        var innerOutputColumns = GetOutputColumns(named, innerContext);
+        var keys = new List<(Expression Column, TransientEqualityLookup Lookup)>(access.HashKeys.Count);
+        foreach (var key in access.HashKeys)
+        {
+            var columnOnLeft = key.Conjunct is BinaryExpression binary
+                && ReferenceEquals(binary.Left, key.ColumnSide);
+            if (!TryMatchTransientEquality(
+                    key.ColumnSide,
+                    key.Value,
+                    columnOnLeft,
+                    named,
+                    table,
+                    innerOutputColumns,
+                    left.Rows[0],
+                    out var lookup))
+            {
+                throw new InvalidOperationException(
+                    "A planned hash anti-join key is not canonicalizable for the build input.");
+            }
+
+            keys.Add((key.ColumnSide, lookup));
+        }
+
+        var buckets = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        var parts = new string[keys.Count];
+        for (var position = 0; position < left.Rows.Count; position++)
+        {
+            innerContext.CheckInterrupt();
+            var buildRow = left.Rows[position];
+            if (!TryBuildHashAntiKey(keys, parts, key => EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                    Evaluate(key.Lookup.ValueExpression, parameters, buildRow, innerContext),
+                    key.Lookup.ValueConvertsTextToNumeric,
+                    key.Lookup.ValueConvertsNumericToText,
+                    key.Lookup.Collation), out var composite))
+            {
+                continue;
+            }
+
+            if (!buckets.TryGetValue(composite, out var bucket))
+            {
+                bucket = [];
+                buckets[composite] = bucket;
+            }
+
+            bucket.Add(position);
+        }
+
+        var matched = new bool[left.Rows.Count];
+        var remaining = left.Rows.Count;
+        var probeRows = GetSideSourceRows(
+            source.Right,
+            sidePredicate: null,
+            parameters,
+            innerContext,
+            outerRow,
+            sourceOrderBy: null);
+        foreach (var probeRow in probeRows.Rows)
+        {
+            innerContext.CheckInterrupt();
+            if (remaining == 0)
+                break;
+            if (!TryBuildHashAntiKey(keys, parts, key => EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                    Evaluate(key.Column, parameters, probeRow, innerContext),
+                    key.Lookup.ColumnConvertsTextToNumeric,
+                    key.Lookup.ColumnConvertsNumericToText,
+                    key.Lookup.Collation), out var composite)
+                || !buckets.TryGetValue(composite, out var bucket))
+            {
+                continue;
+            }
+
+            foreach (var position in bucket)
+            {
+                if (matched[position])
+                    continue;
+                if (!IsTrue(Evaluate(
+                        source.Condition!,
+                        parameters,
+                        probeRow with { Parent = left.Rows[position] },
+                        innerContext)))
+                {
+                    continue;
+                }
+
+                matched[position] = true;
+                remaining--;
+            }
+        }
+
+        var kept = new List<SourceRow>(remaining);
+        for (var position = 0; position < left.Rows.Count; position++)
+        {
+            if (matched[position])
+                continue;
+            kept.Add(left.Rows[position]);
+            if (maximumRows is not null && kept.Count >= maximumRows.Value)
+                break;
+        }
+
+        return Emit(kept);
+
+        static bool TryBuildHashAntiKey(
+            List<(Expression Column, TransientEqualityLookup Lookup)> keys,
+            string[] parts,
+            Func<(Expression Column, TransientEqualityLookup Lookup), string?> canonicalize,
+            out string composite)
+        {
+            for (var index = 0; index < keys.Count; index++)
+            {
+                if (canonicalize(keys[index]) is not { } part)
+                {
+                    composite = string.Empty;
+                    return false;
+                }
+
+                parts[index] = part;
+            }
+
+            composite = parts.Length == 1
+                ? parts[0]
+                : string.Concat(parts.Select(static part => part.Length.ToString(CultureInfo.InvariantCulture) + ":" + part));
+            return true;
+        }
     }
 
     private static IReadOnlyList<EmbeddedColumn?>? CombineColumnDefinitions(

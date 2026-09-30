@@ -462,6 +462,15 @@ public sealed partial class EmbeddedDatabase
             return true;
         }
 
+        // Semi/anti joins whose inner access the ported cost model planned: describe exactly the
+        // access GetSemiOrAntiJoinRows runs (EmbeddedDatabase.SemiAntiJoinAccess.cs).
+        if (TryDescribePlannedSemiAntiJoins(rewritten, context, out var plannedRows, out var plannedOps))
+        {
+            result = new ExecutionResult(ExplainQueryPlanColumns(), plannedRows, 0);
+            ops = plannedOps;
+            return true;
+        }
+
         // EXISTS/NOT EXISTS unnested into an internal semi/anti join (unnest.rs's
         // try_rewrite_exists): the inner table's columns are never visible past a semi/anti join
         // (JoinKind.ProducesLeftShapeOnly), so it is used only for the correlation test itself.
@@ -723,6 +732,131 @@ public sealed partial class EmbeddedDatabase
         => expression is ColumnExpression { BooleanKeyword: null } column
             && column.Qualifier is not null
             && string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Describes a chain of semi/anti joins over one outer base table when every inner access
+    /// was planned by <see cref="PlanSemiOrAntiInnerAccess"/>. The outer read, the inner
+    /// accesses and their order are the ones <c>GetSemiOrAntiJoinRows</c> executes: the outer
+    /// table first (its pushed WHERE may select an index), then each inner search, except that
+    /// a hash anti join reports its probe as <c>HASH JOIN</c> ahead of the build scan, the way
+    /// Turso's EQP lists a hash join.
+    /// </summary>
+    private bool TryDescribePlannedSemiAntiJoins(
+        SelectStatement rewritten,
+        QueryContext context,
+        out List<SqlValue[]> rows,
+        out List<EqpJsonOp?> ops)
+    {
+        rows = [];
+        ops = [];
+        if (rewritten.Source is not JoinTableSource { Kind: JoinKind.Semi or JoinKind.Anti } top)
+            return false;
+
+        var chain = new List<JoinTableSource>();
+        TableSource current = top;
+        while (current is JoinTableSource { Kind: JoinKind.Semi or JoinKind.Anti } link)
+        {
+            chain.Add(link);
+            current = link.Left;
+        }
+
+        if (current is not NamedTableSource outer || !IsPlainEqpBaseTable(outer, context))
+            return false;
+        chain.Reverse();
+
+        var leftPredicate = rewritten.Where is null
+            ? null
+            : SplitJoinSidePredicates(rewritten.Where, top, context, IsPushableMethodFunction).Left;
+        var accesses = new List<SemiAntiInnerAccess>(chain.Count);
+        foreach (var join in chain)
+        {
+            if (PlanSemiOrAntiInnerAccess(join, leftPredicate, context) is not { } access)
+                return false;
+            accesses.Add(access);
+        }
+
+        var outerSelect = new SelectStatement(
+            Distinct: false,
+            Projections: [],
+            Source: outer,
+            Where: leftPredicate,
+            GroupBy: [],
+            Having: null,
+            NamedWindows: [],
+            OrderBy: [],
+            Limit: null,
+            Offset: null);
+        var outerPlan = leftPredicate is null ? null : TryPlanManagedIndexScan(outerSelect, context);
+        var outerDetail = outerPlan is null
+            ? $"SCAN {outer.Name}" + (outer.Alias is null ? string.Empty : $" AS {outer.Alias}")
+            : FormatManagedIndexExplainDetail(outerPlan, outerSelect);
+        var outerOp = outerPlan is null
+            ? (EqpJsonOp)new EqpJsonScanOp(outer.Name, outer.Alias, IndexName: null, Covering: false)
+            : BuildIndexScanOp(outerPlan, outerSelect);
+
+        var planRows = new List<SqlValue[]>();
+        var planOps = new List<EqpJsonOp?>();
+        void Add(string detail, EqpJsonOp op)
+        {
+            planRows.Add(PlanRow(planRows.Count + 1, 0, detail));
+            planOps.Add(op);
+        }
+
+        var startIndex = 0;
+        if (accesses[0].Kind == SemiAntiInnerAccessKind.HashAnti)
+        {
+            var probe = accesses[0].Inner;
+            Add(
+                $"HASH JOIN {probe.Name}" + (probe.Alias is null ? string.Empty : $" AS {probe.Alias}"),
+                new EqpJsonHashJoinOp(probe.Name, probe.Alias, "anti"));
+            startIndex = 1;
+        }
+
+        Add(outerDetail, outerOp);
+        for (var index = startIndex; index < accesses.Count; index++)
+        {
+            var access = accesses[index];
+            var inner = access.Inner;
+            var alias = inner.Alias ?? inner.Name;
+            var joinMarker = chain[index].Kind == JoinKind.Semi ? "semi" : "anti";
+            var constraints = access.ConstraintTexts;
+            switch (access.Kind)
+            {
+                case SemiAntiInnerAccessKind.DeclaredIndexSearch:
+                    Add(
+                        $"SEARCH {alias} USING {(access.Covering ? "COVERING " : string.Empty)}INDEX {access.Index!.Name} ({string.Join(" AND ", constraints)})",
+                        new EqpJsonSearchOp(inner.Name, inner.Alias, access.Index.Name, access.Covering, constraints, Join: joinMarker));
+                    break;
+                case SemiAntiInnerAccessKind.DeclaredIndexScan:
+                    Add(
+                        $"SCAN {inner.Name}" + (inner.Alias is null ? string.Empty : $" AS {inner.Alias}")
+                            + $" USING {(access.Covering ? "COVERING " : string.Empty)}INDEX {access.Index!.Name}",
+                        new EqpJsonScanOp(inner.Name, inner.Alias, access.Index.Name, access.Covering, joinMarker));
+                    break;
+                case SemiAntiInnerAccessKind.EphemeralIndex:
+                    {
+                        var indexName = $"ephemeral_{inner.Name}_t{index * 2 + 3}";
+                        Add(
+                            $"SEARCH {alias} USING COVERING INDEX {indexName} ({string.Join(" AND ", constraints)})",
+                            new EqpJsonSearchOp(inner.Name, inner.Alias, indexName, Covering: true, constraints, Join: joinMarker, Ephemeral: true));
+                        break;
+                    }
+
+                case SemiAntiInnerAccessKind.TableScan:
+                    Add(
+                        $"SCAN {inner.Name}" + (inner.Alias is null ? string.Empty : $" AS {inner.Alias}"),
+                        new EqpJsonScanOp(inner.Name, inner.Alias, IndexName: null, Covering: false, joinMarker));
+                    break;
+                default:
+                    // Only the first join of a chain can hash its (plain base table) outer input.
+                    return false;
+            }
+        }
+
+        rows = planRows;
+        ops = planOps;
+        return true;
+    }
 
     private static bool TryDescribeSemiAntiJoinChain(
         TableSource? source,
