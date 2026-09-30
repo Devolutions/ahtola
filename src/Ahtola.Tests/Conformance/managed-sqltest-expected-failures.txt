@@ -193,7 +193,6 @@ multi_index_or_compound.sqltest::implied-or-filter-keeps-compound-index-searches
 multi_index_or_compound.sqltest::implied-or-filter-uses-only-indexed-column | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN b' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 multi_index_or_compound.sqltest::nested-and-branches-use-one-index-search | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH t USING INDEX tx (x=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
 multi_index_or_compound.sqltest::nested-or-branches-use-one-index-search | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH t USING COVERING INDEX tx (x=?)' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
-sql-error-message-prefix.sqltest::database-full-error-has-no-prefix | database variant 1/1 (:memory:): expected an error but the statement succeeded
 turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
 turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
 turso/alter_column.sqltest::alter-column-rewrites-expression-index-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'
