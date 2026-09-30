@@ -31056,6 +31056,13 @@ out bool hasReturning)
             var leading = index.Columns[0];
             var searchConstraint = GetIndexSearchConstraint(statement.Where, table, leading);
             var search = WhereUsesIndexTerm(statement.Where, table, leading);
+            if (!search && WhereAllowsIndexInSearch(statement.Where, source, table, leading))
+            {
+                // An IN-list (explicit or implied by an OR, see EmbeddedDatabase.OrTermInference.cs)
+                // searches the leading key once per value; Turso reports that as an equality.
+                search = true;
+                searchConstraint = $"{leading.Name}=?";
+            }
             var ordered = TryGetIndexOrderDirection(statement.OrderBy, table, index, out var reverse);
             var scansOnlyPartialPredicate = index.IsPartial
                 && statement.OrderBy.Count == 0
@@ -31699,6 +31706,14 @@ out bool hasReturning)
                 return ExpressionCoveredByIndex(collation.Expression, table, covered);
             case FunctionExpression function:
                 return function.Arguments.All(arg => ExpressionCoveredByIndex(arg, table, covered));
+            case InExpression inList:
+                // An IN list only reads its left operand and constant values.
+                return ExpressionCoveredByIndex(inList.Value, table, covered)
+                    && inList.Values.All(value => ExpressionCoveredByIndex(value, table, covered));
+            case BetweenExpression between:
+                return ExpressionCoveredByIndex(between.Value, table, covered)
+                    && ExpressionCoveredByIndex(between.Lower, table, covered)
+                    && ExpressionCoveredByIndex(between.Upper, table, covered);
             default:
                 // Subqueries, CASE, etc. are not covering-index safe without deeper analysis.
                 return false;
@@ -32310,9 +32325,12 @@ out bool hasReturning)
             planned.Add(new ManagedOrIndexUnionBranch(index, index.Name, branch));
         }
 
-        // Require at least one distinct index name so this is a real multi-index OR,
-        // not a single-index multi-equality that should use a plain index scan.
-        if (planned.Select(static item => item.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() < 2)
+        // Turso's OR-by-union (multi_index.rs consider_multi_index_union) replans every
+        // disjunct with the ordinary compound-seek analysis, so several branches may search
+        // the same index (MULTI-INDEX OR t (txy, txy)). A single-column OR of literals never
+        // reaches this point: its implied IN filter (EmbeddedDatabase.OrTermInference.cs)
+        // already chose an IN-list index search. Rowid-only unions are not modelled here.
+        if (planned.All(static item => item.Index is null))
             return null;
 
         return new ManagedOrIndexUnionPlan(source, table, planned);
@@ -32323,8 +32341,17 @@ out bool hasReturning)
         NamedTableSource source,
         Expression branch)
     {
-        if (!table.HasRowid
-            || branch is not BinaryExpression
+        if (!table.HasRowid)
+            return false;
+
+        // A compound branch uses the rowid when one of its conjuncts is a rowid equality.
+        if (branch is BinaryExpression { Operator: BinaryOperator.And } conjunction)
+        {
+            return IsRowidPrimaryKeyEquality(table, source, conjunction.Left)
+                || IsRowidPrimaryKeyEquality(table, source, conjunction.Right);
+        }
+
+        if (branch is not BinaryExpression
             {
                 Operator: BinaryOperator.Equal or BinaryOperator.Is,
             } equality)
@@ -32361,10 +32388,12 @@ out bool hasReturning)
     {
         branches = [];
         CollectTopLevelOrLeaves(expression, branches);
+        // Each disjunct is an equality, or a conjunction the per-branch compound-seek analysis
+        // plans (multi_index.rs:1005-1075); its remaining conjuncts filter that branch's rows.
         return branches.Count >= 2
-            && branches.All(branch => branch is BinaryExpression
+            && branches.All(static branch => branch is BinaryExpression
             {
-                Operator: BinaryOperator.Equal or BinaryOperator.Is
+                Operator: BinaryOperator.Equal or BinaryOperator.Is or BinaryOperator.And
             });
     }
 
@@ -32388,7 +32417,7 @@ out bool hasReturning)
     {
         index = null!;
         if (branch is not BinaryExpression binary
-            || binary.Operator is not (BinaryOperator.Equal or BinaryOperator.Is))
+            || binary.Operator is not (BinaryOperator.Equal or BinaryOperator.Is or BinaryOperator.And))
         {
             return false;
         }

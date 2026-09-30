@@ -790,8 +790,29 @@ public sealed partial class EmbeddedDatabase
         var outerDetail = outerPlan is null
             ? $"SCAN {outer.Name}" + (outer.Alias is null ? string.Empty : $" AS {outer.Alias}")
             : FormatManagedIndexExplainDetail(outerPlan, outerSelect);
+        // Estimates are reported only when the outer read is the full scan the ported cost
+        // model priced; an index-planned outer read is chosen by the managed heuristic planner.
+        EqpJsonEstimate? outerEstimate = null;
+        var outerRows = 0.0;
+        var runningCost = 0.0;
+        if (outerPlan is null)
+        {
+            (outerRows, runningCost) = EstimateSemiAntiOuterScan(outer, leftPredicate, context);
+            outerEstimate = new EqpJsonEstimate(1, outerRows, outerRows, runningCost, runningCost);
+        }
+
+        EqpJsonEstimate? NextEstimate(SemiAntiInnerAccess access)
+        {
+            if (outerEstimate is null)
+                return null;
+            runningCost += access.Cost;
+            // A semi/anti join keeps or drops each outer row, so its output is its input
+            // (rows_after_join, join.rs:166-172).
+            return new EqpJsonEstimate(outerRows, 1, outerRows, access.Cost, runningCost);
+        }
+
         var outerOp = outerPlan is null
-            ? (EqpJsonOp)new EqpJsonScanOp(outer.Name, outer.Alias, IndexName: null, Covering: false)
+            ? (EqpJsonOp)new EqpJsonScanOp(outer.Name, outer.Alias, IndexName: null, Covering: false, Estimate: outerEstimate)
             : BuildIndexScanOp(outerPlan, outerSelect);
 
         var planRows = new List<SqlValue[]>();
@@ -805,14 +826,18 @@ public sealed partial class EmbeddedDatabase
         var startIndex = 0;
         if (accesses[0].Kind == SemiAntiInnerAccessKind.HashAnti)
         {
+            // The build (outer) read is the first loop of the plan; the probe line comes first
+            // in the listing, as Turso prints a hash join.
             var probe = accesses[0].Inner;
+            var hashEstimate = NextEstimate(accesses[0]);
             Add(
                 $"HASH JOIN {probe.Name}" + (probe.Alias is null ? string.Empty : $" AS {probe.Alias}"),
-                new EqpJsonHashJoinOp(probe.Name, probe.Alias, "anti"));
+                new EqpJsonHashJoinOp(probe.Name, probe.Alias, "anti", hashEstimate));
             startIndex = 1;
         }
 
-        Add(outerDetail, outerOp);
+        planRows.Insert(startIndex == 1 ? 1 : 0, PlanRow(0, 0, outerDetail));
+        planOps.Insert(startIndex == 1 ? 1 : 0, outerOp);
         for (var index = startIndex; index < accesses.Count; index++)
         {
             var access = accesses[index];
@@ -825,27 +850,27 @@ public sealed partial class EmbeddedDatabase
                 case SemiAntiInnerAccessKind.DeclaredIndexSearch:
                     Add(
                         $"SEARCH {alias} USING {(access.Covering ? "COVERING " : string.Empty)}INDEX {access.Index!.Name} ({string.Join(" AND ", constraints)})",
-                        new EqpJsonSearchOp(inner.Name, inner.Alias, access.Index.Name, access.Covering, constraints, Join: joinMarker));
+                        new EqpJsonSearchOp(inner.Name, inner.Alias, access.Index.Name, access.Covering, constraints, Join: joinMarker, Estimate: NextEstimate(access)));
                     break;
                 case SemiAntiInnerAccessKind.DeclaredIndexScan:
                     Add(
                         $"SCAN {inner.Name}" + (inner.Alias is null ? string.Empty : $" AS {inner.Alias}")
                             + $" USING {(access.Covering ? "COVERING " : string.Empty)}INDEX {access.Index!.Name}",
-                        new EqpJsonScanOp(inner.Name, inner.Alias, access.Index.Name, access.Covering, joinMarker));
+                        new EqpJsonScanOp(inner.Name, inner.Alias, access.Index.Name, access.Covering, joinMarker, Estimate: NextEstimate(access)));
                     break;
                 case SemiAntiInnerAccessKind.EphemeralIndex:
                     {
                         var indexName = $"ephemeral_{inner.Name}_t{index * 2 + 3}";
                         Add(
                             $"SEARCH {alias} USING COVERING INDEX {indexName} ({string.Join(" AND ", constraints)})",
-                            new EqpJsonSearchOp(inner.Name, inner.Alias, indexName, Covering: true, constraints, Join: joinMarker, Ephemeral: true));
+                            new EqpJsonSearchOp(inner.Name, inner.Alias, indexName, Covering: true, constraints, Join: joinMarker, Ephemeral: true, Estimate: NextEstimate(access)));
                         break;
                     }
 
                 case SemiAntiInnerAccessKind.TableScan:
                     Add(
                         $"SCAN {inner.Name}" + (inner.Alias is null ? string.Empty : $" AS {inner.Alias}"),
-                        new EqpJsonScanOp(inner.Name, inner.Alias, IndexName: null, Covering: false, joinMarker));
+                        new EqpJsonScanOp(inner.Name, inner.Alias, IndexName: null, Covering: false, joinMarker, Estimate: NextEstimate(access)));
                     break;
                 default:
                     // Only the first join of a chain can hash its (plain base table) outer input.
@@ -853,7 +878,10 @@ public sealed partial class EmbeddedDatabase
             }
         }
 
-        rows = planRows;
+        // Node ids follow the listing order.
+        rows = planRows
+            .Select((row, position) => PlanRow(position + 1, 0, row[3].AsText()))
+            .ToList();
         ops = planOps;
         return true;
     }
@@ -1099,7 +1127,8 @@ internal sealed record EqpJsonSearchOp(
     string? Join = null,
     bool Ephemeral = false,
     string SearchKind = "seek",
-    bool IsIntegerPrimaryKey = false) : EqpJsonOp
+    bool IsIntegerPrimaryKey = false,
+    EqpJsonEstimate? Estimate = null) : EqpJsonOp
 {
     public override string ToJson()
     {
@@ -1116,6 +1145,7 @@ internal sealed record EqpJsonSearchOp(
         json.Append(",\"constraints\":[")
             .Append(string.Join(",", Constraints.Select(static c => EmbeddedDatabase.JsonEscape(c))))
             .Append(']');
+        Estimate?.AppendTo(json);
         return json.Append('}').ToString();
     }
 }
@@ -1125,7 +1155,8 @@ internal sealed record EqpJsonMultiIndexOp(
     string Table,
     IReadOnlyList<string> Indexes,
     bool Union = true,
-    string? Alias = null) : EqpJsonOp
+    string? Alias = null,
+    EqpJsonEstimate? Estimate = null) : EqpJsonOp
 {
     public override string ToJson()
     {
@@ -1136,6 +1167,7 @@ internal sealed record EqpJsonMultiIndexOp(
             .Append("\",\"indexes\":[")
             .Append(string.Join(",", Indexes.Select(static name => EmbeddedDatabase.JsonEscape(name))))
             .Append(']');
+        Estimate?.AppendTo(json);
         return json.Append('}').ToString();
     }
 }
@@ -1144,12 +1176,13 @@ internal sealed record EqpJsonMultiIndexOp(
 /// Mirrors <c>EqpDetail::HashJoin</c>: the build side of a hash join reads the whole table once
 /// before any probe.
 /// </summary>
-internal sealed record EqpJsonHashJoinOp(string Table, string? Alias, string? Join = null) : EqpJsonOp
+internal sealed record EqpJsonHashJoinOp(string Table, string? Alias, string? Join = null, EqpJsonEstimate? Estimate = null) : EqpJsonOp
 {
     public override string ToJson()
     {
         var json = new System.Text.StringBuilder("{\"type\":\"hash_join\",");
         AppendTableFields(json, Table, Alias, Join);
+        Estimate?.AppendTo(json);
         return json.Append('}').ToString();
     }
 }

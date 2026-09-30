@@ -162,7 +162,9 @@ public sealed partial class EmbeddedDatabase
         for (var index = 0; index < conjuncts.Count; index++)
         {
             var conjunct = conjuncts[index];
-            steps[index] = CountTursoWhereSteps(conjunct);
+            // WhereTermInfo.extra_steps (join.rs:2338-2345): the row cost already includes one
+            // simple condition, so a lone comparison adds no WHERE work.
+            steps[index] = CountTursoWhereSteps(conjunct) - 1;
             if (!ForEachColumnReference(conjunct, column =>
                 {
                     if (!IsInnerColumnReference(column, innerQualifier, innerColumns))
@@ -351,10 +353,39 @@ public sealed partial class EmbeddedDatabase
         {
             var hashWithWhere = hash.Cost + EstimateSemiAntiWhereWork(hash, steps, inputRows);
             if (hashWithWhere < bestWithWhere)
+            {
                 best = hash;
+                bestWithWhere = hashWithWhere;
+            }
         }
 
-        return best;
+        // add_where_cost folds the loop's WHERE work into the access method's own cost, which
+        // is what Turso reports as the node's access_cost.
+        return best with { Cost = bestWithWhere };
+    }
+
+    /// <summary>
+    /// The estimate of the first loop of a semi/anti chain: a full scan of the outer table
+    /// (estimate_scan_cost plus the WHERE work of its own filters, access_method.rs:687-707),
+    /// producing its row count reduced by those filters' selectivities (rows_after_join).
+    /// </summary>
+    private (double Rows, double Cost) EstimateSemiAntiOuterScan(
+        NamedTableSource outer,
+        Expression? predicate,
+        QueryContext context)
+    {
+        var table = context.Tables[outer.Name];
+        var baseRows = EstimateTursoTableRows(outer.Name, context);
+        var extraSteps = 0;
+        if (predicate is not null)
+        {
+            foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(predicate))
+                extraSteps += CountTursoWhereSteps(conjunct) - 1;
+        }
+
+        var cost = TursoCostModel.EstimateScanCost(baseRows, 1.0)
+            + TursoCostModel.EstimateWhereWork(1.0, baseRows, consumedSteps: 0, extraSteps);
+        return (baseRows * EstimateTursoLocalSelectivity(predicate, outer, table, context), cost);
     }
 
     /// <summary>
