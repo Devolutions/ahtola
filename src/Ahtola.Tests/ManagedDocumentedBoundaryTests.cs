@@ -45,6 +45,10 @@ public sealed class ManagedDocumentedBoundaryTests
     [Test]
     [TestCase("PRAGMA auto_vacuum")]
     [TestCase("PRAGMA auto_vacuum=NONE")]
+    [TestCase("PRAGMA auto_vacuum='none'")]
+    [TestCase("PRAGMA auto_vacuum=0")]
+    [TestCase("PRAGMA auto_vacuum=00")]
+    [TestCase("PRAGMA auto_vacuum=0x0")]
     [TestCase("PRAGMA incremental_vacuum")]
     [TestCase("PRAGMA incremental_vacuum(10)")]
     public void AutoVacuumFamilyIsAcceptedNoOp(string sql)
@@ -66,6 +70,8 @@ public sealed class ManagedDocumentedBoundaryTests
     [TestCase("PRAGMA auto_vacuum=INCREMENTAL")]
     [TestCase("PRAGMA auto_vacuum=1")]
     [TestCase("PRAGMA auto_vacuum=2")]
+    [TestCase("PRAGMA auto_vacuum=3")]
+    [TestCase("PRAGMA auto_vacuum=bogus")]
     public void AutoVacuumNonNoneModeFailsClosedWithoutExperimentalFlag(string sql)
     {
         using var connection = Open();

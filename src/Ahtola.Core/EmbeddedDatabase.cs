@@ -4075,6 +4075,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException("database or disk is full");
     }
 
+    /// <summary>SQLite's auto-vacuum mode from page 1: 0 NONE, 1 FULL, 2 INCREMENTAL.</summary>
+    internal int GetAutoVacuumMode()
+    {
+        lock (_gate)
+            return _fileStore?.AutoVacuumMode ?? 0;
+    }
+
     internal uint GetFreelistCount()
     {
         lock (_gate)
@@ -9069,6 +9076,77 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// Decides whether an <c>ALTER COLUMN</c> is legal and computes the rows the program rewrites, the
     /// dependent definitions its <c>ParseSchema</c> adopts, and the AUTOINCREMENT state it retires.
     /// </summary>
+    /// <summary>
+    /// Turso's <c>validate_indexes_can_be_rewritten</c> MVCC arm (translate/alter.rs): an ALTER
+    /// COLUMN whose rewrite changes a stored value (becoming generated, toggling VIRTUAL, or an
+    /// affinity change) or may change a VIRTUAL generated value must rebuild every index that
+    /// observes the column or a generated column derived from it, which MVCC mode does not
+    /// support.
+    /// </summary>
+    private void ThrowIfMvccAlterColumnRebuildsIndexes(
+        string columnName,
+        EmbeddedTable original,
+        EmbeddedTable replacement,
+        int columnIndex)
+    {
+        if (!IsMvccEnabled || original.Indexes.Count == 0)
+            return;
+
+        var oldColumn = original.ColumnDefinitions[columnIndex];
+        var newColumn = replacement.ColumnDefinitions[columnIndex];
+        var oldVirtual = oldColumn.IsGenerated && !oldColumn.GeneratedStored;
+        var newVirtual = newColumn.IsGenerated && !newColumn.GeneratedStored;
+        var rewritesPhysicalLayout = (!oldColumn.IsGenerated && newColumn.IsGenerated)
+            || oldVirtual != newVirtual
+            || original.GetColumnAffinity(oldColumn) != replacement.GetColumnAffinity(newColumn);
+        if (!rewritesPhysicalLayout && !oldVirtual && !newVirtual)
+            return;
+
+        var affected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectColumnsAffectedByUpdate(original, columnIndex, affected);
+        CollectColumnsAffectedByUpdate(replacement, columnIndex, affected);
+        if (!original.Indexes.Any(index => IndexObservesAnyColumn(index, affected)))
+            return;
+
+        throw new EmbeddedSqlException(
+            $"cannot ALTER COLUMN \"{columnName}\": rebuilding affected indexes is not supported in MVCC mode");
+
+        static void CollectColumnsAffectedByUpdate(EmbeddedTable table, int columnIndex, HashSet<string> names)
+        {
+            names.Add(table.Columns[columnIndex]);
+            for (var changed = true; changed;)
+            {
+                changed = false;
+                foreach (var column in table.ColumnDefinitions)
+                {
+                    if (column.GenerationExpression is not { } expression || names.Contains(column.Name))
+                        continue;
+
+                    var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    EmbeddedTable.CollectColumnReferences(expression, references);
+                    if (references.Overlaps(names))
+                        changed |= names.Add(column.Name);
+                }
+            }
+        }
+
+        static bool IndexObservesAnyColumn(EmbeddedIndex index, HashSet<string> names)
+        {
+            var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var column in index.Columns)
+            {
+                if (column.Expression is { } expression)
+                    EmbeddedTable.CollectColumnReferences(expression, references);
+                else
+                    references.Add(column.Name);
+            }
+
+            if (index.Where is { } where)
+                EmbeddedTable.CollectColumnReferences(where, references);
+            return references.Overlaps(names);
+        }
+    }
+
     private (string CurrentName, int ColumnIndex, CompiledAlterTablePlan Plan) PlanAlterTableAlterColumn(
         AlterTableAlterColumnStatement statement,
         SchemaCatalog catalog,
@@ -9095,6 +9173,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             statement.ColumnName,
             statement.Column,
             context.CancellationToken);
+        ThrowIfMvccAlterColumnRebuildsIndexes(statement.ColumnName, table, replacement, columnIndex);
         var candidateTables = new Dictionary<string, EmbeddedTable>(
             catalog.Tables,
             StringComparer.OrdinalIgnoreCase)
@@ -65269,22 +65348,46 @@ Func<string, ParsedStatement> rewrite)
     {
         ValidatePragmaSchema(statement.Schema);
         if (statement.Value is null)
-            return new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(0)]], 0);
+        {
+            // Turso reports the mode the pager read from page 1 (largest-root-page and
+            // incremental-vacuum header fields), so an auto-vacuum database SQLite created
+            // reports FULL (1) or INCREMENTAL (2) even though this engine never enables it.
+            var database = ResolvePragmaDatabase(statement.Schema);
+            return new ExecutionResult(["auto_vacuum"], [[SqlValue.Integer(database.GetAutoVacuumMode())]], 0);
+        }
 
-        // Auto-vacuum is always off: Ahtola has no `--experimental-autovacuum` flag/engine
-        // support to turn it on. SQLite spells the mode either by name or by number (0/NONE,
-        // 1/FULL, 2/INCREMENTAL); requesting NONE only restates the state the database is
-        // already in, so it is always accepted, while requesting FULL/INCREMENTAL (or any
-        // unrecognized value) fails the same way it would if the flag existed but was unset.
-        var isNone = string.Equals(statement.Value, "none", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(statement.Value, "0", StringComparison.Ordinal);
-        if (!isNone)
+        // Turso v0.8.1 translate/pragma.rs without the experimental autovacuum feature, which
+        // Ahtola does not have: SQLite spells the mode by name or by number (0/NONE, 1/FULL,
+        // 2/INCREMENTAL) and treats both the same; NONE only restates the state the database
+        // is already in, so it is accepted (and, like SQLite once page 1 exists, has no effect),
+        // while FULL, INCREMENTAL and any unrecognized value fail with the flag diagnostic.
+        if (ParseAutoVacuumMode(statement.Value) != 0)
         {
             throw new EmbeddedSqlException(
                 "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.");
         }
 
         return ExecutionResult.Empty;
+    }
+
+    /// <summary>
+    /// Upstream's <c>requested_mode</c>: a mode name (any case), or a numeric literal whose value
+    /// is 0, 1 or 2 (so <c>00</c> and <c>0x0</c> are NONE). Anything else is <see langword="null"/>.
+    /// </summary>
+    private static int? ParseAutoVacuumMode(string value)
+    {
+        if (value.Equals("none", StringComparison.OrdinalIgnoreCase))
+            return 0;
+        if (value.Equals("full", StringComparison.OrdinalIgnoreCase))
+            return 1;
+        if (value.Equals("incremental", StringComparison.OrdinalIgnoreCase))
+            return 2;
+
+        long number;
+        var parsed = value.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+            ? long.TryParse(value.AsSpan(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out number)
+            : long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out number);
+        return parsed && number is >= 0 and <= 2 ? (int)number : null;
     }
 
     private ExecutionResult ExecutePragmaDataSyncRetry(PragmaDataSyncRetryStatement statement)

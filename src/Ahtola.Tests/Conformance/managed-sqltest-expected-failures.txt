@@ -232,8 +232,8 @@ scalar-functions.sqltest::min-float-equals-int | database variant 1/2 (:default:
 scalar-functions.sqltest::min-int-equals-float | database variant 1/2 (:default:): expected 1 row(s), got 1 row(s); row 0 expected '1.0' but was '1'
 simple-count-optimization.sqltest::simple-count-unusable-partial-index-column-correctness | database variant 1/1 (:memory:): expected success but got error: no query solution
 sql-error-message-prefix.sqltest::database-full-error-has-no-prefix | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded
-turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | database variant 1/1 (:memory:): expected an error but the statement succeeded
+turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
+turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
 turso/alter_column.sqltest::alter-column-rewrites-expression-index-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'
 turso/alter_column.sqltest::alter-column-rewrites-generated-index-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'
 turso/alter_column.sqltest::alter-column-rewrites-indexed-affinity-change | database variant 1/1 (:memory:): expected 5 row(s), got 5 row(s); row 0 expected 'wal' but was 'memory'

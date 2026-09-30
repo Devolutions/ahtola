@@ -456,6 +456,8 @@ public sealed class NativeSqliteChurnInteropTests
             // documented part of the format SQLite accepts.
             ScalarString(managed, "PRAGMA quick_check;").Should().Be("ok",
                 "the managed reader must accept the auto-vacuum database");
+            ScalarLong(managed, "PRAGMA auto_vacuum;").Should().Be(1,
+                "like Turso, the mode is read from page 1 rather than assumed to be NONE");
             var diagnostics = "native churn interop (auto-vacuum)";
             TypedSqliteOracle.AssertEquivalent(
                 managed,

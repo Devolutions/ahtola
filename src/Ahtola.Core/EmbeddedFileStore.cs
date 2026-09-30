@@ -336,6 +336,14 @@ internal sealed class EmbeddedFileStore : IDisposable
     private uint GetCommittedPageCountForLoad(object? pinnedTransaction = null)
         => _pager.CommittedPageCount;
 
+    /// <summary>
+    /// The auto-vacuum mode page 1 declares, as Turso's pager derives it at open: a nonzero
+    /// largest-root-page field means auto-vacuum, and the incremental-vacuum field picks
+    /// INCREMENTAL (2) over FULL (1).
+    /// </summary>
+    internal int AutoVacuumMode
+        => _header.LargestRootBtreePage == 0 ? 0 : _header.IncrementalVacuumEnabled != 0 ? 2 : 1;
+
     private SqliteOverflowChainReader CreateOverflowReaderForLoad(object? pinnedTransaction = null)
         => new(_pager, _header);
 
