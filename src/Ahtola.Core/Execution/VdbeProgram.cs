@@ -2023,6 +2023,19 @@ public sealed class VdbeJoinEquiProbe
     public Func<VdbeJoinRow, string?> BuildLeftKey { get; }
 
     public Func<VdbeJoinRow, string?> BuildRightKey { get; }
+
+    /// <summary>
+    /// The right-side column names of the hash key, in key order, when every key is a plain
+    /// column of the right input (EXPLAIN QUERY PLAN names them as the automatic index's
+    /// constraints); <see langword="null"/> when any key is an expression.
+    /// </summary>
+    internal IReadOnlyList<string>? RightKeyColumns { get; init; }
+
+    /// <summary>
+    /// True when the only hash key is the right table's INTEGER PRIMARY KEY, so hashing the
+    /// right input is a rowid-keyed point lookup.
+    /// </summary>
+    internal bool RightKeyIsRowid { get; init; }
 }
 
 /// <summary>An INNER, LEFT, RIGHT, FULL, SEMI, or ANTI node in a materializing join plan.</summary>
@@ -2046,8 +2059,11 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
     {
         if (!Enum.IsDefined(kind))
             throw new ArgumentOutOfRangeException(nameof(kind));
-        if (!hashBuildRight && kind is not VdbeJoinKind.Inner)
-            throw new ArgumentException("Hash-build-left is only valid for INNER joins.", nameof(hashBuildRight));
+        // Hash-build-left hashes the left input and streams the right as the probe. For a LEFT or
+        // FULL join the build is the preserved side, whose unmatched rows VdbeHashJoinRuntime
+        // emits after the probe scan (Turso HashJoinType::LeftOuter / FullOuter).
+        if (!hashBuildRight && kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Left or VdbeJoinKind.Full))
+            throw new ArgumentException("Hash-build-left is only valid for INNER, LEFT, or FULL joins.", nameof(hashBuildRight));
         if (!hashBuildRight && equiProbe is null)
             throw new ArgumentException("Hash-build-left requires an equijoin probe.", nameof(hashBuildRight));
 

@@ -48,7 +48,7 @@ public sealed class WithoutRowidIndexSeekJoinTests
 
         using var reopened = EmbeddedDatabase.OpenFile("without-rowid-pk-join.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH entry USING COVERING INDEX sqlite_autoindex_entry_1 (code=?)");
 
         reopened.ResetJoinOrderDiagnostics();
@@ -95,7 +95,7 @@ public sealed class WithoutRowidIndexSeekJoinTests
 
         using var reopened = EmbeddedDatabase.OpenFile("without-rowid-secondary-join.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH entry USING COVERING INDEX entry_tag (tag=?)");
 
         reopened.ResetJoinOrderDiagnostics();
@@ -143,7 +143,7 @@ public sealed class WithoutRowidIndexSeekJoinTests
 
         using var reopened = EmbeddedDatabase.OpenFile("without-rowid-noncovering-join.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH entry USING INDEX entry_tag (tag=?)");
 
         reopened.ResetJoinOrderDiagnostics();
@@ -191,7 +191,7 @@ public sealed class WithoutRowidIndexSeekJoinTests
 
         using var reopened = EmbeddedDatabase.OpenFile("without-rowid-composite-pk-join.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH entry USING COVERING INDEX sqlite_autoindex_entry_1 (part=?)");
 
         reopened.ResetJoinOrderDiagnostics();
@@ -240,7 +240,7 @@ public sealed class WithoutRowidIndexSeekJoinTests
 
         using var reopened = EmbeddedDatabase.OpenFile("without-rowid-duplicate-secondary.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH entry USING INDEX entry_tag (tag=?)");
 
         reopened.ResetJoinOrderDiagnostics();
@@ -274,8 +274,8 @@ public sealed class WithoutRowidIndexSeekJoinTests
             ON outer_items.code = entry.code AND outer_items.tag = entry.tag
             ORDER BY entry.payload;
             """;
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
-            .Should().NotContain("sqlite_autoindex_entry_1");
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Select(static row => row[3].AsText())
+            .Should().NotContain(static detail => detail.Contains("sqlite_autoindex_entry_1"));
         ReadRows(connection, sql).Select(row => row[0].AsText()).Should().Equal("p1", "p2");
     }
 
@@ -299,7 +299,7 @@ public sealed class WithoutRowidIndexSeekJoinTests
         using var connection = reopened.Connect();
         const string sql =
             "SELECT entry.payload FROM outer_items JOIN entry ON outer_items.code=entry.code;";
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Contain("sqlite_autoindex_entry_1");
         reopened.ResetJoinOrderDiagnostics();
         ReadRows(connection, sql).Single()[0].AsText().Should().Be("p2");
@@ -379,7 +379,7 @@ public sealed class WithoutRowidIndexSeekJoinTests
 
         // Baseline, no override yet: the implicit primary-key candidate is offered and used, so
         // the freely-planned query genuinely searches while the NOT INDEXED one does not.
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + defaultSql).Single()[3].AsText()
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + defaultSql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH entry USING COVERING INDEX sqlite_autoindex_entry_1 (code=?)");
         database.ResetJoinOrderDiagnostics();
         ReadRows(connection, defaultSql).Select(row => row[0].AsText()).Should().Equal("p2", "p300");

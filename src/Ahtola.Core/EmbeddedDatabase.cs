@@ -21324,6 +21324,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (outerTarget is null || innerTarget is null)
                 return false;
 
+            // This lowering builds an automatic index. When the ported cost model prefers
+            // another inner access (a declared index search, say), the evaluator runs that
+            // access instead, so EXPLAIN QUERY PLAN and execution stay the same plan.
+            if (PlanSemiOrAntiInnerAccess(join, leftPredicate: null, context) is { Kind: not SemiAntiInnerAccessKind.EphemeralIndex })
+                return false;
+
             var outerQualifier = outer.Alias ?? outer.Name;
             var innerQualifier = inner.Alias ?? inner.Name;
             var keyPairs = new List<(int Outer, int Inner)>();
@@ -22924,7 +22930,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (indexSelection is not null)
         {
-            if (kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Semi or VdbeJoinKind.Anti)
+            if (kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Left or VdbeJoinKind.Semi or VdbeJoinKind.Anti)
                 || !TryCreateCompiledJoinIndexScanPlan(
                     join,
                     indexSelection,
@@ -22960,7 +22966,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // INNER equijoin: hash-build the smaller estimated side (default still right).
         // OUTER joins keep hash-build-right so unmatched-side semantics stay correct.
         var hashBuildRight = true;
-        if (kind is VdbeJoinKind.Inner && equiProbe is not null)
+        if (kind is VdbeJoinKind.Left or VdbeJoinKind.Full
+            && equiProbe is not null
+            && hashBuildRightOverrides is not null
+            && hashBuildRightOverrides.TryGetValue(join, out var outerChoice))
+        {
+            // The cost-based stage chose to hash the preserved left input and probe the right
+            // (Turso's LeftOuter/FullOuter hash join); VdbeHashJoinRuntime emits the unmatched
+            // build rows after the probe scan.
+            hashBuildRight = outerChoice;
+        }
+        else if (kind is VdbeJoinKind.Inner && equiProbe is not null)
         {
             // A node the cost-based join-order stage synthesized carries its own build-side
             // decision, scored against the executable shapes in JoinCostModel.EstimateStepCost.
@@ -23146,9 +23162,34 @@ public sealed partial class EmbeddedDatabase : IDisposable
         // matched against the persisted index expression back in TryCreateJoinOrderTerm. Exactly
         // one of keys[position]/expressionOuterOrdinal[position] is populated per position.
         var expressionOuterOrdinal = new int?[selection.EqualityTerms.Count];
+        // Set only for a position bound by a column = literal constant of the right table:
+        // the literal, used verbatim as that key column's seek value.
+        var constantKeys = new SqlValue?[selection.EqualityTerms.Count];
         for (var position = 0; position < keys.Length; position++)
         {
             var candidateColumn = selection.Candidate.Columns[position];
+            if (candidateColumn.IndexExpression is null
+                && !selection.Candidate.Automatic
+                && TryGetConstantEqualityOperands(selection.EqualityTerms[position], out var constantColumn, out var constantValue)
+                && ResolveJoinSideColumn(constantColumn, right.OutputColumns) is { } constantRightColumn
+                && ResolveJoinSideColumn(constantColumn, left.OutputColumns) is null)
+            {
+                var constantDefinition = GetOutputColumnDefinition(join.Right, constantRightColumn, context);
+                if (constantRightColumn.Index != candidateColumn.ColumnOrdinal
+                    || constantDefinition is null
+                    || !IsVerbatimConstantSeekKey(constantDefinition, constantValue)
+                    || !string.Equals(
+                        NormalizeDeclaredCollation(constantDefinition.Collation),
+                        candidateColumn.Collation,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                constantKeys[position] = constantValue;
+                continue;
+            }
+
             if (candidateColumn.IndexExpression is { } indexExpression)
             {
                 // The enumerator only binds this candidate column to a term shaped as an equality
@@ -23274,6 +23315,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var result = new SqlValue[keys.Length];
             for (var position = 0; position < keys.Length; position++)
             {
+                if (constantKeys[position] is { } constantKey)
+                {
+                    result[position] = constantKey;
+                    continue;
+                }
+
                 if (expressionOuterOrdinal[position] is { } ordinal)
                 {
                     if (ordinal < 0 || ordinal >= outer.Values.Length)
@@ -23894,6 +23941,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var leftColumns = GetOutputColumns(join.Left, context);
         var rightColumns = GetOutputColumns(join.Right, context);
         var keys = new List<CompiledJoinHashKey>();
+        List<(int Ordinal, string Name)>? rightKeyColumns = [];
         var pending = new Stack<Expression>();
         pending.Push(join.Condition);
         while (pending.Count > 0)
@@ -23916,6 +23964,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     key.RightConvertsTextToNumeric,
                     key.RightConvertsNumericToText,
                     key.Collation));
+                rightKeyColumns?.Add((key.RightColumn.Index, key.RightColumn.Name));
                 continue;
             }
 
@@ -23955,6 +24004,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RightConvertsTextToNumeric: false,
                 RightConvertsNumericToText: false,
                 Collation: "BINARY"));
+            rightKeyColumns = null;
         }
 
         if (keys.Count == 0)
@@ -23983,7 +24033,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         return new VdbeJoinEquiProbe(
             left => BuildKey(left, leftSide: true),
-            right => BuildKey(right, leftSide: false));
+            right => BuildKey(right, leftSide: false))
+        {
+            // Turso orders a temporary index's key columns by table position.
+            RightKeyColumns = rightKeyColumns?.OrderBy(static column => column.Ordinal).Select(static column => column.Name).ToArray(),
+            RightKeyIsRowid = rightKeyColumns is [var onlyKey]
+                && join.Right is NamedTableSource rightNamed
+                && context.Tables.TryGetValue(rightNamed.Name, out var rightTable)
+                && rightTable.RowidAliasColumnIndex >= 0
+                && rightTable.RowidAliasColumnIndex == onlyKey.Ordinal,
+        };
 
         static bool ExpressionBelongsToSource(
             Expression expression,
@@ -29561,7 +29620,7 @@ out bool hasReturning)
     /// or other named row source as a table. Joins cannot be reconstructed from this syntax;
     /// supported compiled joins instead use their actual OpenJoinCursor plan tree.
     /// </summary>
-    private static (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(
+    private (string Detail, EqpJsonOp Op)? TryDescribeGenuinePlaceholderAccessPath(
         SelectStatement select,
         QueryContext context)
         => select.Source switch
@@ -29578,7 +29637,9 @@ out bool hasReturning)
                     source.Alias,
                     IndexName: null,
                     Covering: false,
-                    Estimate: select.Where is null ? EstimateUnfilteredTableScan(source.Name, context) : null)),
+                    Estimate: select.Where is null
+                        ? EstimateUnfilteredTableScan(source.Name, context)
+                        : EstimateFilteredTableScan(source, select.Where, context))),
             _ => null,
         };
 
@@ -29586,8 +29647,7 @@ out bool hasReturning)
     /// The estimate of a lone, unfiltered full table scan: one input row, every table row out,
     /// priced by the ported Turso scan formula (optimizer/cost.rs estimate_scan_cost). The row
     /// count is the planner's current <c>sqlite_stat1</c> figure, or Turso's 1,000,000-row
-    /// default for an unanalyzed table. A filtered scan needs Turso's per-constraint selectivity
-    /// model, which is not ported, so it reports no estimate rather than an invented one.
+    /// default for an unanalyzed table.
     /// </summary>
     private static EqpJsonEstimate EstimateUnfilteredTableScan(string tableName, QueryContext context)
     {
@@ -29596,6 +29656,238 @@ out bool hasReturning)
             : JoinCostParams.RowsPerTableFallback;
         var cost = JoinCostModel.EstimateFullScanCost(rows, scanCount: 1.0);
         return new EqpJsonEstimate(1, rows, rows, cost, cost);
+    }
+
+    /// <summary>
+    /// The estimate of a lone full table scan filtered by <paramref name="where"/>: one input
+    /// row, every table row visited, priced by <c>estimate_scan_cost</c> plus the WHERE work of
+    /// every ready term (access_method.rs:687-707 cost_with_where_work), producing the rows the
+    /// table's own column constraints keep (join.rs:72-152 constraint_output_multipliers). An
+    /// OR, a subquery or any other term that is not a column constraint visits rows without
+    /// reducing the estimate, as in Turso. Any other term shape (BETWEEN, which Turso first
+    /// rewrites into two range terms, LIKE, IN, subqueries, …) reports no estimate rather than
+    /// an approximated one.
+    /// </summary>
+    private EqpJsonEstimate? EstimateFilteredTableScan(
+        NamedTableSource source,
+        Expression where,
+        QueryContext context)
+    {
+        // An OR-implied IN filter (lift_common_subexpressions.rs) would itself be a constraint.
+        if (ContainsSubqueryExpression(where)
+            || !context.Tables.TryGetValue(source.Name, out var table)
+            || GetImpliedOrInFilters(where, source, table).Count != 0)
+        {
+            return null;
+        }
+
+        var qualifier = source.Alias ?? source.Name;
+        var columns = new HashSet<string>(table.Columns, StringComparer.OrdinalIgnoreCase);
+        foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(where))
+        {
+            if (conjunct is BinaryExpression { Operator: BinaryOperator.Or })
+                continue;
+            if (!TryDescribeSemiAntiConstraint(0, conjunct, table, qualifier, columns, source, table, context, out var constraint)
+                || constraint.DependsOnOuter)
+            {
+                return null;
+            }
+
+            // A constraint Turso could seek (a rowid or a leading index key) means its plan
+            // would not be this full scan; the scan estimate would describe a plan Turso never
+            // picks, so none is reported.
+            if (constraint.Operator is not (TursoConstraintOperator.NotEqual or TursoConstraintOperator.IsNot)
+                && (constraint.ColumnOrdinal == table.RowidAliasColumnIndex
+                    || table.Indexes.Any(index => !index.IsMethodIndex
+                        && index.Columns.Count > 0
+                        && !index.Columns[0].IsExpression
+                        && index.Columns[0].ColumnIndex == constraint.ColumnOrdinal)))
+            {
+                return null;
+            }
+        }
+
+        var (rows, cost) = EstimateSemiAntiOuterScan(source, where, context);
+        return new EqpJsonEstimate(1, rows, rows, cost, cost);
+    }
+
+    /// <summary>
+    /// Turso's first-loop estimate for a single-table index plan: the search of its seek
+    /// constraints, or the ordered scan of the whole index.
+    /// </summary>
+    private EqpJsonEstimate? EstimateSingleTableIndexPlan(
+        SelectStatement select,
+        ManagedIndexScanPlan plan,
+        string constraint,
+        QueryContext context)
+    {
+        if (select.Source is not NamedTableSource source
+            || !TryCollectReferencedTableColumns(select, source, plan.Table, out var usedColumns))
+        {
+            return null;
+        }
+
+        return plan.Search
+            ? select.Where is { } where
+                ? EstimateTursoFirstLoopIndexSearch(
+                    source,
+                    plan.Index,
+                    where,
+                    usedColumns,
+                    constraint.Split(" AND ", StringSplitOptions.TrimEntries),
+                    context)
+                : null
+            : EstimateTursoFirstLoopIndexScan(
+                source,
+                plan.Index,
+                select.Where,
+                usedColumns,
+                IsOrderedByIndexPrefix(select, source, plan.Table, plan.Index),
+                context);
+    }
+
+    /// <summary>Attaches <paramref name="estimate"/> to a single-table scan or search op.</summary>
+    private static EqpJsonOp WithEqpEstimate(EqpJsonOp op, EqpJsonEstimate? estimate)
+        => (op, estimate) switch
+        {
+            (_, null) => op,
+            (EqpJsonSearchOp search, _) => search with { Estimate = estimate },
+            (EqpJsonScanOp scan, _) => scan with { Estimate = estimate },
+            _ => op,
+        };
+
+    /// <summary>
+    /// The coroutine scan of a FROM-clause subquery that is the statement's only source
+    /// (access_method.rs find_best_access_method_for_subquery): <c>estimate_scan_cost</c> over
+    /// the body's estimated rows plus one run of the body. Only a body whose output rows are
+    /// its single table loop's rows (no grouping, DISTINCT, ordering, LIMIT or aggregate) and
+    /// an outer query that adds no filter are described.
+    /// </summary>
+    private EqpJsonEstimate? EstimateCoroutineSubqueryScan(
+        SelectStatement? outer,
+        SelectStatement body,
+        EqpJsonEstimate? bodyEstimate)
+    {
+        if (bodyEstimate is null
+            || outer is not { Where: null }
+            || body.GroupBy.Count != 0
+            || body.Distinct
+            || body.Having is not null
+            || body.OrderBy.Count != 0
+            || body.Limit is not null
+            || body.Offset is not null
+            || IsAggregateSelect(body))
+        {
+            return null;
+        }
+
+        var rows = Math.Max(bodyEstimate.OutputRows, 1.0);
+        var cost = TursoCostModel.EstimateScanCost(rows, 1.0) + bodyEstimate.TotalCost;
+        return new EqpJsonEstimate(1, rows, rows, cost, cost);
+    }
+
+    /// <summary>
+    /// The recursive step's read of the previous iteration's rows: a one-row full scan
+    /// (access_method.rs:790-804) kept by its filters, each a comparison of a CTE column with a
+    /// constant sized by Turso's column-constraint selectivity (no index, no statistics).
+    /// Returns <see langword="null"/> for any other step shape.
+    /// </summary>
+    private static EqpJsonEstimate? EstimateRecursiveCteInputScan(SelectStatement step, string cteName)
+    {
+        if (step.Source is not NamedTableSource input
+            || !string.Equals(input.Name, cteName, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var selectivity = 1.0;
+        var steps = 0;
+        var bounds = new Dictionary<string, (bool Lower, bool Upper)>(StringComparer.OrdinalIgnoreCase);
+        if (step.Where is not null)
+        {
+            foreach (var conjunct in IndexExpressionSemantics.SplitConjuncts(step.Where))
+            {
+                if (conjunct is not BinaryExpression binary
+                    || !(binary.Left is ColumnExpression { BooleanKeyword: null } && binary.Right is LiteralExpression
+                        || binary.Right is ColumnExpression { BooleanKeyword: null } && binary.Left is LiteralExpression))
+                {
+                    return null;
+                }
+
+                var column = (ColumnExpression)(binary.Left is ColumnExpression ? binary.Left : binary.Right);
+                var columnOnLeft = binary.Left is ColumnExpression;
+                var nullLiteral = (binary.Left is LiteralExpression left ? left : (LiteralExpression)binary.Right).Value.Kind == SqlValueKind.Null;
+                double termSelectivity;
+                bool isLower = false, isUpper = false;
+                switch (binary.Operator)
+                {
+                    case BinaryOperator.Equal:
+                        termSelectivity = JoinCostParams.SelectivityEqualityUnindexed;
+                        break;
+                    case BinaryOperator.Is:
+                        termSelectivity = nullLiteral ? TursoCostParams.SelectivityIsNull : JoinCostParams.SelectivityEqualityUnindexed;
+                        break;
+                    case BinaryOperator.IsNot:
+                        termSelectivity = TursoCostParams.SelectivityIsNotNull;
+                        break;
+                    case BinaryOperator.NotEqual:
+                        termSelectivity = JoinCostParams.SelectivityOther;
+                        break;
+                    case BinaryOperator.LessThan or BinaryOperator.LessThanOrEqual:
+                        termSelectivity = JoinCostParams.SelectivityRange;
+                        isUpper = columnOnLeft;
+                        isLower = !columnOnLeft;
+                        break;
+                    case BinaryOperator.GreaterThan or BinaryOperator.GreaterThanOrEqual:
+                        termSelectivity = JoinCostParams.SelectivityRange;
+                        isLower = columnOnLeft;
+                        isUpper = !columnOnLeft;
+                        break;
+                    default:
+                        return null;
+                }
+
+                selectivity *= termSelectivity;
+                steps += CountTursoWhereSteps(conjunct) - 1;
+                if (isLower || isUpper)
+                {
+                    var name = column.UnqualifiedName ?? column.Name;
+                    bounds.TryGetValue(name, out var bound);
+                    bounds[name] = (bound.Lower || isLower, bound.Upper || isUpper);
+                }
+            }
+        }
+
+        foreach (var bound in bounds.Values)
+        {
+            if (bound.Lower && bound.Upper)
+                selectivity *= TursoCostParams.ClosedRangeSelectivityFactor;
+        }
+
+        var cost = TursoCostModel.EstimateScanCost(1.0, 1.0)
+            + TursoCostModel.EstimateWhereWork(1.0, 1.0, consumedSteps: 0, steps);
+        return new EqpJsonEstimate(1, selectivity, selectivity, cost, cost);
+    }
+
+    /// <summary>
+    /// Whether the statement's ORDER BY (or, without one, its GROUP BY) starts with the index's
+    /// leading plain column, so reading the index in key order serves it (Turso's
+    /// <c>is_index_ordered</c>).
+    /// </summary>
+    private static bool IsOrderedByIndexPrefix(
+        SelectStatement select,
+        NamedTableSource source,
+        EmbeddedTable table,
+        EmbeddedIndex index)
+    {
+        var first = select.OrderBy.Count != 0
+            ? select.OrderBy[0].Expression
+            : select.GroupBy.Count != 0 ? select.GroupBy[0] : null;
+        return first is not null
+            && index.Columns.Count > 0
+            && !index.Columns[0].IsExpression
+            && TryResolvePlainTableColumn(first, source, table, out var ordinal)
+            && ordinal == index.Columns[0].ColumnIndex;
     }
 
     internal static string JsonEscape(string value)
@@ -29757,6 +30049,8 @@ out bool hasReturning)
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
             var indexPlanCovering = IndexCoversSelect(plannedSelect, indexPlan.Table, indexPlan.Index);
+            var indexPlanConstraint = indexPlan.SearchConstraint ?? $"{indexPlan.Index.Columns[0].Name}=?";
+            var indexPlanEstimate = EstimateSingleTableIndexPlan(plannedSelect, indexPlan, indexPlanConstraint, compilationContext);
             // The plan carries the exact leading-key predicate chosen by the planner, so JSON
             // can share TEXT's equality/range constraint without re-parsing rendered detail.
             ops = indexPlan.Search
@@ -29766,14 +30060,16 @@ out bool hasReturning)
                         indexPlan.Source.Alias,
                         indexPlan.Index.Name,
                         indexPlanCovering,
-                        [indexPlan.SearchConstraint ?? $"{indexPlan.Index.Columns[0].Name}=?"]),
+                        [indexPlanConstraint],
+                        Estimate: indexPlanEstimate),
                 ]
                 : [
                     new EqpJsonScanOp(
                         indexPlan.Table.Name,
                         indexPlan.Source.Alias,
                         indexPlan.Index.Name,
-                        indexPlanCovering),
+                        indexPlanCovering,
+                        Estimate: indexPlanEstimate),
                 ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -29802,10 +30098,15 @@ out bool hasReturning)
             }
             && TryPlanManagedIndexScan(derivedSelect, compilationContext) is { } derivedIndexPlan)
         {
+            var derivedEstimate = EstimateSingleTableIndexPlan(
+                derivedSelect,
+                derivedIndexPlan,
+                derivedIndexPlan.SearchConstraint ?? $"{derivedIndexPlan.Index.Columns[0].Name}=?",
+                compilationContext);
             ops =
             [
-                new EqpJsonSubqueryScanOp(0),
-                BuildIndexScanOp(derivedIndexPlan, derivedSelect),
+                new EqpJsonSubqueryScanOp(0, EstimateCoroutineSubqueryScan(statement.Inner as SelectStatement, derivedSelect, derivedEstimate)),
+                WithEqpEstimate(BuildIndexScanOp(derivedIndexPlan, derivedSelect), derivedEstimate),
                 new EqpJsonGroupByOp(),
                 new EqpJsonOrderByOp(),
             ];
@@ -29851,13 +30152,22 @@ out bool hasReturning)
             }
             && TryPlanManagedIndexScan(firstTerm, compilationContext) is { } firstIndexPlan)
         {
+            // Each arm is planned on its own, from one input row (optimizer/mod.rs).
+            var firstArmEstimate = EstimateSingleTableIndexPlan(
+                firstTerm,
+                firstIndexPlan,
+                firstIndexPlan.SearchConstraint ?? $"{firstIndexPlan.Index.Columns[0].Name}=?",
+                compilationContext);
+            var secondArmEstimate = secondTerm.Where is null
+                ? EstimateUnfilteredTableScan(secondSource.Name, compilationContext)
+                : EstimateFilteredTableScan(secondSource, secondTerm.Where, compilationContext);
             ops =
             [
                 new EqpJsonCompoundOp(),
                 new EqpJsonCompoundArmOp("left_most", TempBtree: false),
-                BuildIndexScanOp(firstIndexPlan, firstTerm),
+                WithEqpEstimate(BuildIndexScanOp(firstIndexPlan, firstTerm), firstArmEstimate),
                 new EqpJsonCompoundArmOp("union", TempBtree: true),
-                new EqpJsonScanOp(secondSource.Name, secondSource.Alias, IndexName: null, Covering: false),
+                new EqpJsonScanOp(secondSource.Name, secondSource.Alias, IndexName: null, Covering: false, Estimate: secondArmEstimate),
                 new EqpJsonOrderByOp(),
             ];
             return new ExecutionResult(
@@ -29948,19 +30258,31 @@ out bool hasReturning)
                         },
                     },
                 ],
-                Query: SelectStatement { Source: NamedTableSource { Name: var outerName } },
+                Query: SelectStatement { Source: NamedTableSource { Name: var outerName } } recursiveOuter,
             }
             && string.Equals(recursiveName, outerName, StringComparison.OrdinalIgnoreCase)
             && !SelectContainsRegisteredScalarFunction(anchor)
             && !SelectContainsRegisteredScalarFunction(recursiveStep))
         {
+            // A recursive CTE has no row estimate, so its coroutine scan is sized by Turso's
+            // 1,000,000-row fallback with no body cost (access_method.rs
+            // find_best_access_method_for_subquery); the recursive step reads a one-row input
+            // (access_method.rs:790-804).
+            var recursiveScanEstimate = recursiveOuter.Where is null
+                ? new EqpJsonEstimate(
+                    1,
+                    JoinCostParams.RowsPerTableFallback,
+                    JoinCostParams.RowsPerTableFallback,
+                    TursoCostModel.EstimateScanCost(JoinCostParams.RowsPerTableFallback, 1.0),
+                    TursoCostModel.EstimateScanCost(JoinCostParams.RowsPerTableFallback, 1.0))
+                : null;
             ops =
             [
-                new EqpJsonRecursiveCteScanOp(recursiveName),
+                new EqpJsonRecursiveCteScanOp(recursiveName, recursiveScanEstimate),
                 new EqpJsonRecursiveSetupOp(),
                 new EqpJsonConstantRowOp(),
                 new EqpJsonRecursiveStepOp(),
-                new EqpJsonRecursiveCteInputScanOp(recursiveName),
+                new EqpJsonRecursiveCteInputScanOp(recursiveName, EstimateRecursiveCteInputScan(recursiveStep, recursiveName)),
             ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -30024,7 +30346,15 @@ out bool hasReturning)
                 new EqpJsonMultiIndexOp(
                     orUnionPlan.Table.Name,
                     orUnionPlan.Branches.Select(static branch => branch.Name).ToArray(),
-                    Alias: orUnionPlan.Source.Alias),
+                    Alias: orUnionPlan.Source.Alias,
+                    Estimate: orUnionSelect.Where is { } orUnionWhere
+                        ? EstimateTursoMultiIndexOrUnion(
+                            orUnionPlan.Source,
+                            orUnionPlan.Table,
+                            orUnionWhere,
+                            orUnionPlan.Branches.Select(static branch => (branch.Index, branch.Predicate)).ToArray(),
+                            compilationContext)
+                        : null),
             ];
             return new ExecutionResult(
                 ExplainQueryPlanColumns(),
@@ -30111,6 +30441,20 @@ out bool hasReturning)
             compiledJoinCandidate = compiledJoinProgram.Program.Instructions
                 .OfType<OpenJoinCursorInstruction>()
                 .FirstOrDefault()?.Plan.Root;
+            if (compiledJoinCandidate is not null
+                && TryDescribeCompiledJoinPlan(
+                    compiledJoinCandidate,
+                    compiledJoinSelect,
+                    compiledJoinProgram.Program,
+                    out var describedJoin))
+            {
+                ops = describedJoin.Select(static node => (EqpJsonOp?)node.Op).ToArray();
+                return new ExecutionResult(
+                    ExplainQueryPlanColumns(),
+                    describedJoin.Select((node, index) => PlanRow(index + 1, node.Parent + 1, node.Detail)).ToArray(),
+                    0);
+            }
+
             var searches = GetCompiledJoinIndexSearchDescriptions(compiledJoinProgram.Program);
             if (searches.Count > 0)
             {
@@ -30304,6 +30648,204 @@ out bool hasReturning)
         return nodes;
     }
 
+    /// <summary>
+    /// Describes a compiled <c>OpenJoinCursor</c> plan tree step by step in its left-deep
+    /// execution order, formatted like Turso's <c>EqpDetail</c> (core/translate/eqp.rs Display):
+    /// the outer leaf as <c>SCAN</c>; an index seek as <c>SEARCH id USING [COVERING ]INDEX name
+    /// (a=? AND b=?)</c>; a right input the operator hashes once and probes per outer row as
+    /// the automatic index it is (<c>SEARCH id USING COVERING INDEX ephemeral_table_tN (…)</c>,
+    /// Turso's temporary-index access, N being the table's FROM position); a left input it
+    /// hashes before streaming the right as <c>HASH JOIN right</c> followed by the build's
+    /// <c>SCAN</c>, or behind a longer prefix as <c>MATERIALIZE hash build input</c> over that
+    /// prefix; a keyless right input as a nested <c>SCAN</c>. LEFT and FULL joins carry
+    /// <c>LEFT-JOIN</c>. Any node or shape outside that set (derived rows, RIGHT joins, a FULL
+    /// join that is not a hash join, a hash or automatic index Turso would not build for a table
+    /// with an index directive, grouping or DISTINCT) returns <see langword="false"/> so the
+    /// caller keeps its narrower description rather than guess.
+    /// </summary>
+    private static bool TryDescribeCompiledJoinPlan(
+        VdbeJoinPlanNode root,
+        SelectStatement select,
+        VdbeProgram program,
+        out List<(string Detail, EqpJsonOp Op, int Parent)> nodes)
+    {
+        nodes = [];
+        if (select.GroupBy.Count != 0 || select.Distinct || select.Having is not null
+            || !TryGetNamedJoinLeaves(select.Source, out var leaves))
+        {
+            return false;
+        }
+
+        var described = new List<(string Detail, EqpJsonOp Op, int Parent)>();
+        if (!Describe(root, parent: -1))
+            return false;
+
+        if (select.OrderBy.Count != 0)
+        {
+            if (!program.Instructions.OfType<OpenSorterInstruction>().Any())
+                return false;
+            described.Add(("USE SORTER FOR ORDER BY", new EqpJsonOrderByOp(), -1));
+        }
+
+        nodes = described;
+        return true;
+
+        bool Describe(VdbeJoinPlanNode node, int parent)
+        {
+            if (node is VdbeJoinScanPlan outer)
+            {
+                described.Add((
+                    $"SCAN {outer.TableName}" + (outer.Alias is null ? string.Empty : $" AS {outer.Alias}"),
+                    new EqpJsonScanOp(outer.TableName, outer.Alias, IndexName: null, Covering: false),
+                    parent));
+                return true;
+            }
+
+            if (node is not VdbeJoinOperatorPlan
+                {
+                    Kind: VdbeJoinKind.Inner or VdbeJoinKind.Left or VdbeJoinKind.Full,
+                } join)
+            {
+                return false;
+            }
+
+            var marker = GetCompiledJoinMarker(join.Kind);
+            var suffix = join.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full ? " LEFT-JOIN" : string.Empty;
+            // A FULL join is only modelled as the hash join that builds its left input.
+            if (join.Kind == VdbeJoinKind.Full && (join.EquiProbe is null || join.HashBuildRight))
+                return false;
+            if (join.Right is IVdbeJoinSeekPlan && join.Right.SearchMetadata is { } seek)
+            {
+                if (!Describe(join.Left, parent))
+                    return false;
+                var identifier = seek.Alias ?? seek.TableName;
+                var indexName = seek.Ephemeral
+                    ? EphemeralIndexName(seek.TableName, seek.Alias)
+                    : seek.IndexName;
+                if (indexName is null)
+                    return false;
+                var covering = seek.Ephemeral || seek.Covering;
+                described.Add((
+                    $"SEARCH {identifier} USING {(covering ? "COVERING " : string.Empty)}INDEX {indexName} ({string.Join(" AND ", seek.Constraints)}){suffix}",
+                    new EqpJsonSearchOp(seek.TableName, seek.Alias, indexName, covering, seek.Constraints, marker, seek.Ephemeral),
+                    parent));
+                return true;
+            }
+
+            if (join.Right is not VdbeJoinScanPlan right)
+                return false;
+
+            var rightWithAlias = right.TableName + (right.Alias is null ? string.Empty : $" AS {right.Alias}");
+            if (join.EquiProbe is null)
+            {
+                if (!Describe(join.Left, parent))
+                    return false;
+                described.Add(($"SCAN {rightWithAlias}{suffix}", new EqpJsonScanOp(right.TableName, right.Alias, IndexName: null, Covering: false, marker), parent));
+                return true;
+            }
+
+            if (join.HashBuildRight)
+            {
+                if (!Describe(join.Left, parent))
+                    return false;
+
+                // Hashing the right input once on its INTEGER PRIMARY KEY is a rowid lookup.
+                if (join.EquiProbe.RightKeyIsRowid)
+                {
+                    described.Add((
+                        $"SEARCH {right.Alias ?? right.TableName} USING INTEGER PRIMARY KEY (rowid=?){suffix}",
+                        new EqpJsonSearchOp(right.TableName, right.Alias, IndexName: null, Covering: false, ["rowid=?"], marker, IsIntegerPrimaryKey: true),
+                        parent));
+                    return true;
+                }
+
+                // Otherwise the right rows hashed once on the join key and probed per outer row
+                // are an automatic index over the right input. Turso never builds one for a table
+                // carrying INDEXED BY / NOT INDEXED (access_method.rs:916), so that shape has no
+                // Turso description.
+                if (HasIndexDirective(right.TableName, right.Alias)
+                    || join.EquiProbe.RightKeyColumns is not { Count: > 0 } keyColumns
+                    || EphemeralIndexName(right.TableName, right.Alias) is not { } indexName)
+                {
+                    return false;
+                }
+
+                var constraints = keyColumns.Select(static column => $"{column}=?").ToArray();
+                described.Add((
+                    $"SEARCH {right.Alias ?? right.TableName} USING COVERING INDEX {indexName} ({string.Join(" AND ", constraints)}){suffix}",
+                    new EqpJsonSearchOp(right.TableName, right.Alias, indexName, Covering: true, constraints, marker, Ephemeral: true),
+                    parent));
+                return true;
+            }
+
+            // Hash-build-left: the left input is hashed once and the right streams as the probe
+            // (Turso's left-deep hash join builds the previous table and probes the new one).
+            // Turso rejects a hash join whose build or probe table carries INDEXED BY / NOT
+            // INDEXED (access_method.rs:1474-1479 has_indexed_by_directives).
+            if (HasIndexDirective(right.TableName, right.Alias))
+                return false;
+            if (join.Left is VdbeJoinScanPlan build)
+            {
+                if (HasIndexDirective(build.TableName, build.Alias))
+                    return false;
+                described.Add(($"HASH JOIN {rightWithAlias}", new EqpJsonHashJoinOp(right.TableName, right.Alias, marker), parent));
+                described.Add((
+                    $"SCAN {build.TableName}" + (build.Alias is null ? string.Empty : $" AS {build.Alias}"),
+                    new EqpJsonScanOp(build.TableName, build.Alias, IndexName: null, Covering: false),
+                    parent));
+                return true;
+            }
+
+            // Behind a longer prefix the build input is the prefix's joined rows, materialized
+            // before the probe (Turso's materialize_build_input, EqpDetail::HashBuild), named
+            // after the prefix's last table.
+            if (join.Left is not VdbeJoinOperatorPlan prefix
+                || LastTable(prefix) is not { } last
+                || HasIndexDirective(last.Table, last.Alias))
+            {
+                return false;
+            }
+
+            var materializeIndex = described.Count;
+            described.Add((
+                $"MATERIALIZE hash build input for {last.Table}" + (last.Alias is null ? string.Empty : $" AS {last.Alias}"),
+                new EqpJsonCompiledJoinHashBuildOp(last.Table, last.Alias),
+                parent));
+            if (!Describe(prefix, materializeIndex))
+                return false;
+            described.Add(($"HASH JOIN {rightWithAlias}", new EqpJsonHashJoinOp(right.TableName, right.Alias, marker), parent));
+            return true;
+        }
+
+        static (string Table, string? Alias)? LastTable(VdbeJoinOperatorPlan prefix)
+            => prefix.Right switch
+            {
+                VdbeJoinScanPlan scan => (scan.TableName, scan.Alias),
+                { SearchMetadata: { } metadata } => (metadata.TableName, metadata.Alias),
+                _ => null,
+            };
+
+        bool HasIndexDirective(string tableName, string? alias)
+        {
+            var qualifier = alias ?? tableName;
+            return leaves.Any(leaf => leaf.IndexDirective is not null
+                && string.Equals(leaf.Alias ?? leaf.Name, qualifier, StringComparison.OrdinalIgnoreCase));
+        }
+
+        string? EphemeralIndexName(string tableName, string? alias)
+        {
+            // Turso names a temporary index ephemeral_{table}_{internal id}; a FROM table's
+            // internal id is its 1-based position in the statement's FROM list.
+            var qualifier = alias ?? tableName;
+            for (var position = 0; position < leaves.Count; position++)
+            {
+                if (string.Equals(leaves[position].Alias ?? leaves[position].Name, qualifier, StringComparison.OrdinalIgnoreCase))
+                    return $"ephemeral_{tableName}_t{position + 1}";
+            }
+
+            return null;
+        }
+    }
     private static string? GetCompiledJoinMarker(VdbeJoinKind kind) => kind switch
     {
         VdbeJoinKind.Inner => "inner",
@@ -31471,6 +32013,13 @@ out bool hasReturning)
             var leading = index.Columns[0];
             var searchConstraint = GetIndexSearchConstraint(statement.Where, table, leading);
             var search = WhereUsesIndexTerm(statement.Where, table, leading);
+            if (!search && WhereAllowsIndexInSearch(statement.Where, source, table, leading))
+            {
+                // An IN-list (explicit or implied by an OR, see EmbeddedDatabase.OrTermInference.cs)
+                // searches the leading key once per value; Turso reports that as an equality.
+                search = true;
+                searchConstraint = $"{leading.Name}=?";
+            }
             var ordered = TryGetIndexOrderDirection(statement.OrderBy, table, index, out var reverse);
             var scansOnlyPartialPredicate = index.IsPartial
                 && statement.OrderBy.Count == 0
@@ -32114,6 +32663,14 @@ out bool hasReturning)
                 return ExpressionCoveredByIndex(collation.Expression, table, covered);
             case FunctionExpression function:
                 return function.Arguments.All(arg => ExpressionCoveredByIndex(arg, table, covered));
+            case InExpression inList:
+                // An IN list only reads its left operand and constant values.
+                return ExpressionCoveredByIndex(inList.Value, table, covered)
+                    && inList.Values.All(value => ExpressionCoveredByIndex(value, table, covered));
+            case BetweenExpression between:
+                return ExpressionCoveredByIndex(between.Value, table, covered)
+                    && ExpressionCoveredByIndex(between.Lower, table, covered)
+                    && ExpressionCoveredByIndex(between.Upper, table, covered);
             default:
                 // Subqueries, CASE, etc. are not covering-index safe without deeper analysis.
                 return false;
@@ -32725,9 +33282,12 @@ out bool hasReturning)
             planned.Add(new ManagedOrIndexUnionBranch(index, index.Name, branch));
         }
 
-        // Require at least one distinct index name so this is a real multi-index OR,
-        // not a single-index multi-equality that should use a plain index scan.
-        if (planned.Select(static item => item.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() < 2)
+        // Turso's OR-by-union (multi_index.rs consider_multi_index_union) replans every
+        // disjunct with the ordinary compound-seek analysis, so several branches may search
+        // the same index (MULTI-INDEX OR t (txy, txy)). A single-column OR of literals never
+        // reaches this point: its implied IN filter (EmbeddedDatabase.OrTermInference.cs)
+        // already chose an IN-list index search. Rowid-only unions are not modelled here.
+        if (planned.All(static item => item.Index is null))
             return null;
 
         return new ManagedOrIndexUnionPlan(source, table, planned);
@@ -32738,8 +33298,17 @@ out bool hasReturning)
         NamedTableSource source,
         Expression branch)
     {
-        if (!table.HasRowid
-            || branch is not BinaryExpression
+        if (!table.HasRowid)
+            return false;
+
+        // A compound branch uses the rowid when one of its conjuncts is a rowid equality.
+        if (branch is BinaryExpression { Operator: BinaryOperator.And } conjunction)
+        {
+            return IsRowidPrimaryKeyEquality(table, source, conjunction.Left)
+                || IsRowidPrimaryKeyEquality(table, source, conjunction.Right);
+        }
+
+        if (branch is not BinaryExpression
             {
                 Operator: BinaryOperator.Equal or BinaryOperator.Is,
             } equality)
@@ -32776,10 +33345,12 @@ out bool hasReturning)
     {
         branches = [];
         CollectTopLevelOrLeaves(expression, branches);
+        // Each disjunct is an equality, or a conjunction the per-branch compound-seek analysis
+        // plans (multi_index.rs:1005-1075); its remaining conjuncts filter that branch's rows.
         return branches.Count >= 2
-            && branches.All(branch => branch is BinaryExpression
+            && branches.All(static branch => branch is BinaryExpression
             {
-                Operator: BinaryOperator.Equal or BinaryOperator.Is
+                Operator: BinaryOperator.Equal or BinaryOperator.Is or BinaryOperator.And
             });
     }
 
@@ -32803,7 +33374,7 @@ out bool hasReturning)
     {
         index = null!;
         if (branch is not BinaryExpression binary
-            || binary.Operator is not (BinaryOperator.Equal or BinaryOperator.Is))
+            || binary.Operator is not (BinaryOperator.Equal or BinaryOperator.Is or BinaryOperator.And))
         {
             return false;
         }
@@ -38912,24 +39483,35 @@ out bool hasReturning)
         // declared collation it resolved before the rewrite.
         var innerContext = EnterCollationSource(context, source.Right);
 
+        // The inner access is chosen by the ported Turso join cost model (see
+        // EmbeddedDatabase.SemiAntiJoinAccess.cs); EXPLAIN QUERY PLAN describes the same choice.
+        var access = PlanSemiOrAntiInnerAccess(source, leftPredicate, context);
+        if (access is { Kind: SemiAntiInnerAccessKind.HashAnti })
+            return GetHashAntiJoinRows(source, access, left, parameters, innerContext, maximumRows, outerRow);
+
         // The un-rewritten correlated subquery reached its inner table through a cached
-        // transient hash probe. A matching declared index now takes precedence for the narrow
-        // conversion-free equality shape above; all other rewrites retain the hash probe.
+        // transient hash probe. A planned index search or automatic index is served by the same
+        // statement-cached equality probe (the full condition still decides every match); an
+        // unmodelled shape keeps the legacy declared-index-then-probe order.
         SourceData? materializedRight = null;
 
         var keepOnMatch = source.Kind == JoinKind.Semi;
+        var probeAccess = access is null
+            || access.Kind is SemiAntiInnerAccessKind.DeclaredIndexSearch or SemiAntiInnerAccessKind.EphemeralIndex;
         var rows = new List<SourceRow>();
         foreach (var leftRow in left.Rows)
         {
             context.CheckInterrupt();
-            var probed = source.Condition is null
+            var probed = source.Condition is null || !probeAccess
                 ? null
-                : TryGetDeclaredIndexLookupRows(
-                        source.Right,
-                        source.Condition,
-                        parameters,
-                        innerContext,
-                        leftRow)
+                : (access is null
+                        ? TryGetDeclaredIndexLookupRows(
+                            source.Right,
+                            source.Condition,
+                            parameters,
+                            innerContext,
+                            leftRow)
+                        : null)
                     ?? TryGetTransientLookupRows(
                         source.Right,
                         source.Condition,
@@ -38986,6 +39568,157 @@ out bool hasReturning)
             left.Collations,
             left.ColumnDefinitions,
             left.OmittedVirtualTablePredicates);
+    }
+
+    /// <summary>
+    /// Runs a left anti hash join (Turso <c>HashJoinType::LeftAnti</c>): the outer rows are the
+    /// build input, hashed on the outer side of every planned equality key; the inner table is
+    /// read once as the probe; a build row is marked when some probe row in its bucket satisfies
+    /// the complete join condition; and the build rows no probe row marked are emitted in
+    /// their original order. The hash only chooses which pairs are tested, so the result is the
+    /// row-for-row answer of the nested anti-join: SQL equality never holds for a NULL key, so
+    /// a build row with a NULL key cannot match and is kept, and a probe row with one is skipped.
+    /// </summary>
+    private SourceData GetHashAntiJoinRows(
+        JoinTableSource source,
+        SemiAntiInnerAccess access,
+        SourceData left,
+        SqlValue[] parameters,
+        QueryContext innerContext,
+        long? maximumRows,
+        SourceRow? outerRow)
+    {
+        SourceData Emit(IReadOnlyList<SourceRow> kept)
+            => new(left.Columns, kept, left.Collations, left.ColumnDefinitions, left.OmittedVirtualTablePredicates);
+
+        if (left.Rows.Count == 0)
+            return Emit([]);
+
+        var named = (NamedTableSource)source.Right;
+        var table = access.Table;
+        var innerOutputColumns = GetOutputColumns(named, innerContext);
+        var keys = new List<(Expression Column, TransientEqualityLookup Lookup)>(access.HashKeys.Count);
+        foreach (var key in access.HashKeys)
+        {
+            var columnOnLeft = key.Conjunct is BinaryExpression binary
+                && ReferenceEquals(binary.Left, key.ColumnSide);
+            if (!TryMatchTransientEquality(
+                    key.ColumnSide,
+                    key.Value,
+                    columnOnLeft,
+                    named,
+                    table,
+                    innerOutputColumns,
+                    left.Rows[0],
+                    out var lookup))
+            {
+                throw new InvalidOperationException(
+                    "A planned hash anti-join key is not canonicalizable for the build input.");
+            }
+
+            keys.Add((key.ColumnSide, lookup));
+        }
+
+        var buckets = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        var parts = new string[keys.Count];
+        for (var position = 0; position < left.Rows.Count; position++)
+        {
+            innerContext.CheckInterrupt();
+            var buildRow = left.Rows[position];
+            if (!TryBuildHashAntiKey(keys, parts, key => EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                    Evaluate(key.Lookup.ValueExpression, parameters, buildRow, innerContext),
+                    key.Lookup.ValueConvertsTextToNumeric,
+                    key.Lookup.ValueConvertsNumericToText,
+                    key.Lookup.Collation), out var composite))
+            {
+                continue;
+            }
+
+            if (!buckets.TryGetValue(composite, out var bucket))
+            {
+                bucket = [];
+                buckets[composite] = bucket;
+            }
+
+            bucket.Add(position);
+        }
+
+        var matched = new bool[left.Rows.Count];
+        var remaining = left.Rows.Count;
+        var probeRows = GetSideSourceRows(
+            source.Right,
+            sidePredicate: null,
+            parameters,
+            innerContext,
+            outerRow,
+            sourceOrderBy: null);
+        foreach (var probeRow in probeRows.Rows)
+        {
+            innerContext.CheckInterrupt();
+            if (remaining == 0)
+                break;
+            if (!TryBuildHashAntiKey(keys, parts, key => EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                    Evaluate(key.Column, parameters, probeRow, innerContext),
+                    key.Lookup.ColumnConvertsTextToNumeric,
+                    key.Lookup.ColumnConvertsNumericToText,
+                    key.Lookup.Collation), out var composite)
+                || !buckets.TryGetValue(composite, out var bucket))
+            {
+                continue;
+            }
+
+            foreach (var position in bucket)
+            {
+                if (matched[position])
+                    continue;
+                if (!IsTrue(Evaluate(
+                        source.Condition!,
+                        parameters,
+                        probeRow with { Parent = left.Rows[position] },
+                        innerContext)))
+                {
+                    continue;
+                }
+
+                matched[position] = true;
+                remaining--;
+            }
+        }
+
+        var kept = new List<SourceRow>(remaining);
+        for (var position = 0; position < left.Rows.Count; position++)
+        {
+            if (matched[position])
+                continue;
+            kept.Add(left.Rows[position]);
+            if (maximumRows is not null && kept.Count >= maximumRows.Value)
+                break;
+        }
+
+        return Emit(kept);
+
+        static bool TryBuildHashAntiKey(
+            List<(Expression Column, TransientEqualityLookup Lookup)> keys,
+            string[] parts,
+            Func<(Expression Column, TransientEqualityLookup Lookup), string?> canonicalize,
+            out string composite)
+        {
+            for (var index = 0; index < keys.Count; index++)
+            {
+                if (canonicalize(keys[index]) is not { } part)
+                {
+                    composite = string.Empty;
+                    return false;
+                }
+
+                parts[index] = part;
+            }
+
+            composite = parts.Length == 1
+                ? parts[0]
+                : string.Concat(parts.Select(static part => part.Length.ToString(CultureInfo.InvariantCulture) + ":" + part));
+            return true;
+        }
     }
 
     private static IReadOnlyList<EmbeddedColumn?>? CombineColumnDefinitions(

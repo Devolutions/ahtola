@@ -272,7 +272,7 @@ public sealed class PlannerAccessPathDepthTests
     }
 
     [Test]
-    public void ProfitableInnerJoinBuildsOneAutomaticCoveringIndex()
+    public void AnalyzedUnindexedInnerJoinHashesItsFirstTableOnce()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -296,17 +296,20 @@ public sealed class PlannerAccessPathDepthTests
             FROM outer_items JOIN inner_items ON outer_items.k=inner_items.k
             ORDER BY outer_items.k;
             """;
-        PlanDetail(connection, sql).Should().Be(
-            "SEARCH inner_items USING AUTOMATIC COVERING INDEX (k=?)");
+        // Turso's hash join (build the first table, probe the second) is cheaper than building
+        // a temporary index on inner_items, so no automatic index is built.
+        PlanDetails(connection, sql).Should().Equal(
+            "HASH JOIN inner_items",
+            "SCAN outer_items",
+            "USE SORTER FOR ORDER BY");
 
         database.ResetJoinOrderDiagnostics();
         var rows = ReadRows(connection, sql);
         rows.Should().HaveCount(100);
         rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Text("i1"));
         rows[^1].Should().Equal(SqlValue.Integer(100), SqlValue.Text("i100"));
-        database.JoinIndexSeekMetrics.AutomaticIndexesBuilt.Should().Be(1);
-        database.JoinIndexSeekMetrics.IndexRowsMaterialized.Should().Be(100);
-        database.JoinIndexSeekMetrics.CandidateRowsVisited.Should().Be(100);
+        database.JoinIndexSeekMetrics.AutomaticIndexesBuilt.Should().Be(0);
+        database.JoinIndexSeekMetrics.IndexRowsMaterialized.Should().Be(0);
     }
 
     [Test]
@@ -376,8 +379,12 @@ public sealed class PlannerAccessPathDepthTests
             JOIN second_keys ON target.k2=second_keys.k2
             ORDER BY target.k1;
             """;
-        PlanDetails(connection, sql).Should().Contain(detail =>
-            detail.StartsWith("SEARCH target USING AUTOMATIC COVERING INDEX", StringComparison.Ordinal));
+        // second_keys is joined after target, so no access path for target may constrain k2.
+        var details = PlanDetails(connection, sql);
+        details.Should().Contain(detail => detail.Contains("target", StringComparison.Ordinal));
+        details.Should().NotContain(detail =>
+            detail.StartsWith("SEARCH target ", StringComparison.Ordinal)
+            && detail.Contains("k2=?", StringComparison.Ordinal));
         ReadRows(connection, sql).Select(row => row[0].AsText())
             .Should().Equal(Enumerable.Range(1, 100).Select(value => $"p{value}"));
     }
@@ -411,8 +418,10 @@ public sealed class PlannerAccessPathDepthTests
             JOIN inner_items INDEXED BY inner_items_k ON outer_items.k=inner_items.k
             ORDER BY outer_items.k;
             """;
-        PlanDetail(reopenedConnection, sql).Should().Be(
-            "SEARCH inner_items USING INDEX inner_items_k (k=?)");
+        PlanDetails(reopenedConnection, sql).Should().Equal(
+            "SCAN outer_items",
+            "SEARCH inner_items USING INDEX inner_items_k (k=?)",
+            "USE SORTER FOR ORDER BY");
         reopened.JoinIndexSeekMetrics.IndexRowsMaterialized.Should().Be(0);
 
         reopened.ResetJoinOrderDiagnostics();
@@ -431,8 +440,10 @@ public sealed class PlannerAccessPathDepthTests
             JOIN inner_items INDEXED BY inner_items_k_payload ON outer_items.k=inner_items.k
             ORDER BY outer_items.k;
             """;
-        PlanDetail(reopenedConnection, coveringSql).Should().Be(
-            "SEARCH inner_items USING COVERING INDEX inner_items_k_payload (k=?)");
+        PlanDetails(reopenedConnection, coveringSql).Should().Equal(
+            "SCAN outer_items",
+            "SEARCH inner_items USING COVERING INDEX inner_items_k_payload (k=?)",
+            "USE SORTER FOR ORDER BY");
         reopened.ResetJoinOrderDiagnostics();
         ReadRows(reopenedConnection, coveringSql).Select(row => row[0].AsText())
             .Should().Equal("p3", "p197", "p499");

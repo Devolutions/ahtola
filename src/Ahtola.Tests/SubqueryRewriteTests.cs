@@ -820,12 +820,39 @@ public sealed class SubqueryRewriteTests
     }
 
     [Test]
-    public void DoesNotRewriteCorrelationPredicatesThatAreNotPlainEqualities()
+    public void RewritesDirectCorrelatedComparisonsThatAreNotEqualities()
     {
-        var queries = new[]
+        // Turso v0.8.1 (f7aac1fc5, unnest.rs is_inner_outer_comparison) moves any direct
+        // comparison (=, <>, <, <=, >, >=, IS, IS NOT) whose sides each read one scope.
+        var semiQueries = new[]
         {
             "SELECT c.id FROM customers AS c WHERE EXISTS (SELECT 1 FROM orders AS o WHERE o.customer_id > c.id) ORDER BY c.id;",
             "SELECT c.id FROM customers AS c WHERE EXISTS (SELECT 1 FROM orders AS o WHERE o.customer_id IS c.id) ORDER BY c.id;",
+            "SELECT c.id FROM customers AS c WHERE EXISTS (SELECT 1 FROM orders AS o WHERE o.customer_id = c.id AND o.total <> c.id) ORDER BY c.id;",
+        };
+        foreach (var query in semiQueries)
+        {
+            AssertMatchesSqlite(OrdersSetup, query);
+            AssertRewrites(OrdersSetup, query, semiJoins: 1, antiJoins: 0);
+        }
+
+        var antiQueries = new[]
+        {
+            "SELECT c.id FROM customers AS c WHERE NOT EXISTS (SELECT 1 FROM orders AS o WHERE o.customer_id >= c.id) ORDER BY c.id;",
+            "SELECT c.id FROM customers AS c WHERE NOT EXISTS (SELECT 1 FROM orders AS o WHERE o.customer_id = c.id AND o.total IS NOT c.id) ORDER BY c.id;",
+        };
+        foreach (var query in antiQueries)
+        {
+            AssertMatchesSqlite(OrdersSetup, query);
+            AssertRewrites(OrdersSetup, query, semiJoins: 0, antiJoins: 1);
+        }
+    }
+
+    [Test]
+    public void DoesNotRewriteCorrelationPredicatesThatAreNotDirectComparisons()
+    {
+        var queries = new[]
+        {
             "SELECT c.id FROM customers AS c WHERE EXISTS (SELECT 1 FROM orders AS o WHERE o.customer_id + c.id = 3) ORDER BY c.id;",
             """
             SELECT c.id FROM customers AS c

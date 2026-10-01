@@ -17,7 +17,27 @@ internal sealed record JoinSegmentMember(
     int OriginalIndex,
     double RowCount,
     int ColumnWidth,
-    IReadOnlyList<JoinIndexCandidate>? IndexCandidates = null);
+    IReadOnlyList<JoinIndexCandidate>? IndexCandidates = null)
+{
+    /// <summary>
+    /// Table ordinal of the member's INTEGER PRIMARY KEY (rowid alias) column, or -1. Only the
+    /// Turso cost model reads it (a rowid-alias hash build key keeps the index path,
+    /// access_method.rs:1360-1389).
+    /// </summary>
+    public int RowidAliasOrdinal { get; init; } = -1;
+
+    /// <summary>
+    /// Table ordinals that any declared index of the member contains. Only the Turso cost
+    /// model reads it (an indexed plain build column keeps the index path).
+    /// </summary>
+    public IReadOnlyCollection<int> IndexedColumnOrdinals { get; init; } = [];
+
+    /// <summary>
+    /// Table ordinals that lead a declared index of the member (Turso's
+    /// <c>probe_index_can_seek_join_key</c>, access_method.rs:1563-1592).
+    /// </summary>
+    public IReadOnlyCollection<int> IndexLeadingColumnOrdinals { get; init; } = [];
+}
 
 /// <summary>
 /// One persisted or automatic index usable as an outer-bound join access. <c>Forced</c> is true
@@ -113,7 +133,45 @@ internal sealed record JoinPredicateTerm(
     bool EqualityRightConvertsTextToNumeric = false,
     bool EqualityRightConvertsNumericToText = false,
     string? EqualityCollation = null,
-    string? EqualitySeekCollation = null);
+    string? EqualitySeekCollation = null)
+{
+    /// <summary>
+    /// Turso <c>estimate_selectivity</c> of this equality seen as a constraint on the left
+    /// operand's member (constraints.rs:367-437), or NaN when not computed.
+    /// </summary>
+    public double TursoLeftSelectivity { get; init; } = double.NaN;
+
+    /// <summary>The same figure for the right operand's member.</summary>
+    public double TursoRightSelectivity { get; init; } = double.NaN;
+
+    /// <summary>
+    /// Turso selectivity of a single-member constraint whose other side reads no table
+    /// (a local filter), or 1 when the term is not such a constraint.
+    /// </summary>
+    public double TursoLocalSelectivity { get; init; } = 1.0;
+
+    /// <summary>
+    /// <c>where_expr_steps(term) - 1</c> (join.rs:2338-2345): the WHERE work the term adds to
+    /// the loop where it becomes ready, beyond the one simple condition a row already pays for.
+    /// </summary>
+    public int WhereExtraSteps { get; init; }
+
+    /// <summary>
+    /// True for a WHERE conjunct that only feeds the cost model: it is never attached to a
+    /// synthesized join node, because the surviving WHERE evaluates it.
+    /// </summary>
+    public bool CostOnly { get; init; }
+
+    /// <summary>
+    /// For <c>column = literal</c> on one member (a constant constraint Turso lets an index seek
+    /// consume, constraints.rs), the column's table ordinal; otherwise -1. Such a term is never
+    /// an <see cref="IsEquality"/> join key and is never hashed.
+    /// </summary>
+    public int ConstantEqualityOrdinal { get; init; } = -1;
+
+    /// <summary>The collation a <see cref="ConstantEqualityOrdinal"/> comparison uses.</summary>
+    public string? ConstantEqualityCollation { get; init; }
+}
 
 /// <summary>
 /// Exact index and equality terms selected for one <c>IndexSeekRight</c> step.
@@ -129,7 +187,15 @@ internal sealed record JoinIndexAccessChoice(
 /// </summary>
 internal sealed record JoinSegment(
     IReadOnlyList<JoinSegmentMember> Members,
-    IReadOnlyList<JoinPredicateTerm> Terms);
+    IReadOnlyList<JoinPredicateTerm> Terms)
+{
+    /// <summary>
+    /// When true, steps are costed with the ported Turso v0.8.1 join planner
+    /// (<see cref="JoinOrderEnumerator"/> <c>EvaluateTursoStep</c>) instead of the narrowed
+    /// executor-shape model.
+    /// </summary>
+    public bool UseTursoCostModel { get; init; }
+}
 
 /// <summary>
 /// One enumerated left-deep plan: the member order, the physical shape chosen for each step, and

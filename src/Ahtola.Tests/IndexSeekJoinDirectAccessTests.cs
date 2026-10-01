@@ -48,7 +48,7 @@ public sealed class IndexSeekJoinDirectAccessTests
 
         using var reopened = EmbeddedDatabase.OpenFile("partial-index-join.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH inner_items USING INDEX inner_items_partial (k=?)");
 
         reopened.ResetJoinOrderDiagnostics();
@@ -81,8 +81,8 @@ public sealed class IndexSeekJoinDirectAccessTests
             ON outer_items.k = inner_items.k
             ORDER BY inner_items.payload;
             """;
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
-            .Should().NotContain("inner_items_partial");
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Select(static row => row[3].AsText())
+            .Should().NotContain(static detail => detail.Contains("inner_items_partial"));
 
         database.ResetJoinOrderDiagnostics();
         ReadRows(connection, sql).Select(row => row[0].AsText()).Should().Equal("dropped", "kept");
@@ -125,7 +125,7 @@ public sealed class IndexSeekJoinDirectAccessTests
 
         using var reopened = EmbeddedDatabase.OpenFile("expression-index-join.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(reopenedConnection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Contain("inner_items_lower_k");
 
         reopened.ResetJoinOrderDiagnostics();

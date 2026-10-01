@@ -222,10 +222,10 @@ public sealed partial class EmbeddedDatabase
                 map[left.SlotMap.Length + index] = left.SlotMap.Length + right.SlotMap[index];
 
             var changed = left.Changed || right.Changed;
-            result = new JoinOrderRewrittenSource(
-                changed ? join with { Left = left.Source, Right = right.Source } : join,
-                map,
-                changed);
+            var rebuilt = changed ? join with { Left = left.Source, Right = right.Source } : join;
+            if (TryPlanTursoOuterJoinNode(rebuilt, state, isRoot))
+                changed = true;
+            result = new JoinOrderRewrittenSource(rebuilt, map, changed);
             return true;
         }
 
@@ -277,21 +277,43 @@ public sealed partial class EmbeddedDatabase
                 return false;
             }
 
-            terms.Add(term);
+            terms.Add(WithTursoTermEstimates(term, conjunct, sources, infos, state.Context));
             placements.Add(new JoinOrderTermPlacement(conjunct, term.TableMask));
         }
 
         var pushedWhereTerms = 0;
+        List<Expression>? costOnlyConjuncts = null;
         if (isRoot && state.Where is not null)
         {
             foreach (var conjunct in SplitJoinOrderConjunction(state.Where))
             {
                 if (!TryCreatePushableJoinOrderWhereTerm(conjunct, infos, state.Context, out var term))
+                {
+                    (costOnlyConjuncts ??= []).Add(conjunct);
                     continue;
+                }
 
-                terms.Add(term);
+                terms.Add(WithTursoTermEstimates(term, conjunct, sources, infos, state.Context));
                 placements.Add(new JoinOrderTermPlacement(conjunct, term.TableMask));
                 pushedWhereTerms++;
+            }
+        }
+
+        // The rest of the WHERE clause is never attached to a synthesized node (the surviving
+        // WHERE evaluates it), but Turso charges its evaluation to the loop where it becomes
+        // ready. Such terms follow every placement, so placement indices stay aligned.
+        if (costOnlyConjuncts is not null)
+        {
+            foreach (var conjunct in costOnlyConjuncts)
+            {
+                if (!TryResolveJoinOrderMask(conjunct, infos, out var mask) || mask == 0)
+                    continue;
+                terms.Add(WithTursoTermEstimates(
+                    new JoinPredicateTerm(mask, IsEquality: false, 0, 0, 0.0, 0.0, Selectivity: 1.0) { CostOnly = true },
+                    conjunct,
+                    sources,
+                    infos,
+                    state.Context));
             }
         }
 
@@ -308,15 +330,33 @@ public sealed partial class EmbeddedDatabase
                 indexCandidates = [.. indexCandidates, automatic];
             }
 
+            var memberTable = infos[index].Table;
             members[index] = new JoinSegmentMember(
                 index,
                 infos[index].RowCount,
                 infos[index].Width,
-                indexCandidates);
+                indexCandidates)
+            {
+                RowidAliasOrdinal = memberTable?.RowidAliasColumnIndex ?? -1,
+                IndexedColumnOrdinals = memberTable is null
+                    ? []
+                    : memberTable.Indexes
+                        .Where(static index => !index.IsMethodIndex)
+                        .SelectMany(static index => index.Columns)
+                        .Where(static column => !column.IsExpression)
+                        .Select(static column => column.ColumnIndex)
+                        .ToHashSet(),
+                IndexLeadingColumnOrdinals = memberTable is null
+                    ? []
+                    : memberTable.Indexes
+                        .Where(static index => !index.IsMethodIndex && index.Columns.Count > 0 && !index.Columns[0].IsExpression)
+                        .Select(static index => index.Columns[0].ColumnIndex)
+                        .ToHashSet(),
+            };
         }
 
         Interlocked.Increment(ref _joinOrderSegmentsConsidered);
-        var plan = JoinOrderEnumerator.Compute(new JoinSegment(members, terms));
+        var plan = JoinOrderEnumerator.Compute(new JoinSegment(members, terms) { UseTursoCostModel = true });
         if (plan is null)
         {
             Interlocked.Increment(ref _joinOrderDeclines);
@@ -345,6 +385,110 @@ public sealed partial class EmbeddedDatabase
 
         result = new JoinOrderRewrittenSource(synthesized, slotMap, Changed: true);
         return true;
+    }
+
+    /// <summary>
+    /// Chooses the right input's access for a two-table LEFT or FULL join of base tables with
+    /// the ported Turso step model (<see cref="JoinOrderEnumerator.EvaluateTursoStep"/>): a hash
+    /// join building the preserved left table and probing the right (Turso
+    /// <c>HashJoinType::LeftOuter</c>/<c>FullOuter</c>), a declared index seek, or the operator's
+    /// hash of the right input (Turso's temporary index). The decision is recorded for the
+    /// builder; true when one was recorded.
+    /// </summary>
+    private bool TryPlanTursoOuterJoinNode(JoinTableSource join, JoinOrderRewriteState state, bool isRoot)
+    {
+        if (join.Kind is not (JoinKind.Left or JoinKind.Full)
+            || join.Left is not NamedTableSource
+            || join.Right is not NamedTableSource
+            || join.Condition is null
+            || join.UsingColumns is not null
+            || join.Natural)
+        {
+            return false;
+        }
+
+        var conjuncts = SplitJoinOrderConjunction(join.Condition).ToList();
+        var sources = new List<TableSource> { join.Left, join.Right };
+        var infos = new JoinOrderMemberInfo[2];
+        for (var index = 0; index < 2; index++)
+        {
+            if (!TryDescribeJoinOrderMember(sources[index], conjuncts, state.Context, out var info))
+                return false;
+            infos[index] = info;
+        }
+
+        var terms = new List<JoinPredicateTerm>();
+        var placements = new List<JoinOrderTermPlacement>();
+        foreach (var conjunct in conjuncts)
+        {
+            if (!TryCreateJoinOrderTerm(conjunct, infos, state.Context, out var term))
+                return false;
+            terms.Add(WithTursoTermEstimates(term, conjunct, sources, infos, state.Context));
+            placements.Add(new JoinOrderTermPlacement(conjunct, term.TableMask));
+        }
+
+        // WHERE filters on the preserved table narrow the rows that reach the right input.
+        if (isRoot && state.Where is not null)
+        {
+            foreach (var conjunct in SplitJoinOrderConjunction(state.Where))
+            {
+                if (TryResolveJoinOrderMask(conjunct, infos, out var mask) && mask == 1UL)
+                {
+                    terms.Add(WithTursoTermEstimates(
+                        new JoinPredicateTerm(mask, IsEquality: false, 0, 0, 0.0, 0.0, Selectivity: 1.0) { CostOnly = true },
+                        conjunct,
+                        sources,
+                        infos,
+                        state.Context));
+                }
+            }
+        }
+
+        var members = new JoinSegmentMember[2];
+        for (var index = 0; index < 2; index++)
+        {
+            var memberTable = infos[index].Table;
+            members[index] = new JoinSegmentMember(index, infos[index].RowCount, infos[index].Width, infos[index].IndexCandidates)
+            {
+                RowidAliasOrdinal = memberTable?.RowidAliasColumnIndex ?? -1,
+                IndexedColumnOrdinals = memberTable is null
+                    ? []
+                    : memberTable.Indexes
+                        .Where(static index => !index.IsMethodIndex)
+                        .SelectMany(static index => index.Columns)
+                        .Where(static column => !column.IsExpression)
+                        .Select(static column => column.ColumnIndex)
+                        .ToHashSet(),
+                IndexLeadingColumnOrdinals = memberTable is null
+                    ? []
+                    : memberTable.Indexes
+                        .Where(static index => !index.IsMethodIndex && index.Columns.Count > 0 && !index.Columns[0].IsExpression)
+                        .Select(static index => index.Columns[0].ColumnIndex)
+                        .ToHashSet(),
+            };
+        }
+
+        var segment = new JoinSegment(members, terms) { UseTursoCostModel = true };
+        var (_, outerRows) = JoinOrderEnumerator.EvaluateFirstStep(segment, 0);
+        var step = JoinOrderEnumerator.EvaluateTursoStep(
+            segment,
+            placedMask: 1UL,
+            member: 1,
+            outerRows,
+            join.Kind == JoinKind.Full ? TursoOuterJoin.Full : TursoOuterJoin.Left);
+        switch (step.Shape)
+        {
+            case JoinStepShape.HashBuildLeft:
+                state.HashBuildRight[join] = false;
+                return true;
+            case JoinStepShape.IndexSeekRight when join.Kind == JoinKind.Left && step.IndexAccess is { } access:
+                state.IndexSeeks[join] = new CompiledJoinIndexSelection(
+                    members[1].IndexCandidates![access.CandidateIndex],
+                    access.EqualityTermIndices.Select(index => placements[index].Expression).ToArray());
+                return true;
+            default:
+                return false;
+        }
     }
 
     /// <summary>
@@ -1623,6 +1767,166 @@ public sealed partial class EmbeddedDatabase
         public EmbeddedTable? Table { get; } = table;
 
         public IReadOnlyList<JoinIndexCandidate> IndexCandidates { get; } = indexCandidates;
+    }
+
+    /// <summary>
+    /// Adds the Turso cost-model figures to one segment term: the <c>estimate_selectivity</c>
+    /// of an equality from each operand's member, the selectivity of a single-member filter,
+    /// and the term's <c>where_expr_steps - 1</c> WHERE work.
+    /// </summary>
+    private JoinPredicateTerm WithTursoTermEstimates(
+        JoinPredicateTerm term,
+        Expression conjunct,
+        List<TableSource> sources,
+        JoinOrderMemberInfo[] infos,
+        QueryContext context)
+    {
+        var leftSelectivity = double.NaN;
+        var rightSelectivity = double.NaN;
+        if (term.IsEquality)
+        {
+            leftSelectivity = MemberEqualitySelectivity(term.EqualityLeftMask, term.EqualityLeftColumnOrdinal);
+            rightSelectivity = MemberEqualitySelectivity(term.EqualityRightMask, term.EqualityRightColumnOrdinal);
+        }
+
+        var localSelectivity = 1.0;
+        if (System.Numerics.BitOperations.PopCount(term.TableMask) == 1)
+        {
+            var member = System.Numerics.BitOperations.TrailingZeroCount(term.TableMask);
+            if (sources[member] is NamedTableSource named && infos[member].Table is { } table)
+                localSelectivity = EstimateTursoLocalSelectivity(conjunct, named, table, context);
+        }
+
+        var constantOrdinal = -1;
+        string? constantCollation = null;
+        if (!term.IsEquality
+            && !term.CostOnly
+            && System.Numerics.BitOperations.PopCount(term.TableMask) == 1
+            && TryDescribeConstantEquality(conjunct, infos, context, out var constantMember, out var ordinal, out var collation)
+            && term.TableMask == 1UL << constantMember)
+        {
+            constantOrdinal = ordinal;
+            constantCollation = collation;
+        }
+
+        return term with
+        {
+            TursoLeftSelectivity = leftSelectivity,
+            TursoRightSelectivity = rightSelectivity,
+            TursoLocalSelectivity = localSelectivity,
+            WhereExtraSteps = CountTursoWhereSteps(conjunct) - 1,
+            ConstantEqualityOrdinal = constantOrdinal,
+            ConstantEqualityCollation = constantCollation,
+        };
+
+        double MemberEqualitySelectivity(ulong mask, int ordinal)
+        {
+            if (mask == 0 || ordinal < 0)
+                return double.NaN;
+            var member = System.Numerics.BitOperations.TrailingZeroCount(mask);
+            return infos[member].Table is { } table && ordinal < table.Columns.Length
+                ? EstimateTursoColumnSelectivity(table, ordinal, TursoConstraintOperator.Equal, context)
+                : double.NaN;
+        }
+    }
+
+    /// <summary>
+    /// Recognizes <c>column = literal</c> (either side; a numeric literal may carry a sign) on
+    /// one join member whose comparison needs no affinity conversion of the literal — a
+    /// numeric literal against a numeric-affinity column, a text literal against a TEXT column,
+    /// or any literal against a BLOB-affinity column — so an index seek can use the literal as
+    /// its key verbatim. The comparison collation is the column's declared collation.
+    /// </summary>
+    private static bool TryDescribeConstantEquality(
+        Expression conjunct,
+        JoinOrderMemberInfo[] infos,
+        QueryContext context,
+        out int member,
+        out int ordinal,
+        out string collation)
+    {
+        member = -1;
+        ordinal = -1;
+        collation = "BINARY";
+        if (!TryGetConstantEqualityOperands(conjunct, out var column, out var value)
+            || !TryResolveJoinOrderMember(column, infos, out member)
+            || infos[member].Table is not { } table
+            || TryResolveJoinOrderColumnDefinition(infos[member], column, context) is not { } definition
+            || !table.TryGetColumnIndex(definition.Name, out ordinal))
+        {
+            return false;
+        }
+
+        if (!IsVerbatimConstantSeekKey(definition, value))
+            return false;
+
+        collation = NormalizeDeclaredCollation(definition.Collation).ToUpperInvariant();
+        return true;
+    }
+
+    /// <summary>
+    /// Whether comparing <paramref name="definition"/>'s column with the literal
+    /// <paramref name="value"/> applies no affinity conversion to the literal, so the literal
+    /// can be an index seek key as written.
+    /// </summary>
+    private static bool IsVerbatimConstantSeekKey(EmbeddedColumn definition, SqlValue value)
+    {
+        var affinity = GetJoinKeyAffinity(definition);
+        return affinity is null or ColumnAffinity.Blob
+            || IsNumericAffinity(affinity) && value.Kind is SqlValueKind.Integer or SqlValueKind.Real
+            || affinity == ColumnAffinity.Text && value.Kind == SqlValueKind.Text;
+    }
+
+    /// <summary>
+    /// The bare column and literal value of <c>column = literal</c> / <c>literal = column</c>
+    /// with no explicit COLLATE; NULL and BLOB literals are not constant seek keys.
+    /// </summary>
+    private static bool TryGetConstantEqualityOperands(
+        Expression conjunct,
+        out ColumnExpression column,
+        out SqlValue value)
+    {
+        column = null!;
+        value = SqlValue.Null;
+        if (conjunct is not BinaryExpression { Operator: BinaryOperator.Equal } binary)
+            return false;
+
+        if (binary.Left is ColumnExpression { BooleanKeyword: null } leftColumn && TryGetLiteral(binary.Right, out value))
+        {
+            column = leftColumn;
+            return true;
+        }
+
+        if (binary.Right is ColumnExpression { BooleanKeyword: null } rightColumn && TryGetLiteral(binary.Left, out value))
+        {
+            column = rightColumn;
+            return true;
+        }
+
+        return false;
+
+        static bool TryGetLiteral(Expression expression, out SqlValue literal)
+        {
+            literal = SqlValue.Null;
+            switch (expression)
+            {
+                case LiteralExpression { Value.Kind: SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Text } plain:
+                    literal = plain.Value;
+                    return true;
+                case UnaryExpression { Operator: UnaryOperator.Plus, Operand: LiteralExpression { Value.Kind: SqlValueKind.Integer or SqlValueKind.Real } positive }:
+                    literal = positive.Value;
+                    return true;
+                case UnaryExpression { Operator: UnaryOperator.Negate, Operand: LiteralExpression { Value.Kind: SqlValueKind.Real } negativeReal }:
+                    literal = SqlValue.Real(-negativeReal.Value.AsReal());
+                    return true;
+                case UnaryExpression { Operator: UnaryOperator.Negate, Operand: LiteralExpression { Value.Kind: SqlValueKind.Integer } negativeInteger }
+                    when negativeInteger.Value.AsInteger() != long.MinValue:
+                    literal = SqlValue.Integer(-negativeInteger.Value.AsInteger());
+                    return true;
+                default:
+                    return false;
+            }
+        }
     }
 
     private readonly record struct JoinOrderTermPlacement(Expression Expression, ulong Mask);
