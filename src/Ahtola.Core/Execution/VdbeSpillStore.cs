@@ -265,7 +265,7 @@ internal static class VdbeSpillRecordCodec
     private static ReadOnlySpan<byte> Magic => "AHTSPILL"u8;
     private const byte FormatVersion = 1;
     public const int FileHeaderSize = 10;
-    private const int RecordLengthSize = 5;
+    public const int RecordLengthSize = 5;
 
     public static long InitializeFile(
         IFile file,

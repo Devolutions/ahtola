@@ -128,6 +128,36 @@ public sealed class VdbeBufferedSpillFileTests
             "the spilled sort must not degrade to per-value file I/O (it took ~28 s before)");
     }
 
+    [Test]
+    public void SpilledHashJoinKeepsProbeBatchingAndReadsPartitionsInBlocks()
+    {
+        // Under the default 2 MB budget this join spills its build side. Resident partitions
+        // used to starve probe-batch admission (one probe per batch, a partition reload per
+        // probe, half of them failing part-way), all read one value at a time: ~32 s at 3k rows.
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        Execute(connection, "CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER, pad TEXT)");
+        Execute(connection, "CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, pad TEXT)");
+        Execute(connection, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 3000) INSERT INTO a(k, pad) SELECT i, printf('%050d', i) FROM n");
+        Execute(connection, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 3000) INSERT INTO b(k, pad) SELECT i % 1500, printf('%050d', i) FROM n");
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT count(*), sum(a.k) FROM a JOIN b ON a.k = b.k";
+        using var reader = command.ExecuteReader();
+        reader.Read().Should().BeTrue();
+        var matches = reader.GetInt64(0);
+        var keySum = reader.GetInt64(1);
+        watch.Stop();
+
+        // b.k cycles 0..1499 twice; a.k 1..1499 match two rows each (k = 0 matches nothing).
+        matches.Should().Be(2998);
+        keySum.Should().Be(2L * (1499L * 1500L / 2));
+        watch.Elapsed.Should().BeLessThan(
+            TimeSpan.FromSeconds(10),
+            "a spilled hash join must not degrade to a partition reload per probe");
+    }
+
     private static byte[] WriteRecords(Func<IFile, IFile> wrap, IReadOnlyList<SqlValue[]> rows)
     {
         using var inner = OpenFile();

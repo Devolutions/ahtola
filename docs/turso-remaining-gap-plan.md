@@ -111,11 +111,18 @@ plus two older generated-column integrity markers. The ledger now holds
   sorter's spill file now coalesces writes, and each run reader reads ahead.
   Both buffers scale with the memory limit and are charged to it. The same
   query now takes under a second, and `groupby/default.sqltest` runs in
-  about 80 s for the whole file, down from about 15 minutes. Hash-join,
-  window and keyed-row spills still use unbuffered I/O.
-- Large plain equi-joins (3,000 × 3,000) take tens of seconds, both before and
-  after this work. This is likely the hash-join spill path under the 2 MB
-  execution budget.
+  about 80 s for the whole file, down from about 15 minutes.
+- Fixed: a spilled 3,000 × 3,000 equi-join took about 32 s. Resident build
+  partitions starved probe-batch admission, so batches held one probe and each
+  probe reloaded its partition. About half of those loads ran out of memory
+  part-way and started again, and every read went one value at a time.
+  Now a probe batch evicts cached partitions to keep growing, and groups are
+  answered resident-first. A load first makes room for its partition's
+  recorded entry retention, and skips a load that cannot fit. Each sequential
+  partition scan reads through a charged read-ahead block. The join now takes
+  about 0.4 s, and 10,000 × 10,000 takes about 2.4 s. Each probe batch still
+  re-reads the partitions it touches, because output keeps probe order.
+  Window and keyed-row spills still use unbuffered I/O.
 - INDEXED BY / NOT INDEXED should rule out hash joins and ephemeral indexes,
   as in Turso.
 - At page size 1024, large index keys pack less tightly than in SQLite, which

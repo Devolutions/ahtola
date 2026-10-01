@@ -352,6 +352,16 @@ internal static class VdbeManagedFootprint
     public static int GetSorterRunReadBufferBytes(long memoryLimitBytes)
         => ScaleSpillBuffer(memoryLimitBytes / 512, MaximumSorterRunReadBufferBytes);
 
+    /// <summary>
+    /// Transient read-ahead block of one sequential hash-spill scan (partition load, key
+    /// index build or fallback scan), sized like a sorter run reader's block.
+    /// </summary>
+    public static int GetSpillScanReadBufferBytes(long memoryLimitBytes)
+        => GetSorterRunReadBufferBytes(memoryLimitBytes);
+
+    /// <summary>The bytes a spill read-ahead view of <paramref name="bufferBytes"/> retains.</summary>
+    public static long EstimateSpillReadBuffer(int bufferBytes) => EstimateSpillBuffer(bufferBytes);
+
     private static int ScaleSpillBuffer(long share, int maximum)
         => share < MinimumSpillBufferBytes ? 0 : (int)Math.Min(share, maximum);
 
