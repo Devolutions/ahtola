@@ -122,7 +122,20 @@ plus two older generated-column integrity markers. The ledger now holds
   partition scan reads through a charged read-ahead block. The join now takes
   about 0.4 s, and 10,000 × 10,000 takes about 2.4 s. Each probe batch still
   re-reads the partitions it touches, because output keeps probe order.
-  Window and keyed-row spills still use unbuffered I/O.
+  Window and keyed-row spills still use unbuffered I/O, but no SQL shape
+  measured here reached them: window, DISTINCT, compound and recursive
+  queries over 20,000 rows created no spill files even at a 200 KB budget.
+- Fixed: evaluator DISTINCT, UNION/INTERSECT/EXCEPT, DISTINCT aggregates
+  and recursive-CTE UNION compared each row with every kept row, whatever
+  the memory budget. At 20,000 rows `count(DISTINCT pad)` took about 16 s
+  and a self-UNION about 42 s. They now share a set that buckets rows by a
+  hash consistent with DISTINCT equality: integer and real compare
+  numerically, and BINARY, NOCASE and RTRIM text get their own hashes. Any
+  other collation hashes text as a constant, so it stays correct, just
+  slower. The same queries now take about 0.1–0.25 s. UNION still keeps the
+  later row of an equal group, as the pinned corpus expects.
+- Pre-existing, noticed while testing: a stored `-0.0` loses its sign, and
+  `quote()` renders 9007199254740992.0 as `9.007199254740992e+15`.
 - INDEXED BY / NOT INDEXED should rule out hash joins and ephemeral indexes,
   as in Turso.
 - At page size 1024, large index keys pack less tightly than in SQLite, which

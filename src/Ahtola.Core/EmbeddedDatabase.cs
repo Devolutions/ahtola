@@ -35757,7 +35757,7 @@ out bool hasReturning)
         }
 
         var result = new List<SourceRow>();
-        var seen = deduplicate ? new List<SqlValue[]>() : null;
+        var seen = deduplicate ? new DistinctRowSet(this, collations) : null;
         // The budget caps how many EMITTED rows the expansion may produce: the
         // compound's own LIMIT (the OFFSET is consumed inside this loop), or the
         // outer query's row budget when the compound is unlimited. With both, the
@@ -36110,16 +36110,19 @@ out bool hasReturning)
             anchorRows, Transform, RecursiveCteRowLimit, RecursiveCteRowLimit);
     }
 
-    private bool TryAddRecursiveDistinctRow(
-        List<SqlValue[]> seen,
+    private static bool TryAddRecursiveDistinctRow(
+        DistinctRowSet seen,
         SqlValue[] candidate,
         IReadOnlyList<string?> collations)
     {
-        if (seen.Any(existing => RecursiveRowsEqual(existing, candidate, collations)))
-            return false;
+        // A row whose width does not match the collation list never equals another row.
+        if (candidate.Length != collations.Count)
+        {
+            seen.Add(candidate);
+            return true;
+        }
 
-        seen.Add(candidate);
-        return true;
+        return seen.TryAdd(candidate);
     }
 
     private bool RecursiveRowsEqual(
@@ -37007,18 +37010,18 @@ out bool hasReturning)
         IReadOnlyList<SqlValue[]> right,
         IReadOnlyList<string?> collations)
     {
-        var result = new List<SqlValue[]>();
+        var rightSet = new DistinctRowSet(this, collations, right);
+        var result = new DistinctRowSet(this, collations);
         foreach (var row in left)
         {
-            if (result.Any(candidate => RowsEqual(candidate, row, collations))
-                || !right.Any(candidate => RowsEqual(candidate, row, collations)))
+            if (!rightSet.Contains(row) || result.Contains(row))
                 continue;
 
             result.Add(row.ToArray());
         }
 
-        SortCompoundSetRows(result, collations);
-        return result;
+        SortCompoundSetRows(result.Rows, collations);
+        return result.Rows;
     }
 
     private List<SqlValue[]> ApplyExcept(
@@ -37026,18 +37029,18 @@ out bool hasReturning)
         IReadOnlyList<SqlValue[]> right,
         IReadOnlyList<string?> collations)
     {
-        var result = new List<SqlValue[]>();
+        var rightSet = new DistinctRowSet(this, collations, right);
+        var result = new DistinctRowSet(this, collations);
         foreach (var row in left)
         {
-            if (result.Any(candidate => RowsEqual(candidate, row, collations))
-                || right.Any(candidate => RowsEqual(candidate, row, collations)))
+            if (rightSet.Contains(row) || result.Contains(row))
                 continue;
 
             result.Add(row.ToArray());
         }
 
-        SortCompoundSetRows(result, collations);
-        return result;
+        SortCompoundSetRows(result.Rows, collations);
+        return result.Rows;
     }
 
     // SQLite/Turso materialize UNION, INTERSECT, and EXCEPT sets in a temporary B-tree. The traversal of
@@ -37078,11 +37081,14 @@ out bool hasReturning)
         IEnumerable<SqlValue[]> source,
         IReadOnlyList<string?> collations)
     {
+        // A later row replaces the kept row of its equal group, as the pinned corpus expects
+        // (select/memory.sqltest collate-compound-1).
+        var set = new DistinctRowSet(this, collations, backing: destination);
         foreach (var row in source)
         {
-            var existingIndex = destination.FindIndex(candidate => RowsEqual(candidate, row, collations));
+            var existingIndex = set.IndexOf(row);
             if (existingIndex < 0)
-                destination.Add(row.ToArray());
+                set.Add(row.ToArray());
             else
                 destination[existingIndex] = row.ToArray();
         }
@@ -37413,14 +37419,14 @@ out bool hasReturning)
         var rows = source.ToList();
         if (distinct)
         {
-            var distinctRows = new List<SqlValue[]>(rows.Count);
+            // Bucket kept rows by a hash that agrees with RowsEqual, so each row is compared only
+            // with the kept rows that could equal it instead of with every kept row (quadratic).
+            // RowsEqual still decides equality inside a bucket, and first occurrences keep order.
+            var distinctRows = new DistinctRowSet(this, collations);
             foreach (var row in rows)
-            {
-                if (!distinctRows.Any(candidate => RowsEqual(candidate, row, collations)))
-                    distinctRows.Add(row);
-            }
+                distinctRows.TryAdd(row);
 
-            rows = distinctRows;
+            rows = distinctRows.Rows;
         }
 
         if (offset >= rows.Count)
@@ -37431,6 +37437,194 @@ out bool hasReturning)
             rows.RemoveRange((int)limit.Value, rows.Count - (int)limit.Value);
 
         return rows.ToArray();
+    }
+
+    /// <summary>
+    /// Insertion-ordered set of rows under DISTINCT equality (<see cref="RowsEqual"/>): rows are
+    /// bucketed by <see cref="HashDistinctRow"/> and compared only within their bucket, so
+    /// UNION/INTERSECT/EXCEPT, DISTINCT and DISTINCT aggregates stay linear instead of comparing
+    /// each row with every kept row.
+    /// </summary>
+    private sealed class DistinctRowSet
+    {
+        private readonly EmbeddedDatabase _owner;
+        private readonly IReadOnlyList<string?>? _collations;
+        private readonly Dictionary<int, List<int>> _buckets = [];
+        private DistinctTextHash?[] _textHashes = [];
+
+        /// <param name="owner">Supplies DISTINCT equality and collation resolution.</param>
+        /// <param name="collations">Per-column collations, or null for BINARY.</param>
+        /// <param name="initial">Rows added (without deduplication) to a new backing list.</param>
+        /// <param name="backing">
+        /// A caller-owned list to index and append to in place, instead of a new list. The caller
+        /// may replace a kept row with an equal one; equal rows share a bucket.
+        /// </param>
+        public DistinctRowSet(
+            EmbeddedDatabase owner,
+            IReadOnlyList<string?>? collations,
+            IEnumerable<SqlValue[]>? initial = null,
+            List<SqlValue[]>? backing = null)
+        {
+            _owner = owner;
+            _collations = collations;
+            Rows = backing ?? [];
+            for (var index = 0; index < Rows.Count; index++)
+                Index(Rows[index], index);
+
+            if (initial is null)
+                return;
+
+            foreach (var row in initial)
+                Add(row);
+        }
+
+        /// <summary>The kept rows, in insertion order.</summary>
+        public List<SqlValue[]> Rows { get; }
+
+        public bool Contains(IReadOnlyList<SqlValue> row) => IndexOf(row) >= 0;
+
+        public int IndexOf(IReadOnlyList<SqlValue> row)
+        {
+            if (!_buckets.TryGetValue(Hash(row), out var candidates))
+                return -1;
+
+            foreach (var candidate in candidates)
+            {
+                if (_owner.RowsEqual(Rows[candidate], row, _collations))
+                    return candidate;
+            }
+
+            return -1;
+        }
+
+        /// <summary>Adds <paramref name="row"/> unless an equal row is already kept.</summary>
+        public bool TryAdd(SqlValue[] row)
+        {
+            if (Contains(row))
+                return false;
+
+            Add(row);
+            return true;
+        }
+
+        /// <summary>Appends <paramref name="row"/>; the caller has established it is new.</summary>
+        public void Add(SqlValue[] row)
+        {
+            Index(row, Rows.Count);
+            Rows.Add(row);
+        }
+
+        private void Index(IReadOnlyList<SqlValue> row, int position)
+        {
+            var hash = Hash(row);
+            if (!_buckets.TryGetValue(hash, out var candidates))
+            {
+                candidates = [];
+                _buckets.Add(hash, candidates);
+            }
+
+            candidates.Add(position);
+        }
+
+        private int Hash(IReadOnlyList<SqlValue> row)
+        {
+            if (_textHashes.Length < row.Count)
+                Array.Resize(ref _textHashes, row.Count);
+            return _owner.HashDistinctRow(row, _collations, _textHashes);
+        }
+    }
+
+    /// <summary>How a DISTINCT column's text values hash consistently with <see cref="Compare"/>.</summary>
+    private enum DistinctTextHash
+    {
+        /// <summary>The collation's equality is not modeled; text contributes a constant.</summary>
+        Opaque,
+        Binary,
+        NoCase,
+        RTrim,
+    }
+
+    /// <summary>
+    /// Hashes a row so values RowsEqual treats as equal hash equally: NULLs alike, integers and
+    /// reals through their numeric value, blobs by bytes, and text by the column collation's
+    /// built-in equality. A registered, external or locale collation is opaque.
+    /// </summary>
+    private int HashDistinctRow(
+        IReadOnlyList<SqlValue> row,
+        IReadOnlyList<string?>? collations,
+        DistinctTextHash?[] textHashes)
+    {
+        var hash = new HashCode();
+        for (var index = 0; index < row.Count; index++)
+        {
+            var value = row[index];
+            switch (value.Kind)
+            {
+                case SqlValueKind.Null:
+                    hash.Add(0);
+                    break;
+                case SqlValueKind.Integer:
+                    hash.Add(HashDistinctNumber(value.AsInteger()));
+                    break;
+                case SqlValueKind.Real:
+                    hash.Add(HashDistinctNumber(value.AsReal()));
+                    break;
+                case SqlValueKind.Blob:
+                    var blobHash = new HashCode();
+                    blobHash.AddBytes(value.AsBlobSpan());
+                    hash.Add(blobHash.ToHashCode());
+                    break;
+                case SqlValueKind.Text:
+                    var mode = index < textHashes.Length
+                        ? textHashes[index] ??= ResolveDistinctTextHash(collations?[index])
+                        : DistinctTextHash.Opaque;
+                    hash.Add(HashDistinctText(value.AsText(), mode));
+                    break;
+            }
+        }
+
+        return hash.ToHashCode();
+    }
+
+    // An integer and a real compare equal only when the real is exactly that integer, which is
+    // then exactly representable, so hashing both as doubles keeps equal values together.
+    private static int HashDistinctNumber(double value)
+        => value == 0 ? 0 : value.GetHashCode();
+
+    private DistinctTextHash ResolveDistinctTextHash(string? collation)
+    {
+        var name = collation ?? "BINARY";
+        if (_collations.ContainsKey(name) || _externalCollationResolver is not null)
+            return DistinctTextHash.Opaque;
+        if (string.Equals(name, "BINARY", StringComparison.OrdinalIgnoreCase))
+            return DistinctTextHash.Binary;
+        if (string.Equals(name, "NOCASE", StringComparison.OrdinalIgnoreCase))
+            return DistinctTextHash.NoCase;
+        if (string.Equals(name, "RTRIM", StringComparison.OrdinalIgnoreCase))
+            return DistinctTextHash.RTrim;
+        return DistinctTextHash.Opaque;
+    }
+
+    private static int HashDistinctText(string text, DistinctTextHash mode)
+    {
+        switch (mode)
+        {
+            case DistinctTextHash.Binary:
+                return string.GetHashCode(text, StringComparison.Ordinal);
+            case DistinctTextHash.RTrim:
+                return string.GetHashCode(text.AsSpan().TrimEnd(' '), StringComparison.Ordinal);
+            case DistinctTextHash.NoCase:
+                // NOCASE folds only ASCII letters; past an embedded NUL it compares lengths
+                // alone, so such text is left opaque rather than modeled here.
+                if (text.Contains('\0'))
+                    return 1;
+                var hash = new HashCode();
+                foreach (var character in text)
+                    hash.Add(character is >= 'A' and <= 'Z' ? (char)(character + ('a' - 'A')) : character);
+                return hash.ToHashCode();
+            default:
+                return 1;
+        }
     }
 
     private SqlValue[] EvaluateGroupKey(
@@ -45858,16 +46052,15 @@ out bool hasReturning)
                 throw new EmbeddedSqlException("DISTINCT aggregates must have exactly one argument.");
 
             var collation = GetEffectiveCollation(function.Arguments[0], context);
-            var seen = new List<SqlValue>();
+            var seen = new DistinctRowSet(this, [collation]);
             var deduplicated = new List<SourceRow>();
             foreach (var row in result)
             {
                 context.CheckInterrupt();
                 var value = Evaluate(function.Arguments[0], parameters, row, context);
-                if (seen.Any(existing => DistinctValuesEqual(existing, value, collation)))
+                if (!seen.TryAdd([value]))
                     continue;
 
-                seen.Add(value);
                 deduplicated.Add(row);
             }
 
