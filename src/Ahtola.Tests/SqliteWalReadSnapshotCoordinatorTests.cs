@@ -86,6 +86,53 @@ public sealed class SqliteWalReadSnapshotCoordinatorTests
         snapshot.MaximumFrame.Should().Be(region.Header.MaximumFrame);
     }
 
+    // Turso 74eb80c83 / SQLite walTryBeginRead: a checkpoint holds read-mark 0 exclusively
+    // while it runs, and a reader of a fully backfilled WAL must not wait for it. It pins the
+    // committed boundary with read-marks 1..4 instead, which the checkpoint does not touch.
+    [Test]
+    [NonParallelizable]
+    public void BackfilledReaderPinsAnotherReadMarkWhileACheckpointHoldsReadMarkZero()
+    {
+        RequireSnapshotSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using (var checkpointer = new SqliteConnection($"Data Source={artifact.DatabasePath};Mode=ReadWrite;Pooling=False"))
+        {
+            checkpointer.Open();
+            Execute(checkpointer, "PRAGMA wal_checkpoint(PASSIVE);");
+        }
+
+        using var coordinator = SqliteWalReadSnapshotCoordinator.Open(artifact.DatabasePath);
+        uint backfilledFrame;
+        using (var wal = OpenWalCopy(artifact.DatabasePath))
+        {
+            backfilledFrame = checked((uint)wal.ScanRecovery().LastCommittedFrameNumber);
+            backfilledFrame.Should().BeGreaterThan(0, "a PASSIVE checkpoint keeps the backfilled frames");
+        }
+
+        using (var checkpointHoldsReadMarkZero = new CrossProcessReadMarkProbe(
+                   artifact.WorkDirectory,
+                   artifact.DatabasePath + "-shm",
+                   readMarkIndex: 0))
+        {
+            checkpointHoldsReadMarkZero.Result.Should().Be("acquired");
+
+            using var pinned = coordinator.BeginRead(TimeSpan.Zero);
+            pinned.ReadMarkIndex.Should().BeInRange(1, SqliteWalIndexCheckpointInfo.ReadMarkCount - 1);
+            pinned.MaximumFrame.Should().Be(backfilledFrame);
+            pinned.ReadFrame(pinned.MaximumFrame).Header.IsCommit.Should().BeTrue();
+
+            // A second backfilled reader shares the mark the first one published.
+            using var shared = coordinator.BeginRead(TimeSpan.Zero);
+            shared.ReadMarkIndex.Should().Be(pinned.ReadMarkIndex);
+            shared.MaximumFrame.Should().Be(backfilledFrame);
+        }
+
+        // Once the checkpoint lets read-mark 0 go, a backfilled reader ignores the WAL again.
+        using var databaseOnly = coordinator.BeginRead(TimeSpan.Zero);
+        databaseOnly.ReadMarkIndex.Should().Be(0);
+        databaseOnly.MaximumFrame.Should().Be(0);
+    }
+
     [Test]
     [NonParallelizable]
     public void SnapshotIgnoresFramesAppendedByASeparateSqliteWriterProcess()

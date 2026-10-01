@@ -85,7 +85,6 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
                 shape,
                 matchExpression,
                 FiltersRows: true,
-                ValidateArgument: ValidateMatchArgument,
                 RetainsUnrankedRows: false);
             return true;
         }
@@ -107,37 +106,20 @@ internal sealed class ManagedFtsPlannerAdapter : IManagedIndexMethodPlannerAdapt
             ManagedIndexPatternShape.Score,
             orderedScoreExpression,
             FiltersRows: false,
-            ValidateArgument: ValidateScoreArgument,
             UnrankedMergePolicy: ManagedIndexUnrankedMergePolicy.MergeByDescendingRank,
             UnrankedRank: 0.0);
         return true;
     }
 
     /// <summary>
-    /// Reproduces the exact type error <c>fts_match()</c> raises for the same argument, so choosing
-    /// the index can never turn a scalar error into an empty result set.
+    /// Reads a non-NULL query argument as text. Like Turso's <c>FtsCursor::query_start</c> and
+    /// scalar <c>fts_match</c> (upstream d485aa6d8), an integer, real or blob query is searched
+    /// by its SQL text form rather than rejected; NULL matches nothing and never reaches here.
     /// </summary>
-    private static void ValidateMatchArgument(SqlValue value)
-    {
-        if (value.Kind is SqlValueKind.Null or SqlValueKind.Text)
-            return;
-
-        throw new EmbeddedSqlException("fts_match() requires a text query");
-    }
-
-    private static void ValidateScoreArgument(SqlValue value)
-    {
-        if (value.Kind is SqlValueKind.Null or SqlValueKind.Text)
-            return;
-
-        throw new EmbeddedSqlException("fts_score() requires a text query");
-    }
-
-    /// <summary>Reads a query argument that already passed validation.</summary>
     public static string RequireQueryText(SqlValue value)
-        => value.Kind == SqlValueKind.Text
-            ? value.AsText()
-            : throw new EmbeddedSqlException("fts query must be text");
+        => value.Kind == SqlValueKind.Null
+            ? throw new EmbeddedSqlException("fts query must not be NULL")
+            : EmbeddedDatabase.ToSqlText(value);
 
     /// <summary>
     /// Finds <c>fts_match(cols…, query)</c> among the conjuncts of a WHERE predicate, and reports

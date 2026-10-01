@@ -35,7 +35,6 @@ public sealed partial class EmbeddedDatabase
             throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteStat4TableName}");
         }
 
-        EnforceMaxPageCountForCatalogChange(1);
         var statistics = new EmbeddedTable(
             SqliteStat4TableName,
             [

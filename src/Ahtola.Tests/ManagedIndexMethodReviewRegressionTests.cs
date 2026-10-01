@@ -777,22 +777,87 @@ public sealed class ManagedIndexMethodReviewRegressionTests
     // Finding 16: the indexed path preserves scalar type and error semantics.
     // ---------------------------------------------------------------------------------------
 
-    [Test]
-    public void ANumericQueryArgumentErrorsOnBothPaths()
+    // Turso d485aa6d8 ("fts: accept null and non-text search inputs"): a non-NULL query of any
+    // storage class is searched by its text form on both paths, mirroring
+    // test_fts_query_input_types / test_fts_bound_query_input_types.
+    [TestCase(false)]
+    [TestCase(true)]
+    public void NonTextQueryLiteralsAreSearchedAsTextOnBothPaths(bool indexed)
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        SeedSparseCorpus(connection);
+        SeedNumericBodies(connection, indexed);
 
-        // Indexed path.
-        ExplainDetail(connection, "SELECT id FROM docs WHERE fts_match(title, body, 'needle');")
-            .Should().Contain("INDEX METHOD");
-        ShouldThrow(connection, "SELECT id FROM docs WHERE fts_match(title, body, 123);")
-            .Message.Should().Contain("requires a text query");
+        foreach (var (query, expected) in new[] { ("NULL", Array.Empty<long>()), ("42", [1L]), ("7.5", [3L]), ("x'3432'", [1L]) })
+        {
+            foreach (var suffix in new[] { string.Empty, " LIMIT 10" })
+            {
+                var sql = $"SELECT id FROM d WHERE fts_match(body, {query}){suffix};";
+                QueryIntegers(connection, sql).Should().Equal(expected, sql);
+            }
+        }
+    }
 
-        Execute(connection, "DROP INDEX docs_fts;");
-        ShouldThrow(connection, "SELECT id FROM docs WHERE fts_match(title, body, 123);")
-            .Message.Should().Contain("requires a text query");
+    [TestCase(false)]
+    [TestCase(true)]
+    public void NonTextBoundQueriesAreSearchedAsTextOnBothPaths(bool indexed)
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        SeedNumericBodies(connection, indexed);
+
+        string[] statements =
+        [
+            "SELECT id FROM d WHERE fts_match(body, ?1)",
+            "SELECT id FROM d WHERE fts_match(body, ?1) LIMIT 10",
+            "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1)",
+            "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) LIMIT 10",
+            "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) ORDER BY score DESC",
+            "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) ORDER BY score DESC LIMIT 10",
+        ];
+        (SqlValue Query, long[] Expected)[] inputs =
+        [
+            (SqlValue.Text("42"), [1L]),
+            (SqlValue.Null, []),
+            (SqlValue.Integer(42), [1L]),
+            (SqlValue.Real(7.5), [3L]),
+            (SqlValue.Blob("42"u8.ToArray()), [1L]),
+            (SqlValue.Null, []),
+        ];
+
+        foreach (var sql in statements)
+        {
+            using var statement = connection.Prepare(sql);
+            foreach (var (query, expected) in inputs)
+            {
+                statement.Reset();
+                statement.Bind(1, query);
+                var ids = new List<long>();
+                while (statement.Step() == StatementStepResult.Row)
+                {
+                    ids.Add(statement.GetValue(0).AsInteger());
+                    if (indexed && statement.ColumnCount > 1)
+                        statement.GetValue(1).AsReal().Should().BeGreaterThan(0.0, sql);
+                }
+
+                ids.Should().Equal(expected, $"{sql} with {query.Kind}");
+            }
+        }
+    }
+
+    private static void SeedNumericBodies(EmbeddedConnection connection, bool indexed)
+    {
+        Execute(connection, "CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT);");
+        if (indexed)
+            Execute(connection, "CREATE INDEX fx ON d USING fts(body);");
+        Execute(connection, "INSERT INTO d VALUES (1, '42'), (2, NULL), (3, '7.5');");
+        for (var id = 4; id <= 400; id++)
+            Execute(connection, $"INSERT INTO d VALUES ({id}, 'filler text');");
+        if (indexed)
+        {
+            ExplainDetail(connection, "SELECT id FROM d WHERE fts_match(body, '42');")
+                .Should().Contain("INDEX METHOD");
+        }
     }
 
     [Test]

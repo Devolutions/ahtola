@@ -75,8 +75,13 @@ public sealed partial class EmbeddedDatabase
             var name = Evaluate(function.Arguments[0], parameters, row, context);
             var value = Evaluate(function.Arguments[1], parameters, row, context);
 
+            // SQLite (and Turso's update_agg_payload since 517ec809f) skips rows whose label is
+            // SQL NULL before encoding the value; a NULL value is still encoded as JSON null.
+            if (name.Kind == SqlValueKind.Null)
+                continue;
+
             // Labels are coerced to text so a non-text name still produces a well-formed object.
-            members.Add(SqlValue.Text(name.Kind == SqlValueKind.Null ? string.Empty : ToSqlText(name)));
+            members.Add(SqlValue.Text(ToSqlText(name)));
             members.Add(value);
         }
 

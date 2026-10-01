@@ -185,7 +185,10 @@ Common connection-string keywords: `Data Source`, `Mode`, `Cache`, `Pooling`,
 `DateTimeKind`, `BinaryGUID`, or `Encryption Cipher` + `Encryption Key` (hex
 AES-GCM or AEGIS keys). Turso/Hrana URLs
 also accept `Auth Token`, `Replica Path`, `Sync Interval`, `Read Your Writes`,
-and `Tls` through either ADO.NET facade. Default local provider is managed-only.
+and `Tls` through either ADO.NET facade, plus Turso's advanced embedded-replica
+keywords (`Sync Client Name`, `Sync Long Poll Timeout`, `Bootstrap If Empty`,
+partial-bootstrap, remote-encryption and threshold keys) and Ahtola's
+`Automatic Sync Mode` — see [docs/dotnet-packages.md](docs/dotnet-packages.md#connection-string-reference). Default local provider is managed-only.
 
 ### Standard SQLite files
 

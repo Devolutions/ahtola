@@ -909,16 +909,16 @@ public sealed partial class EmbeddedDatabase
                 return false;
             }
 
-            // Every term that reaches out of the subquery must be a plain equality with all
-            // inner references on one side and all outer references on the other, so it can
-            // run as a join condition (unnest.rs:1423-1478).
+            // Every term that reaches out of the subquery must be one direct comparison with
+            // all inner references on one side and all outer references on the other, so it
+            // can run as a join condition (can_move_join_term, unnest.rs:1379-1400).
             if (referencesOuter)
             {
                 // The equality synthesized for IN always spans both scopes; it is what makes
                 // the join, not evidence that the subquery itself was correlated.
                 if (!ReferenceEquals(conjunct, inEquality))
                     correlated = true;
-                if (!IsInnerOuterEquality(conjunct, innerQualifier, innerColumns))
+                if (!IsInnerOuterComparison(conjunct, innerQualifier, innerColumns))
                     return false;
             }
 
@@ -1090,17 +1090,34 @@ public sealed partial class EmbeddedDatabase
     }
 
     /// <summary>
-    /// True when the conjunct is <c>inner = outer</c> or <c>outer = inner</c> with each side
-    /// referencing exactly one of the two scopes (unnest.rs:1448-1478). Any other operator, or
-    /// a side mixing both scopes, cannot be evaluated as a join key.
+    /// True when the conjunct is one direct comparison (<c>=</c>, <c>&lt;&gt;</c>, <c>&lt;</c>,
+    /// <c>&lt;=</c>, <c>&gt;</c>, <c>&gt;=</c>, <c>IS</c>, <c>IS NOT</c>) with one side referencing
+    /// only the inner scope and the other only the outer scope. Ports v0.8.1
+    /// <c>is_inner_outer_comparison</c> (unnest.rs:1402-1436, f7aac1fc5, which widened the
+    /// v0.8.0 <c>=</c>-only rule). A comparison operator yields NULL exactly when the
+    /// correlated subquery's WHERE would, and a semi/anti join treats NULL as "no match" the way
+    /// the subquery's WHERE did, so every listed operator keeps its three-valued answer when it
+    /// moves into the join condition. A side mixing both scopes still declines.
     /// </summary>
-    private static bool IsInnerOuterEquality(
+    private static bool IsInnerOuterComparison(
         Expression expression,
         string innerQualifier,
         HashSet<string> innerColumns)
     {
-        if (expression is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+        if (expression is not BinaryExpression
+            {
+                Operator: BinaryOperator.Equal
+                    or BinaryOperator.NotEqual
+                    or BinaryOperator.LessThan
+                    or BinaryOperator.LessThanOrEqual
+                    or BinaryOperator.GreaterThan
+                    or BinaryOperator.GreaterThanOrEqual
+                    or BinaryOperator.Is
+                    or BinaryOperator.IsNot,
+            } equality)
+        {
             return false;
+        }
 
         if (!TryClassifyJoinTerm(equality.Left, innerQualifier, innerColumns, out var leftInner, out var leftOuter)
             || !TryClassifyJoinTerm(equality.Right, innerQualifier, innerColumns, out var rightInner, out var rightOuter))

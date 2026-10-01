@@ -14,7 +14,10 @@ including the tagged browser WASM binding, without cloning ad hoc or guessing
 at API shape. Historical gap/MVCC contracts that explicitly name `v0.7.2`
 retain that version as their behavioral analysis baseline, and the gap
 inventory and audits that name `v0.8.0-pre.7` (commit `277ddd050`) keep that
-tag as theirs until they are refreshed against the current pin.
+tag as theirs until they are refreshed against the current pin. The vendored
+sqltest corpus (`conformance/sqlite-sqltests`) and its expected-failures
+ledger are refreshed to `v0.8.1`; see the "v0.8.1 refresh" section of
+`docs/turso-remaining-gap-plan.md`.
 
 ```powershell
 git submodule update --init --recursive      # first checkout / fresh clone

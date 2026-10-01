@@ -283,6 +283,61 @@ internal static class SqliteFixtureBytePatcher
     /// an empty TEXT value (serial type 13, zero body bytes) so swapping in NULL (serial type
     /// 0, also zero body bytes) does not disturb the record's payload layout.
     /// </summary>
+    /// <summary>
+    /// Replaces the serial type of one column of the table's first row with another that stores
+    /// the same number of body bytes (mirrors <c>patch_first_row_serial_type</c>), so the rest of
+    /// the record keeps its place while the value's storage class changes.
+    /// </summary>
+    public static void PatchFirstRowSerialType(
+        byte[] bytes,
+        int pageSize,
+        int rootPage,
+        int columnIndex,
+        byte expectedSerialType,
+        byte newSerialType)
+    {
+        if (SerialTypePayloadLength(expectedSerialType) != SerialTypePayloadLength(newSerialType))
+        {
+            throw new InvalidOperationException(
+                $"serial types {expectedSerialType} and {newSerialType} do not store the same number of bytes");
+        }
+
+        var pageStart = (rootPage - 1) * pageSize;
+        ValidatePageBounds(bytes, pageSize, rootPage, pageStart, 8);
+        if (ReadPageHeaderCellCount(bytes, pageStart) < 1)
+            throw new InvalidOperationException($"cannot patch table row on page {rootPage}: no cells");
+
+        var cellStart = pageStart + ReadCellPointer(bytes, pageStart + 8);
+        if (cellStart >= bytes.Length)
+            throw new InvalidOperationException($"cell pointer out of bounds on page {rootPage}");
+
+        var (_, payloadVarintLength) = ParseVarint(bytes, cellStart);
+        var (_, rowidVarintLength) = ParseVarint(bytes, cellStart + payloadVarintLength);
+        var payloadStart = cellStart + payloadVarintLength + rowidVarintLength;
+        var (headerSize, headerSizeVarintLength) = ParseVarint(bytes, payloadStart);
+        var headerEnd = payloadStart + (int)headerSize;
+        if (headerEnd > bytes.Length)
+            throw new InvalidOperationException($"record header out of bounds on page {rootPage}");
+
+        var serialOffset = payloadStart + headerSizeVarintLength;
+        for (var column = 0; column < columnIndex; column++)
+        {
+            if (serialOffset >= headerEnd)
+                throw new InvalidOperationException($"record does not contain column {columnIndex} on page {rootPage}");
+            serialOffset += ParseVarint(bytes, serialOffset).Length;
+        }
+
+        if (serialOffset >= headerEnd)
+            throw new InvalidOperationException($"record does not contain column {columnIndex} on page {rootPage}");
+        if (bytes[serialOffset] != expectedSerialType)
+        {
+            throw new InvalidOperationException(
+                $"unexpected serial type {bytes[serialOffset]} for fixture row column {columnIndex}; expected {expectedSerialType}");
+        }
+
+        bytes[serialOffset] = newSerialType;
+    }
+
     public static void SetSecondTableColumnToNullInFirstRow(byte[] bytes, int pageSize, int rootPage)
     {
         var pageStart = (rootPage - 1) * pageSize;

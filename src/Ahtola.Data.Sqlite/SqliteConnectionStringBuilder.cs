@@ -31,6 +31,20 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Replica Path",
         "Read Your Writes",
         "Sync Interval",
+        "Sync Client Name",
+        "Sync Long Poll Timeout",
+        "Bootstrap If Empty",
+        "Partial Bootstrap Prefix",
+        "Partial Bootstrap Query",
+        "Partial Sync Segment Size",
+        "Partial Sync Prefetch",
+        "Remote Encryption Cipher",
+        "Remote Encryption Key",
+        "Push Operations Threshold",
+        "Pull Bytes Threshold",
+        "Force Logical MVCC Pull",
+        "Sync Experimental Features",
+        "Automatic Sync Mode",
         "Tls",
         "Ws Keepalive Interval",
         "Ws Keepalive Timeout",
@@ -82,6 +96,35 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["ReadYourWrites"] = "Read Your Writes",
         ["Sync Interval"] = "Sync Interval",
         ["SyncInterval"] = "Sync Interval",
+        // Advanced embedded-replica options, named as in Turso's SqliteConnectionStringBuilder.
+        ["Sync Client Name"] = "Sync Client Name",
+        ["SyncClientName"] = "Sync Client Name",
+        ["Sync Long Poll Timeout"] = "Sync Long Poll Timeout",
+        ["SyncLongPollTimeout"] = "Sync Long Poll Timeout",
+        ["Bootstrap If Empty"] = "Bootstrap If Empty",
+        ["BootstrapIfEmpty"] = "Bootstrap If Empty",
+        ["Partial Bootstrap Prefix"] = "Partial Bootstrap Prefix",
+        ["PartialBootstrapPrefix"] = "Partial Bootstrap Prefix",
+        ["Partial Bootstrap Query"] = "Partial Bootstrap Query",
+        ["PartialBootstrapQuery"] = "Partial Bootstrap Query",
+        ["Partial Sync Segment Size"] = "Partial Sync Segment Size",
+        ["PartialSyncSegmentSize"] = "Partial Sync Segment Size",
+        ["Partial Sync Prefetch"] = "Partial Sync Prefetch",
+        ["PartialSyncPrefetch"] = "Partial Sync Prefetch",
+        ["Remote Encryption Cipher"] = "Remote Encryption Cipher",
+        ["RemoteEncryptionCipher"] = "Remote Encryption Cipher",
+        ["Remote Encryption Key"] = "Remote Encryption Key",
+        ["RemoteEncryptionKey"] = "Remote Encryption Key",
+        ["Push Operations Threshold"] = "Push Operations Threshold",
+        ["PushOperationsThreshold"] = "Push Operations Threshold",
+        ["Pull Bytes Threshold"] = "Pull Bytes Threshold",
+        ["PullBytesThreshold"] = "Pull Bytes Threshold",
+        ["Force Logical MVCC Pull"] = "Force Logical MVCC Pull",
+        ["ForceLogicalMvccPull"] = "Force Logical MVCC Pull",
+        ["Sync Experimental Features"] = "Sync Experimental Features",
+        ["SyncExperimentalFeatures"] = "Sync Experimental Features",
+        ["Automatic Sync Mode"] = "Automatic Sync Mode",
+        ["AutomaticSyncMode"] = "Automatic Sync Mode",
         ["Tls"] = "Tls",
         ["TLS"] = "Tls",
         // Hrana WebSocket (ws/wss) transport tunables; ignored by the HTTP pipeline.
@@ -262,6 +305,133 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         }
     }
 
+    /// <summary>Client name prefixing the sync client identifier of a new embedded replica.</summary>
+    public string SyncClientName
+    {
+        get => GetString("Sync Client Name");
+        set => SetString("Sync Client Name", value);
+    }
+
+    /// <summary>Embedded-replica pull long-poll timeout in milliseconds; 0 disables long polling.</summary>
+    public int SyncLongPollTimeout
+    {
+        get => GetInt("Sync Long Poll Timeout", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Sync Long Poll Timeout"] = value;
+        }
+    }
+
+    /// <summary>Whether a missing embedded replica is bootstrapped from the remote (default true).</summary>
+    public bool BootstrapIfEmpty
+    {
+        get => GetBool("Bootstrap If Empty", true);
+        set => this["Bootstrap If Empty"] = value;
+    }
+
+    /// <summary>Byte prefix of a partial embedded-replica bootstrap; 0 disables it.</summary>
+    public int PartialBootstrapPrefix
+    {
+        get => GetInt("Partial Bootstrap Prefix", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Partial Bootstrap Prefix"] = value;
+        }
+    }
+
+    /// <summary>Server-side query selecting the pages of a partial embedded-replica bootstrap.</summary>
+    public string PartialBootstrapQuery
+    {
+        get => GetString("Partial Bootstrap Query");
+        set => SetString("Partial Bootstrap Query", value);
+    }
+
+    /// <summary>Lazy-loading segment size in bytes of a partial bootstrap; 0 uses the default.</summary>
+    public long PartialSyncSegmentSize
+    {
+        get => GetLong("Partial Sync Segment Size", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Partial Sync Segment Size"] = value;
+        }
+    }
+
+    /// <summary>Whether a partial bootstrap prefetches adjacent pages during lazy loading.</summary>
+    public bool PartialSyncPrefetch
+    {
+        get => GetBool("Partial Sync Prefetch");
+        set => this["Partial Sync Prefetch"] = value;
+    }
+
+    /// <summary>Cipher of an encrypted remote database used by an embedded replica (e.g. <c>aes256gcm</c>).</summary>
+    public string RemoteEncryptionCipher
+    {
+        get => GetString("Remote Encryption Cipher");
+        set => SetString("Remote Encryption Cipher", value);
+    }
+
+    /// <summary>Base64-encoded key of an encrypted remote database used by an embedded replica.</summary>
+    public string RemoteEncryptionKey
+    {
+        get => GetString("Remote Encryption Key");
+        set => SetString("Remote Encryption Key", value);
+    }
+
+    /// <summary>Maximum change operations per embedded-replica push batch; 0 uses the default.</summary>
+    public long PushOperationsThreshold
+    {
+        get => GetLong("Push Operations Threshold", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Push Operations Threshold"] = value;
+        }
+    }
+
+    /// <summary>Target size in bytes of each initial bootstrap pull; 0 pulls the whole image.</summary>
+    public long PullBytesThreshold
+    {
+        get => GetLong("Pull Bytes Threshold", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Pull Bytes Threshold"] = value;
+        }
+    }
+
+    /// <summary>
+    /// Turso's forced MVCC logical-pull escape hatch. The managed provider always auto-detects
+    /// the pull protocol, so <see langword="true"/> fails closed when the connection opens.
+    /// </summary>
+    public bool ForceLogicalMvccPull
+    {
+        get => GetBool("Force Logical MVCC Pull");
+        set => this["Force Logical MVCC Pull"] = value;
+    }
+
+    /// <summary>
+    /// Turso's experimental-feature list for the replica's local database; validated, but it
+    /// has no effect on the managed engine.
+    /// </summary>
+    public string SyncExperimentalFeatures
+    {
+        get => GetString("Sync Experimental Features");
+        set => SetString("Sync Experimental Features", value);
+    }
+
+    /// <summary>
+    /// What each <see cref="SyncInterval"/> tick does: <see cref="AhtolaAutomaticSyncMode.PushAndPull"/>
+    /// (the default) or Turso's <see cref="AhtolaAutomaticSyncMode.PullOnly"/>.
+    /// </summary>
+    public AhtolaAutomaticSyncMode AutomaticSyncMode
+    {
+        get => GetEnum("Automatic Sync Mode", AhtolaAutomaticSyncMode.PushAndPull);
+        set => this["Automatic Sync Mode"] = value;
+    }
+
     public bool? Tls
     {
         get => GetNullableBool("Tls");
@@ -421,6 +591,34 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             builder["Read Your Writes"] = ReadYourWrites;
         if (base.ContainsKey("Sync Interval"))
             builder["Sync Interval"] = SyncInterval;
+        if (base.ContainsKey("Sync Client Name"))
+            builder["Sync Client Name"] = SyncClientName;
+        if (base.ContainsKey("Sync Long Poll Timeout"))
+            builder["Sync Long Poll Timeout"] = SyncLongPollTimeout;
+        if (base.ContainsKey("Bootstrap If Empty"))
+            builder["Bootstrap If Empty"] = BootstrapIfEmpty;
+        if (base.ContainsKey("Partial Bootstrap Prefix"))
+            builder["Partial Bootstrap Prefix"] = PartialBootstrapPrefix;
+        if (base.ContainsKey("Partial Bootstrap Query"))
+            builder["Partial Bootstrap Query"] = PartialBootstrapQuery;
+        if (base.ContainsKey("Partial Sync Segment Size"))
+            builder["Partial Sync Segment Size"] = PartialSyncSegmentSize;
+        if (base.ContainsKey("Partial Sync Prefetch"))
+            builder["Partial Sync Prefetch"] = PartialSyncPrefetch;
+        if (base.ContainsKey("Remote Encryption Cipher"))
+            builder["Remote Encryption Cipher"] = RemoteEncryptionCipher;
+        if (base.ContainsKey("Remote Encryption Key"))
+            builder["Remote Encryption Key"] = RemoteEncryptionKey;
+        if (base.ContainsKey("Push Operations Threshold"))
+            builder["Push Operations Threshold"] = PushOperationsThreshold;
+        if (base.ContainsKey("Pull Bytes Threshold"))
+            builder["Pull Bytes Threshold"] = PullBytesThreshold;
+        if (base.ContainsKey("Force Logical MVCC Pull"))
+            builder["Force Logical MVCC Pull"] = ForceLogicalMvccPull;
+        if (base.ContainsKey("Sync Experimental Features"))
+            builder["Sync Experimental Features"] = SyncExperimentalFeatures;
+        if (base.ContainsKey("Automatic Sync Mode"))
+            builder["Automatic Sync Mode"] = AutomaticSyncMode.ToString();
         if (base.ContainsKey("Tls"))
             builder["Tls"] = Tls!.Value;
         if (base.ContainsKey("Ws Keepalive Interval"))
@@ -539,6 +737,13 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             : defaultValue;
     }
 
+    private long GetLong(string keyword, long defaultValue)
+    {
+        return base.TryGetValue(keyword, out var value)
+            ? Convert.ToInt64(value, CultureInfo.InvariantCulture)
+            : defaultValue;
+    }
+
     private TEnum GetEnum<TEnum>(string keyword, TEnum defaultValue)
         where TEnum : struct
     {
@@ -575,13 +780,19 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => ConvertOpenMode(value),
             "Cache" => ConvertCacheMode(value),
             "Foreign Keys" => ConvertToNullableBoolean(value),
-            "Recursive Triggers" or "Pooling" or "BinaryGUID" or "Foreign Read Only" or "Read Your Writes" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
+            "Recursive Triggers" or "Pooling" or "BinaryGUID" or "Foreign Read Only" or "Read Your Writes"
+                or "Bootstrap If Empty" or "Partial Sync Prefetch" or "Force Logical MVCC Pull"
+                => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
             "Tls" => ConvertToNullableBoolean(value),
             "Default Timeout" or "Version" or "Sync Interval" or "Ws Keepalive Interval" or "Ws Keepalive Timeout"
                 or "Ws Half Open Timeout" or "Ws Max Message Bytes" or "Ws Connect Attempts"
+                or "Sync Long Poll Timeout" or "Partial Bootstrap Prefix"
                 => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+            "Partial Sync Segment Size" or "Push Operations Threshold" or "Pull Bytes Threshold"
+                => Convert.ToInt64(value, CultureInfo.InvariantCulture),
             "DateTimeKind" => ConvertDateTimeKind(value),
             "Local Provider" => ConvertLocalProvider(value),
+            "Automatic Sync Mode" => ConvertAutomaticSyncMode(value),
             _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty,
         };
     }
@@ -597,6 +808,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Read Your Writes" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
             "DateTimeKind" => ConvertDateTimeKind(value),
             "Local Provider" => ConvertLocalProvider(value),
+            "Automatic Sync Mode" => ConvertAutomaticSyncMode(value),
             _ => value,
         };
     }
@@ -627,6 +839,20 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Replica Path" => string.Empty,
             "Read Your Writes" => true,
             "Sync Interval" => 0,
+            "Sync Client Name" => string.Empty,
+            "Sync Long Poll Timeout" => 0,
+            "Bootstrap If Empty" => true,
+            "Partial Bootstrap Prefix" => 0,
+            "Partial Bootstrap Query" => string.Empty,
+            "Partial Sync Segment Size" => 0L,
+            "Partial Sync Prefetch" => false,
+            "Remote Encryption Cipher" => string.Empty,
+            "Remote Encryption Key" => string.Empty,
+            "Push Operations Threshold" => 0L,
+            "Pull Bytes Threshold" => 0L,
+            "Force Logical MVCC Pull" => false,
+            "Sync Experimental Features" => string.Empty,
+            "Automatic Sync Mode" => AhtolaAutomaticSyncMode.PushAndPull,
             "Tls" => null!,
             "Ws Keepalive Interval" => 30,
             "Ws Keepalive Timeout" => 20,
@@ -686,6 +912,18 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             throw new ArgumentOutOfRangeException(nameof(value), value, Properties.Resources.InvalidEnumValue(typeof(DateTimeKind), kind));
 
         return kind;
+    }
+
+    private static AhtolaAutomaticSyncMode ConvertAutomaticSyncMode(object value)
+    {
+        var mode = ConvertEnum<AhtolaAutomaticSyncMode>(value);
+        if (!Enum.IsDefined(mode))
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                Properties.Resources.InvalidEnumValue(typeof(AhtolaAutomaticSyncMode), mode));
+
+        return mode;
     }
 
     private static AhtolaLocalProvider ConvertLocalProvider(object value)

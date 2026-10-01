@@ -38,8 +38,8 @@ public sealed class IndexSeekJoinTests
                 FROM outer_items JOIN inner_items INDEXED BY inner_items_k
                 ON outer_items.k = inner_items.k;
                 """)
-            .Should().ContainSingle()
-            .Which[3].AsText().Should().Be("SEARCH inner_items USING INDEX inner_items_k (k=?)");
+            .Select(row => row[3].AsText())
+            .Should().Equal("SCAN outer_items", "SEARCH inner_items USING INDEX inner_items_k (k=?)");
         database.JoinIndexSeekMetrics.PlansCreated.Should().Be(0);
         database.JoinIndexSeekMetrics.IndexRowsMaterialized.Should().Be(0);
 
@@ -94,8 +94,9 @@ public sealed class IndexSeekJoinTests
         foreach (var statement in setup)
             Execute(connection, statement);
 
-        var detail = ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText();
-        detail.Should().Be("SEARCH inner_items USING INDEX inner_items_ab (a=?, b=?)");
+        var detail = ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText();
+        // Turso joins a search's constraints with " AND " (core/translate/eqp.rs Display).
+        detail.Should().Be("SEARCH inner_items USING INDEX inner_items_ab (a=? AND b=?)");
         database.ResetJoinOrderDiagnostics();
         ReadRows(connection, sql).Should().HaveCount(2);
         database.JoinIndexSeekMetrics.SeeksAttempted.Should().Be(3);
@@ -128,7 +129,7 @@ public sealed class IndexSeekJoinTests
 
         AssertMatchesSqlite(setup, sql);
         using var connection = OpenManaged(setup);
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Contain("SEARCH inner_items USING INDEX inner_items_k");
     }
 
@@ -154,7 +155,11 @@ public sealed class IndexSeekJoinTests
         var detail = ReadRows(
             connection,
             $"EXPLAIN QUERY PLAN SELECT outer_items.a FROM outer_items JOIN inner_items ON {condition};");
-        detail.Select(row => row[3].AsText()).Should().NotContain(value => value.StartsWith("SEARCH ", StringComparison.Ordinal));
+        // No declared index can drive these equalities; an automatic (ephemeral) index built
+        // for the join is still allowed, but the unusable declared index is never advertised.
+        detail.Select(row => row[3].AsText()).Should().NotContain(value =>
+            value.StartsWith("SEARCH ", StringComparison.Ordinal)
+            && !value.Contains("INDEX ephemeral_", StringComparison.Ordinal));
         ReadRows(
                 connection,
                 $"SELECT outer_items.a FROM outer_items JOIN inner_items ON {condition};")
@@ -215,7 +220,7 @@ public sealed class IndexSeekJoinTests
             JOIN inner_items INDEXED BY inner_items_k_desc ON outer_items.k = inner_items.k
             ORDER BY outer_items.k;
             """;
-        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
             .Should().Be("SEARCH inner_items USING INDEX inner_items_k_desc (k=?)");
         database.ResetJoinOrderDiagnostics();
         ReadRows(connection, sql).Select(row => row[0].AsText()).Should().Equal("p2", "p250", "p499");
@@ -275,7 +280,7 @@ public sealed class IndexSeekJoinTests
                 ON outer_items.k = inner_items.k
                 ORDER BY outer_items.k;
                 """;
-            ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single()[3].AsText()
+            ReadRows(connection, "EXPLAIN QUERY PLAN " + sql).Single(static row => row[3].AsText().StartsWith("SEARCH ", StringComparison.Ordinal))[3].AsText()
                 .Should().Be("SEARCH inner_items USING INDEX inner_items_k (k=?)");
             ReadRows(connection, sql).Select(row => row[0].AsText()).Should().Equal("p2", "p40");
         }

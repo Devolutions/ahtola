@@ -72,8 +72,11 @@ public class CompiledJoinVdbeSqlRoutingTests
         ReadRows(
                 connection,
                 "EXPLAIN QUERY PLAN SELECT a.av, b.bv, c.cv FROM a JOIN b ON a.id=b.id JOIN c ON b.id=c.id;")
-            .Should().ContainSingle()
-            .Which[3].Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+            .Select(row => row[3].AsText())
+            .Should().Equal(
+                "SCAN a",
+                "SEARCH b USING COVERING INDEX ephemeral_b_t2 (id=?)",
+                "SEARCH c USING COVERING INDEX ephemeral_c_t3 (id=?)");
     }
 
     [Test]
@@ -475,8 +478,8 @@ public class CompiledJoinVdbeSqlRoutingTests
         ReadRows(
                 routed,
                 "EXPLAIN QUERY PLAN SELECT fail_on_two(l.id) FROM l JOIN r ON l.id=r.id;")
-            .Should().ContainSingle().Which[3]
-            .Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+            .Select(row => row[3].AsText())
+            .Should().Equal("SCAN l", "SEARCH r USING COVERING INDEX ephemeral_r_t2 (id=?)");
         ReadRows(
                 fallback,
                 "EXPLAIN QUERY PLAN SELECT fail_on_two(l.id) FROM l JOIN r ON l.id=r.id COLLATE callback_collation;")

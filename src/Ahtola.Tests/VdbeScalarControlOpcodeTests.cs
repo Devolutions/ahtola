@@ -222,7 +222,9 @@ public sealed class VdbeScalarControlOpcodeTests
 
             using var statement = new ResumableStatement(program);
             var error = Assert.Throws<EmbeddedSqlException>(() => statement.StepResumable());
-            error!.SqliteErrorCode.Should().Be(SqliteResultCode.Constraint);
+            // Turso bails with a Constraint error here, but SQLite (and so the
+            // Microsoft.Data.Sqlite facade) reports "datatype mismatch" as SQLITE_MISMATCH.
+            error!.SqliteErrorCode.Should().Be(SqliteResultCode.Mismatch);
             error.Message.Should().Contain("datatype mismatch");
         }
     }
@@ -431,7 +433,7 @@ public sealed class VdbeScalarControlOpcodeTests
 
         using var statement = new ResumableStatement(program);
         var error = Assert.Throws<EmbeddedSqlException>(() => statement.StepResumable());
-        error!.SqliteErrorCode.Should().Be(SqliteResultCode.Constraint);
+        error!.SqliteErrorCode.Should().Be(SqliteResultCode.Mismatch);
         error.Message.Should().Contain("datatype mismatch");
     }
 

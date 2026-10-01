@@ -7,6 +7,9 @@ namespace Ahtola.Core.Parsing;
 
 internal sealed class SqlParser
 {
+    /// <summary>SQLite's default <c>SQLITE_MAX_COLUMN</c> (Turso's <c>MAX_COLUMN</c>).</summary>
+    internal const int MaxColumns = 2000;
+
     private readonly SqlLexer _lexer;
     private readonly string _sql;
     private readonly Dictionary<string, int> _namedParameterIndices = new(StringComparer.Ordinal);
@@ -1169,6 +1172,14 @@ internal sealed class SqlParser
             {
                 extentColumn = ParseColumnDefinition();
                 columns.Add(extentColumn);
+                // sqlite3AddColumn rejects the column past SQLITE_MAX_COLUMN while parsing.
+                if (columns.Count > MaxColumns)
+                {
+                    var tableName = ManagedSchemaName.TrySplit(name, out _, out var localTableName)
+                        ? localTableName
+                        : name;
+                    throw new EmbeddedSqlException($"too many columns on {tableName}");
+                }
             }
 
             if (_lexer.Current.Kind != TokenKind.Comma)
@@ -3166,23 +3177,31 @@ internal sealed class SqlParser
         var source = ParseSimpleTableSource();
         while (true)
         {
+            // SQLite's join-constraint grammar attaches an optional ON/USING clause to every join
+            // operator, the comma and CROSS JOIN included (parse.y joinop/on_using), so
+            // `a, b ON ...` and `a CROSS JOIN b USING (...)` are ordinary inner joins.
+            Expression? condition = null;
+            IReadOnlyList<string>? usingColumns = null;
             if (Consume(TokenKind.Comma))
             {
-                source = new JoinTableSource(source, ParseSimpleTableSource(), null, JoinKind.Inner);
-                continue;
-            }
-
-            if (ConsumeKeyword("CROSS"))
-            {
-                ExpectKeyword("JOIN");
-                source = new JoinTableSource(source, ParseSimpleTableSource(), null, JoinKind.Inner);
+                var commaRight = ParseSimpleTableSource();
+                ParseJoinConstraint(ref condition, ref usingColumns);
+                source = new JoinTableSource(source, commaRight, condition, JoinKind.Inner, usingColumns);
                 continue;
             }
 
             var natural = ConsumeKeyword("NATURAL");
 
             JoinKind kind;
-            if (ConsumeKeyword("LEFT"))
+            var cross = false;
+            if (ConsumeKeyword("CROSS"))
+            {
+                // CROSS JOIN is an INNER join the planner must not reorder (SQLite JT_CROSS;
+                // Turso JoinInfo::no_reorder, planner.rs).
+                kind = JoinKind.Inner;
+                cross = true;
+            }
+            else if (ConsumeKeyword("LEFT"))
             {
                 ConsumeKeyword("OUTER");
                 kind = JoinKind.Left;
@@ -3205,30 +3224,33 @@ internal sealed class SqlParser
 
             if (!ConsumeKeyword("JOIN"))
             {
-                if (natural || kind != JoinKind.Inner)
+                if (natural || cross || kind != JoinKind.Inner)
                     throw Error("Expected JOIN.");
 
                 return source;
             }
 
             var right = ParseSimpleTableSource();
-            Expression? condition = null;
-            IReadOnlyList<string>? usingColumns = null;
-            if (ConsumeKeyword("ON"))
-            {
-                condition = ParseExpression();
-            }
-            else if (ConsumeKeyword("USING"))
-            {
-                Expect(TokenKind.LeftParen);
-                usingColumns = ParseIdentifierList();
-                Expect(TokenKind.RightParen);
-            }
+            ParseJoinConstraint(ref condition, ref usingColumns);
 
             if (natural && (condition is not null || usingColumns is not null))
                 throw Error("a NATURAL join may not have an ON or USING clause");
 
-            source = new JoinTableSource(source, right, condition, kind, usingColumns, natural);
+            source = new JoinTableSource(source, right, condition, kind, usingColumns, natural, cross);
+        }
+    }
+
+    private void ParseJoinConstraint(ref Expression? condition, ref IReadOnlyList<string>? usingColumns)
+    {
+        if (ConsumeKeyword("ON"))
+        {
+            condition = ParseExpression();
+        }
+        else if (ConsumeKeyword("USING"))
+        {
+            Expect(TokenKind.LeftParen);
+            usingColumns = ParseIdentifierList();
+            Expect(TokenKind.RightParen);
         }
     }
 
@@ -4238,6 +4260,7 @@ internal sealed class SqlParser
         int? primaryKeyDeclarationOrder = null;
         int? uniqueDeclarationOrder = null;
         string? pendingConstraintName = null;
+        var hasDefault = false;
         while (_lexer.Current.Kind == TokenKind.Identifier)
         {
             if (ConsumeKeyword("CONSTRAINT"))
@@ -4305,6 +4328,10 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("DEFAULT"))
             {
+                // sqlite3AddDefaultValue rejects a DEFAULT that follows a generation clause.
+                if (generationExpression is not null)
+                    throw new EmbeddedSqlException("cannot use DEFAULT on a generated column");
+                hasDefault = true;
                 var startOffset = _lexer.Current.Offset;
                 var parenthesized = _lexer.Current.Kind == TokenKind.LeftParen;
                 var expression = parenthesized
@@ -4337,9 +4364,10 @@ internal sealed class SqlParser
             // round-trips through schema regeneration.
             if (ConsumeKeyword("GENERATED"))
             {
+                ThrowIfGenerationClauseIsInvalid(name, generationExpression is not null || hasDefault);
                 ExpectKeyword("ALWAYS");
                 ExpectKeyword("AS");
-                (generationExpression, generationSql, generatedStored, generationVirtualSpelled) = ParseGenerationClause();
+                (generationExpression, generationSql, generatedStored, generationVirtualSpelled) = ParseGenerationClause(name);
                 generationAlways = true;
                 generationConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
@@ -4347,7 +4375,8 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("AS"))
             {
-                (generationExpression, generationSql, generatedStored, generationVirtualSpelled) = ParseGenerationClause();
+                ThrowIfGenerationClauseIsInvalid(name, generationExpression is not null || hasDefault);
+                (generationExpression, generationSql, generatedStored, generationVirtualSpelled) = ParseGenerationClause(name);
                 generationConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
                 continue;
@@ -4488,7 +4517,7 @@ internal sealed class SqlParser
     // generated column can be regenerated verbatim; VIRTUAL is the SQLite default. Also
     // reports whether VIRTUAL was spelled out, because SQLite preserves the original
     // spelling and schema regeneration must not add a VIRTUAL keyword that was not written.
-    private (Expression Expression, string Sql, bool Stored, bool VirtualSpelled) ParseGenerationClause()
+    private (Expression Expression, string Sql, bool Stored, bool VirtualSpelled) ParseGenerationClause(string columnName)
     {
         Expect(TokenKind.LeftParen);
         var startOffset = _lexer.Current.Offset;
@@ -4504,7 +4533,27 @@ internal sealed class SqlParser
         else
             virtualSpelled = ConsumeKeyword("VIRTUAL");
 
+        // SQLite's grammar reads any identifier after the parenthesized expression as the
+        // generated-column type, and sqlite3AddGenerated rejects everything except STORED and
+        // VIRTUAL (Turso's "reject invalid generated-column clauses"). A following column
+        // constraint keyword still begins the next constraint.
+        if (!stored
+            && !virtualSpelled
+            && _lexer.Current.Kind == TokenKind.Identifier
+            && (_lexer.Current.IsQuoted || !IsColumnConstraintKeyword(_lexer.Current.Text)))
+        {
+            ThrowIfGenerationClauseIsInvalid(columnName, invalid: true);
+        }
+
         return (expression, rawSql, stored, virtualSpelled);
+    }
+
+    // sqlite3AddGenerated's generated_error: a second generation clause, a generation clause
+    // after DEFAULT, or an unknown generated-column type all report this one message.
+    private static void ThrowIfGenerationClauseIsInvalid(string columnName, bool invalid)
+    {
+        if (invalid)
+            throw new EmbeddedSqlException($"error in generated column \"{columnName}\"");
     }
 
     private bool IsTableConstraintStart()

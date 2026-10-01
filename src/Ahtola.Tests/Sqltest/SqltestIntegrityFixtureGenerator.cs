@@ -3,7 +3,7 @@ using Ahtola.Core;
 namespace Ahtola.Tests.Sqltest;
 
 /// <summary>
-/// Builds the 12 <c>integrity_check/parity_*</c> corruption fixtures the pinned corpus
+/// Builds the 16 <c>integrity_check/parity_*</c> corruption fixtures the pinned corpus
 /// expects at <c>database/integrity_*.db</c>. Each fixture is produced by running ordinary
 /// setup SQL through the managed engine's real write path (so the physical page layout is
 /// whatever Ahtola actually produces, not a synthetic mock), then patching a handful of
@@ -65,6 +65,83 @@ internal static class SqltestIntegrityFixtureGenerator
         generators["database/integrity_freelist_trunk_corrupt.db"] = GenerateFreelistTrunkCorrupt;
         generators["database/integrity_overflow_list_length_mismatch.db"] = GenerateOverflowListLengthMismatch;
         generators["database/integrity_gencol_not_null_violation.db"] = GenerateGencolNotNullViolation;
+
+        // Mirrors generate_strict_*_fixture: build a STRICT table through the real write path,
+        // then swap one first-row serial type for another of the same body length.
+        generators["database/integrity_strict_type_violation.db"] = path => GenerateStrictFixture(
+            path,
+            """
+            PRAGMA page_size=4096;
+            CREATE TABLE t(a ANY, b TEXT) STRICT;
+            INSERT INTO t VALUES('x', 'A');
+            """,
+            columnIndex: 1,
+            expectedSerialType: SerialTypeTextOneByte,
+            newSerialType: SerialTypeInt8);
+        generators["database/integrity_strict_gencol_type_violation.db"] = path => GenerateStrictFixture(
+            path,
+            """
+            PRAGMA page_size=4096;
+            CREATE TABLE t(a ANY, b INT AS (a) VIRTUAL) STRICT;
+            INSERT INTO t(a) VALUES(0);
+            """,
+            columnIndex: 0,
+            expectedSerialType: SerialTypeIntZero,
+            newSerialType: SerialTypeTextEmpty);
+        generators["database/integrity_strict_not_null_violation.db"] = path => GenerateStrictFixture(
+            path,
+            """
+            PRAGMA page_size=4096;
+            CREATE TABLE t(a ANY, b TEXT NOT NULL) STRICT;
+            INSERT INTO t VALUES('x', '');
+            """,
+            columnIndex: 1,
+            expectedSerialType: SerialTypeTextEmpty,
+            newSerialType: SerialTypeNull);
+        generators["database/integrity_strict_real_integer_serial.db"] = path => GenerateStrictFixture(
+            path,
+            """
+            PRAGMA page_size=4096;
+            CREATE TABLE t(a ANY, r REAL) STRICT;
+            INSERT INTO t VALUES('x', 1.5);
+            """,
+            columnIndex: 1,
+            expectedSerialType: SerialTypeFloat64,
+            newSerialType: SerialTypeInt64);
+    }
+
+    private const byte SerialTypeNull = 0;
+    private const byte SerialTypeInt8 = 1;
+    private const byte SerialTypeInt64 = 6;
+    private const byte SerialTypeFloat64 = 7;
+    private const byte SerialTypeIntZero = 8;
+    private const byte SerialTypeTextEmpty = 13;
+    private const byte SerialTypeTextOneByte = 15;
+
+    /// <summary>
+    /// Mirrors <c>generate_strict_fixture</c>: Turso (and SQLite) never write these storage
+    /// classes into a STRICT column through SQL, so the fixture changes the file directly.
+    /// </summary>
+    private static void GenerateStrictFixture(
+        string path,
+        string setupSql,
+        int columnIndex,
+        byte expectedSerialType,
+        byte newSerialType)
+    {
+        Build(path, connection => ExecuteScript(connection, setupSql));
+
+        var bytes = File.ReadAllBytes(path);
+        var pageSize = SqliteFixtureBytePatcher.ReadDbHeaderPageSize(bytes);
+        var rootPage = SqliteFixtureBytePatcher.FindObjectRootPage(bytes, pageSize, "t");
+        SqliteFixtureBytePatcher.PatchFirstRowSerialType(
+            bytes,
+            pageSize,
+            rootPage,
+            columnIndex,
+            expectedSerialType,
+            newSerialType);
+        File.WriteAllBytes(path, bytes);
     }
 
     /// <summary>

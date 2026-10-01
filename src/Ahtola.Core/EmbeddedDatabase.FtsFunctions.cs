@@ -154,8 +154,6 @@ public sealed partial class EmbeddedDatabase
         {
             if (arguments[^1].Kind == SqlValueKind.Null)
                 return SqlValue.Real(0.0);
-            if (arguments[^1].Kind != SqlValueKind.Text)
-                throw new EmbeddedSqlException("fts_score() requires a text query");
             if (bound.RowId is not { } rowId)
                 return SqlValue.Real(0.0);
 

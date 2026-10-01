@@ -229,7 +229,7 @@ internal static class VdbeHashJoinRuntime
     {
         HashSpill? spill = null;
         var residency = new PartitionResidencyCache();
-        var trackUnmatchedBuild = buildIsRight && plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full;
+        var trackUnmatchedBuild = KeepsUnmatchedBuild(plan, buildIsRight);
         var spillInfrastructureBytes = VdbeManagedFootprint.EstimateHashSpillInfrastructure(
             context.Options.TemporaryDirectory,
             PartitionCount,
@@ -403,9 +403,9 @@ internal static class VdbeHashJoinRuntime
                         }
                     }
 
-                    if (!matchedProbe && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                    if (!matchedProbe && KeepsUnmatchedProbe(plan, buildIsRight))
                     {
-                        yield return Combine(probe, NullRow(buildNode));
+                        yield return NullExtendProbe(probe, buildNode, buildIsRight);
                         if (maximumRows is { } maximum && ++emitted >= maximum)
                             yield break;
                     }
@@ -456,6 +456,11 @@ internal static class VdbeHashJoinRuntime
                 // budget in addition keeps that headroom scaling WITH the budget.
                 var residencyReserve = context.Memory.LimitBytes / 4;
                 var reserve = Math.Max(maxBuildEntryBytes, residencyReserve);
+                while (context.Memory.AvailableBytes - entryBytes < reserve
+                    && residency.EvictForProbeBatch(context))
+                {
+                }
+
                 if (context.Memory.AvailableBytes - entryBytes >= reserve
                     && context.Memory.TryRetain(entryBytes))
                 {
@@ -500,7 +505,7 @@ internal static class VdbeHashJoinRuntime
                         context.ThrowIfCancellationRequested();
                         if (matched![index])
                             continue;
-                        yield return Combine(nullProbe, buffered[index].Row);
+                        yield return NullExtendBuild(buffered[index].Row, nullProbe, buildIsRight);
                         if (maximumRows is { } maximum && ++emitted >= maximum)
                             yield break;
                     }
@@ -516,7 +521,7 @@ internal static class VdbeHashJoinRuntime
                             var build = lease.Entry;
                             if (spill.IsMatched(build.Ordinal, context))
                                 continue;
-                            combined = Combine(nullProbe, build.Row);
+                            combined = NullExtendBuild(build.Row, nullProbe, buildIsRight);
                         }
                         yield return combined;
                         if (maximumRows is { } maximum && ++emitted >= maximum)
@@ -673,9 +678,9 @@ internal static class VdbeHashJoinRuntime
                         outputRetainedBytes[localIndex] = 0;
                     }
                 }
-                else if (buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+                else if (KeepsUnmatchedProbe(plan, buildIsRight))
                 {
-                    yield return Combine(batch[localIndex].Probe!, NullRow(buildNode));
+                    yield return NullExtendProbe(batch[localIndex].Probe!, buildNode, buildIsRight);
                 }
             }
             else
@@ -706,8 +711,8 @@ internal static class VdbeHashJoinRuntime
                     }
                 }
 
-                if (!matchedProbe && buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
-                    yield return Combine(probe, NullRow(buildNode));
+                if (!matchedProbe && KeepsUnmatchedProbe(plan, buildIsRight))
+                    yield return NullExtendProbe(probe, buildNode, buildIsRight);
             }
 
             ReleaseInput(localIndex);
@@ -777,7 +782,7 @@ internal static class VdbeHashJoinRuntime
                     var localIndex = localIndices[slot];
                     var key = batch[localIndex].Key!;
                     var probe = batch[localIndex].Probe!;
-                    var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                    var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                     if (!ReserveSlot(key, probe, resolution.Loaded.CountFor(key), needsNullExtension, out var reserved))
                         continue; // Deferred whole to individual streaming; nothing evaluated.
 
@@ -795,7 +800,7 @@ internal static class VdbeHashJoinRuntime
                             matchedOrdinals?.Add(build.Ordinal);
                         }
                         if (matches is null && needsNullExtension)
-                            (matches ??= []).Add(Combine(probe, NullRow(buildNode)));
+                            (matches ??= []).Add(NullExtendProbe(probe, buildNode, buildIsRight));
                     }
                     catch
                     {
@@ -812,7 +817,7 @@ internal static class VdbeHashJoinRuntime
                     var localIndex = localIndices[slot];
                     var key = batch[localIndex].Key!;
                     var probe = batch[localIndex].Probe!;
-                    var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                    var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                     if (!ReserveSlot(key, probe, resolution.Index.Find(key).Count, needsNullExtension, out var reserved))
                         continue;
 
@@ -844,7 +849,7 @@ internal static class VdbeHashJoinRuntime
                                 matchedOrdinals?.Add(ordinal);
                         }
                         if (matches is null && needsNullExtension)
-                            (matches ??= []).Add(Combine(probe, NullRow(buildNode)));
+                            (matches ??= []).Add(NullExtendProbe(probe, buildNode, buildIsRight));
                     }
                     catch
                     {
@@ -879,7 +884,7 @@ internal static class VdbeHashJoinRuntime
                         var localIndex = localIndices[slot];
                         var key = batch[localIndex].Key!;
                         var probe = batch[localIndex].Probe!;
-                        var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                        var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                         if (!ReserveSlot(key, probe, partitionEntryCount, needsNullExtension, out var reserved))
                             continue;
 
@@ -922,11 +927,11 @@ internal static class VdbeHashJoinRuntime
                         if (reservedBySlot[slot] == 0)
                             continue;
                         var localIndex = localIndices[slot];
-                        var needsNullExtension = buildIsRight && plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+                        var needsNullExtension = KeepsUnmatchedProbe(plan, buildIsRight);
                         var matches = matchesBySlot[slot];
                         if (matches is null && needsNullExtension)
                         {
-                            (matches ??= []).Add(Combine(batch[localIndex].Probe!, NullRow(buildNode)));
+                            (matches ??= []).Add(NullExtendProbe(batch[localIndex].Probe!, buildNode, buildIsRight));
                             matchesBySlot[slot] = matches;
                         }
                     }
@@ -1020,7 +1025,17 @@ internal static class VdbeHashJoinRuntime
                 indices.Add(localIndex);
             }
 
-            foreach (var topIndex in orderedTopLevelIndices)
+            // Answer groups whose partition is already resident first. Batches tend to touch
+            // the same partitions in the same order, and when they outnumber what the cache
+            // can hold, first-appearance order makes LRU evict each partition just before the
+            // next batch needs it again (a cyclic sweep that never hits). Results are still
+            // emitted strictly in original probe order through EmitReadyPrefix.
+            var residentFirst = orderedTopLevelIndices
+                .Where(residency.HasResident)
+                .Concat(orderedTopLevelIndices.Where(topIndex => !residency.HasResident(topIndex)))
+                .ToList();
+
+            foreach (var topIndex in residentFirst)
             {
                 context.ThrowIfCancellationRequested();
                 var topLevelLocalIndices = topLevelGroups[topIndex];
@@ -1215,6 +1230,27 @@ internal static class VdbeHashJoinRuntime
             ? plan.Condition(probe, build, combined)
             : plan.Condition(build, probe, combined);
     }
+
+    /// <summary>
+    /// Whether the preserved side of an outer join is the build input, whose unmatched rows are
+    /// emitted after the probe scan (Turso <c>HashJoinType::keeps_unmatched_build_rows</c>).
+    /// </summary>
+    private static bool KeepsUnmatchedBuild(VdbeJoinOperatorPlan plan, bool buildIsRight)
+        => buildIsRight
+            ? plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full
+            : plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full;
+
+    /// <summary>Whether an unmatched probe row is emitted null-extended as it streams.</summary>
+    private static bool KeepsUnmatchedProbe(VdbeJoinOperatorPlan plan, bool buildIsRight)
+        => buildIsRight
+            ? plan.Kind is VdbeJoinKind.Left or VdbeJoinKind.Full
+            : plan.Kind is VdbeJoinKind.Right or VdbeJoinKind.Full;
+
+    private static VdbeJoinRow NullExtendProbe(VdbeJoinRow probe, VdbeJoinPlanNode buildNode, bool buildIsRight)
+        => buildIsRight ? Combine(probe, NullRow(buildNode)) : Combine(NullRow(buildNode), probe);
+
+    private static VdbeJoinRow NullExtendBuild(VdbeJoinRow build, VdbeJoinRow nullProbe, bool buildIsRight)
+        => buildIsRight ? Combine(nullProbe, build) : Combine(build, nullProbe);
 
     private static VdbeJoinRow Combine(VdbeJoinRow build, VdbeJoinRow probe, bool buildIsRight) =>
         buildIsRight
@@ -1663,6 +1699,18 @@ internal static class VdbeHashJoinRuntime
             PartitionKey id,
             VdbeJoinExecutionContext context)
         {
+            // Make room for at least the partition's known entry retention before reading it,
+            // and skip a load that cannot fit even with every other partition evicted: a load
+            // that runs out of memory part-way rereads the partition from the start after
+            // each further eviction, which made failed loads half of all partition reads.
+            var required = spill.GetLoadLowerBoundBytes(id);
+            while (context.Memory.AvailableBytes < required && EvictOneLeastRecentlyUsed(id, context))
+            {
+            }
+
+            if (context.Memory.AvailableBytes < required)
+                return null;
+
             var loaded = spill.TryLoadPartitionByKey(id, context);
             while (loaded is null && EvictOneLeastRecentlyUsed(id, context))
                 loaded = spill.TryLoadPartitionByKey(id, context);
@@ -1721,14 +1769,36 @@ internal static class VdbeHashJoinRuntime
             return true;
         }
 
+        /// <summary>
+        /// Evicts the least-recently-used resident partition so a probe batch can keep growing.
+        /// Resident partitions are only a cache; a batch that cannot grow flushes one probe at a
+        /// time and makes every probe re-resolve (and typically reload) its partition, so
+        /// trading cached partitions for batch headroom is what keeps grouping effective.
+        /// Returns false once nothing is resident.
+        /// </summary>
+        public bool HasResident(int topIndex)
+        {
+            foreach (var id in _lruNodes.Keys)
+            {
+                if (id.TopIndex == topIndex)
+                    return true;
+            }
+            return false;
+        }
+
+        public bool EvictForProbeBatch(VdbeJoinExecutionContext context) =>
+            _lruOrder.First is { } node && Evict(node, context);
+
         private bool EvictOneLeastRecentlyUsed(PartitionKey protect, VdbeJoinExecutionContext context)
         {
             var node = _lruOrder.First;
             while (node is not null && node.Value.Equals(protect))
                 node = node.Next;
-            if (node is null)
-                return false;
+            return node is not null && Evict(node, context);
+        }
 
+        private bool Evict(LinkedListNode<PartitionKey> node, VdbeJoinExecutionContext context)
+        {
             var victim = node.Value;
             _lruOrder.Remove(node);
             _lruNodes.Remove(victim);
@@ -1903,6 +1973,7 @@ internal static class VdbeHashJoinRuntime
             var partition = _partitions[entry.Key is null ? 0 : GetPartition(entry.Key)]!;
             var position = partition.Position;
             WriteEntry(partition.File.File, ref position, entry, context);
+            partition.RecordEntry(EstimateRetainedEntryBytes(partition.Position, position));
             partition.Position = position;
             partition.Count++;
             _totalBuildEntries++;
@@ -1961,8 +2032,21 @@ internal static class VdbeHashJoinRuntime
                 partition.File.File,
                 VdbeSpillFileKind.HashPartition,
                 _options.Metrics);
-            return ReadEntriesWithEviction(partition.File.File, partition.Count, context, id, residency);
+            return ReadEntriesWithEviction(partition.File.File, partition.Count, context, id, residency, scanView: true);
         }
+
+        /// <summary>
+        /// A lower bound on the memory a full load of the partition retains: the sum of its
+        /// entries' decode retention (the same estimate <c>TryReadEntry</c> charges), without
+        /// the bucket dictionary's own overhead. A load cannot succeed with less available.
+        /// </summary>
+        public long GetLoadLowerBoundBytes(PartitionKey id) => GetPartitionFile(id).EntryRetainedBytes;
+
+        private long EstimateRetainedEntryBytes(long recordStart, long recordEnd) =>
+            VdbeManagedFootprint.EstimateHashBuildEntryFromEncodedLength(
+                recordEnd - recordStart - VdbeSpillRecordCodec.RecordLengthSize,
+                _columnCount,
+                _rowIdCount);
 
         public LoadedPartition? TryLoadPartitionByKey(
             PartitionKey id,
@@ -1989,11 +2073,12 @@ internal static class VdbeHashJoinRuntime
                     partition.File.File,
                     VdbeSpillFileKind.HashPartition,
                     _options.Metrics);
+                using var scan = OpenScanView(partition.File.File, context);
                 long position = VdbeSpillRecordCodec.FileHeaderSize;
                 for (var index = 0; index < partition.Count; index++)
                 {
                     using var lease = TryReadEntry(
-                        partition.File.File,
+                        scan.File,
                         ref position,
                         context,
                         requireAvailable: false);
@@ -2132,24 +2217,25 @@ internal static class VdbeHashJoinRuntime
                     partition.File.File,
                     VdbeSpillFileKind.HashPartition,
                     _options.Metrics);
+                using var scan = OpenScanView(partition.File.File, context);
                 long position = VdbeSpillRecordCodec.FileHeaderSize;
                 for (var entryIndex = 0; entryIndex < partition.Count; entryIndex++)
                 {
                     context.ThrowIfCancellationRequested();
                     var recordStart = position;
                     var recordEnd = VdbeSpillRecordCodec.ReadRecordEnd(
-                        partition.File.File,
+                        scan.File,
                         ref position,
                         _options.Metrics);
                     // Skip the ordinal - the index only needs to locate a record, not its
                     // build-side ordinal, which is re-read from the record itself on a hit.
-                    VdbeSpillRecordCodec.ReadInt64(partition.File.File, ref position, _options.Metrics);
-                    var hasKey = VdbeSpillRecordCodec.ReadByte(partition.File.File, ref position, _options.Metrics);
+                    VdbeSpillRecordCodec.ReadInt64(scan.File, ref position, _options.Metrics);
+                    var hasKey = VdbeSpillRecordCodec.ReadByte(scan.File, ref position, _options.Metrics);
                     string? key = hasKey switch
                     {
                         0 => null,
                         1 => VdbeSpillRecordCodec.ReadString(
-                            partition.File.File,
+                            scan.File,
                             ref position,
                             recordEnd,
                             _options.Metrics),
@@ -2346,6 +2432,7 @@ internal static class VdbeHashJoinRuntime
                         var sub = subPartitions[subIndex];
                         var position = sub.Position;
                         WriteEntry(sub.File.File, ref position, entry, context);
+                        sub.RecordEntry(EstimateRetainedEntryBytes(sub.Position, position));
                         sub.Position = position;
                         sub.Count++;
                     }
@@ -2495,16 +2582,55 @@ internal static class VdbeHashJoinRuntime
             }
         }
 
+        /// <summary>
+        /// Opens a transient read-ahead view for one sequential scan of a spill file, so a
+        /// partition load, key-index build or fallback scan reads whole blocks instead of
+        /// issuing a file read per decoded value. The block is charged to the statement's
+        /// memory for the scan's duration; when it does not fit, the scan reads directly.
+        /// </summary>
+        private static SpillScanView OpenScanView(IFile file, VdbeJoinExecutionContext context)
+        {
+            var bufferBytes = VdbeManagedFootprint.GetSpillScanReadBufferBytes(context.Memory.LimitBytes);
+            var chargedBytes = VdbeManagedFootprint.EstimateSpillReadBuffer(bufferBytes);
+            if (bufferBytes == 0 || !context.Memory.TryRetain(chargedBytes, rows: 0))
+                return SpillScanView.Direct(file);
+
+            return new SpillScanView(
+                new VdbeReadAheadSpillFile(file, bufferBytes),
+                context.Memory,
+                chargedBytes);
+        }
+
+        private sealed class SpillScanView(IFile file, VdbeExecutionMemory? memory, long chargedBytes)
+            : IDisposable
+        {
+            private long _chargedBytes = chargedBytes;
+
+            public IFile File { get; } = file;
+
+            public static SpillScanView Direct(IFile file) => new(file, memory: null, chargedBytes: 0);
+
+            public void Dispose()
+            {
+                if (_chargedBytes == 0)
+                    return;
+
+                memory!.Release(_chargedBytes, rows: 0);
+                _chargedBytes = 0;
+            }
+        }
+
         private IEnumerable<BuildEntryLease> ReadEntries(
             IFile file,
             int count,
             VdbeJoinExecutionContext context)
         {
+            using var scan = OpenScanView(file, context);
             long position = VdbeSpillRecordCodec.FileHeaderSize;
             for (var index = 0; index < count; index++)
             {
                 yield return TryReadEntry(
-                    file,
+                    scan.File,
                     ref position,
                     context,
                     requireAvailable: true)!;
@@ -2527,8 +2653,11 @@ internal static class VdbeHashJoinRuntime
             int count,
             VdbeJoinExecutionContext context,
             PartitionKey protectId,
-            PartitionResidencyCache residency)
+            PartitionResidencyCache residency,
+            bool scanView)
         {
+            using var scan = scanView ? OpenScanView(file, context) : SpillScanView.Direct(file);
+            file = scan.File;
             long position = VdbeSpillRecordCodec.FileHeaderSize;
             for (var index = 0; index < count; index++)
             {
@@ -2709,6 +2838,12 @@ internal static class VdbeHashJoinRuntime
             public long Position { get; set; }
 
             public int Count { get; set; }
+
+            /// <summary>Sum of the written entries' decode retention estimates.</summary>
+            public long EntryRetainedBytes { get; private set; }
+
+            public void RecordEntry(long retainedBytes) =>
+                EntryRetainedBytes = checked(EntryRetainedBytes + retainedBytes);
 
             public void SetFile(VdbeTemporaryFile file) => _file = file;
 

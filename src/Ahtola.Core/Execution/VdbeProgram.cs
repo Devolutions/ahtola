@@ -709,13 +709,165 @@ public static class SqliteResultCode
 {
     public const int Ok = 0;
     public const int Error = 1;
+    public const int Abort = 4;
+    public const int Busy = 5;
+    public const int Locked = 6;
+    public const int ReadOnly = 8;
+    public const int Interrupt = 9;
+    public const int Corrupt = 11;
+    public const int Full = 13;
+    public const int CantOpen = 14;
+    public const int TooBig = 18;
     public const int Constraint = 19;
+    public const int Mismatch = 20;
+    public const int NotADatabase = 26;
     public const int ConstraintCheck = 275;
     public const int ConstraintNotNull = 1299;
     public const int ConstraintPrimaryKey = 1555;
     public const int ConstraintUnique = 2067;
     public const int ConstraintTrigger = 1811;
     public const int ConstraintForeignKey = 787;
+    public const int ConstraintRowId = 2579;
+    public const int ConstraintDataType = 3091;
+
+    /// <summary>The primary result code of a possibly extended one (<c>code &amp; 0xFF</c>).</summary>
+    public static int Primary(int code) => code & 0xFF;
+
+    private static readonly Dictionary<string, int> s_codesByName = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["SQLITE_ERROR"] = 1,
+        ["SQLITE_INTERNAL"] = 2,
+        ["SQLITE_PERM"] = 3,
+        ["SQLITE_ABORT"] = 4,
+        ["SQLITE_BUSY"] = 5,
+        ["SQLITE_LOCKED"] = 6,
+        ["SQLITE_NOMEM"] = 7,
+        ["SQLITE_READONLY"] = 8,
+        ["SQLITE_INTERRUPT"] = 9,
+        ["SQLITE_IOERR"] = 10,
+        ["SQLITE_CORRUPT"] = 11,
+        ["SQLITE_NOTFOUND"] = 12,
+        ["SQLITE_FULL"] = 13,
+        ["SQLITE_CANTOPEN"] = 14,
+        ["SQLITE_PROTOCOL"] = 15,
+        ["SQLITE_EMPTY"] = 16,
+        ["SQLITE_SCHEMA"] = 17,
+        ["SQLITE_TOOBIG"] = 18,
+        ["SQLITE_CONSTRAINT"] = 19,
+        ["SQLITE_MISMATCH"] = 20,
+        ["SQLITE_MISUSE"] = 21,
+        ["SQLITE_NOLFS"] = 22,
+        ["SQLITE_AUTH"] = 23,
+        ["SQLITE_FORMAT"] = 24,
+        ["SQLITE_RANGE"] = 25,
+        ["SQLITE_NOTADB"] = 26,
+        ["SQLITE_ERROR_MISSING_COLLSEQ"] = 257,
+        ["SQLITE_ERROR_RETRY"] = 513,
+        ["SQLITE_ERROR_SNAPSHOT"] = 769,
+        ["SQLITE_BUSY_RECOVERY"] = 261,
+        ["SQLITE_BUSY_SNAPSHOT"] = 517,
+        ["SQLITE_BUSY_TIMEOUT"] = 773,
+        ["SQLITE_LOCKED_SHAREDCACHE"] = 262,
+        ["SQLITE_LOCKED_VTAB"] = 518,
+        ["SQLITE_READONLY_RECOVERY"] = 264,
+        ["SQLITE_READONLY_CANTLOCK"] = 520,
+        ["SQLITE_READONLY_ROLLBACK"] = 776,
+        ["SQLITE_READONLY_DBMOVED"] = 1032,
+        ["SQLITE_READONLY_CANTINIT"] = 1288,
+        ["SQLITE_READONLY_DIRECTORY"] = 1544,
+        ["SQLITE_ABORT_ROLLBACK"] = 516,
+        ["SQLITE_CORRUPT_VTAB"] = 267,
+        ["SQLITE_CORRUPT_SEQUENCE"] = 523,
+        ["SQLITE_CORRUPT_INDEX"] = 779,
+        ["SQLITE_CANTOPEN_NOTEMPDIR"] = 270,
+        ["SQLITE_CANTOPEN_ISDIR"] = 526,
+        ["SQLITE_CANTOPEN_FULLPATH"] = 782,
+        ["SQLITE_CANTOPEN_CONVPATH"] = 1038,
+        ["SQLITE_CANTOPEN_DIRTYWAL"] = 1294,
+        ["SQLITE_CANTOPEN_SYMLINK"] = 1550,
+        ["SQLITE_CONSTRAINT_CHECK"] = ConstraintCheck,
+        ["SQLITE_CONSTRAINT_COMMITHOOK"] = 531,
+        ["SQLITE_CONSTRAINT_FOREIGNKEY"] = ConstraintForeignKey,
+        ["SQLITE_CONSTRAINT_FUNCTION"] = 1043,
+        ["SQLITE_CONSTRAINT_NOTNULL"] = ConstraintNotNull,
+        ["SQLITE_CONSTRAINT_PRIMARYKEY"] = ConstraintPrimaryKey,
+        ["SQLITE_CONSTRAINT_TRIGGER"] = ConstraintTrigger,
+        ["SQLITE_CONSTRAINT_UNIQUE"] = ConstraintUnique,
+        ["SQLITE_CONSTRAINT_VTAB"] = 2323,
+        ["SQLITE_CONSTRAINT_ROWID"] = ConstraintRowId,
+        ["SQLITE_CONSTRAINT_PINNED"] = 2835,
+        ["SQLITE_CONSTRAINT_DATATYPE"] = ConstraintDataType,
+    };
+
+    /// <summary>
+    /// Resolves a symbolic SQLite result code name as remote protocols report it (Hrana's
+    /// <c>error.code</c>, e.g. <c>SQLITE_CONSTRAINT_UNIQUE</c>) to its numeric value. An
+    /// extended name this table does not list resolves to its primary family
+    /// (<c>SQLITE_IOERR_SHORT_READ</c> → 10). Non-SQLite codes (<c>SQL_PARSE_ERROR</c>,
+    /// <c>STREAM_EXPIRED</c>) are not SQLite result codes and return <see langword="false"/>.
+    /// </summary>
+    public static bool TryParseName(string? name, out int code)
+    {
+        code = 0;
+        if (string.IsNullOrWhiteSpace(name))
+            return false;
+
+        name = name.Trim();
+        if (s_codesByName.TryGetValue(name, out code))
+            return true;
+
+        for (var separator = name.LastIndexOf('_'); separator > "SQLITE_".Length; separator = name.LastIndexOf('_', separator - 1))
+        {
+            if (s_codesByName.TryGetValue(name[..separator], out code) && code == Primary(code))
+                return true;
+        }
+
+        code = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Derives SQLite's (extended) result code from the exact error text SQLite reports for
+    /// that failure class, for raise sites that carry only the message. Returns
+    /// <see langword="null"/> for text that is an ordinary <c>SQLITE_ERROR</c>. Primary-key
+    /// conflicts share the "UNIQUE constraint failed" text, so their raise sites pass
+    /// <see cref="ConstraintPrimaryKey"/> explicitly.
+    /// </summary>
+    public static int? InferFromMessage(string? message)
+    {
+        if (string.IsNullOrEmpty(message))
+            return null;
+
+        if (message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal))
+            return ConstraintUnique;
+        if (message.StartsWith("NOT NULL constraint failed:", StringComparison.Ordinal))
+            return ConstraintNotNull;
+        if (message.StartsWith("CHECK constraint failed:", StringComparison.Ordinal))
+            return ConstraintCheck;
+        if (message.Equals("FOREIGN KEY constraint failed", StringComparison.Ordinal))
+            return ConstraintForeignKey;
+        if (message.StartsWith("cannot store ", StringComparison.Ordinal)
+            && message.Contains(" value in ", StringComparison.Ordinal)
+            && message.Contains(" column ", StringComparison.Ordinal))
+        {
+            return ConstraintDataType;
+        }
+
+        return message switch
+        {
+            "datatype mismatch" => Mismatch,
+            "attempt to write a readonly database" => ReadOnly,
+            "database is locked" => Busy,
+            "database table is locked" => Locked,
+            "database or disk is full" => Full,
+            "string or blob too big" => TooBig,
+            "database disk image is malformed" => Corrupt,
+            "file is not a database" => NotADatabase,
+            "unable to open database file" => CantOpen,
+            "interrupted" => Interrupt,
+            _ => null,
+        };
+    }
 }
 
 /// <summary>
@@ -1871,6 +2023,19 @@ public sealed class VdbeJoinEquiProbe
     public Func<VdbeJoinRow, string?> BuildLeftKey { get; }
 
     public Func<VdbeJoinRow, string?> BuildRightKey { get; }
+
+    /// <summary>
+    /// The right-side column names of the hash key, in key order, when every key is a plain
+    /// column of the right input (EXPLAIN QUERY PLAN names them as the automatic index's
+    /// constraints); <see langword="null"/> when any key is an expression.
+    /// </summary>
+    internal IReadOnlyList<string>? RightKeyColumns { get; init; }
+
+    /// <summary>
+    /// True when the only hash key is the right table's INTEGER PRIMARY KEY, so hashing the
+    /// right input is a rowid-keyed point lookup.
+    /// </summary>
+    internal bool RightKeyIsRowid { get; init; }
 }
 
 /// <summary>An INNER, LEFT, RIGHT, FULL, SEMI, or ANTI node in a materializing join plan.</summary>
@@ -1894,8 +2059,11 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
     {
         if (!Enum.IsDefined(kind))
             throw new ArgumentOutOfRangeException(nameof(kind));
-        if (!hashBuildRight && kind is not VdbeJoinKind.Inner)
-            throw new ArgumentException("Hash-build-left is only valid for INNER joins.", nameof(hashBuildRight));
+        // Hash-build-left hashes the left input and streams the right as the probe. For a LEFT or
+        // FULL join the build is the preserved side, whose unmatched rows VdbeHashJoinRuntime
+        // emits after the probe scan (Turso HashJoinType::LeftOuter / FullOuter).
+        if (!hashBuildRight && kind is not (VdbeJoinKind.Inner or VdbeJoinKind.Left or VdbeJoinKind.Full))
+            throw new ArgumentException("Hash-build-left is only valid for INNER, LEFT, or FULL joins.", nameof(hashBuildRight));
         if (!hashBuildRight && equiProbe is null)
             throw new ArgumentException("Hash-build-left requires an equijoin probe.", nameof(hashBuildRight));
 

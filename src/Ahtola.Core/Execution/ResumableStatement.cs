@@ -1673,7 +1673,7 @@ public sealed class ResumableStatement : IDisposable
                         {
                             throw new EmbeddedSqlException(
                                 "datatype mismatch",
-                                SqliteResultCode.Constraint,
+                                SqliteResultCode.Mismatch,
                                 InsertConflictAlgorithm.Abort);
                         }
 
@@ -1704,7 +1704,7 @@ public sealed class ResumableStatement : IDisposable
                         {
                             throw new EmbeddedSqlException(
                                 "datatype mismatch",
-                                SqliteResultCode.Constraint,
+                                SqliteResultCode.Mismatch,
                                 InsertConflictAlgorithm.Abort);
                         }
 
@@ -5027,7 +5027,9 @@ public sealed class ResumableStatement : IDisposable
         private void StartMerge(CancellationToken cancellationToken)
         {
             var runCount = _spill!.RunCount;
-            var infrastructureBytes = VdbeManagedFootprint.EstimateMergeInfrastructure(runCount);
+            var infrastructureBytes = VdbeManagedFootprint.EstimateMergeInfrastructure(
+                runCount,
+                _memory.LimitBytes);
             _memory.RetainOrThrow(infrastructureBytes, rows: 0);
             _mergeInfrastructureBytes = infrastructureBytes;
             try
@@ -5128,7 +5130,8 @@ public sealed class ResumableStatement : IDisposable
                 VdbeMemoryReservation.Create(
                     _memory,
                     VdbeManagedFootprint.EstimateSorterSpillInfrastructure(
-                        _executionOptions.TemporaryDirectory));
+                        _executionOptions.TemporaryDirectory,
+                        _memory.LimitBytes));
             try
             {
                 return SorterSpill.Create(
@@ -5172,7 +5175,8 @@ public sealed class ResumableStatement : IDisposable
                 && _executionOptions.AllowTemporaryFileSpill
                 && retainedBytes > _memory.AvailableBytes
                     - VdbeManagedFootprint.EstimateSorterSpillInfrastructure(
-                        _executionOptions.TemporaryDirectory))
+                        _executionOptions.TemporaryDirectory,
+                        _memory.LimitBytes))
             {
                 return false;
             }
@@ -5345,7 +5349,10 @@ public sealed class ResumableStatement : IDisposable
                     currentCapacity: 0,
                     requiredCount: 1));
             _temporaryFile = VdbeTemporaryFile.Create(_executionOptions, "sorter");
-            _file = _temporaryFile.File;
+            var writeBufferBytes = VdbeManagedFootprint.GetSorterSpillWriteBufferBytes(_memory.LimitBytes);
+            _file = writeBufferBytes == 0
+                ? _temporaryFile.File
+                : new VdbeBufferedSpillFile(_temporaryFile.File, writeBufferBytes);
             _writePosition = VdbeSpillRecordCodec.InitializeFile(
                 File,
                 VdbeSpillFileKind.SorterRun,
@@ -5583,7 +5590,9 @@ public sealed class ResumableStatement : IDisposable
             RunReader[]? readers = null;
             RowLease[]? heads = null;
             RowLease? current = null;
-            var infrastructureBytes = VdbeManagedFootprint.EstimateMergeInfrastructure(count);
+            var infrastructureBytes = VdbeManagedFootprint.EstimateMergeInfrastructure(
+                count,
+                memory.LimitBytes);
             memory.RetainOrThrow(infrastructureBytes, rows: 0);
             try
             {
@@ -5600,7 +5609,8 @@ public sealed class ResumableStatement : IDisposable
                         input.Offset,
                         input.RowCount,
                         _columnCount,
-                        _executionOptions.Metrics);
+                        _executionOptions.Metrics,
+                        VdbeManagedFootprint.GetSorterRunReadBufferBytes(memory.LimitBytes));
                     readers[index] = reader;
                     if (reader.TryReadNext(memory, out var row, cancellationToken))
                     {
@@ -5692,7 +5702,8 @@ public sealed class ResumableStatement : IDisposable
                 run.Offset,
                 run.RowCount,
                 _columnCount,
-                _executionOptions.Metrics);
+                _executionOptions.Metrics,
+                VdbeManagedFootprint.GetSorterRunReadBufferBytes(_memory.LimitBytes));
         }
 
         public void Dispose()
@@ -5726,7 +5737,7 @@ public sealed class ResumableStatement : IDisposable
 
         private long EstimateMergeBytes(int start, int count)
         {
-            var total = VdbeManagedFootprint.EstimateMergeInfrastructure(count);
+            var total = VdbeManagedFootprint.EstimateMergeInfrastructure(count, _memory.LimitBytes);
             for (var index = 0; index < count; index++)
             {
                 total = checked(
@@ -5833,6 +5844,7 @@ public sealed class ResumableStatement : IDisposable
             private readonly IFile _file;
             private readonly int _columnCount;
             private readonly VdbeExecutionMetrics _metrics;
+            private readonly bool _ownsView;
             private long _position;
 
             public RunReader(
@@ -5840,9 +5852,11 @@ public sealed class ResumableStatement : IDisposable
                 long offset,
                 int rowCount,
                 int columnCount,
-                VdbeExecutionMetrics metrics)
+                VdbeExecutionMetrics metrics,
+                int readBufferBytes)
             {
-                _file = file;
+                _file = readBufferBytes == 0 ? file : new VdbeReadAheadSpillFile(file, readBufferBytes);
+                _ownsView = readBufferBytes != 0;
                 _columnCount = columnCount;
                 _metrics = metrics;
                 _position = offset;
@@ -5899,7 +5913,10 @@ public sealed class ResumableStatement : IDisposable
 
             public void Dispose()
             {
-                // The IFile is shared and owned by SorterSpill.
+                // The underlying IFile is shared and owned by SorterSpill; only the
+                // read-ahead view belongs to this reader.
+                if (_ownsView)
+                    _file.Dispose();
             }
         }
     }

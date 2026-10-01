@@ -177,6 +177,7 @@ internal static class ManagedReplicaBootstrapper
                 download.Protocol,
                 tableMap,
                 cancellationToken,
+                clientId: options.CreateClientId(),
                 remoteBaseSha256: remoteBaseSha256).ConfigureAwait(false);
 
             ManagedReplicaFaultInjection.Hit(ManagedReplicaDurableBoundary.BootstrapStagedDatabase);
@@ -612,7 +613,7 @@ internal static class ManagedReplicaBootstrapper
         try
         {
             var revision = StrictUtf8.GetString(Convert.FromBase64String(encodedRevision));
-            if (revision.Length == 0 || !Guid.TryParseExact(clientId, "N", out _))
+            if (revision.Length == 0 || !AhtolaReplicaOptions.IsValidClientId(clientId))
                 throw new InvalidDataException("Managed embedded replica metadata is invalid.");
             if (!IsSha256Hex(fingerprint))
                 throw new InvalidDataException("Managed embedded replica metadata is invalid.");
@@ -1074,8 +1075,8 @@ internal static class ManagedReplicaBootstrapper
         using var scope = options.EnterApplicationHttpScope();
         using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
         client.Timeout = Timeout.InfiniteTimeSpan;
-        var token = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
         var effectiveToken = timeout?.Token ?? cancellationToken;
+        var token = await options.ResolveAuthTokenAsync(effectiveToken).ConfigureAwait(false);
         using var response = await AhtolaRemoteTransportSecurity
             .SendAsync(
                 client,
@@ -1358,7 +1359,7 @@ internal static class ManagedReplicaBootstrapper
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
         return new ManagedReplicaPullOutcome(
             new AhtolaSyncResult(AhtolaSyncOutcome.UpToDate,
-                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, staged.RequestPayloadLength, staged.ResponseBytesRead, metadata.Revision)),
+                new AhtolaSyncStatistics(0, GetMainWalSize(options.Path), GetRevertWalSize(options.Path), DateTimeOffset.UtcNow, null, staged.RequestPayloadLength, staged.ResponseBytesRead, metadata.Revision)),
             ReplayedLocalChangeCount: 0);
     }
 
@@ -1438,7 +1439,7 @@ internal static class ManagedReplicaBootstrapper
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
         return new ManagedReplicaPullOutcome(
             new AhtolaSyncResult(AhtolaSyncOutcome.RemoteChangesApplied,
-                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, staged.RequestPayloadLength, staged.ResponseBytesRead, header.Revision)),
+                new AhtolaSyncStatistics(0, GetMainWalSize(options.Path), GetRevertWalSize(options.Path), DateTimeOffset.UtcNow, null, staged.RequestPayloadLength, staged.ResponseBytesRead, header.Revision)),
             ReplayedLocalChangeCount: 0);
     }
 
@@ -1753,7 +1754,7 @@ internal static class ManagedReplicaBootstrapper
             // below.
             syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
             return (AhtolaSyncOutcome.UpToDate,
-                new AhtolaSyncStatistics(0, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, metadata.Revision),
+                new AhtolaSyncStatistics(0, GetMainWalSize(options.Path), GetRevertWalSize(options.Path), DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, metadata.Revision),
                 0);
         }
         if (pendingLocalChanges.Count != 0 || quarantineActive)
@@ -1952,7 +1953,7 @@ internal static class ManagedReplicaBootstrapper
 
         syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
         return (AhtolaSyncOutcome.RemoteChangesApplied,
-            new AhtolaSyncStatistics(operationCount, 0, 0, DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, header.Revision),
+            new AhtolaSyncStatistics(operationCount, GetMainWalSize(options.Path), GetRevertWalSize(options.Path), DateTimeOffset.UtcNow, null, networkSentBytes, networkReceivedBytes, header.Revision),
             0);
     }
 
@@ -2114,8 +2115,8 @@ internal static class ManagedReplicaBootstrapper
             AhtolaSyncOutcome.RemoteChangesApplied,
             new AhtolaSyncStatistics(
                 operationCount,
-                0,
-                0,
+                GetMainWalSize(options.Path),
+                GetRevertWalSize(options.Path),
                 DateTimeOffset.UtcNow,
                 null,
                 networkSentBytes,
@@ -2848,7 +2849,6 @@ internal static class ManagedReplicaBootstrapper
         using var scope = options.EnterApplicationHttpScope();
         using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
         client.Timeout = Timeout.InfiniteTimeSpan;
-        var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
         var querySelector = GetBootstrapQuerySelector(options.PartialBootstrap);
 
         // Query bootstrap is never chunked. The server -- not the client -- decides which pages the
@@ -2885,7 +2885,6 @@ internal static class ManagedReplicaBootstrapper
             var header = await PullBootstrapChunkAsync(
                     client,
                     options,
-                    authToken,
                     staging,
                     CreateBootstrapPullRequest(
                         serverRevision: null,
@@ -2914,7 +2913,6 @@ internal static class ManagedReplicaBootstrapper
                     _ = await PullBootstrapChunkAsync(
                             client,
                             options,
-                            authToken,
                             staging,
                             CreateBootstrapPullRequest(
                                 header.Revision,
@@ -2975,7 +2973,6 @@ internal static class ManagedReplicaBootstrapper
     private static async Task<PullHeader> PullBootstrapChunkAsync(
         HttpClient client,
         AhtolaReplicaOptions options,
-        string? authToken,
         FileStream staging,
         byte[] requestPayload,
         PullHeader? expectedHeader,
@@ -2987,6 +2984,7 @@ internal static class ManagedReplicaBootstrapper
     {
         using var timeout = CreateTimeout(options.HttpPolicy.RequestTimeout, cancellationToken);
         var effectiveCancellationToken = timeout?.Token ?? cancellationToken;
+        var authToken = await options.ResolveAuthTokenAsync(effectiveCancellationToken).ConfigureAwait(false);
         using var response = await AhtolaRemoteTransportSecurity
             .SendAsync(
                 client,
@@ -3158,7 +3156,7 @@ internal static class ManagedReplicaBootstrapper
         using var scope = options.EnterApplicationHttpScope();
         using var client = options.HttpPolicy.CreateHttpClient(options.RemoteEncryption is not null);
         client.Timeout = Timeout.InfiniteTimeSpan;
-        var authToken = string.IsNullOrWhiteSpace(options.AuthToken) ? null : options.AuthToken;
+        var authToken = await options.ResolveAuthTokenAsync(effectiveCancellationToken).ConfigureAwait(false);
         using var response = await AhtolaRemoteTransportSecurity
             .SendAsync(
                 client,
@@ -4262,6 +4260,95 @@ internal static class ManagedReplicaBootstrapper
             throw new NotSupportedException("Managed embedded replica local divergence was detected; incremental pull cannot replace local changes.");
         if (!string.Equals(ComputeDatabaseFingerprint(databasePath), metadata.DatabaseSha256, StringComparison.Ordinal))
             throw new NotSupportedException("Managed embedded replica local divergence was detected; incremental pull cannot replace local changes.");
+    }
+
+    /// <summary>Current size in bytes of the replica's main write-ahead log, or 0 when absent.</summary>
+    internal static long GetMainWalSize(string databasePath) => GetFileLength(databasePath + "-wal");
+
+    /// <summary>
+    /// Current size in bytes of the replica's revert (checkpoint-recovery) WAL sidecar, or 0 when
+    /// no recovery bundle is pending. This is Ahtola's counterpart of Turso's revert WAL.
+    /// </summary>
+    internal static long GetRevertWalSize(string databasePath)
+        => GetFileLength(databasePath + ManagedReplicaRevertWal.Suffix);
+
+    private static long GetFileLength(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            return info.Exists ? info.Length : 0;
+        }
+        catch (IOException)
+        {
+            return 0;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Folds the committed frames of the replica's main WAL into its database file and republishes
+    /// the local fingerprint, exactly like the pending-local-changes checkpoint that an incremental
+    /// page apply already performs (see <see cref="EnsurePagesApplyIsSafe"/>). The change journal
+    /// is untouched, so every unpushed local change is still pushed by the next push or sync. The
+    /// caller must hold exclusive managed-replica publication (every host closed).
+    /// </summary>
+    /// <remarks>
+    /// Fails closed, instead of guessing, while a checkpoint-recovery bundle or push outcome is
+    /// pending (a sync resolves those), while a push conflict is unresolved, and while a partial
+    /// replica is still lazily materializing pages.
+    /// </remarks>
+    internal static async Task CheckpointLocalWalAsync(
+        AhtolaReplicaOptions options,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        await using var pushLease = await ManagedReplicaPushLock
+            .AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        await using var applyLease = await ManagedReplicaApplyLock
+            .AcquireExclusiveAsync(options.Path, cancellationToken)
+            .ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        ManagedReplicaConflictState.ThrowIfPending(options.Path);
+        var metadata = LoadMetadata(options.Path)
+            ?? throw new NotSupportedException(
+                "Managed embedded replica checkpoint requires bootstrap metadata.");
+        ManagedReplicaRevertWal.ValidateSynchronizationReady(options.Path, metadata);
+        if (File.Exists(options.Path + ManagedReplicaPageMaterializingFileSystem.StateSuffix))
+        {
+            throw new NotSupportedException(
+                "Managed embedded replica checkpoint is not supported while a partial replica is still "
+                + "lazily materializing pages; synchronize to complete the image first.");
+        }
+
+        if (GetMainWalSize(options.Path) <= 32)
+            return;
+
+        using (var opened = ManagedReplicaEncryption.OpenDatabase(options.Path, options.RemoteEncryption))
+            ExecuteNonQuery(opened.Database.Connect(), "PRAGMA wal_checkpoint(TRUNCATE)");
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var fingerprint = ComputeDatabaseFingerprint(options.Path);
+        if (string.Equals(fingerprint, metadata.DatabaseSha256, StringComparison.Ordinal))
+            return;
+
+        var metadataPath = options.Path + MetadataSuffix;
+        var metadataStagingPath = Path.Combine(
+            Path.GetDirectoryName(Path.GetFullPath(options.Path))!,
+            $".{Path.GetFileName(metadataPath)}.checkpoint-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            WriteMetadata(metadataStagingPath, metadataPath, metadata with { DatabaseSha256 = fingerprint });
+        }
+        finally
+        {
+            DeleteIfExists(metadataStagingPath);
+        }
     }
 
     /// <summary>Determines whether a bootstrapped managed embedded replica is present at

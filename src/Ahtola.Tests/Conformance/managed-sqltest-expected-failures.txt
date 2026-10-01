@@ -78,8 +78,8 @@ turso/without_rowid.sqltest::without-rowid-foreign-keys-rejected | intentional e
 # through the managed harness -- SqltestManagedRunner.RunVariant converts the resulting
 # open-time EmbeddedSqlException/InvalidDataException into a plain SqltestOutcome instead of
 # letting it escape as an unhandled test exception, so each case is compared and recorded like
-# any other. All 18 cases below are real observed engine behavior:
-# EmbeddedFileStore.Load() validates b-tree/index/allocation-map/generated-column structural
+# any other. All 16 cases below are real observed engine behavior:
+# EmbeddedFileStore.Load() validates b-tree/index/allocation-map structural
 # integrity eagerly at file-open time, where Turso/SQLite open the file unconditionally and
 # defer to PRAGMA integrity_check/quick_check to report the same defect as row output (the
 # same class of pre-existing divergence already exercised by
@@ -87,11 +87,12 @@ turso/without_rowid.sqltest::without-rowid-foreign-keys-rejected | intentional e
 # The separate legacy-view loader gap is closed: malformed stored views no longer prevent
 # unrelated operations, and resolving a broken view for queries or trigger DML fails closed.
 # The other
-# 3 files this generator builds (parity_check_constraint, parity_quick_check_constraint,
-# parity_not_null_violation) are NOT listed here: ordinary column CHECK/NOT NULL values are not
-# re-validated on load, only generated-column values are recomputed (and their NOT NULL
-# rechecked), so those 3 open successfully and PRAGMA integrity_check/quick_check see the
-# corruption exactly as the pinned corpus expects.
+# 8 files this generator builds (parity_check_constraint, parity_quick_check_constraint,
+# parity_not_null_violation, parity_gencol_not_null_violation and the four parity_strict_*
+# files) are NOT listed here: stored values are not re-validated on load (VIRTUAL generated
+# columns are recomputed with affinity only, like a SQLite column read, without NOT NULL or
+# STRICT enforcement), so those files open successfully and PRAGMA integrity_check/quick_check
+# report the NULL, STRICT storage-class and CHECK violations exactly as the pinned corpus expects.
 integrity_check/parity_corrupt_index.sqltest::integrity-check-corrupt-missing-index-entry | database variant 1/1 (database/integrity_missing_index_entry.db): database failed to open: Stored index 'idx_b' is not a valid supported SQLite index b-tree.
 integrity_check/parity_corrupt_index.sqltest::quick-check-corrupt-missing-index-entry | database variant 1/1 (database/integrity_missing_index_entry.db): database failed to open: Stored index 'idx_b' is not a valid supported SQLite index b-tree.
 integrity_check/parity_corrupt_expression_index.sqltest::integrity-check-corrupt-missing-expression-index-entry | database variant 1/1 (database/integrity_missing_expression_index_entry.db): database failed to open: Stored index 'idx_expr' is not a valid supported SQLite index b-tree.
@@ -102,8 +103,6 @@ integrity_check/parity_freelist_count_mismatch.sqltest::integrity-check-freelist
 integrity_check/parity_freelist_count_mismatch.sqltest::quick-check-freelist-count-mismatch | open-time validation: SQLite freelist header declares 202 pages but its trunks contain 201.
 integrity_check/parity_freelist_trunk_corrupt.sqltest::integrity-check-freelist-trunk-corrupt | open-time validation: SQLite freelist trunk page 2 declares 1023 leaves, exceeding capacity 1022.
 integrity_check/parity_freelist_trunk_corrupt.sqltest::quick-check-freelist-trunk-corrupt | open-time validation: SQLite freelist trunk page 2 declares 1023 leaves, exceeding capacity 1022.
-integrity_check/parity_gencol_not_null_violation.sqltest::integrity-check-gencol-not-null-violation | database variant 1/1 (database/integrity_gencol_not_null_violation.db): database failed to open: NOT NULL constraint failed: t.b
-integrity_check/parity_gencol_not_null_violation.sqltest::quick-check-gencol-not-null-violation | database variant 1/1 (database/integrity_gencol_not_null_violation.db): database failed to open: NOT NULL constraint failed: t.b
 integrity_check/parity_missing_unique_index.sqltest::integrity-check-missing-unique-index-entry | database variant 1/1 (database/integrity_missing_unique_index_entry.db): database failed to open: Stored index 'idx_u_missing' does not match table 't' at record 1.
 integrity_check/parity_missing_unique_index.sqltest::quick-check-missing-unique-index-entry | database variant 1/1 (database/integrity_missing_unique_index_entry.db): database failed to open: Stored index 'idx_u_missing' does not match table 't' at record 1.
 integrity_check/parity_non_unique_index.sqltest::integrity-check-non-unique-index-entry | database variant 1/1 (database/integrity_non_unique_index_entry.db): database failed to open: Stored unique index 'idx_u' on table 't' contains duplicate non-NULL keys.
@@ -159,3 +158,40 @@ turso/mvcc_sequence_adversarial.sqltest::mvcc-user-sequence-survives-concurrent-
 turso/mvcc_sequence.sqltest::mvcc-to-wal-autoincrement-continues | intentional storage-mode policy: a :memory: WAL request retains mvcc mode; committed AUTOINCREMENT values still advance correctly
 turso/mvcc_sequence.sqltest::mvcc-to-wal-user-sequence-continues | intentional storage-mode policy: a :memory: WAL request retains mvcc mode; committed user-sequence values still advance correctly
 turso/mvcc_sequence.sqltest::mvcc-wal-mvcc-roundtrip-autoincrement | intentional storage-mode policy: a :memory: WAL request retains mvcc mode without losing allocation watermarks
+
+# v0.8.1 corpus adoption (2026-09-30): the vendored corpus was refreshed from the
+# pinned turso-src v0.8.1 (8549c1659): 33 new files and 41 refreshed files. The
+# entries below are the differences that refresh exposed, pending closure.
+alter_table.sqltest::alter-table-add-column-preserve-schema-collate-locale | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)' but was 'CREATE TABLE tbl (c TEXT COLLATE 'fr-FR', d)'
+integrity_check/memory.sqltest::integrity-check-qualified-corrupt-attached-database | intentional managed-ATTACH policy: a file ATTACH needs a file-backed managed primary whose IFileSystem the attachment shares (a :memory: primary has none), and the corrupt fixture is independently rejected at open (see the parity_corrupt_index entries)
+join/hash_join_order_by.sqltest::hash-join-keeps-outer-table-order-elision | database variant 1/1 (:memory:): expected 3 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN c' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+join/hash_join_order_by.sqltest::hash-join-materialized-prefix-uses-sorter | database variant 1/1 (:memory:): output does not match pattern '(?s)MATERIALIZE hash build input for a.*HASH JOIN b.*USE SORTER FOR ORDER BY'
+join/hash_join_order_by.sqltest::hash-join-order-by-build-table-uses-sorter | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN b.*SCAN a.*USE SORTER FOR ORDER BY'
+join/memory.sqltest::equality-prefix-keeps-index-search | database variant 1/1 (:memory:): output does not match pattern 'SEARCH child USING COVERING INDEX sqlite_autoindex_prefix_child_1 \(group_id=\? AND parent_id=\?\)'
+join/memory.sqltest::expression-index-after-earlier-join-reads-source-table | database variant 1/1 (:memory:): output does not match pattern '(?s)MATERIALIZE hash build input for expression_build_orders AS orders.*SCAN expression_build_customers AS customers.*SEARCH orders USIN
+join/memory.sqltest::expression-index-hash-build-reads-source-table | database variant 1/1 (:memory:): output does not match pattern '(?s)MATERIALIZE hash build input for expression_build_orders AS orders.*HASH JOIN expression_build_inventory AS inventory.*SEARCH orders
+join/memory.sqltest::future-table-cannot-make-index-usable | database variant 1/1 (:memory:): output does not match pattern '(?s)HASH JOIN future_index_child AS child.*SEARCH group_table USING INTEGER PRIMARY KEY.*SCAN future_index_parent AS parent'
+join/memory.sqltest::group-sort-cost-keeps-cheaper-correlated-seeks | database variant 1/1 (:memory:): output does not match pattern '(?s)CORRELATED SCALAR SUBQUERY.*SEARCH child USING INDEX sqlite_autoindex_sort_cost_child_1 \(parent_id=\?\)'
+join/memory.sqltest::hash-join-cost-includes-rows-visited | database variant 1/1 (:memory:): output does not match pattern '(?s)"detail":"HASH JOIN hash_cost_right".*"access_cost":300110000'
+join/memory.sqltest::materialized-hash-build-keeps-index-search | database variant 1/1 (:memory:): output does not match pattern '(?s)"detail":"MATERIALIZE hash build input for selected_hash_build AS build_rows".*"detail":"SEARCH build_rows USING INDEX selected_hash
+join/memory.sqltest::no-stats-hash-join-keeps-unindexed-probe-fanout | database variant 1/1 (:memory:): output does not match pattern '(?s)"detail":"HASH JOIN c".*"rows_per_input":100000.*"detail":"SEARCH d USING INTEGER PRIMARY KEY'
+join/memory.sqltest::partial-stats-hash-join-uses-known-unique-key-count | database variant 1/1 (:memory:): output does not match pattern '(?s)"detail":"HASH JOIN c".*"rows_per_input":5.*"detail":"SEARCH d USING INTEGER PRIMARY KEY'
+join/memory.sqltest::range-prefix-still-allows-hash-join | database variant 1/1 (:memory:): output does not match pattern 'HASH JOIN prefix_child AS child'
+join/memory.sqltest::unique-composite-hash-key-uses-one-key-estimate | database variant 1/1 (:memory:): output does not match pattern '(?s)"detail":"HASH JOIN composite_hash_child AS child".*"rows_per_input":5'
+join/memory.sqltest::unique-hash-key-does-not-apply-to-a-different-collation | database variant 1/1 (:memory:): output does not match pattern '(?s)"detail":"HASH JOIN collation_unique_probe".*"rows_per_input":0.1'
+multi_index_or_compound.sqltest::implied-or-filter-accepts-negative-numbers | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN b' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+multi_index_or_compound.sqltest::implied-or-filter-accepts-parenthesized-equalities | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN b' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+multi_index_or_compound.sqltest::implied-or-filter-keeps-compound-index-searches | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN b' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+multi_index_or_compound.sqltest::implied-or-filter-uses-only-indexed-column | database variant 1/1 (:memory:): expected 2 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN b' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+turso/alter_column.sqltest::alter-column-rejects-index-only-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
+turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc | error message lacks the CLI "Parse error:" prefix the Turso corpus pins (the MVCC index-rebuild rejection text is otherwise identical)
+turso/alter_column.sqltest::alter-column-rewrites-expression-index-affinity-change | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/alter_column.sqltest::alter-column-rewrites-generated-index-affinity-change | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/alter_column.sqltest::alter-column-rewrites-indexed-affinity-change | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/alter_column.sqltest::alter-column-rewrites-indexed-regular-to-virtual | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/alter_column.sqltest::alter-column-rewrites-indexed-virtual-expression-change | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/alter_column.sqltest::alter-column-rewrites-indexed-virtual-to-regular | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/alter_column.sqltest::alter-column-rewrites-partial-index-affinity-change | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/alter_column.sqltest::alter-column-rewrites-partial-index-virtual-expression-change | intentional storage-mode policy: a :memory: database keeps journal_mode=memory where Turso reports wal; every later row (rewritten values, index reads, integrity_check) matches
+turso/explain-query-plan-json.sqltest::both-readers-of-a-shared-cte-point-at-one-materialization | database variant 1/1 (:memory:): expected 1 row(s), got 1 row(s); row 0 expected '{"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    WITH spenders AS (\n        SELECT user_id, sum(amount) AS tot
+turso/vacuum.sqltest::vacuum-rejects-query-only | database variant 1/1 (:temp:): error 'attempt to write a readonly database' does not match pattern 'Cannot execute VACUUM in query_only mode'

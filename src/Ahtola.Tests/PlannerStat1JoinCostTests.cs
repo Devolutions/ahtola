@@ -99,7 +99,7 @@ public sealed class PlannerStat1JoinCostTests
     }
 
     [Test]
-    public void ThreeWayInnerEquijoinHashBuildsSmallerLeftSideAfterAnalyze()
+    public void ThreeWayInnerRowidEquijoinSeeksEachLaterTableAfterAnalyze()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE small(id INTEGER PRIMARY KEY, s TEXT);");
@@ -113,7 +113,9 @@ public sealed class PlannerStat1JoinCostTests
             Execute(connection, $"INSERT INTO seed VALUES ({i});");
         Execute(connection, "ANALYZE;");
 
-        // Root is (small ⋈ seed) ⋈ big: left residual ~3, right big=40 → hash-build left.
+        // Both later tables are joined on their INTEGER PRIMARY KEY, and a unique rowid seek per
+        // outer row is cheaper than any hash join (Turso v0.8.1 access_method.rs), so every step
+        // is a rowid lookup keyed by the accumulated left row.
         var explain = ReadRows(
             connection,
             """
@@ -122,9 +124,20 @@ public sealed class PlannerStat1JoinCostTests
             """);
         var openJoin = explain.Single(row => row[1].AsText() == "OpenJoinCursor");
         // EXPLAIN columns: addr, opcode, p1, p2, p3, p4, comment — p4 is index 5.
-        openJoin[5].AsText().Should().Contain("hash-build left");
+        openJoin[5].AsText().Should().Contain("hash-build right");
         // The FROM order is already optimal here, so the cost optimizer keeps it.
         openJoin[5].AsText().Should().Contain("scan order: small, seed, big");
+        ReadRows(
+                connection,
+                """
+                EXPLAIN QUERY PLAN SELECT small.s, big.b
+                FROM small JOIN seed ON small.id = seed.x JOIN big ON small.id = big.id;
+                """)
+            .Select(row => row[3].AsText())
+            .Should().Equal(
+                "SCAN small",
+                "SEARCH seed USING INTEGER PRIMARY KEY (rowid=?)",
+                "SEARCH big USING INTEGER PRIMARY KEY (rowid=?)");
 
         var rows = ReadRows(
             connection,
@@ -152,8 +165,7 @@ public sealed class PlannerStat1JoinCostTests
         Execute(connection, "ANALYZE;");
 
         // FROM order is big(40), small(3), seed(1). The N-way cost optimizer drives from the
-        // one-row table instead, and the resulting root builds its hash over that tiny
-        // accumulated left side rather than over the 3-row right input.
+        // one-row table instead, then looks up each later table by its INTEGER PRIMARY KEY.
         var explain = ReadRows(
             connection,
             """
@@ -162,7 +174,7 @@ public sealed class PlannerStat1JoinCostTests
             """);
         var openJoin = explain.Single(row => row[1].AsText() == "OpenJoinCursor");
         openJoin[5].AsText().Should().Contain("scan order: seed, big, small");
-        openJoin[5].AsText().Should().Contain("hash-build left");
+        openJoin[5].AsText().Should().Contain("hash-build right");
 
         ReadRows(
                 connection,

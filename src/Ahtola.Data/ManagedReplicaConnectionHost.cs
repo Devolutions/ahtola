@@ -733,16 +733,39 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             .ConfigureAwait(false);
         metadata = metadataAfterPush;
         _metadata = metadata;
+        var pushedAt = pushedChangeCount == 0 ? (DateTimeOffset?)null : DateTimeOffset.UtcNow;
+        if (pushedAt is not null)
+            _syncEntry.RecordCompletedOperation(pulledAt: null, pushedAt, 0, 0);
 
+        var result = await WaitAndApplyRemoteChangesAsync(replicaOptions, metadata, syncOptions, cancellationToken)
+            .ConfigureAwait(false);
+        return result with
+        {
+            Statistics = result.Statistics with
+            {
+                CdcOperations = checked(result.Statistics.CdcOperations + pushedChangeCount),
+                LastPush = pushedAt ?? result.Statistics.LastPush,
+            },
+        };
+    }
+
+    /// <summary>
+    /// The pull half of a sync cycle: waits for remote changes and applies them, retrying
+    /// (bounded, with backoff) when the staged response turns out to be stale relative to local
+    /// state. The wait itself runs entirely outside any publication gate -- see
+    /// ManagedReplicaBootstrapper.WaitAndApplyRemoteChangesAsync -- while the apply runs gated,
+    /// since it mutates the local database file. Mirrors Turso's wait_changes_from_remote -&gt;
+    /// apply_changes_from_remote split (turso-src/sync/engine/src/database_sync_engine.rs).
+    /// </summary>
+    private async Task<AhtolaSyncResult> WaitAndApplyRemoteChangesAsync(
+        AhtolaReplicaOptions replicaOptions,
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata,
+        AhtolaSyncOptions syncOptions,
+        CancellationToken cancellationToken)
+    {
         var pendingLocalChanges = _changeJournal.ReadBatch(int.MaxValue).Changes;
         var acknowledgedLocalChanges = _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark);
 
-        // Wait for remote changes and apply them, retrying (bounded, with backoff) when the staged
-        // response turns out to be stale relative to local state. The wait itself runs entirely
-        // outside any publication gate -- see ManagedReplicaBootstrapper.WaitAndApplyRemoteChangesAsync
-        // -- while the apply runs gated, since it mutates the local database file. Mirrors Turso's
-        // wait_changes_from_remote -> apply_changes_from_remote split
-        // (turso-src/sync/engine/src/database_sync_engine.rs).
         var outcome = await ManagedReplicaBootstrapper.WaitAndApplyRemoteChangesAsync(
                 replicaOptions, metadata, syncOptions, pendingLocalChanges, acknowledgedLocalChanges,
                 (staged, token) => _syncEntry.PublishExclusiveAsync(
@@ -756,15 +779,198 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
         _metadata = ManagedReplicaBootstrapper.LoadMetadata(replicaOptions.Path);
         if (result.Outcome == AhtolaSyncOutcome.RemoteChangesApplied && _metadata is { } published)
             _changeJournal.PruneAcknowledged(published.JournalBaseWatermark);
-        return result with
-        {
-            Statistics = result.Statistics with
-            {
-                CdcOperations = checked(result.Statistics.CdcOperations + pushedChangeCount),
-                LastPush = pushedChangeCount == 0 ? result.Statistics.LastPush : DateTimeOffset.UtcNow,
-            },
-        };
+        _syncEntry.RecordCompletedOperation(
+            result.Statistics.LastPull ?? DateTimeOffset.UtcNow,
+            pushedAt: null,
+            result.Statistics.NetworkSentBytes,
+            result.Statistics.NetworkReceivedBytes);
+        return result;
     }
+
+    /// <summary>
+    /// Pulls and applies remote changes without pushing local changes, mirroring Turso's
+    /// <c>TursoSyncDatabase.PullAsync</c>. Pending local changes are preserved exactly as a full
+    /// sync preserves the ones a capped push left behind (see
+    /// <c>ManagedReplicaBootstrapper.CheckForUpdatesAsync</c>). A pending checkpoint-recovery
+    /// bundle or push outcome is not resolved here: it fails closed until a full sync (whose push
+    /// phase performs that recovery) runs.
+    /// </summary>
+    public Task<AhtolaSyncResult> PullAsync(
+        AhtolaSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (_metadata is null)
+            return Task.FromException<AhtolaSyncResult>(CreateMissingMetadataException());
+
+        return _syncEntry.SynchronizeAsync(
+            this,
+            ManagedReplicaSyncKind.PullOnly,
+            async token =>
+            {
+                var metadata = LoadRequiredMetadata();
+                ThrowIfReplicaConflictIsPending(_options.Path);
+                metadata = PrepareSynchronizationMetadata(metadata);
+
+                // A partial replica still catching up completes its pinned image first, exactly as
+                // in a full sync; that step can mutate the local file, so it runs gated.
+                metadata = await _syncEntry.PublishExclusiveAsync(
+                        gateToken => ManagedReplicaBootstrapper.CompletePartialReplicaAsync(
+                            _options,
+                            metadata,
+                            allowTrackedLocalMutations: HasTrackedLocalChanges(metadata),
+                            ReadRetainedMaterializer(),
+                            gateToken),
+                        token)
+                    .ConfigureAwait(false);
+                _metadata = metadata;
+                return await WaitAndApplyRemoteChangesAsync(_options, metadata, options, token).ConfigureAwait(false);
+            },
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Pushes every local change that was pending when the call started, without pulling remote
+    /// changes, mirroring Turso's <c>TursoSyncDatabase.PushAsync</c>. Batches are still bounded
+    /// by <see cref="AhtolaReplicaOptions.PushOperationsThreshold"/>; several batches are sent when
+    /// needed. The result's <see cref="AhtolaSyncStatistics.CdcOperations"/> is the number of
+    /// changes pushed, and its outcome is always <see cref="AhtolaSyncOutcome.UpToDate"/> because
+    /// no remote change is applied.
+    /// </summary>
+    public Task<AhtolaSyncResult> PushAsync(
+        AhtolaSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (_metadata is null)
+            return Task.FromException<AhtolaSyncResult>(CreateMissingMetadataException());
+
+        return _syncEntry.SynchronizeAsync(
+            this,
+            ManagedReplicaSyncKind.PushOnly,
+            token => PushAllPendingAsync(options, token),
+            cancellationToken);
+    }
+
+    private async Task<AhtolaSyncResult> PushAllPendingAsync(
+        AhtolaSyncOptions syncOptions,
+        CancellationToken cancellationToken)
+    {
+        var metadata = LoadRequiredMetadata();
+        ThrowIfReplicaConflictIsPending(_options.Path);
+        metadata = PrepareSynchronizationMetadata(metadata);
+
+        var pending = ManagedReplicaChangeJournal.Open(_options.Path).ReadBatch(int.MaxValue).Changes;
+        var targetSequence = pending.Count == 0 ? 0 : pending[^1].Sequence;
+        long pushedChangeCount = 0;
+
+        // Each round pushes at least one change or stops, so the pending count at entry bounds the
+        // loop; changes committed after this call started are left for the next push or sync.
+        for (var round = 0; round <= pending.Count; round++)
+        {
+            var roundMetadata = metadata;
+            var push = await _syncEntry.PublishExclusiveAsync(
+                    token => PushLocalChangesAsync(
+                        _options,
+                        roundMetadata,
+                        syncOptions,
+                        ReadRetainedMaterializer(),
+                        token),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            metadata = push.Metadata;
+            _metadata = metadata;
+            pushedChangeCount = checked(pushedChangeCount + push.ChangeCount);
+            if (push.ChangeCount == 0)
+                break;
+
+            var next = _changeJournal.ReadBatch(1).Changes;
+            if (next.Count == 0 || next[0].Sequence > targetSequence)
+                break;
+        }
+
+        var pushedAt = pushedChangeCount == 0 ? (DateTimeOffset?)null : DateTimeOffset.UtcNow;
+        if (pushedAt is not null)
+            _syncEntry.RecordCompletedOperation(pulledAt: null, pushedAt, 0, 0);
+        syncOptions.Progress?.Report(new AhtolaSyncProgress(AhtolaSyncProgressStage.Completed));
+        return new AhtolaSyncResult(
+            AhtolaSyncOutcome.UpToDate,
+            new AhtolaSyncStatistics(
+                pushedChangeCount,
+                ManagedReplicaBootstrapper.GetMainWalSize(_options.Path),
+                ManagedReplicaBootstrapper.GetRevertWalSize(_options.Path),
+                LastPull: null,
+                LastPush: pushedAt,
+                NetworkSentBytes: 0,
+                NetworkReceivedBytes: 0,
+                metadata.Revision));
+    }
+
+    /// <summary>
+    /// Folds the local replica's committed WAL frames into its main database file. See
+    /// <see cref="ManagedReplicaBootstrapper.CheckpointLocalWalAsync"/> for the exact contract.
+    /// </summary>
+    public Task CheckpointAsync(CancellationToken cancellationToken)
+    {
+        if (_metadata is null)
+            return Task.FromException(CreateMissingMetadataException());
+
+        return _syncEntry.PublishExclusiveAsync(
+            async token =>
+            {
+                await ManagedReplicaBootstrapper.CheckpointLocalWalAsync(_options, token).ConfigureAwait(false);
+                _metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path);
+                return true;
+            },
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns a snapshot of this replica's synchronization statistics: the number of local
+    /// changes still waiting to be pushed, the current main and revert WAL sizes, the durable
+    /// server revision, and the in-process history of the last pull, last push and cumulative
+    /// pull-updates traffic. Pure read: no network access and no local mutation.
+    /// </summary>
+    public AhtolaSyncStatistics GetSyncStatistics()
+    {
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path)
+            ?? _metadata
+            ?? throw CreateMissingMetadataException();
+        var pending = ManagedReplicaChangeJournal.Open(_options.Path).ReadBatch(int.MaxValue).Changes.Count;
+        var history = _syncEntry.GetStatistics();
+        return new AhtolaSyncStatistics(
+            pending,
+            ManagedReplicaBootstrapper.GetMainWalSize(_options.Path),
+            ManagedReplicaBootstrapper.GetRevertWalSize(_options.Path),
+            history.LastPull,
+            history.LastPush,
+            history.NetworkSentBytes,
+            history.NetworkReceivedBytes,
+            metadata.Revision);
+    }
+
+    private ManagedReplicaBootstrapper.ManagedReplicaMetadata LoadRequiredMetadata()
+    {
+        var metadata = ManagedReplicaBootstrapper.LoadMetadata(_options.Path)
+            ?? throw CreateMissingMetadataException();
+        _metadata = metadata;
+        return metadata;
+    }
+
+    private ManagedReplicaBootstrapper.ManagedReplicaMetadata PrepareSynchronizationMetadata(
+        ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+    {
+        if (metadata.JournalBaseWatermark < _changeJournal.RetentionBase)
+            metadata = metadata with { JournalBaseWatermark = _changeJournal.RetentionBase };
+        return ManagedReplicaBootstrapper.EnsureLegacyRemoteBaseSnapshot(_options.Path, metadata);
+    }
+
+    private bool HasTrackedLocalChanges(ManagedReplicaBootstrapper.ManagedReplicaMetadata metadata)
+        => _changeJournal.ReadBatch(int.MaxValue).Changes.Count != 0
+           || _changeJournal.ReadAcknowledged(metadata.JournalBaseWatermark).Count != 0;
+
+    private static NotSupportedException CreateMissingMetadataException()
+        => new("Managed embedded replica synchronization requires bootstrap metadata.");
 
     /// <summary>
     /// Runs the gated first half of one sync cycle: push local changes to the remote, then (when a
@@ -1225,7 +1431,8 @@ internal sealed class ManagedReplicaConnectionHost : IDisposable
             replicaOptions.AuthToken,
             replicaOptions.RemoteEncryption,
             disposeHttpClient: false,
-            automaticRedirectsDisabled: true);
+            automaticRedirectsDisabled: true,
+            replicaOptions.AuthTokenProvider);
 
         var sourcePullGeneration = selectionMetadata.PushState?.SourcePullGeneration ?? 0;
         if (recoveringUnknownPush)

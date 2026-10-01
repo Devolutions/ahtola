@@ -863,6 +863,10 @@ internal sealed class MvStore
             {
                 ThrowIfTypedKeyInsertConflict(tx, chain);
             }
+            else
+            {
+                ThrowIfConcurrentLiveInsert(tx, chain);
+            }
 
             chain.Add(version);
             tx.RecordLogOp(CreateLogUpsert(rowId, version.Cells));
@@ -1520,26 +1524,68 @@ internal sealed class MvStore
 
     /// <summary>
     /// Concurrent pure base tombstones/inserts share End=null, so the end-stamp WW
-    /// path never fires. Detect peer Active/Preparing begins (or ends) on the chain.
+    /// path never fires. Detect peer Active/Preparing begins (or ends) on the chain,
+    /// and peer writes committed after this snapshot: a base row's deletion marker is
+    /// a separate tombstone version here, so a post-snapshot commit is invisible to
+    /// <paramref name="tx"/> yet still owns the row (Turso 0f7f30eac: an older snapshot
+    /// may read the row, but must not write it again without a conflict).
     /// </summary>
     private void ThrowIfConcurrentWriterOnRow(MvccTransaction tx, List<MvccRowVersion> chain)
     {
         foreach (var version in chain)
         {
-            if (version.Begin is { IsTimestamp: false, Value: var beginTx }
-                && beginTx != tx.Id.Value
-                && IsActiveOrPreparingTx(beginTx))
-            {
+            if (version.Begin is { } begin && IsConcurrentWriteStamp(tx, begin))
                 throw new EmbeddedWriteWriteConflictException();
-            }
 
-            if (version.End is { IsTimestamp: false, Value: var endTx }
-                && endTx != tx.Id.Value
-                && IsActiveOrPreparingTx(endTx))
-            {
+            if (version.End is { } end && IsConcurrentWriteStamp(tx, end))
                 throw new EmbeddedWriteWriteConflictException();
-            }
         }
+    }
+
+    /// <summary>
+    /// Automatic rowids come from the store-global allocator, so two live versions of one
+    /// integer rowid can only arise from explicit keys. A peer's in-flight or post-snapshot
+    /// live version already owns the rowid: inserting it again must conflict instead of
+    /// letting both commits keep the same key.
+    /// </summary>
+    private void ThrowIfConcurrentLiveInsert(MvccTransaction tx, List<MvccRowVersion> chain)
+    {
+        foreach (var version in chain)
+        {
+            if (version.IsTombstone || version.End is not null)
+                continue;
+            if (version.Begin is { } begin && IsConcurrentWriteStamp(tx, begin))
+                throw new EmbeddedWriteWriteConflictException();
+        }
+    }
+
+    /// <summary>
+    /// True when <paramref name="stamp"/> belongs to a peer that is still in flight or
+    /// that committed after <paramref name="tx"/>'s snapshot.
+    /// </summary>
+    private bool IsConcurrentWriteStamp(MvccTransaction tx, MvccStamp stamp)
+    {
+        if (stamp.IsTimestamp)
+            return stamp.Value > tx.BeginTimestamp;
+
+        if (stamp.Value == tx.Id.Value)
+            return false;
+
+        if (_transactions.TryGetValue(stamp.Value, out var other))
+        {
+            return other.State switch
+            {
+                MvccTransactionState.Active or MvccTransactionState.Preparing => true,
+                MvccTransactionState.Committed =>
+                    other.CommitTimestamp is not { } cts || cts > tx.BeginTimestamp,
+                _ => false,
+            };
+        }
+
+        return _finalizedStates.TryGetValue(stamp.Value, out var finalized)
+            && finalized == MvccTransactionState.Committed
+            && _finalizedCommitTimestamps.TryGetValue(stamp.Value, out var finalizedCts)
+            && finalizedCts > tx.BeginTimestamp;
     }
 
     /// <summary>
@@ -1565,10 +1611,6 @@ internal sealed class MvStore
             throw new EmbeddedWriteWriteConflictException();
         }
     }
-
-    private bool IsActiveOrPreparingTx(ulong otherTxId)
-        => _transactions.TryGetValue(otherTxId, out var other)
-            && other.State is MvccTransactionState.Active or MvccTransactionState.Preparing;
 
     private void ClearExclusive(MvccTxId id)
     {

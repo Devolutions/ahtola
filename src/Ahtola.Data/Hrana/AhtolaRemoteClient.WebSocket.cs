@@ -36,7 +36,8 @@ internal sealed partial class AhtolaRemoteClient
         string? authToken,
         AhtolaHranaWebSocketOptions webSocketOptions,
         AhtolaRemoteEncryptionOptions? remoteEncryption = null,
-        IAhtolaWebSocketConnector? connector = null)
+        IAhtolaWebSocketConnector? connector = null,
+        Func<CancellationToken, ValueTask<string?>>? authTokenProvider = null)
     {
         ArgumentNullException.ThrowIfNull(webSocketEndpoint);
         ArgumentNullException.ThrowIfNull(webSocketOptions);
@@ -51,11 +52,15 @@ internal sealed partial class AhtolaRemoteClient
                 + $"the {EncryptionKeyHeaderName} header on every pipeline request.");
         }
 
-        AhtolaRemoteTransportSecurity.Validate(webSocketEndpoint, authToken, remoteEncryptionConfigured: false);
+        _authToken = string.IsNullOrWhiteSpace(authToken) ? null : authToken;
+        _authTokenProvider = authTokenProvider;
+        AhtolaRemoteTransportSecurity.Validate(
+            webSocketEndpoint,
+            CredentialValidationToken,
+            remoteEncryptionConfigured: false);
 
         _httpClient = null;
         _disposeHttpClient = false;
-        _authToken = string.IsNullOrWhiteSpace(authToken) ? null : authToken;
         _remoteEncryptionKey = null;
         _pipelineUri = webSocketEndpoint;
         _cursorUri = webSocketEndpoint;
@@ -65,7 +70,8 @@ internal sealed partial class AhtolaRemoteClient
             webSocketEndpoint,
             _authToken,
             webSocketOptions,
-            connector);
+            connector,
+            authTokenProvider);
     }
 
     /// <summary>True when this client speaks Hrana over a persistent WebSocket.</summary>

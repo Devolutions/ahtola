@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using AwesomeAssertions;
+using Ahtola.Core;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Tests;
@@ -497,7 +498,7 @@ public sealed class StorageAuditBoundedGapTests
         allocator.MaximumPageCount.Should().Be(6u);
         allocator.Allocate().PageNumber.Should().Be(5u);
         allocator.Allocate().PageNumber.Should().Be(6u);
-        Assert.Throws<InvalidOperationException>(() => allocator.Allocate());
+        Assert.Catch<EmbeddedSqlException>(() => allocator.Allocate())!.Message.Should().Be("database or disk is full");
 
         var io = new SqliteStagedBtreePageIo(
             _ => new byte[SqlitePageSize.Minimum],
@@ -506,7 +507,7 @@ public sealed class StorageAuditBoundedGapTests
             usableSpace: SqlitePageSize.Minimum);
         io.SetMaximumPageCount(5).Should().Be(5u);
         io.AllocatePage().Should().Be(5u);
-        Assert.Throws<InvalidOperationException>(() => io.AllocatePage());
+        Assert.Catch<EmbeddedSqlException>(() => io.AllocatePage())!.Message.Should().Be("database or disk is full");
         io.SetMaximumPageCount(1).Should().Be(5u);
     }
 

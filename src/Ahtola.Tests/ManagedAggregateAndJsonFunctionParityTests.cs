@@ -94,19 +94,27 @@ public sealed class ManagedAggregateAndJsonFunctionParityTests
     }
 
     [Test]
-    public void JsonGroupObjectCoercesANullNameToAnEmptyQuotedLabel()
+    public void JsonGroupObjectSkipsRowsWithANullLabel()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Seed(connection);
 
-        // SQLite 3.46 emits a bare `:value` here, which is not valid JSON. The Rust core
-        // converts the name with a to-string conversion, so the managed engine matches the
-        // core and always produces a parseable document.
+        // SQLite's jsonObjectStep drops a row whose label is SQL NULL, and Turso matches it
+        // since 517ec809f ("json: skip NULL labels in object aggregates"). A NULL *value* is
+        // still kept as a JSON null.
         ReadValue(connection, "SELECT json_group_object(v, n) FROM t;")
-            .Should().Be(SqlValue.JsonText("{\"x\":1,\"y\":2,\"\":3}"));
-        ReadValue(connection, "SELECT json_valid(json_group_object(v, n)) FROM t;")
-            .Should().Be(SqlValue.Integer(1));
+            .Should().Be(SqlValue.JsonText("{\"x\":1,\"y\":2}"));
+        ReadValue(connection, "SELECT json(jsonb_group_object(v, n)) FROM t;")
+            .Should().Be(SqlValue.JsonText("{\"x\":1,\"y\":2}"));
+        ReadValue(connection, "SELECT json_group_object(k, v) FROM t;")
+            .Should().Be(SqlValue.JsonText("{\"a\":\"x\",\"b\":\"y\",\"c\":null}"));
+        ReadValue(connection, "SELECT json_group_object(NULL, n) FROM t;")
+            .Should().Be(SqlValue.JsonText("{}"));
+        ReadValue(connection, "SELECT json(jsonb_group_object(NULL, n)) FROM t;")
+            .Should().Be(SqlValue.JsonText("{}"));
+        ReadColumn(connection, "SELECT json_group_object(v, n) OVER (ORDER BY n) FROM t;")
+            .Should().Equal("{\"x\":1}", "{\"x\":1,\"y\":2}", "{\"x\":1,\"y\":2}");
     }
 
     [Test]
@@ -151,7 +159,9 @@ public sealed class ManagedAggregateAndJsonFunctionParityTests
             .Should().Be(SqlValue.Text("4C17311332"));
         ReadValue(connection, "SELECT hex(jsonb_group_object(1.5, 2));")
             .Should().Be(SqlValue.Text("6C37312E351332"));
-        ReadValue(connection, "SELECT hex(jsonb(NULL));")
+        ReadValue(connection, "SELECT jsonb(NULL);")
+            .Should().Be(SqlValue.Null);
+        ReadValue(connection, "SELECT hex(jsonb('null'));")
             .Should().Be(SqlValue.Text("00"));
         ReadValue(connection, "SELECT json(jsonb_group_object(1, jsonb_array(2)));")
             .Should().Be(SqlValue.JsonText("{\"1\":[2]}"));

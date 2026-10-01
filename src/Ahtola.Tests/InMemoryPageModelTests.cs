@@ -78,14 +78,14 @@ public sealed class InMemoryPageModelTests
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "PRAGMA max_page_count=1");
-        Assert.Throws<EmbeddedSqlException>(
+        Assert.Catch<EmbeddedSqlException>(
             () => Execute(connection, "CREATE TABLE t(a)"));
 
         using var connection2 = new EmbeddedDatabase().Connect();
         Execute(connection2, "PRAGMA max_page_count=2");
         Execute(connection2, "CREATE TABLE t(a)");
         // Header + one root fit the limit; the second table does not.
-        Assert.Throws<EmbeddedSqlException>(
+        Assert.Catch<EmbeddedSqlException>(
             () => Execute(connection2, "CREATE TABLE t2(b)"));
     }
 

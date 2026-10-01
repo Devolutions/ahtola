@@ -30,6 +30,53 @@ public sealed class ManagedAlterTableAlterColumnTests
             .Equal("1\u001fx", "2\u001fy", "<null>\u001fz");
     }
 
+    // turso/alter_column.sqltest::alter-column-rejects-index-rewrite-mvcc and
+    // ::alter-column-rejects-index-only-rewrite-mvcc: MVCC mode cannot rebuild the indexes
+    // an ALTER COLUMN rewrite invalidates, so upstream rejects the statement up front.
+    [TestCase(
+        "CREATE TABLE t(x NUMERIC); CREATE INDEX idx_x ON t(x); INSERT INTO t VALUES(10),(2),(30);",
+        "ALTER TABLE t ALTER COLUMN x TO y TEXT;",
+        "x")]
+    [TestCase(
+        "CREATE TABLE t(a TEXT, g TEXT GENERATED ALWAYS AS ('old:' || a) VIRTUAL); CREATE INDEX idx_g ON t(g); INSERT INTO t(a) VALUES('a'),('b');",
+        "ALTER TABLE t ALTER COLUMN g TO h TEXT GENERATED ALWAYS AS ('new:' || a) VIRTUAL;",
+        "g")]
+    [TestCase(
+        "CREATE TABLE t(a NUMERIC, g GENERATED ALWAYS AS (a + 1) VIRTUAL); CREATE INDEX idx_g ON t(g); INSERT INTO t(a) VALUES(1);",
+        "ALTER TABLE t ALTER COLUMN a TO a TEXT;",
+        "a")]
+    public void MvccAlterColumnThatMustRebuildIndexesIsRejected(string setup, string alter, string column)
+    {
+        using var connection = new ManagedSqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        Execute(connection, "PRAGMA journal_mode = 'mvcc';");
+        Execute(connection, setup);
+        var schemaBefore = Scalar<string>(connection, "SELECT group_concat(sql, ';') FROM sqlite_schema;");
+
+        var act = () => Execute(connection, alter);
+
+        act.Should().Throw<Ahtola.Data.Sqlite.SqliteException>().WithMessage(
+            $"*cannot ALTER COLUMN \"{column}\": rebuilding affected indexes is not supported in MVCC mode*");
+        Scalar<string>(connection, "SELECT group_concat(sql, ';') FROM sqlite_schema;").Should().Be(schemaBefore);
+    }
+
+    [Test]
+    public void MvccAlterColumnThatLeavesIndexesValidStillSucceeds()
+    {
+        using var connection = new ManagedSqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        Execute(connection, "PRAGMA journal_mode = 'mvcc';");
+        Execute(connection, """
+            CREATE TABLE t(x TEXT, y NUMERIC);
+            CREATE INDEX idx_x ON t(x);
+            INSERT INTO t VALUES('a', 1);
+            ALTER TABLE t ALTER COLUMN x TO x2 TEXT;
+            ALTER TABLE t ALTER COLUMN y TO y2 TEXT;
+            """);
+
+        ReadRows(connection, "SELECT x2, y2 FROM t;").Should().Equal("a\u001f1");
+    }
+
     private static void Execute(ManagedSqliteConnection connection, string sql)
     {
         using var command = connection.CreateCommand();

@@ -22,6 +22,7 @@ internal sealed class AhtolaHranaWebSocketTransport : IAsyncDisposable, IDisposa
 {
     private readonly Uri _endpoint;
     private readonly string? _authToken;
+    private readonly Func<CancellationToken, ValueTask<string?>>? _authTokenProvider;
     private readonly IAhtolaWebSocketConnector _connector;
 
     /// <summary>
@@ -52,13 +53,15 @@ internal sealed class AhtolaHranaWebSocketTransport : IAsyncDisposable, IDisposa
         Uri endpoint,
         string? authToken,
         AhtolaHranaWebSocketOptions options,
-        IAhtolaWebSocketConnector? connector = null)
+        IAhtolaWebSocketConnector? connector = null,
+        Func<CancellationToken, ValueTask<string?>>? authTokenProvider = null)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
         ArgumentNullException.ThrowIfNull(options);
 
         _endpoint = endpoint;
         _authToken = string.IsNullOrWhiteSpace(authToken) ? null : authToken;
+        _authTokenProvider = authTokenProvider;
         Options = options.Validate();
         _connector = connector ?? AhtolaClientWebSocketConnector.Instance;
     }
@@ -877,8 +880,13 @@ internal sealed class AhtolaHranaWebSocketTransport : IAsyncDisposable, IDisposa
             var generation = Interlocked.Increment(ref _generation);
             try
             {
+                // A provider is consulted on every (re)connect, so the hello of each new physical
+                // connection carries the current token.
+                var authToken = await AhtolaRemoteClient
+                    .ResolveAuthTokenAsync(_authToken, _authTokenProvider, cancellationToken)
+                    .ConfigureAwait(false);
                 return await AhtolaHranaWebSocketConnection
-                    .ConnectAsync(_endpoint, _authToken, _connector, Options, generation, cancellationToken)
+                    .ConnectAsync(_endpoint, authToken, _connector, Options, generation, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

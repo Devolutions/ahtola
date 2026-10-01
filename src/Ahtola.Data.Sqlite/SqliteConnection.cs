@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using Ahtola;
 using Ahtola.Core;
+using Ahtola.Core.Execution;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Data.Sqlite;
@@ -27,6 +28,8 @@ public partial class SqliteConnection :
     private readonly IManagedDatabaseFactory? _managedDatabaseFactory;
     private AhtolaConnection? _ahtolaConnection;
     private bool _ahtolaConnectionWasOpen;
+    private Func<CancellationToken, ValueTask<string?>>? _authTokenProvider;
+    private AhtolaAutomaticSyncStatus _lastAutomaticSyncStatus = AhtolaAutomaticSyncStatus.Stopped;
     private ManagedConnectionPoolLease? _managedPoolLease;
     private SqliteConnectionStringBuilder _connectionOptions = new();
     private bool _disposed;
@@ -236,7 +239,7 @@ public partial class SqliteConnection :
             var remoteOriginalState = State;
             try
             {
-                _ahtolaConnection = new AhtolaConnection(_connectionOptions.GetAhtolaConnectionString());
+                _ahtolaConnection = CreateRemoteConnection();
                 _ahtolaConnection.Open();
                 _ahtolaConnectionWasOpen = true;
                 _dataSource = _ahtolaConnection.DataSource;
@@ -344,6 +347,15 @@ public partial class SqliteConnection :
             CleanupFailedOpen(sharedMemoryPath);
             throw MapManagedEncryptionOpenFailure(ex, managedEncryption is not null || useManaged);
         }
+        catch (InvalidDataException ex) when (managedEncryption is null && PageCodec is null && IsPlainNotADatabase(ex))
+        {
+            // An unkeyed, codec-less open of a garbage plain header is SQLite's SQLITE_NOTADB.
+            // A configured key or codec keeps the encrypted-or-not-a-database phrase below.
+            CleanupFailedOpen(sharedMemoryPath);
+            throw SqliteCommand.CreateSqliteException(
+                SqliteResultCode.NotADatabase,
+                SqliteNotADatabaseException.SqliteMessage);
+        }
         catch (InvalidDataException ex)
         {
             CleanupFailedOpen(sharedMemoryPath);
@@ -450,7 +462,7 @@ public partial class SqliteConnection :
         var remoteOpenOriginalState = State;
         try
         {
-            var connection = new AhtolaConnection(_connectionOptions.GetAhtolaConnectionString());
+            var connection = CreateRemoteConnection();
             _ahtolaConnection = connection;
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
             _ahtolaConnectionWasOpen = true;
@@ -469,6 +481,133 @@ public partial class SqliteConnection :
             _ahtolaConnection?.Dispose();
             _ahtolaConnection = null;
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Optional bearer-token provider for remote and embedded-replica data sources; see
+    /// <see cref="AhtolaConnection.AuthTokenProvider"/>. Takes precedence over <c>Auth Token</c>
+    /// and is invoked before every remote request. Must be set before the connection opens.
+    /// </summary>
+    public Func<CancellationToken, ValueTask<string?>>? AuthTokenProvider
+    {
+        get => _authTokenProvider;
+        set
+        {
+            if (State == ConnectionState.Open)
+                throw new InvalidOperationException("AuthTokenProvider cannot be set while the connection is open.");
+            _authTokenProvider = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets the status of the embedded replica's automatic synchronization loop
+    /// (<c>Sync Interval</c>); see <see cref="AhtolaConnection.AutomaticSyncStatus"/>.
+    /// </summary>
+    public AhtolaAutomaticSyncStatus AutomaticSyncStatus
+        => _ahtolaConnection?.AutomaticSyncStatus ?? _lastAutomaticSyncStatus;
+
+    /// <summary>
+    /// Raised on a thread-pool thread whenever <see cref="AutomaticSyncStatus"/> changes; see
+    /// <see cref="AhtolaConnection.AutomaticSyncStatusChanged"/>. The sender is this connection.
+    /// </summary>
+    public event EventHandler<AhtolaAutomaticSyncStatusChangedEventArgs>? AutomaticSyncStatusChanged;
+
+    private AhtolaConnection CreateRemoteConnection()
+    {
+        var connection = new AhtolaConnection(_connectionOptions.GetAhtolaConnectionString())
+        {
+            AuthTokenProvider = _authTokenProvider,
+        };
+        connection.AutomaticSyncStatusChanged += (_, args) =>
+        {
+            _lastAutomaticSyncStatus = args.Status;
+            AutomaticSyncStatusChanged?.Invoke(this, args);
+        };
+        return connection;
+    }
+
+    private AhtolaConnection RequireReplicaConnection()
+        => _ahtolaConnection
+           ?? throw new NotSupportedException("Sync requires an open embedded replica connection.");
+
+    /// <summary>
+    /// Pulls and applies remote changes without pushing local changes; see
+    /// <see cref="AhtolaConnection.Pull()"/>.
+    /// </summary>
+    public AhtolaSyncResult Pull()
+        => RunReplicaOperation(static connection => connection.Pull());
+
+    /// <inheritdoc cref="Pull()"/>
+    public Task<AhtolaSyncResult> PullAsync(CancellationToken cancellationToken = default)
+        => RunReplicaOperationAsync(connection => connection.PullAsync(cancellationToken));
+
+    /// <summary>
+    /// Pushes pending local changes without pulling remote changes; see
+    /// <see cref="AhtolaConnection.Push()"/>.
+    /// </summary>
+    public AhtolaSyncResult Push()
+        => RunReplicaOperation(static connection => connection.Push());
+
+    /// <inheritdoc cref="Push()"/>
+    public Task<AhtolaSyncResult> PushAsync(CancellationToken cancellationToken = default)
+        => RunReplicaOperationAsync(connection => connection.PushAsync(cancellationToken));
+
+    /// <summary>
+    /// Checkpoints the embedded replica's local write-ahead log; see
+    /// <see cref="AhtolaConnection.Checkpoint()"/>.
+    /// </summary>
+    public void Checkpoint()
+        => RunReplicaOperation(static connection =>
+        {
+            connection.Checkpoint();
+            return true;
+        });
+
+    /// <inheritdoc cref="Checkpoint()"/>
+    public Task CheckpointAsync(CancellationToken cancellationToken = default)
+        => RunReplicaOperationAsync(async connection =>
+        {
+            await connection.CheckpointAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        });
+
+    /// <summary>
+    /// Returns a snapshot of the embedded replica's synchronization statistics; see
+    /// <see cref="AhtolaConnection.GetSyncStatistics()"/>.
+    /// </summary>
+    public AhtolaSyncStatistics GetSyncStatistics()
+        => RunReplicaOperation(static connection => connection.GetSyncStatistics());
+
+    /// <inheritdoc cref="GetSyncStatistics()"/>
+    public Task<AhtolaSyncStatistics> GetSyncStatisticsAsync(CancellationToken cancellationToken = default)
+        => RunReplicaOperationAsync(connection => connection.GetSyncStatisticsAsync(cancellationToken));
+
+    private T RunReplicaOperation<T>(Func<AhtolaConnection, T> operation)
+    {
+        var connection = RequireReplicaConnection();
+        try
+        {
+            return operation(connection);
+        }
+        catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+        {
+            ObserveRemoteInvalidation();
+            throw MapRemoteLifecycleException(ex);
+        }
+    }
+
+    private async Task<T> RunReplicaOperationAsync<T>(Func<AhtolaConnection, Task<T>> operation)
+    {
+        var connection = RequireReplicaConnection();
+        try
+        {
+            return await operation(connection).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is AhtolaException or HttpRequestException)
+        {
+            ObserveRemoteInvalidation();
+            throw MapRemoteLifecycleException(ex);
         }
     }
 
@@ -553,6 +692,7 @@ public partial class SqliteConnection :
                 catch when (cleanupError is not null)
                 {
                 }
+                _lastAutomaticSyncStatus = connection.AutomaticSyncStatus;
                 _ahtolaConnectionWasOpen = false;
                 _dataSource = null;
                 _readOnly = false;
@@ -1183,6 +1323,7 @@ public partial class SqliteConnection :
             finally
             {
                 connection.Dispose();
+                _lastAutomaticSyncStatus = connection.AutomaticSyncStatus;
             }
         }
         catch
@@ -1932,6 +2073,17 @@ public partial class SqliteConnection :
             if (File.Exists(candidate))
                 File.Delete(candidate);
         }
+    }
+
+    private static bool IsPlainNotADatabase(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is SqliteNotADatabaseException)
+                return true;
+        }
+
+        return false;
     }
 
     private static SqliteException ToSqliteException(AhtolaException exception)

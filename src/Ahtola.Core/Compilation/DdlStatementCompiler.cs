@@ -18,9 +18,10 @@ namespace Ahtola.Core.Compilation;
 /// functions, so it cannot be a static rule.
 /// </param>
 /// <param name="EnforceMaxPageCount">
-/// Rejects the statement when creating this many additional b-trees would exceed
-/// <c>PRAGMA max_page_count</c>. <c>EXPLAIN</c> passes a no-op: describing a program must not consult a
-/// runtime storage limit, and it never allocates a page.
+/// Notified of how many additional b-tree roots the statement creates. The engine passes a no-op:
+/// <c>PRAGMA max_page_count</c> is a per-connection ceiling enforced against the pages the finished
+/// statement's catalog actually needs (<c>EmbeddedDatabase.EnsureCatalogFitsPageLimit</c> and the
+/// pager growth ceiling), which a per-root estimate made while compiling cannot know.
 /// </param>
 /// <param name="Database">The routed database index every schema instruction addresses.</param>
 /// <param name="HasCollation">
