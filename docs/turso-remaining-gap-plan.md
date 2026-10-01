@@ -104,11 +104,15 @@ plus two older generated-column integrity markers. The ledger now holds
 
 ### Known follow-ups
 
-- A single-table GROUP BY over the 10,000-row default fixture takes 25–40 s.
-  It is equally slow on the pre-refresh build `4d17cd2`. That puts
-  `groupby/default.sqltest` and `offset/default.sqltest` right at the corpus's
-  30-second per-case cap, so they intermittently time out. This is a
-  pre-existing performance problem, not a v0.8.1 parity difference.
+- Fixed: a single-table GROUP BY over the 10,000-row default fixture took
+  25–40 s, which also predated the refresh (`4d17cd2`). The sort spills
+  under the default 2 MB execution budget, and the spill codec issued two or
+  three unbuffered file operations for every value it wrote or read. The
+  sorter's spill file now coalesces writes, and each run reader reads ahead.
+  Both buffers scale with the memory limit and are charged to it. The same
+  query now takes under a second, and `groupby/default.sqltest` runs in
+  about 80 s for the whole file, down from about 15 minutes. Hash-join,
+  window and keyed-row spills still use unbuffered I/O.
 - Large plain equi-joins (3,000 × 3,000) take tens of seconds, both before and
   after this work. This is likely the hash-join spill path under the 2 MB
   execution budget.

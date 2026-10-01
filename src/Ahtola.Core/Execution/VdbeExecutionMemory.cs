@@ -331,6 +331,34 @@ internal static class VdbeManagedFootprint
     private const long PriorityQueueObjectBytes = 64;
     private const long PriorityQueueNodeBytes = 48;
     private const long RunReaderObjectBytes = 64;
+    private const long BufferedSpillFileObjectBytes = 48;
+
+    private const int MaximumSorterSpillWriteBufferBytes = 16 * 1024;
+    private const int MaximumSorterRunReadBufferBytes = 4 * 1024;
+    private const int MinimumSpillBufferBytes = 512;
+
+    /// <summary>
+    /// Write-coalescing buffer of a sorter spill file: at most 1/64 of the statement's memory
+    /// limit (capped at 16 KB), and none below 512 bytes, so a small budget keeps unbuffered
+    /// writes. Charged with the spill infrastructure.
+    /// </summary>
+    public static int GetSorterSpillWriteBufferBytes(long memoryLimitBytes)
+        => ScaleSpillBuffer(memoryLimitBytes / 64, MaximumSorterSpillWriteBufferBytes);
+
+    /// <summary>
+    /// Read-ahead block of one sorter run reader: at most 1/512 of the statement's memory limit
+    /// (capped at 4 KB), and none below 512 bytes. Charged with the merge infrastructure.
+    /// </summary>
+    public static int GetSorterRunReadBufferBytes(long memoryLimitBytes)
+        => ScaleSpillBuffer(memoryLimitBytes / 512, MaximumSorterRunReadBufferBytes);
+
+    private static int ScaleSpillBuffer(long share, int maximum)
+        => share < MinimumSpillBufferBytes ? 0 : (int)Math.Min(share, maximum);
+
+    private static long EstimateSpillBuffer(int bufferBytes)
+        => bufferBytes == 0
+            ? 0
+            : checked(BufferedSpillFileObjectBytes + EstimateArray(sizeof(byte), bufferBytes));
     private const long RunDescriptorSlotBytes = 32;
     private const long SorterSpillObjectBytes = 96;
     private const long HashSpillObjectBytes = 96;
@@ -434,7 +462,7 @@ internal static class VdbeManagedFootprint
                 + ListObjectBytes
                 + EstimateArray(ReferenceBytes, count));
 
-    public static long EstimateMergeInfrastructure(int runCount)
+    public static long EstimateMergeInfrastructure(int runCount, long memoryLimitBytes = 0)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(runCount);
         if (runCount == 0)
@@ -443,7 +471,8 @@ internal static class VdbeManagedFootprint
             PriorityQueueObjectBytes
             + EstimateArray(PriorityQueueNodeBytes, runCount)
             + (2 * EstimateArray(ReferenceBytes, runCount))
-            + (runCount * RunReaderObjectBytes));
+            + (runCount * (RunReaderObjectBytes
+                + EstimateSpillBuffer(GetSorterRunReadBufferBytes(memoryLimitBytes)))));
     }
 
     public static long EstimateHashSpillInfrastructure(
@@ -500,7 +529,9 @@ internal static class VdbeManagedFootprint
             + (subPartitionCount * (HashPartitionObjectBytes + subPartitionFileBytes)));
     }
 
-    public static long EstimateSorterSpillInfrastructure(string temporaryDirectory)
+    public static long EstimateSorterSpillInfrastructure(
+        string temporaryDirectory,
+        long memoryLimitBytes = 0)
     {
         ArgumentNullException.ThrowIfNull(temporaryDirectory);
         return checked(
@@ -512,7 +543,8 @@ internal static class VdbeManagedFootprint
                     requiredCount: 1))
             + EstimateTemporaryFileInfrastructure(
                 temporaryDirectory.Length,
-                "sorter".Length));
+                "sorter".Length)
+            + EstimateSpillBuffer(GetSorterSpillWriteBufferBytes(memoryLimitBytes)));
     }
 
     public static long EstimateKeyedRowSetSpillInfrastructure(string temporaryDirectory)

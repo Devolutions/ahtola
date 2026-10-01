@@ -109,6 +109,157 @@ internal sealed class VdbeTemporaryFile : IDisposable
     }
 }
 
+/// <summary>
+/// Coalesces a spill writer's small value writes into one buffered byte range so a record
+/// costs a few file writes per buffer instead of several per value. The record codec writes
+/// each value at the end of the record and then patches the record's length header at its
+/// start, so the buffer accepts writes anywhere inside its capacity (a reserved header gap is
+/// filled before the record completes) and a header written just ahead of a fresh buffer.
+/// Reads of buffered bytes, length changes and flushes write the buffer out first. The
+/// buffer is part of the owner's charged spill infrastructure.
+/// </summary>
+internal sealed class VdbeBufferedSpillFile(IFile inner, int bufferBytes) : IFile
+{
+    private readonly byte[] _buffer = new byte[bufferBytes];
+    private long _bufferStart;
+    private int _bufferLength;
+
+    public long Length => _bufferLength == 0
+        ? inner.Length
+        : Math.Max(inner.Length, _bufferStart + _bufferLength);
+
+    public bool IsReadOnly => inner.IsReadOnly;
+
+    public int Read(long position, Span<byte> destination)
+    {
+        if (_bufferLength > 0
+            && position < _bufferStart + _bufferLength
+            && position + destination.Length > _bufferStart)
+        {
+            FlushBuffer();
+        }
+
+        return inner.Read(position, destination);
+    }
+
+    public void Write(long position, ReadOnlySpan<byte> source)
+    {
+        if (_bufferLength > 0)
+        {
+            var offset = position - _bufferStart;
+            // A gap after the buffered bytes may only be zero-filled while it is still unwritten
+            // file space; otherwise flushing the buffer would overwrite bytes already on disk.
+            if (offset >= 0
+                && offset + source.Length <= _buffer.Length
+                && (offset <= _bufferLength || _bufferStart + _bufferLength >= inner.Length))
+            {
+                var gapStart = _bufferLength;
+                var end = checked((int)offset + source.Length);
+                if (offset > gapStart)
+                    _buffer.AsSpan(gapStart, (int)offset - gapStart).Clear();
+                source.CopyTo(_buffer.AsSpan((int)offset));
+                _bufferLength = Math.Max(_bufferLength, end);
+                return;
+            }
+
+            if (position + source.Length == _bufferStart
+                && _bufferLength + source.Length <= _buffer.Length)
+            {
+                _buffer.AsSpan(0, _bufferLength).CopyTo(_buffer.AsSpan(source.Length));
+                source.CopyTo(_buffer);
+                _bufferStart = position;
+                _bufferLength += source.Length;
+                return;
+            }
+
+            FlushBuffer();
+        }
+
+        if (source.Length >= _buffer.Length)
+        {
+            inner.Write(position, source);
+            return;
+        }
+
+        source.CopyTo(_buffer);
+        _bufferStart = position;
+        _bufferLength = source.Length;
+    }
+
+    public void SetLength(long length)
+    {
+        FlushBuffer();
+        inner.SetLength(length);
+    }
+
+    public void FlushToDisk()
+    {
+        FlushBuffer();
+        inner.FlushToDisk();
+    }
+
+    // The temporary file that owns the handle disposes it; buffered bytes of a discarded
+    // spill are never read again.
+    public void Dispose() => _bufferLength = 0;
+
+    private void FlushBuffer()
+    {
+        if (_bufferLength == 0)
+            return;
+
+        inner.Write(_bufferStart, _buffer.AsSpan(0, _bufferLength));
+        _bufferLength = 0;
+    }
+}
+
+/// <summary>
+/// A sequential reader's read-ahead window over an immutable spill run. Short value reads are
+/// served from one refilled block instead of one file read each. The block is charged as part
+/// of the reader's merge infrastructure. Writes are not supported through this view.
+/// </summary>
+internal sealed class VdbeReadAheadSpillFile(IFile inner, int bufferBytes) : IFile
+{
+    private readonly byte[] _buffer = new byte[bufferBytes];
+    private long _bufferStart;
+    private int _bufferLength;
+
+    public long Length => inner.Length;
+
+    public bool IsReadOnly => true;
+
+    public int Read(long position, Span<byte> destination)
+    {
+        var offset = position - _bufferStart;
+        if (_bufferLength == 0 || offset < 0 || offset >= _bufferLength)
+        {
+            if (destination.Length >= _buffer.Length)
+                return inner.Read(position, destination);
+
+            _bufferLength = Math.Max(0, inner.Read(position, _buffer));
+            _bufferStart = position;
+            offset = 0;
+            if (_bufferLength == 0)
+                return 0;
+        }
+
+        var count = Math.Min(destination.Length, _bufferLength - (int)offset);
+        _buffer.AsSpan((int)offset, count).CopyTo(destination);
+        return count;
+    }
+
+    public void Write(long position, ReadOnlySpan<byte> source) =>
+        throw new NotSupportedException("A spill read-ahead view is read-only.");
+
+    public void SetLength(long length) =>
+        throw new NotSupportedException("A spill read-ahead view is read-only.");
+
+    public void FlushToDisk()
+    {
+    }
+
+    public void Dispose() => _bufferLength = 0;
+}
+
 internal static class VdbeSpillRecordCodec
 {
     private static ReadOnlySpan<byte> Magic => "AHTSPILL"u8;
