@@ -1,5 +1,122 @@
 # Remaining Turso gap closure plan
 
+## v0.8.1 refresh (2026-09-30)
+
+The `turso-src` pin moved to `v0.8.1` (`8549c1659`), and the vendored corpus
+was refreshed to match: 33 new and 41 changed sqltest files. The refresh
+exposed 113 new case-level differences. The 0.8 parity work closed 80 of them,
+plus two older generated-column integrity markers. The ledger now holds
+**109** entries: 76 from earlier baselines and 33 from this refresh.
+
+### Delivered
+
+- **MVCC correctness.** A `BEGIN CONCURRENT` writer whose snapshot predates a
+  peer's committed update or delete now gets a write-write conflict. Before
+  this, it could overwrite the peer or bring back a deleted row (Turso
+  `0f7f30eac`). Explicit rowids and INTEGER PRIMARY KEY values are no longer
+  rewritten by the store-global allocator. Only rowids the statement chose
+  itself are promoted, and two concurrent explicit inserts of one key conflict.
+- **SQL surface.**
+  - `CROSS JOIN ... ON/USING`, and a comma join followed by `ON`, now parse.
+    CROSS JOIN no longer allows the joins to be reordered.
+  - Correlated IN/EXISTS after a FULL JOIN now runs instead of being rejected.
+  - Generated columns: REPLACE and DEFAULT values are applied before virtual
+    columns are computed, and invalid clauses are rejected.
+  - UPSERT honours the target alias. A BEFORE UPDATE trigger now refreshes the
+    columns the UPSERT does not SET.
+  - Internal tables are protected whatever their letter case.
+  - The 2,000-column limit is enforced.
+  - Parameter names follow SQLite's rules: a bare `$` is rejected, and
+    TCL-style `$::v` and `$a(b)` names are accepted.
+  - `PRAGMA count_changes` behaves like SQLite.
+  - Smaller fixes: renaming a table onto an existing view, the
+    temp.synchronous value, and NULL arguments to `generate_series`.
+- **Functions.**
+  - `json_group_object` skips NULL labels, and `jsonb(NULL)` returns NULL.
+  - `json_each` and `json_tree` expose a `rowid`.
+  - Date/time functions read BLOB arguments as text, and round correctly just
+    before the Unix epoch.
+  - `min`/`max` break ties the way SQLite does.
+  - A COUNT on a NOT NULL column uses the simple-count plan.
+- **Planner (Turso 0.8 cost model, `TursoCostModel.cs`).**
+  - Correlated IN/EXISTS with non-equality comparisons is unnested, and the
+    inner side is costed with Turso's semi/anti-join model. NOT EXISTS can use
+    a hash anti-join.
+  - IN-list and OR-implied IN index searches; multi-index OR with AND branches.
+  - A disjunct of a partial index's predicate can prove that index usable.
+  - Compiled joins are costed with Turso's join planner. This includes
+    left-deep hash joins and materialized build prefixes.
+  - EQP output describes the join tree that actually executes, and FORMAT=JSON
+    reports the cost model's real estimates.
+  - ANALYZE row estimates are reported for unfiltered scans.
+- **Storage.**
+  - `PRAGMA max_page_count` is enforced on file-backed and `:memory:`
+    databases, failing with `database or disk is full` (code 13).
+  - `page_count` is exact; for `:memory:` it is computed from a fresh page
+    image built by the same page builders the engine uses to write the file.
+  - integrity_check reports STRICT storage-class violations and virtual
+    generated-column violations.
+  - Explicit checkpoints are refused while a statement is still running on
+    the same connection.
+  - WAL readers can use read-marks 1–4 while a checkpoint holds read-mark 0.
+  - auto_vacuum reports the mode stored in page 1.
+  - MVCC ALTER COLUMN rejects changes that would require rebuilding an index.
+  - FTS converts non-text queries to text.
+- **Error codes.** SQLite primary and extended result codes now reach
+  `SqliteException`, on both local and remote connections: constraint
+  19/2067/1299/275/1555/787, full 13, notadb 26, busy 5, readonly 8.
+- **Bindings (Turso 0.8 `bindings/dotnet`).**
+  - 13 replica connection-string keys.
+  - Explicit `Pull`, `Push`, `Checkpoint` and `GetSyncStatistics` calls.
+  - An automatic-sync status property and change event, plus an opt-in
+    `PullOnly` mode (the default still pushes and pulls).
+  - An auth-token provider hook for rotating tokens.
+  - Unexpected `replication_index` values are tolerated instead of throwing.
+
+### Remaining v0.8.1 differences (33)
+
+- **Planner shapes the evaluator route cannot honestly report (19):** in
+  join/memory, hash_join_order_by and multi_index_or_compound, plus one
+  shared-CTE JSON case. The corpus harness runs with a cancellation token,
+  which sends non-aggregate SELECTs through the evaluator. The evaluator always
+  hashes the right input. It has no build-left join, no materialized-prefix
+  join and no reordering. Other remaining cases need Turso's
+  1,000,000-row default for tables with no ANALYZE statistics, or per-step
+  JSON estimates passed through to the executed plan. Printing Turso's plan
+  for any of these would describe work that does not run.
+- **Documented policies (14):**
+  - Eight `turso/alter_column` cases differ only because a `:memory:`
+    database keeps journal_mode=memory. Every later row was verified to match.
+  - Two MVCC ALTER COLUMN rejections differ only by the CLI's `Parse error:`
+    prefix.
+  - Schema text keeps SQLite's verbatim `COLLATE 'fr-FR'` quoting.
+  - VACUUM under query_only reports SQLite's readonly error.
+  - Managed ATTACH requires a file-backed primary database.
+  - One planner case would print `COVERING` for a seek that does read table
+    rows, so it is left as is.
+
+### Not ported
+
+- The PostgreSQL frontend, general typed values and incremental materialized
+  views remain separate product decisions (see below).
+- Replica connection pooling, the standalone Serverless/Platform client
+  packages, `Force Logical MVCC Pull=True`, and per-step batch statistics.
+
+### Known follow-ups
+
+- A single-table GROUP BY over the 10,000-row default fixture takes 25–40 s.
+  It is equally slow on the pre-refresh build `4d17cd2`. That puts
+  `groupby/default.sqltest` and `offset/default.sqltest` right at the corpus's
+  30-second per-case cap, so they intermittently time out. This is a
+  pre-existing performance problem, not a v0.8.1 parity difference.
+- Large plain equi-joins (3,000 × 3,000) take tens of seconds, both before and
+  after this work. This is likely the hash-join spill path under the 2 MB
+  execution budget.
+- INDEXED BY / NOT INDEXED should rule out hash joins and ephemeral indexes,
+  as in Turso.
+- At page size 1024, large index keys pack less tightly than in SQLite, which
+  shows in `page_count`.
+
 ## Baseline and scope
 
 Prepared 2026-09-06 against Ahtola `83bb892` and the read-only Turso
