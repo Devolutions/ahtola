@@ -271,6 +271,41 @@ public sealed class PlannerAccessPathDepthTests
         database.PlannerAccessPathMetrics.Stat4RowsWritten.Should().Be(48);
     }
 
+    [TestCase("outer_items NOT INDEXED", "inner_items")]
+    [TestCase("outer_items", "inner_items NOT INDEXED")]
+    public void IndexDirectivesRuleOutHashJoinsAndTemporaryIndexes(string outerSource, string innerSource)
+    {
+        // Turso access_method.rs has_indexed_by_directives: INDEXED BY / NOT INDEXED on either
+        // side keeps the scan the SQL asked for, so the hash join chosen without a directive
+        // (AnalyzedUnindexedInnerJoinHashesItsFirstTableOnce) is ruled out.
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE outer_items(k INTEGER, payload TEXT);");
+        Execute(connection, "CREATE TABLE inner_items(k INTEGER, payload TEXT);");
+        Execute(
+            connection,
+            "INSERT INTO outer_items VALUES "
+            + string.Join(", ", Enumerable.Range(1, 100).Select(value => $"({value}, 'o{value}')"))
+            + ";");
+        Execute(
+            connection,
+            "INSERT INTO inner_items VALUES "
+            + string.Join(", ", Enumerable.Range(1, 100).Select(value => $"({value}, 'i{value}')"))
+            + ";");
+        Execute(connection, "ANALYZE;");
+
+        var sql = "SELECT outer_items.k, inner_items.payload "
+            + $"FROM {outerSource} JOIN {innerSource} ON outer_items.k=inner_items.k "
+            + "ORDER BY outer_items.k;";
+        var details = PlanDetails(connection, sql);
+        details.Should().NotContain(static detail => detail.StartsWith("HASH JOIN", StringComparison.Ordinal));
+        details.Should().NotContain(static detail => detail.Contains("AUTOMATIC", StringComparison.Ordinal));
+
+        var rows = ReadRows(connection, sql);
+        rows.Should().HaveCount(100);
+        rows[41].Should().Equal(SqlValue.Integer(42), SqlValue.Text("i42"));
+    }
+
     [Test]
     public void AnalyzedUnindexedInnerJoinHashesItsFirstTableOnce()
     {

@@ -359,6 +359,8 @@ public sealed class MvccLogicalLogTests
 
         using (var file = storage.OpenFile(logPath, FileOpenMode.OpenExisting))
         {
+            var logHeader = new byte[MvccLogicalLogFormat.LogHeaderSize];
+            file.Read(0, logHeader).Should().Be(logHeader.Length);
             var frame = new byte[checked((int)(file.Length - MvccLogicalLogFormat.LogHeaderSize))];
             file.Read(MvccLogicalLogFormat.LogHeaderSize, frame).Should().Be(frame.Length);
             frame[16] ^= 0x01; // commit_ts is authenticated associated data.
@@ -367,7 +369,7 @@ public sealed class MvccLogicalLogTests
                                 + MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintextSize);
             BinaryPrimitives.WriteUInt32LittleEndian(
                 frame.AsSpan(trailerOffset),
-                Crc32C.Compute(frame.AsSpan(0, trailerOffset)));
+                MvccLogTestCrc.FirstFrame(logHeader, frame.AsSpan(0, trailerOffset)));
             file.Write(MvccLogicalLogFormat.LogHeaderSize, frame);
             file.FlushToDisk();
         }
@@ -407,6 +409,9 @@ public sealed class MvccLogicalLogTests
             BinaryPrimitives.WriteUInt32LittleEndian(
                 image.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart),
                 Crc32C.Compute(image.AsSpan(0, MvccLogicalLogFormat.LogHeaderSize)));
+            // The unkeyed frame CRC is forged for the downgraded version too, so only the
+            // authenticated version byte can reject the frame.
+            RewriteFirstEncryptedFrameCrc(image);
             file.Write(0, image);
             file.FlushToDisk();
         }
@@ -449,9 +454,11 @@ public sealed class MvccLogicalLogTests
             BinaryPrimitives.WriteUInt64LittleEndian(
                 frame.AsSpan(4),
                 checked((ulong)(originalSize + delta)));
+            var logHeader = new byte[MvccLogicalLogFormat.LogHeaderSize];
+            file.Read(0, logHeader).Should().Be(logHeader.Length);
             BinaryPrimitives.WriteUInt32LittleEndian(
                 frame.AsSpan(originalTrailerOffset),
-                Crc32C.Compute(frame.AsSpan(0, originalTrailerOffset)));
+                MvccLogTestCrc.FirstFrame(logHeader, frame.AsSpan(0, originalTrailerOffset)));
             file.Write(MvccLogicalLogFormat.LogHeaderSize, frame);
             file.FlushToDisk();
         }
@@ -521,7 +528,7 @@ public sealed class MvccLogicalLogTests
         var trailerOffset = frameOffset + MvccLogicalLogFormat.TxHeaderSize + enlargedPayloadSize;
         BinaryPrimitives.WriteUInt32LittleEndian(
             rewritten.AsSpan(trailerOffset),
-            Crc32C.Compute(rewritten.AsSpan(
+            MvccLogTestCrc.FirstFrame(rewritten, rewritten.AsSpan(
                 frameOffset,
                 MvccLogicalLogFormat.TxHeaderSize + enlargedPayloadSize)));
         BinaryPrimitives.WriteUInt32LittleEndian(
@@ -596,5 +603,17 @@ public sealed class MvccLogicalLogTests
         var bytes = new byte[checked((int)file.Length)];
         file.Read(0, bytes).Should().Be(bytes.Length);
         return bytes;
+    }
+
+    private static void RewriteFirstEncryptedFrameCrc(byte[] image)
+    {
+        var frameOffset = MvccLogicalLogFormat.LogHeaderSize;
+        var plaintextSize = checked((int)BinaryPrimitives.ReadUInt64LittleEndian(image.AsSpan(frameOffset + 4)));
+        var trailerOffset = frameOffset
+                            + MvccLogicalLogFormat.TxHeaderSize
+                            + MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintextSize);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            image.AsSpan(trailerOffset),
+            MvccLogTestCrc.FirstFrame(image, image.AsSpan(frameOffset, trailerOffset - frameOffset)));
     }
 }

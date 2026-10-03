@@ -220,16 +220,37 @@ internal sealed class SqlParser
         ConsumeKeyword("DATABASE");
         var path = ParseExpression();
         ExpectKeyword("AS");
-        var alias = ExpectIdentifier();
+        var alias = ParseDatabaseNameOperand(out var aliasExpression);
         var key = ConsumeKeyword("KEY") ? ParseExpression() : null;
 
-        return new AttachDatabaseStatement(path, alias, key);
+        return new AttachDatabaseStatement(path, alias, key, aliasExpression);
     }
 
     private ParsedStatement ParseDetach()
     {
         ConsumeKeyword("DATABASE");
-        return new DetachDatabaseStatement(ExpectIdentifier());
+        var alias = ParseDatabaseNameOperand(out var aliasExpression);
+        return new DetachDatabaseStatement(alias, aliasExpression);
+    }
+
+    /// <summary>
+    /// The database name of ATTACH/DETACH. Turso's <c>translate/attach.rs</c> uses an
+    /// identifier or string literal as the name itself and evaluates any other expression.
+    /// </summary>
+    private string ParseDatabaseNameOperand(out Expression? expression)
+    {
+        expression = null;
+        var parsed = ParseExpression();
+        switch (parsed)
+        {
+            case LiteralExpression { Value.Kind: SqlValueKind.Text } literal:
+                return literal.Value.AsText();
+            case ColumnExpression { Qualifier: null } column:
+                return column.Name;
+            default:
+                expression = parsed;
+                return string.Empty;
+        }
     }
 
     private ParsedStatement ParseVacuum()
@@ -408,6 +429,15 @@ internal sealed class SqlParser
             return new PragmaMvccCheckpointThresholdStatement(ParseOptionalPragmaLong(name), schema);
         if (name.Equals("mvcc_gc_threshold", StringComparison.OrdinalIgnoreCase))
             return new PragmaMvccGcThresholdStatement(ParseOptionalPragmaLong(name), schema);
+        if (name.Equals("mvcc_group_commit", StringComparison.OrdinalIgnoreCase))
+            return new PragmaMvccGroupCommitStatement(ParseOptionalPragmaBoolean(name), schema);
+        if (name.Equals("fts_merge_threshold", StringComparison.OrdinalIgnoreCase))
+            return new PragmaFtsMergeThresholdStatement(ParseOptionalPragmaLong(name), schema);
+        if (name.Equals("pragma_list", StringComparison.OrdinalIgnoreCase))
+        {
+            RequireReadOnlyPragma(name);
+            return new PragmaListStatement(schema);
+        }
         if (name.Equals("list_types", StringComparison.OrdinalIgnoreCase))
         {
             // Turso rejects an assignment to list_types with a dedicated diagnostic rather
@@ -427,6 +457,10 @@ internal sealed class SqlParser
             RequireReadOnlyPragma(name);
             return new PragmaModuleListStatement(schema);
         }
+        if (name.Equals("hexkey", StringComparison.OrdinalIgnoreCase))
+            return new PragmaEncryptionStatement(PragmaEncryptionSetting.HexKey, ParseOptionalPragmaSetting(name), schema);
+        if (name.Equals("cipher", StringComparison.OrdinalIgnoreCase))
+            return new PragmaEncryptionStatement(PragmaEncryptionSetting.Cipher, ParseOptionalPragmaSetting(name), schema);
 
         // Every other unrecognized pragma is silently ignored by SQLite, so accept
         // the common argument shapes and execute as a no-op (Turso translate/pragma.rs

@@ -928,7 +928,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ManagedSchemaRowSet? StagedSchemaRows = null,
         ManagedSequenceSession? SequenceSession = null,
         // Connection-scoped: several connections may share the same EmbeddedDatabase.
-        Func<string?, string>? DescribeJournalMode = null,
+        ConnectionScope? ConnectionScope = null,
         SelectStatement? ExistsJoinBody = null)
     {
         /// <summary>
@@ -1280,6 +1280,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     internal sealed class StatementExecutionState(long lastInsertRowId)
     {
         public long LastInsertRowId { get; set; } = lastInsertRowId;
+
+        /// <summary><c>conn_txn_id</c> for an autocommit statement; -1 until first set.</summary>
+        public long ConnTxnId { get; set; } = -1;
 
         // Automatic (transient) equality indexes built on demand for scans whose predicates
         // equate a scan column to a scan-constant expression - the shape correlated
@@ -2253,7 +2256,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
         ManagedSequenceSession? sequenceSession = null,
-        Func<string?, string>? describeJournalMode = null,
+        ConnectionScope? connectionScope = null,
         uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         var result = ExecuteCore(
@@ -2276,7 +2279,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             synchronousMode,
             virtualTableTransaction,
             sequenceSession,
-            describeJournalMode,
+            connectionScope,
             maxPageCount);
 
         RecordChangeCounters(statement, result);
@@ -2321,7 +2324,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqliteSynchronousMode synchronousMode = SqliteSynchronousMode.Full,
         ManagedVirtualTableTransaction? virtualTableTransaction = null,
         ManagedSequenceSession? sequenceSession = null,
-        Func<string?, string>? describeJournalMode = null,
+        ConnectionScope? connectionScope = null,
         uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
     {
         synchronousMode.Validate(nameof(synchronousMode));
@@ -2352,7 +2355,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 synchronousMode,
                 virtualTableTransaction,
                 sequenceSession,
-                describeJournalMode,
+                connectionScope,
                 maxPageCount));
         }
 
@@ -2423,7 +2426,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                     vdbeExecutionOptions: vdbeExecutionOptions,
                                     virtualTableTransaction: statementVirtualTableTransaction,
                                     sequenceSession: sequenceSession,
-                                    describeJournalMode: describeJournalMode);
+                                    connectionScope: connectionScope);
                             }
                             catch (EmbeddedConflictFailException)
                             {
@@ -2533,7 +2536,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 changeDataCapture: changeDataCapture,
                                 vdbeExecutionOptions: vdbeExecutionOptions,
                                 sequenceSession: sequenceSession,
-                                describeJournalMode: describeJournalMode);
+                                connectionScope: connectionScope);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -2582,7 +2585,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                             changeDataCapture: changeDataCapture,
                             vdbeExecutionOptions: vdbeExecutionOptions,
                             sequenceSession: sequenceSession,
-                            describeJournalMode: describeJournalMode);
+                            connectionScope: connectionScope);
 
                     var working = new SchemaCatalog(_tables, _views, _triggers, _virtualTables).Clone();
                     try
@@ -2610,7 +2613,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                                 vdbeExecutionOptions: vdbeExecutionOptions,
                                 virtualTableTransaction: virtualTableTransaction,
                                 sequenceSession: sequenceSession,
-                                describeJournalMode: describeJournalMode);
+                                connectionScope: connectionScope);
                         }
                         catch (EmbeddedConflictFailException)
                         {
@@ -2719,7 +2722,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 VirtualTables: catalog.VirtualTables,
                 VirtualTableTransaction: outer.VirtualTableTransaction,
                 ChangeDataCapture: outer.ChangeDataCapture,
-                DescribeJournalMode: outer.DescribeJournalMode);
+                ConnectionScope: outer.ConnectionScope);
             return statement switch
             {
                 InsertStatement insert => ExecuteDmlWithAutoIncrementState(
@@ -3512,7 +3515,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
-        Func<string?, string>? describeJournalMode = null)
+        ConnectionScope? connectionScope = null)
     {
         lock (_gate)
         {
@@ -3527,7 +3530,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 vdbeExecutionOptions,
                 executeTableList,
                 externalTables,
-                describeJournalMode);
+                connectionScope);
         }
     }
 
@@ -3542,7 +3545,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         VdbeExecutionOptions? vdbeExecutionOptions = null,
         Func<string?, string?, ExecutionResult>? executeTableList = null,
         IReadOnlyDictionary<string, EmbeddedTable>? externalTables = null,
-        Func<string?, string>? describeJournalMode = null)
+        ConnectionScope? connectionScope = null)
     {
         var tables = CreateExecutionTables(catalog.Tables, externalTables);
         var context = new QueryContext(
@@ -3558,7 +3561,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             VirtualTables: catalog.VirtualTables,
             VdbeExecutionOptions: vdbeExecutionOptions,
             Database: this,
-            DescribeJournalMode: describeJournalMode);
+            ConnectionScope: connectionScope);
         var result = MaterializeQueryResult(ExecuteQuery(statement, parameters, context, outerRow: null));
         var affinities = DescribeQueryAffinities(
             statement,
@@ -5825,7 +5828,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedFileReadSnapshot? transactionPinnedSnapshot = null,
         Action<string, long>? transactionBlobMutation = null,
         ManagedSequenceSession? sequenceSession = null,
-        Func<string?, string>? describeJournalMode = null)
+        ConnectionScope? connectionScope = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -5859,7 +5862,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 transactionPinnedSnapshot,
                 transactionBlobMutation,
                 sequenceSession,
-                describeJournalMode));
+                connectionScope));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -5907,7 +5910,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ? new CteMutationState()
                 : null,
             Database: this,
-            DescribeJournalMode: describeJournalMode,
+            ConnectionScope: connectionScope,
             TransactionOverlay: transactionOverlay,
             TransactionPinnedSnapshot: transactionPinnedSnapshot,
             TransactionBlobMutation: transactionBlobMutation,
@@ -41588,7 +41591,7 @@ out bool hasReturning)
     private static string BuildCreateIndexSql(string tableName, EmbeddedIndex index)
         => IndexSqlFormatter.BuildCreateIndexSql(tableName, index);
 
-    private static string FormatSqlLiteral(SqlValue value)
+    internal static string FormatSqlLiteral(SqlValue value)
     {
         return value.Kind switch
         {
@@ -46142,7 +46145,8 @@ out bool hasReturning)
             || name.Equals("MODE", StringComparison.OrdinalIgnoreCase)
             || name.Equals("PERCENTILE", StringComparison.OrdinalIgnoreCase)
             || name.Equals("PERCENTILE_CONT", StringComparison.OrdinalIgnoreCase)
-            || name.Equals("PERCENTILE_DISC", StringComparison.OrdinalIgnoreCase);
+            || name.Equals("PERCENTILE_DISC", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("STDDEV", StringComparison.OrdinalIgnoreCase);
     }
 
     // The aggregate-ownership machinery below implements SQLite's rule that an aggregate
@@ -47620,6 +47624,8 @@ out bool hasReturning)
         var name = function.Name.ToUpperInvariant();
         if (name == "MODE")
             return EvaluateModeAggregate(function, rows, parameters, context);
+        if (name == "STDDEV")
+            return EvaluateStandardDeviationAggregate(function, rows, parameters, context);
         if (function.OrderedSet)
             return EvaluateOrderedSetPercentileAggregate(function, rows, parameters, context, representative);
 
@@ -47859,6 +47865,39 @@ out bool hasReturning)
         }
 
         return values[bestIndex];
+    }
+
+    /// <summary>
+    /// Turso <c>core/percentile.rs</c> <c>StandardDeviation</c>: the sample standard deviation
+    /// by Welford's algorithm over the numeric (or numeric-text) arguments, NULL below two.
+    /// </summary>
+    private SqlValue EvaluateStandardDeviationAggregate(
+        FunctionExpression function,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        RequireAggregateArgumentCount("stddev", function.Arguments, 1);
+        long count = 0;
+        var mean = 0d;
+        var sumOfSquares = 0d;
+        foreach (var row in rows)
+        {
+            context.CheckInterrupt();
+            if (!TryGetPercentileNumericValue(
+                    Evaluate(function.Arguments[0], parameters, row, context),
+                    out var value))
+            {
+                continue;
+            }
+
+            count++;
+            var delta = value - mean;
+            mean += delta / count;
+            sumOfSquares += delta * (value - mean);
+        }
+
+        return count < 2 ? SqlValue.Null : SqlValue.Real(Math.Sqrt(sumOfSquares / (count - 1)));
     }
 
     private static bool TryGetPercentileNumericValue(SqlValue value, out double numeric)
@@ -48252,6 +48291,9 @@ out bool hasReturning)
             "JULIANDAY" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.JulianDay),
             "LAST_INSERT_ROWID" => EvaluateLastInsertRowId(arguments, context),
             "IS_AUTOCOMMIT" => EvaluateIsAutocommit(arguments, context),
+            "CONN_TXN_ID" => EvaluateConnTxnId(arguments, context),
+            "TABLE_COLUMNS_JSON_ARRAY" => EvaluateTableColumnsJsonArray(arguments, context),
+            "BIN_RECORD_JSON_OBJECT" => EvaluateBinRecordJsonObject(arguments),
             "LENGTH" or "CHAR_LENGTH" or "CHARACTER_LENGTH" => EvaluateLength(arguments),
             "OCTET_LENGTH" => EvaluateOctetLength(arguments),
             "LIKE" => EvaluateLikeFunction(arguments),
@@ -49796,6 +49838,96 @@ out bool hasReturning)
     {
         RequireArgumentCount("is_autocommit", arguments, 0);
         return SqlValue.Integer(context.InTransaction ? 0 : 1);
+    }
+
+    /// <summary>
+    /// Turso <c>conn_txn_id(candidate)</c> (vdbe/execute.rs <c>ScalarFunc::ConnTxnId</c>): the
+    /// first candidate of a transaction becomes its CDC transaction id and later calls return
+    /// it. With capture on it is the id the capture session stamps on change rows; otherwise
+    /// it lasts for the explicit transaction, or for the statement in autocommit mode.
+    /// </summary>
+    private static SqlValue EvaluateConnTxnId(IReadOnlyList<SqlValue> arguments, QueryContext context)
+    {
+        RequireArgumentCount("conn_txn_id", arguments, 1);
+        var candidate = arguments[0].Kind == SqlValueKind.Integer ? arguments[0].AsInteger() : -1;
+        if (context.ChangeDataCapture is { } changeDataCapture)
+            return SqlValue.Integer(changeDataCapture.GetOrSetTransactionId(candidate));
+        if (context.InTransaction && context.ConnectionScope is { } scope)
+            return SqlValue.Integer(scope.GetOrSetTransactionId(candidate));
+        if (context.StatementState is { } statement)
+        {
+            if (statement.ConnTxnId < 0)
+                statement.ConnTxnId = candidate;
+            return SqlValue.Integer(statement.ConnTxnId);
+        }
+
+        return SqlValue.Integer(candidate);
+    }
+
+    /// <summary>
+    /// Turso <c>table_columns_json_array(table)</c>: the table's column names as a JSON array,
+    /// used to decode CDC records.
+    /// </summary>
+    private static SqlValue EvaluateTableColumnsJsonArray(IReadOnlyList<SqlValue> arguments, QueryContext context)
+    {
+        RequireArgumentCount("table_columns_json_array", arguments, 1);
+        if (arguments[0].Kind != SqlValueKind.Text)
+            throw new EmbeddedSqlException("table_columns_json_array: function argument must be of type TEXT");
+        var name = arguments[0].AsText();
+        if (!context.Tables.TryGetValue(name, out var table))
+            throw new EmbeddedSqlException($"table_columns_json_array: table {name} doesn't exists");
+
+        return SqliteJson.JsonArray([.. table.Columns.Select(static column => SqlValue.Text(column))]);
+    }
+
+    /// <summary>
+    /// Turso <c>bin_record_json_object(columns, record)</c>: pairs the names of a JSON array
+    /// with the values of a SQLite record blob (a CDC <c>before</c>/<c>after</c> image).
+    /// </summary>
+    private static SqlValue EvaluateBinRecordJsonObject(IReadOnlyList<SqlValue> arguments)
+    {
+        const string TypeError =
+            "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly";
+        RequireArgumentCount("bin_record_json_object", arguments, 2);
+        if (arguments[0].Kind != SqlValueKind.Text)
+            throw new EmbeddedSqlException(TypeError);
+        if (arguments[1].Kind == SqlValueKind.Null)
+            return SqlValue.Null;
+        if (arguments[1].Kind != SqlValueKind.Blob)
+            throw new EmbeddedSqlException(TypeError);
+
+        var columns = arguments[0];
+        var count = SqliteJson.JsonArrayLength([columns]).AsInteger();
+        SqlValue[] values;
+        try
+        {
+            values = Storage.SqliteRecordCodec.Decode(arguments[1].AsBlob().Span);
+        }
+        catch (Exception exception) when (exception is InvalidDataException or ArgumentException or IndexOutOfRangeException)
+        {
+            throw new EmbeddedSqlException($"bin_record_json_object: {exception.Message}");
+        }
+
+        var members = new SqlValue[checked((int)count * 2)];
+        for (var index = 0; index < count; index++)
+        {
+            if (index >= values.Length)
+            {
+                throw new EmbeddedSqlException(
+                    "bin_record_json_object: binary record has fewer columns than specified in the columns argument");
+            }
+            if (values[index].Kind == SqlValueKind.Blob)
+            {
+                throw new EmbeddedSqlException(
+                    "bin_record_json_object: formatting of BLOB values stored in binary record is not supported");
+            }
+
+            members[index * 2] = SqliteJson.JsonExtract(
+                [columns, SqlValue.Text(string.Create(CultureInfo.InvariantCulture, $"$[{index}]"))]);
+            members[(index * 2) + 1] = values[index];
+        }
+
+        return SqliteJson.JsonObject(members);
     }
 
     private static long GetLastInsertRowId(QueryContext context)
@@ -60967,11 +61099,16 @@ public sealed partial class EmbeddedConnection : IDisposable
                 RollbackToSavepoint(rollbackTo.Name);
                 return ExecutionResult.Empty;
             case AttachDatabaseStatement attach:
+                attach = attach.AliasExpression is { } attachAlias
+                    ? attach with { Alias = EvaluateDatabaseName(attachAlias, parameters), AliasExpression = null }
+                    : attach;
                 return ExecuteWithMutationReservation(
                     _database,
                     () => ExecuteAttach(attach, parameters));
             case DetachDatabaseStatement detach:
-                return ExecuteDetach(detach);
+                return ExecuteDetach(detach.AliasExpression is { } detachAlias
+                    ? detach with { Alias = EvaluateDatabaseName(detachAlias, parameters), AliasExpression = null }
+                    : detach);
             case ReindexStatement reindex when IsMultiDatabaseReindex(reindex):
                 return ExecuteMultiDatabaseReindex(reindex, cancellationToken);
             case OptimizeIndexStatement { IndexName: null } optimize:
@@ -61043,6 +61180,15 @@ public sealed partial class EmbeddedConnection : IDisposable
                 return ExecutePragmaFunctionList(functionList);
             case PragmaModuleListStatement moduleList:
                 return ExecutePragmaModuleList(moduleList);
+            case PragmaEncryptionStatement encryption:
+                return ExecutePragmaEncryption(encryption);
+            case PragmaMvccGroupCommitStatement groupCommit:
+                return ExecutePragmaMvccGroupCommit(groupCommit);
+            case PragmaFtsMergeThresholdStatement ftsMergeThreshold:
+                return ExecutePragmaFtsMergeThreshold(ftsMergeThreshold);
+            case PragmaListStatement pragmaList:
+                ValidatePragmaSchema(pragmaList.Schema);
+                return new ExecutionResult(["pragma_list"], [.. PragmaListNames.Select(static name => new[] { SqlValue.Text(name) })], 0);
             case PragmaNoOpStatement:
                 // SQLite silently ignores unrecognized pragmas (Turso falls through its
                 // translate switch without emitting anything).
@@ -61138,7 +61284,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                                 vdbeExecutionOptions: vdbeExecutionOptions,
                                 virtualTableTransaction: transactionState?.VirtualTableTransaction,
                                 sequenceSession: _sequenceSession,
-                                describeJournalMode: DescribeJournalModeForSchema);
+                                connectionScope: SessionScope);
                         }
                         else if (transactionState is null)
                         {
@@ -61164,7 +61310,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     vdbeExecutionOptions: vdbeExecutionOptions,
                                     synchronousMode: GetSynchronousMode(routed.Database),
                                     sequenceSession: _sequenceSession,
-                                    describeJournalMode: DescribeJournalModeForSchema,
+                                    connectionScope: SessionScope,
                                     maxPageCount: GetMaxPageCount(routed.Database));
                             }
                             catch (Exception failure)
@@ -61224,7 +61370,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                                     : transactionState.PinnedSnapshot,
                                 transactionBlobMutation: transactionState.RecordBlobMutation,
                                 sequenceSession: _sequenceSession,
-                                describeJournalMode: DescribeJournalModeForSchema);
+                                connectionScope: SessionScope);
                             if (routedMayMutate)
                                 cancellationToken.ThrowIfCancellationRequested();
                             // SQLite allocates a statement's pages while it runs and fails it with
@@ -61584,12 +61730,20 @@ public sealed partial class EmbeddedConnection : IDisposable
             state.PendingDeferredViolations.Add(introduced);
     }
 
+    private string EvaluateDatabaseName(Expression expression, SqlValue[] parameters)
+    {
+        var value = _database.EvaluateConstant(expression, parameters, _lastInsertRowId);
+        if (value.Kind == SqlValueKind.Null)
+            throw new EmbeddedSqlException("database name must not be NULL");
+        return EmbeddedDatabase.ToSqlText(value);
+    }
+
     private ExecutionResult ExecuteAttach(AttachDatabaseStatement statement, SqlValue[] parameters)
     {
         EnsureAutocommitAttachmentLifecycle();
         var pathValue = _database.EvaluateConstant(statement.Path, parameters, _lastInsertRowId);
         var requestedPath = EmbeddedDatabase.ToSqlText(pathValue);
-        var (path, uriReadOnly) = ResolveAttachmentPath(requestedPath);
+        var (path, uriReadOnly, uriCipher, uriHexKey) = ResolveAttachmentPath(requestedPath);
 
         if (_attachedDatabases.ContainsKey(statement.Alias))
             throw new EmbeddedSqlException($"database {statement.Alias} is already in use");
@@ -61608,7 +61762,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         {
             if (uriReadOnly)
                 throw new EmbeddedSqlException("Managed ATTACH cannot open an in-memory database read-only.");
-            if (statement.Key is not null)
+            if (statement.Key is not null || uriHexKey is not null)
                 throw new EmbeddedSqlException("Managed ATTACH KEY is not supported for in-memory attachments.");
 
             var sequence = GetNextAttachedDatabaseSequence();
@@ -61660,7 +61814,36 @@ public sealed partial class EmbeddedConnection : IDisposable
         var readOnly = _database.IsReadOnly || uriReadOnly;
         IFileSystem attachmentFileSystem = _database.FileSystem;
         AhtolaEncryptionFileSystem? ownedFileSystem = null;
-        if (statement.Key is not null)
+        if (uriHexKey is not null)
+        {
+            if (statement.Key is not null)
+            {
+                throw new EmbeddedSqlException(
+                    "Managed ATTACH cannot combine KEY with URI cipher/hexkey options.");
+            }
+            if (!AhtolaEncryptionCipherNames.TryParse(uriCipher, out var cipher))
+                throw new EmbeddedSqlException($"Unknown cipher name: {uriCipher}");
+
+            AhtolaEncryptionOptions encryption;
+            try
+            {
+                encryption = AhtolaEncryptionOptions.FromHex(cipher, uriHexKey);
+            }
+            catch (ArgumentException exception)
+            {
+                throw new EmbeddedSqlException(
+                    $"Managed ATTACH hexkey must be a hexadecimal key for cipher '{AhtolaEncryptionCipherNames.Format(cipher)}'.",
+                    exception);
+            }
+            using (encryption)
+            {
+                ownedFileSystem = new AhtolaEncryptionFileSystem(
+                    AhtolaEncryptionFileSystem.Unwrap(_database.FileSystem),
+                    encryption);
+            }
+            attachmentFileSystem = ownedFileSystem;
+        }
+        else if (statement.Key is not null)
         {
             if (_database.FileSystem is not AhtolaEncryptionFileSystem encryptedFileSystem)
             {
@@ -61980,7 +62163,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                 vdbeExecutionOptions,
                 ExecutePragmaTableList,
                 source.ExternalTables,
-                DescribeJournalModeForSchema)
+                SessionScope)
             : source.Database.MaterializeCreateTableAs(
                 sourceQuery,
                 parameters,
@@ -61992,7 +62175,7 @@ public sealed partial class EmbeddedConnection : IDisposable
                 vdbeExecutionOptions,
                 ExecutePragmaTableList,
                 source.ExternalTables,
-                DescribeJournalModeForSchema);
+                SessionScope);
         cancellationToken.ThrowIfCancellationRequested();
         if (ReferenceEquals(source.Database, _tempDatabase))
             _tempInitialized = true;
@@ -65183,10 +65366,10 @@ Func<string, ParsedStatement> rewrite)
             || ExpressionContainsSchemaQualification(window.Frame?.End.Offset);
     }
 
-    private (string Path, bool ReadOnly) ResolveAttachmentPath(string requestedPath)
+    private (string Path, bool ReadOnly, string? Cipher, string? HexKey) ResolveAttachmentPath(string requestedPath)
     {
         if (!requestedPath.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
-            return (requestedPath, false);
+            return (requestedPath, false, null, null);
 
         var queryStart = requestedPath.IndexOf('?', StringComparison.Ordinal);
         var escapedPath = queryStart < 0 ? requestedPath[5..] : requestedPath[5..queryStart];
@@ -65206,30 +65389,45 @@ Func<string, ParsedStatement> rewrite)
         }
         catch (UriFormatException exception)
         {
-            throw new EmbeddedSqlException($"Invalid managed ATTACH URI path '{requestedPath}'.", exception);
+            // Report only the path: the query string can carry a hexkey.
+            throw new EmbeddedSqlException(
+                $"Invalid managed ATTACH URI path '{(queryStart < 0 ? requestedPath : requestedPath[..queryStart])}'.",
+                exception);
         }
 
         var mode = "rwc";
+        string? cipher = null;
+        string? hexKey = null;
         var query = queryStart < 0 ? string.Empty : requestedPath[(queryStart + 1)..];
         foreach (var part in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
         {
             var pieces = part.Split('=', 2);
             var name = Uri.UnescapeDataString(pieces[0]);
             // Turso OpenOptions::parse recognizes mode/modeof/cache/immutable/vfs/cipher/hexkey
-            // and ignores unknown keys. Managed ATTACH applies mode; other known options are
-            // accepted as no-ops so Turso-compatible URIs attach cleanly.
+            // and ignores unknown keys. Managed ATTACH applies mode, cipher and hexkey; the
+            // other known options are accepted as no-ops so Turso-compatible URIs attach cleanly.
             if (name.Equals("mode", StringComparison.OrdinalIgnoreCase))
             {
                 mode = pieces.Length == 2 ? Uri.UnescapeDataString(pieces[1]) : string.Empty;
                 continue;
             }
 
+            if (name.Equals("cipher", StringComparison.OrdinalIgnoreCase))
+            {
+                cipher = pieces.Length == 2 ? Uri.UnescapeDataString(pieces[1]) : string.Empty;
+                continue;
+            }
+
+            if (name.Equals("hexkey", StringComparison.OrdinalIgnoreCase))
+            {
+                hexKey = pieces.Length == 2 ? Uri.UnescapeDataString(pieces[1]) : string.Empty;
+                continue;
+            }
+
             if (name.Equals("modeof", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("cache", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("immutable", StringComparison.OrdinalIgnoreCase)
-                || name.Equals("vfs", StringComparison.OrdinalIgnoreCase)
-                || name.Equals("cipher", StringComparison.OrdinalIgnoreCase)
-                || name.Equals("hexkey", StringComparison.OrdinalIgnoreCase))
+                || name.Equals("vfs", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -65248,7 +65446,13 @@ Func<string, ParsedStatement> rewrite)
         if (requireExisting && (!_database.FileSystem.FileExists(path) || !_database.FileSystem.FileExists(path + "-wal")))
             throw new EmbeddedSqlException($"unable to open database file: {path}");
 
-        return (path, readOnly);
+        // Turso connection.rs from_uri_attached: cipher and hexkey must be given together.
+        if (cipher is not null && hexKey is null)
+            throw new EmbeddedSqlException("hexkey is required when cipher is provided");
+        if (hexKey is not null && cipher is null)
+            throw new EmbeddedSqlException("cipher is required when hexkey is provided");
+
+        return (path, readOnly, cipher, hexKey);
     }
 
     private static string GetAttachmentPathIdentity(string path)
@@ -65550,6 +65754,7 @@ Func<string, ParsedStatement> rewrite)
             _mvccTransactions[pair.Key] = pair.Value;
         _savepoints.Clear();
         _changeDataCapture?.StartTransaction();
+        _connTxnId = -1;
     }
 
     /// <summary>
@@ -66471,6 +66676,41 @@ Func<string, ParsedStatement> rewrite)
         return database.GetJournalMode().ToString().ToLowerInvariant();
     }
 
+    private ConnectionScope? _sessionScope;
+
+    /// <summary>
+    /// This connection's answers for the <c>pragma_*</c> table-valued functions, so the
+    /// function form reads connection settings (foreign_keys, query_only, ...) from the
+    /// connection that runs the query rather than from the shared database.
+    /// </summary>
+    private ConnectionScope SessionScope
+        => _sessionScope ??= new ConnectionScope(DescribeJournalModeForSchema, QueryPragmaForSchema, GetOrSetConnTxnId);
+
+    // Turso connection.rs cdc_transaction_id: -1 until conn_txn_id sets it, reset when the
+    // explicit transaction ends.
+    private long _connTxnId = -1;
+
+    private long GetOrSetConnTxnId(long candidate)
+    {
+        if (_connTxnId < 0)
+            _connTxnId = candidate;
+        return _connTxnId;
+    }
+
+    /// <summary>
+    /// Runs the query form <c>PRAGMA [schema.]name</c> on this connection, which is what
+    /// Turso's pragma virtual table does (<c>core/pragma.rs</c> <c>PragmaVirtualTableCursor::filter</c>).
+    /// Only names registered as read-only pragma functions reach here.
+    /// </summary>
+    private ExecutionResult QueryPragmaForSchema(string? schema, string name)
+    {
+        var sql = schema is null
+            ? $"PRAGMA \"{name}\""
+            : $"PRAGMA \"{schema.Replace("\"", "\"\"", StringComparison.Ordinal)}\".\"{name}\"";
+        var statement = SqlParser.Parse(sql, SqlParameterMap.Parse(sql));
+        return Execute(statement, []);
+    }
+
     // A null schema has the same main-database default as the statement form.
     private string DescribeJournalModeForSchema(string? schema)
     {
@@ -67030,6 +67270,74 @@ Func<string, ParsedStatement> rewrite)
 
     private const long DefaultMvccGcThreshold = 16 * 1024;
 
+    // Turso index_method/mod.rs DEFAULT_FTS_MERGE_THRESHOLD.
+    private const long DefaultFtsMergeThreshold = 32;
+
+    private long _ftsMergeThreshold = DefaultFtsMergeThreshold;
+
+    /// <summary>
+    /// Turso's pragma names in <c>PragmaName</c> order (its <c>pragma_list</c> output on a
+    /// non-Apple build), followed by the pragmas only Ahtola implements.
+    /// </summary>
+    internal static readonly string[] PragmaListNames =
+    [
+        "application_id", "auto_vacuum", "busy_timeout", "cache_size", "cache_spill", "count_changes",
+        "cipher", "data_sync_retry", "database_list", "encoding", "freelist_count", "foreign_keys",
+        "foreign_key_list", "full_column_names", "function_list", "ignore_check_constraints",
+        "integrity_check", "journal_mode", "locking_mode", "quick_check", "hexkey", "legacy_file_format",
+        "max_page_count", "module_list", "page_count", "page_size", "query_only", "schema_version",
+        "short_column_names", "i_am_a_dummy", "require_where", "synchronous", "temp_store", "index_info",
+        "index_xinfo", "index_list", "table_list", "table_info", "table_xinfo", "capture_data_changes_conn",
+        "unstable_capture_data_changes_conn", "user_version", "wal_checkpoint", "mvcc_checkpoint_threshold",
+        "mvcc_gc_threshold", "mvcc_group_commit", "fts_merge_threshold", "list_types",
+        "empty_result_callbacks", "vdbe_trace",
+        "defer_foreign_keys", "foreign_key_check", "recursive_triggers",
+    ];
+
+    /// <summary>
+    /// <c>PRAGMA mvcc_group_commit</c>. Like Turso it requires an MVCC database. The managed
+    /// MVCC log syncs each commit's frame before the commit returns; it does not batch
+    /// commits behind one sync, so it reports 0 and refuses to enable batching.
+    /// </summary>
+    private ExecutionResult ExecutePragmaMvccGroupCommit(PragmaMvccGroupCommitStatement statement)
+    {
+        var database = ResolvePragmaDatabase(statement.Schema);
+        if (!database.IsMvccEnabled)
+            throw new EmbeddedSqlException("MVCC not enabled");
+        if (statement.Enabled is { } enabled)
+        {
+            if (enabled)
+            {
+                throw new EmbeddedSqlException(
+                    "mvcc_group_commit is not supported by the managed engine: each MVCC commit syncs its own log frame");
+            }
+
+            return ExecutionResult.Empty;
+        }
+
+        return new ExecutionResult(["mvcc_group_commit"], [[SqlValue.Integer(0)]], 0);
+    }
+
+    /// <summary>
+    /// <c>PRAGMA fts_merge_threshold</c>, with Turso's validation. Turso uses it to decide
+    /// when a statement's flush merges FTS segments. Ahtola's FTS index merges by size tier
+    /// on its own, so the value is kept as connection state: it never changes a result.
+    /// </summary>
+    private ExecutionResult ExecutePragmaFtsMergeThreshold(PragmaFtsMergeThresholdStatement statement)
+    {
+        ValidatePragmaSchema(statement.Schema);
+        if (statement.Value is { } value)
+        {
+            if (value < 0)
+                throw new EmbeddedSqlException("fts_merge_threshold must be 0 (disabled) or a positive integer");
+
+            _ftsMergeThreshold = value;
+            return ExecutionResult.Empty;
+        }
+
+        return new ExecutionResult(["fts_merge_threshold"], [[SqlValue.Integer(_ftsMergeThreshold)]], 0);
+    }
+
     private ExecutionResult ExecutePragmaMvccCheckpointThreshold(PragmaMvccCheckpointThresholdStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
@@ -67073,6 +67381,8 @@ Func<string, ParsedStatement> rewrite)
     private ExecutionResult ExecutePragmaListTypes(PragmaListTypesStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
+        // Turso translate/pragma.rs ListTypes: the built-in storage classes, then every
+        // registered TYPE/DOMAIN in name order with its base type and default.
         var rows = ListTypeNames
             .Select(name => new[]
             {
@@ -67084,11 +67394,33 @@ Func<string, ParsedStatement> rewrite)
                 SqlValue.Null,
             })
             .ToList();
-        return new ExecutionResult(
-            ["name", "type", "notnull", "dflt_value", "pk", "hidden"],
-            rows,
-            0);
+        var database = ResolvePragmaDatabase(statement.Schema);
+        foreach (var (_, definition) in database.LiveCatalog.TypeDefinitions
+                     .OrderBy(static entry => entry.Key, StringComparer.Ordinal))
+        {
+            var (name, baseType, defaultValue) = definition switch
+            {
+                CreateTypeStatement type => (type.Name, type.BaseType, (Expression?)null),
+                CreateDomainStatement domain => (domain.Name, domain.BaseType, domain.Default),
+                _ => (null, null, null),
+            };
+            if (name is null)
+                continue;
+            rows.Add(
+            [
+                SqlValue.Text(name),
+                SqlValue.Text(baseType!),
+                SqlValue.Null,
+                SqlValue.Null,
+                defaultValue is LiteralExpression literal ? SqlValue.Text(EmbeddedDatabase.FormatSqlLiteral(literal.Value)) : SqlValue.Null,
+                SqlValue.Null,
+            ]);
+        }
+
+        return new ExecutionResult(ListTypesColumns, rows, 0);
     }
+
+    private static readonly string[] ListTypesColumns = ["type", "parent", "encode", "decode", "default", "operators"];
 
     private ExecutionResult ExecutePragmaFunctionList(PragmaFunctionListStatement statement)
     {
@@ -67097,6 +67429,71 @@ Func<string, ParsedStatement> rewrite)
             ["name", "builtin", "type", "enc", "narg", "flags"],
             EmbeddedDatabase.BuildPragmaFunctionListRows(_database),
             0);
+    }
+
+    private ExecutionResult ExecutePragmaEncryption(PragmaEncryptionStatement statement)
+    {
+        // Turso keeps hexkey/cipher per connection, so a temp schema reports main's state.
+        var database = ResolvePragmaDatabase(statement.Schema);
+        if (ReferenceEquals(database, _tempDatabase))
+            database = _database;
+        var encryption = database.FileSystem is AhtolaEncryptionFileSystem encryptedFileSystem
+            ? encryptedFileSystem.Encryption
+            : null;
+        var name = statement.Setting == PragmaEncryptionSetting.HexKey ? "hexkey" : "cipher";
+
+        if (statement.Value is null)
+        {
+            if (statement.Setting == PragmaEncryptionSetting.HexKey)
+            {
+                // Turso translate/pragma.rs query_pragma EncryptionKey: never echoes the key.
+                var message = encryption is null
+                    ? "encryption key is not set for this session"
+                    : "encryption key is set for this session";
+                return new ExecutionResult([name], [[SqlValue.Text(message)]], 0);
+            }
+
+            return encryption is null
+                ? new ExecutionResult([name], [], 0)
+                : new ExecutionResult([name], [[SqlValue.Text(AhtolaEncryptionCipherNames.Format(encryption.Cipher))]], 0);
+        }
+
+        // Validate the value first, as Turso does, so a malformed key or cipher name gets
+        // the same diagnostic whether or not the connection is encrypted.
+        if (statement.Setting == PragmaEncryptionSetting.HexKey)
+            ValidatePragmaHexKey(statement.Value);
+        else if (!AhtolaEncryptionCipherNames.TryParse(statement.Value, out _))
+            throw new EmbeddedSqlException($"Unknown cipher name: {statement.Value}");
+
+        if (encryption is not null)
+            throw new EmbeddedSqlException("cannot reset encryption attributes if already set in the session");
+
+        // Turso can key a connection whose pager has not read page 1 yet. A managed
+        // connection reads and validates the file when it opens, so a key supplied now
+        // would either be ignored or leave a plaintext file the caller believes is
+        // encrypted. Fail instead of silently succeeding.
+        throw new EmbeddedSqlException(
+            $"PRAGMA {name} cannot enable encryption on an open managed connection; "
+            + "supply the key and cipher when opening the database "
+            + "(connection string 'Encryption Key' and 'Encryption Cipher').");
+    }
+
+    private static void ValidatePragmaHexKey(string value)
+    {
+        byte[] key;
+        try
+        {
+            key = Convert.FromHexString(value.Trim());
+        }
+        catch (FormatException)
+        {
+            throw new EmbeddedSqlException("Invalid hex string: the key must contain an even number of hexadecimal digits");
+        }
+
+        var length = key.Length;
+        System.Security.Cryptography.CryptographicOperations.ZeroMemory(key);
+        if (length is not (16 or 32))
+            throw new EmbeddedSqlException($"Hex string must decode to exactly 16 or 32 bytes, got {length}");
     }
 
     private ExecutionResult ExecutePragmaModuleList(PragmaModuleListStatement statement)
@@ -67300,11 +67697,19 @@ Func<string, ParsedStatement> rewrite)
         if (statement is PragmaMvccGcThresholdStatement { Value: null })
             return ["mvcc_gc_threshold"];
         if (statement is PragmaListTypesStatement)
-            return ["name", "type", "notnull", "dflt_value", "pk", "hidden"];
+            return ListTypesColumns;
+        if (statement is PragmaMvccGroupCommitStatement { Enabled: null })
+            return ["mvcc_group_commit"];
+        if (statement is PragmaFtsMergeThresholdStatement { Value: null })
+            return ["fts_merge_threshold"];
+        if (statement is PragmaListStatement)
+            return ["pragma_list"];
         if (statement is PragmaFunctionListStatement)
             return ["name", "builtin", "type", "enc", "narg", "flags"];
         if (statement is PragmaModuleListStatement)
             return ["name"];
+        if (statement is PragmaEncryptionStatement { Value: null } encryption)
+            return [encryption.Setting == PragmaEncryptionSetting.HexKey ? "hexkey" : "cipher"];
 
         var routed = RouteStatement(statement);
         var transactionState = GetTransactionState(routed.Database);
@@ -67583,6 +67988,7 @@ Func<string, ParsedStatement> rewrite)
 
         _savepoints.Clear();
         _changeDataCapture?.ResetTransaction();
+        _connTxnId = -1;
         _deferForeignKeys = false;
         ReleaseTransactionWriteReservations();
         if (transactionDatabases is not null)
@@ -67752,6 +68158,10 @@ public sealed class EmbeddedStatement : IDisposable
             || _statement is PragmaTempStoreStatement { Value: null }
             || _statement is PragmaWalCheckpointStatement
             || _statement is PragmaBusyTimeoutStatement { Value: null }
+            || _statement is PragmaEncryptionStatement { Value: null }
+            || _statement is PragmaMvccGroupCommitStatement { Enabled: null }
+            || _statement is PragmaFtsMergeThresholdStatement { Value: null }
+            || _statement is PragmaListStatement
             || EmbeddedDatabase.TryGetReturning(_statement, out _, out _))
         {
             ExecuteIfNeeded();

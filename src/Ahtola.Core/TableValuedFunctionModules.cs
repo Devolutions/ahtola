@@ -164,6 +164,64 @@ internal sealed class JsonTraversalModule(bool recursive) : TableValuedFunctionM
 }
 
 /// <summary>
+/// State that belongs to the connection running a statement rather than to the database,
+/// which several connections may share: the answers the <c>pragma_*</c> table-valued
+/// functions report, and the transaction id behind <c>conn_txn_id</c>.
+/// </summary>
+internal sealed class ConnectionScope(
+    Func<string?, string> describeJournalMode,
+    Func<string?, string, ExecutionResult> query,
+    Func<long, long> getOrSetTransactionId)
+{
+    /// <summary>The journal mode for a schema (main when null).</summary>
+    public Func<string?, string> DescribeJournalMode { get; } = describeJournalMode;
+
+    /// <summary>Runs the query form of a pragma for a schema (main when null).</summary>
+    public Func<string?, string, ExecutionResult> Query { get; } = query;
+
+    /// <summary>
+    /// Turso <c>conn_txn_id</c> get-or-set for the explicit transaction: the first candidate
+    /// is kept until the transaction ends.
+    /// </summary>
+    public Func<long, long> GetOrSetTransactionId { get; } = getOrSetTransactionId;
+}
+
+/// <summary>
+/// A <c>pragma_*</c> function for a pragma whose query form returns rows, mirroring Turso's
+/// generic <c>PragmaVirtualTable</c> (<c>core/pragma.rs</c>): one for every pragma flagged
+/// <c>Result0</c>. Only the query form runs, so the function never changes a setting. The
+/// optional hidden <c>schema</c> argument routes to that database, which Turso rejects with
+/// "Schema argument is not supported yet".
+/// </summary>
+internal sealed class PragmaQueryModule(
+    string pragmaName,
+    IReadOnlyList<string> visibleColumns,
+    bool hasSchemaArgument) : TableValuedFunctionModule
+{
+    private readonly string _pragmaName = pragmaName;
+
+    public override string Name { get; } = "pragma_" + pragmaName;
+
+    public override TableValuedFunctionSchema Schema { get; } = new(
+        visibleColumns,
+        hasSchemaArgument ? ["schema"] : [],
+        [.. Enumerable.Repeat(ColumnAffinity.Blob, visibleColumns.Count + (hasSchemaArgument ? 1 : 0))]);
+
+    public override int? SchemaNameArgumentIndex => hasSchemaArgument ? 0 : null;
+
+    public override IReadOnlyList<SqlValue[]> Enumerate(TableValuedFunctionCall call)
+    {
+        var schema = hasSchemaArgument && call.HasArgument(0) && call.Arguments[0].Kind != SqlValueKind.Null
+            ? TableValuedFunctionRows.CoerceToText(call.Arguments[0])
+            : null;
+        var query = call.Context.ConnectionScope?.Query
+            ?? throw new InvalidOperationException("A connection scope is required for pragma functions.");
+        var result = query(schema, _pragmaName);
+        return TableValuedFunctionRows.AppendArguments(result.Rows, call.Arguments, Schema);
+    }
+}
+
+/// <summary>
 /// The <c>pragma_*</c> introspection family. Each module forwards to the PRAGMA statement
 /// that produces the same result columns, so the function form and the statement form can
 /// never disagree.
@@ -280,7 +338,7 @@ internal sealed class PragmaJournalModeModule : TableValuedFunctionModule
         var schema = call.HasArgument(0) && call.Arguments[0].Kind != SqlValueKind.Null
             ? TableValuedFunctionRows.CoerceToText(call.Arguments[0])
             : null;
-        var describe = call.Context.DescribeJournalMode
+        var describe = call.Context.ConnectionScope?.DescribeJournalMode
             ?? throw new InvalidOperationException("A connection-scoped journal-mode resolver is required.");
         var mode = describe(schema);
         return [[SqlValue.Text(mode), call.Arguments[0]]];

@@ -370,7 +370,7 @@ internal sealed class ChangeDataCaptureSession(ChangeDataCaptureConfiguration co
         return changeId;
     }
 
-    private long GetOrSetTransactionId(long candidate)
+    internal long GetOrSetTransactionId(long candidate)
     {
         if (_transactionId < 0)
             _transactionId = candidate;

@@ -14,7 +14,19 @@ internal sealed class MvccLogicalLog : IDisposable
 {
     // Turso logical_log.rs constants.
     private const byte LegacyLogVersion = 3;
-    private const byte CurrentLogVersion = 4;
+
+    /// <summary>Typed (non-integer) row keys and object names.</summary>
+    private const byte TypedKeyLogVersion = 4;
+
+    /// <summary>
+    /// V4 frames whose CRC32C is chained like Turso's (<c>logical_log.rs</c>): the first
+    /// frame's CRC continues <c>crc32c(salt)</c> and each later one continues the previous
+    /// frame's, so a frame that is reordered, replaced or dropped from the middle no longer
+    /// validates.
+    /// </summary>
+    private const byte ChainedLogVersion = MvccLogicalLogFormat.ChainedVersion;
+
+    private const byte CurrentLogVersion = ChainedLogVersion;
     private const int LogHeaderSize = MvccLogicalLogFormat.LogHeaderSize;
     private const int TxHeaderSize = MvccLogicalLogFormat.TxHeaderSize;
     private const int TxTrailerSize = MvccLogicalLogFormat.TxTrailerSize;
@@ -32,6 +44,11 @@ internal sealed class MvccLogicalLog : IDisposable
     private byte _version;
     private bool _disposed;
 
+    // The CRC the next chained frame continues, valid for the frame that starts at
+    // _runningCrcOffset. A log opened without replay computes it lazily before appending.
+    private uint _runningCrc;
+    private long _runningCrcOffset = -1;
+
     private MvccLogicalLog(
         IFileSystem fileSystem,
         string path,
@@ -48,6 +65,8 @@ internal sealed class MvccLogicalLog : IDisposable
         _salt = salt;
         _version = version;
         _encryption = encryption;
+        if (offset == LogHeaderSize)
+            ResetRunningCrc();
     }
 
     internal string Path => _path;
@@ -63,7 +82,7 @@ internal sealed class MvccLogicalLog : IDisposable
     /// </summary>
     internal bool RequiresVersion4Upgrade
     {
-        get { lock (_gate) return _version < CurrentLogVersion; }
+        get { lock (_gate) return _version < TypedKeyLogVersion; }
     }
 
     /// <summary>Bytes past the log header (approximate "frames" size for checkpoint stats).</summary>
@@ -190,7 +209,7 @@ internal sealed class MvccLogicalLog : IDisposable
             ThrowIfDisposed();
             var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
 
-            if (RequiresVersion4(ops) && _version < CurrentLogVersion)
+            if (RequiresVersion4(ops) && _version < TypedKeyLogVersion)
             {
                 throw new MvccLogicalLogUpgradeRequiredException(
                     "MVCC typed keys require an exclusive checkpoint before upgrading the logical log to version 4.");
@@ -212,7 +231,7 @@ internal sealed class MvccLogicalLog : IDisposable
             BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(12, 4), (uint)ops.Count);
             BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(16, 8), commitTs);
             payload.CopyTo(frame.AsSpan(TxHeaderSize));
-            var crc = Crc32C.Compute(frame.AsSpan(0, TxHeaderSize + payload.Length));
+            var crc = ComputeFrameCrc(EnsureRunningCrc(file), frame.AsSpan(0, TxHeaderSize + payload.Length));
             BinaryPrimitives.WriteUInt32LittleEndian(
                 frame.AsSpan(TxHeaderSize + payload.Length, 4),
                 crc);
@@ -234,6 +253,8 @@ internal sealed class MvccLogicalLog : IDisposable
                 throw new MvccLogicalLogCommitIndeterminateException(exception);
             }
             _offset += frame.Length;
+            _runningCrc = crc;
+            _runningCrcOffset = _offset;
         }
     }
 
@@ -264,13 +285,15 @@ internal sealed class MvccLogicalLog : IDisposable
             // already-materialized frames before a later marker is encountered.
             long position = LogHeaderSize;
             ulong durableTimestamp = 0;
+            var runningCrc = InitialRunningCrc(_salt);
             while (position + TxHeaderSize + TxTrailerSize <= file.Length)
             {
-                if (!TryReadValidatedFrame(file, position, out var validated))
+                if (!TryReadValidatedFrame(file, position, runningCrc, out var validated))
                     break;
                 if (validated.OpCount == 0)
                     durableTimestamp = Math.Max(durableTimestamp, validated.CommitTimestamp);
                 position += validated.Length;
+                runningCrc = validated.Crc;
             }
 
             // A short final frame is a torn append, not a valid durability
@@ -284,12 +307,14 @@ internal sealed class MvccLogicalLog : IDisposable
             }
 
             var validatedEnd = position;
+            var validatedCrc = runningCrc;
             if (durableTimestamp != 0)
                 store.ApplyRecoveredWatermark(durableTimestamp);
             position = LogHeaderSize;
+            runningCrc = InitialRunningCrc(_salt);
             while (position < validatedEnd)
             {
-                if (!TryReadValidatedFrame(file, position, out var validated))
+                if (!TryReadValidatedFrame(file, position, runningCrc, out var validated))
                 {
                     throw new InvalidDataException(
                         "MVCC logical-log validated prefix changed during recovery.");
@@ -300,9 +325,12 @@ internal sealed class MvccLogicalLog : IDisposable
                     store.ApplyRecoveredCommit(validated.CommitTimestamp, validated.Operations);
                 }
                 position += validated.Length;
+                runningCrc = validated.Crc;
             }
 
             _offset = validatedEnd;
+            _runningCrc = validatedCrc;
+            _runningCrcOffset = validatedEnd;
         }
     }
 
@@ -316,14 +344,20 @@ internal sealed class MvccLogicalLog : IDisposable
             ThrowIfDisposed();
             var file = _file ?? throw new ObjectDisposedException(nameof(MvccLogicalLog));
             var freshSalt = CreateSalt();
+            // A header-only log has no frame to reinterpret, so a typed-key log adopts
+            // chained CRCs here. A legacy V3 log keeps its version until the materializing
+            // checkpoint upgrades it.
+            var version = _version >= TypedKeyLogVersion ? CurrentLogVersion : _version;
             Span<byte> header = stackalloc byte[LogHeaderSize];
-            WriteHeader(header, freshSalt, _version);
+            WriteHeader(header, freshSalt, version);
             file.SetLength(0);
             file.Write(0, header);
             if (synchronousMode.SyncsCheckpoint())
                 file.FlushToDisk();
             _salt = freshSalt;
+            _version = version;
             _offset = LogHeaderSize;
+            ResetRunningCrc();
         }
     }
 
@@ -339,7 +373,7 @@ internal sealed class MvccLogicalLog : IDisposable
         lock (_gate)
         {
             ThrowIfDisposed();
-            if (_version >= CurrentLogVersion)
+            if (_version >= TypedKeyLogVersion)
                 return;
             if (_offset != LogHeaderSize)
             {
@@ -404,7 +438,60 @@ internal sealed class MvccLogicalLog : IDisposable
             }
 
             _version = CurrentLogVersion;
+            ResetRunningCrc();
         }
+    }
+
+    private void ResetRunningCrc()
+    {
+        _runningCrc = InitialRunningCrc(_salt);
+        _runningCrcOffset = LogHeaderSize;
+    }
+
+    /// <summary>Turso <c>derive_initial_crc</c>: <c>crc32c(salt.to_le_bytes())</c>.</summary>
+    private static uint InitialRunningCrc(ulong salt)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, salt);
+        return Crc32C.Compute(bytes);
+    }
+
+    private uint ComputeFrameCrc(uint previousCrc, ReadOnlySpan<byte> frameBytes)
+        => _version >= ChainedLogVersion
+            ? Crc32C.Append(previousCrc, frameBytes)
+            : Crc32C.Compute(frameBytes);
+
+    /// <summary>
+    /// The chained CRC the next appended frame continues. After replay it is already known;
+    /// otherwise it is the stored CRC of the last frame before <see cref="_offset"/>.
+    /// </summary>
+    private uint EnsureRunningCrc(IFile file)
+    {
+        if (_runningCrcOffset == _offset)
+            return _runningCrc;
+
+        long position = LogHeaderSize;
+        var crc = InitialRunningCrc(_salt);
+        Span<byte> header = stackalloc byte[TxHeaderSize];
+        Span<byte> trailer = stackalloc byte[TxTrailerSize];
+        while (position < _offset)
+        {
+            ReadExact(file, position, header);
+            var (payloadSize, _, _) = MvccLogicalLogFormat.ReadFrameHeader(header);
+            var storedPayloadSize = _encryption is null
+                ? payloadSize
+                : MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize);
+            var frameLength = checked(TxHeaderSize + storedPayloadSize + TxTrailerSize);
+            ReadExact(file, position + TxHeaderSize + storedPayloadSize, trailer);
+            crc = BinaryPrimitives.ReadUInt32LittleEndian(trailer);
+            position += frameLength;
+        }
+
+        if (position != _offset)
+            throw new InvalidDataException("MVCC logical-log frames do not end at the append offset.");
+        _runningCrc = crc;
+        _runningCrcOffset = _offset;
+        return crc;
     }
 
     public void Dispose()
@@ -518,6 +605,7 @@ internal sealed class MvccLogicalLog : IDisposable
     private bool TryReadValidatedFrame(
         IFile file,
         long position,
+        uint previousCrc,
         out ValidatedLogicalFrame validated)
     {
         Span<byte> header = stackalloc byte[TxHeaderSize];
@@ -543,13 +631,13 @@ internal sealed class MvccLogicalLog : IDisposable
         if (position + frameLength > file.Length)
         {
             if (_encryption is not null
-                && IsCompletePlaintextFrame(file, position, payloadSize))
+                && IsCompletePlaintextFrame(file, position, payloadSize, previousCrc))
             {
                 throw new InvalidDataException(
                     "Encrypted MVCC storage contains a plaintext logical-log frame. "
                     + "Automatic migration is not safe; checkpoint the log without encryption first.");
             }
-            if (ContainsCompleteStoredFrame(file, position))
+            if (ContainsCompleteStoredFrame(file, position, previousCrc))
             {
                 throw new InvalidDataException(
                     "MVCC logical-log payload length does not match its complete frame boundary. "
@@ -568,7 +656,7 @@ internal sealed class MvccLogicalLog : IDisposable
             frame.AsSpan(TxHeaderSize + storedPayloadSize + 4, 4));
         if (end != MvccLogicalLogFormat.EndMagic)
             throw new InvalidDataException("MVCC log frame end magic mismatch.");
-        var actualCrc = Crc32C.Compute(frame.AsSpan(0, TxHeaderSize + storedPayloadSize));
+        var actualCrc = ComputeFrameCrc(previousCrc, frame.AsSpan(0, TxHeaderSize + storedPayloadSize));
         if (actualCrc != expectedCrc)
             throw new InvalidDataException("MVCC log frame CRC mismatch.");
 
@@ -587,11 +675,12 @@ internal sealed class MvccLogicalLog : IDisposable
             frameLength,
             opCount,
             commitTs,
-            operations);
+            operations,
+            actualCrc);
         return true;
     }
 
-    private static bool IsCompletePlaintextFrame(IFile file, long position, int payloadSize)
+    private bool IsCompletePlaintextFrame(IFile file, long position, int payloadSize, uint previousCrc)
     {
         var frameLength = checked(TxHeaderSize + payloadSize + TxTrailerSize);
         if (position + frameLength > file.Length)
@@ -603,10 +692,10 @@ internal sealed class MvccLogicalLog : IDisposable
         return BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(trailerOffset + 4))
                    == MvccLogicalLogFormat.EndMagic
                && BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(trailerOffset))
-                   == Crc32C.Compute(frame.AsSpan(0, trailerOffset));
+                   == ComputeFrameCrc(previousCrc, frame.AsSpan(0, trailerOffset));
     }
 
-    private static bool ContainsCompleteStoredFrame(IFile file, long position)
+    private bool ContainsCompleteStoredFrame(IFile file, long position, uint previousCrc)
     {
         var remaining = file.Length - position;
         if (remaining <= 0)
@@ -619,7 +708,7 @@ internal sealed class MvccLogicalLog : IDisposable
 
         var bytes = new byte[(int)remaining];
         ReadExact(file, position, bytes);
-        return MvccLogicalLogFormat.ContainsCompleteFrameBoundary(bytes);
+        return MvccLogicalLogFormat.ContainsCompleteFrameBoundary(bytes, _version, previousCrc);
     }
 
     private static bool RequiresVersion4(IReadOnlyList<MvccLogOp> ops)
@@ -629,7 +718,8 @@ internal sealed class MvccLogicalLog : IDisposable
         int Length,
         uint OpCount,
         ulong CommitTimestamp,
-        IReadOnlyList<MvccLogOp> Operations);
+        IReadOnlyList<MvccLogOp> Operations,
+        uint Crc);
 
     private static byte[] EncodeOps(IReadOnlyList<MvccLogOp> ops, byte version)
     {
@@ -641,7 +731,7 @@ internal sealed class MvccLogicalLog : IDisposable
                 (op.IsDelete ? OpDeleteTable : OpUpsertTable)
                 | (op.IsBaseTombstone ? OpBaseTombstone : 0)));
             writer.Write(op.RowId.TableId);
-            if (version >= CurrentLogVersion)
+            if (version >= TypedKeyLogVersion)
             {
                 WriteObjectName(writer, op.ObjectName);
                 writer.Write((byte)op.RowId.Key.Kind);
@@ -684,7 +774,7 @@ internal sealed class MvccLogicalLog : IDisposable
             if (offset >= payload.Length)
                 throw new InvalidDataException("MVCC log op truncated.");
             var encodedKind = payload[offset++];
-            var isBaseTombstone = version >= CurrentLogVersion
+            var isBaseTombstone = version >= TypedKeyLogVersion
                 && (encodedKind & OpBaseTombstone) != 0;
             var kind = (byte)(encodedKind & ~OpBaseTombstone);
             if (isBaseTombstone && kind != OpDeleteTable)
@@ -694,10 +784,10 @@ internal sealed class MvccLogicalLog : IDisposable
             var tableId = BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]);
             offset += 8;
             string? objectName = null;
-            if (version >= CurrentLogVersion)
+            if (version >= TypedKeyLogVersion)
                 objectName = ReadObjectName(payload, ref offset);
             MvccKey key;
-            if (version >= CurrentLogVersion)
+            if (version >= TypedKeyLogVersion)
             {
                 if (offset >= payload.Length)
                     throw new InvalidDataException("MVCC log key kind truncated.");
@@ -1116,6 +1206,18 @@ internal static class Crc32C
         foreach (var b in data)
             crc = Update(crc, b);
         return Complete(crc);
+    }
+
+    /// <summary>
+    /// Continues a completed CRC over more data, like the <c>crc32c</c> crate's
+    /// <c>crc32c_append</c>: <c>Append(Compute(a), b) == Compute(a || b)</c>.
+    /// </summary>
+    internal static uint Append(uint crc, ReadOnlySpan<byte> data)
+    {
+        var state = crc ^ 0xFFFFFFFFu;
+        foreach (var b in data)
+            state = Update(state, b);
+        return Complete(state);
     }
 
     internal static uint Update(uint crc, byte value)

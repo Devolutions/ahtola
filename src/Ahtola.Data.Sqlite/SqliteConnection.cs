@@ -195,7 +195,11 @@ public partial class SqliteConnection :
 
     public AhtolaConnectionCapabilities Capabilities
         => _ahtolaConnection is not null
-            ? AhtolaConnectionCapabilities.ForSqliteMode(_ahtolaConnection.Capabilities.Mode)
+            ? _ahtolaConnection.Capabilities.Mode == AhtolaConnectionMode.EmbeddedReplica
+              && _ahtolaConnection.State == ConnectionState.Open
+                ? AhtolaConnectionCapabilities.ForSqliteReplica(
+                    managed: _ahtolaConnection.ManagedReplicaConnection is not null)
+                : AhtolaConnectionCapabilities.ForSqliteMode(_ahtolaConnection.Capabilities.Mode)
             : EndpointMode switch
             {
                 AhtolaConnectionEndpointMode.RemoteHrana => AhtolaConnectionCapabilities.ForSqliteRemote(isReplica: false),
@@ -524,6 +528,9 @@ public partial class SqliteConnection :
             _lastAutomaticSyncStatus = args.Status;
             AutomaticSyncStatusChanged?.Invoke(this, args);
         };
+        // A publication reopens the replica's local database; the new adapter starts with
+        // no client callbacks, so register them again.
+        connection.ManagedReplicaDatabaseRestored = RegisterManagedCallbacks;
         return connection;
     }
 
@@ -1522,6 +1529,35 @@ public partial class SqliteConnection :
         }
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
+
+        // Turso bindings/dotnet RegisterManagedReplicaCallbacks: client callbacks run on the
+        // replica's local database.
+        if (CallbackConnection is { } replicaConnection)
+        {
+            using var replicaOperation = EnterCallbackRegistration();
+            RegisterManagedCallbacks(replicaConnection);
+        }
+    }
+
+    /// <summary>
+    /// The managed connection that receives client functions, aggregates and collations:
+    /// a managed local database, or the local database of a managed embedded replica.
+    /// </summary>
+    private IManagedConnectionAdapter? CallbackConnection
+        => IsManagedConnection ? ManagedConnection : _ahtolaConnection?.ManagedReplicaConnection;
+
+    /// <summary>
+    /// Serializes a callback change on a managed embedded replica with sync publication,
+    /// which can replace the replica's local database.
+    /// </summary>
+    private IDisposable? EnterCallbackRegistration()
+        => IsManagedConnection ? null : _ahtolaConnection?.EnterManagedReplicaOperation(CancellationToken.None);
+
+    private void RegisterManagedCallbacks(IManagedConnectionAdapter connection)
+    {
+        RegisterScalarFunctions(connection);
+        RegisterAggregateFunctions(connection);
+        RegisterCollations(connection);
     }
 
     private void ValidateRemoteOpenMode()

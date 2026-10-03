@@ -1164,8 +1164,8 @@ repository.
 ### 9.1 Managed Cloud replica support matrix
 
 The historical analysis baseline is Turso v0.7.2, but current sync behavior is
-audited against the read-only submodule pinned at **v0.8.0-pre.7**
-(`277ddd050`). Citations that explicitly name v0.7.2 remain historical baseline
+audited against the read-only submodule pinned at **v0.8.1**
+(`8549c1659`; the 2026-10-02 audit in `turso-remaining-gap-plan.md`). Citations that explicitly name v0.7.2 remain historical baseline
 evidence; the submodule pointer is the source of truth for current parity work.
 
 This matrix applies only to the pure-managed `ManagedReplicaConnectionHost`
@@ -1214,7 +1214,7 @@ qualified subset in the matrix above.
 | `sync-no-partial-sync-lazy-page-storage` | closed | s2-capability | L | 0 | 0 | Incomplete prefix and query-selected images publish only after their bootstrap marker, metadata, and integrity-protected page-state sidecar are durable. The sidecar stores arbitrary unordered/non-contiguous page sets as a run list, so worst-case scattered query selections cost one run per page. Pager reads coalesce targeted pulls pinned to the bootstrap revision, validate page identity and size before durable publication, support optional segment prefetch, persist across reopen, and use write-ahead mutation intents plus process-exclusive physical ownership. Tracked local changes are pushed before the pinned image is completed for ordinary revision-advancing sync. |
 | `sync-no-revert-db-checkpoint-safety` | partial | s1-correctness | L | 0 | 0 | Managed ReplaceBase checkpointing durably publishes an integrity-checked `<db>-wal-revert` plus source-WAL watermark metadata before overwriting or truncating rollback-relevant frames. Push ambiguity is now independent of that bundle: metadata v7/v8 records every ordinary or checkpoint-bound batch before transport, recovers from `turso_sync_last_change_id`, and clears only after durable acknowledgement or definitive conflict. The revert sidecar still contains both exact pre-checkpoint bytes and the committed checkpoint image: interrupted publication resumes from the committed image, while only a typed push conflict restores the pre-checkpoint bytes. Missing/corrupt recovery state fails closed. Turso's reusable passive-prefix/history checkpoint policy remains tracked by `sync-checkpoint-mode-mismatch-vs-managed-storage`. |
 | `sync-partial-encryption-mutual-exclusion-unenforced` | divergent | s1-correctness | S | 0 | 0 | Turso hard-errors when partial-sync + remote-encryption + MVCC-logical-pull are combined incompatibly. Ahtola's AhtolaReplicaOptions.Validate() checks PartialBootstrap/Bo… |
-| `sync-remote-encryption-header-not-wired-for-remote-client` | missing | s2-capability | S | 0 | 0 | AhtolaRemoteEncryptionOptions models the cipher/base64 key surface used to compute reserved-bytes for encrypted Turso Cloud databases (consumed by the not-yet-existing re… |
+| `sync-remote-encryption-header-not-wired-for-remote-client` | closed | s2-capability | S | 0 | 0 | The managed remote client sends the `x-turso-encryption-key` header (`AhtolaRemoteClient`); the inventory records the closure. |
 | `sync-remote-execute-stream-only-two-request-kinds` | divergent | s4-intentional | S | 0 | 0 | Turso's own vendored server_proto.rs already restricts the Hrana-like pipeline to Execute and Batch stream kinds (no cursor/describe/sequence/store_sql variants seen in f… |
 | `sync-remote-hrana-batch-cond-unsupported` | closed | s2-capability | M | 0 | 0 | Remote batches serialize nested `ok`/`error`/`not`/`and`/`or`/`is_autocommit` conditions. Multi-statement commands and explicit batches chain `ok(previous)` so later destructive steps do not run after a failure. |
 | `sync-remote-no-replication-index-tracking` | closed | s3-perf | S | 0 | 0 | The managed Hrana client tracks the highest valid batch or statement `replication_index`, sends it with subsequent batches, and accepts both string and legacy numeric encodings. `RemoteReplicationIndexTests` covers request propagation and validation. |
@@ -1788,6 +1788,58 @@ SEQUENCE family, typed values, materialized views, multi-DB atomic
 commit, and the generated-column error-message split — stays
 `s4-intentional` pending an explicit product decision; this wave records
 that status, it does not flip it.
+
+### F10 — v0.8.1 gap audit fixes (2026-10-02)
+
+The audit against the `v0.8.1` pin found three silent behaviors that no doc
+tracked, and fixed them. The inventory grows 217 → **220** entries, all
+closed.
+
+- `pragma-encryption-hexkey-cipher-silent-noop`: `PRAGMA hexkey`/`cipher`
+  report Turso's session state and refuse assignment. ATTACH URI
+  `cipher`/`hexkey` encrypt the attachment instead of being ignored.
+- `sync-replica-client-callbacks-rejected`: managed embedded replicas register
+  custom functions, aggregates and collations on their local database, and
+  register them again after a publication reopens it.
+- `sync-experimental-features-silently-ignored`: `Sync Experimental Features`
+  is forwarded to `AhtolaReplicaOptions`. The managed replica honors or
+  rejects each name.
+
+The remaining untracked findings from the audit (MVCC log chaining and group
+commit, CDC 0.8 pieces, `pragma_*` table-valued functions, `stddev`, the WAL
+frame API, HTTP Hrana request kinds, browser sync) are listed by priority in
+`turso-remaining-gap-plan.md`. They are not added as open inventory records:
+the plan is where current work is tracked. The expected-failures ledger is
+unchanged at 109.
+
+### F11 — v0.8.1 audit second pass (2026-10-02)
+
+The second pass re-assessed every finding F10 left open. The inventory grows
+220 → **229** entries, all closed:
+
+- `func-stddev-aggregate`: the `stddev()` aggregate.
+- `pragma-table-valued-function-family`: `pragma_*` functions for every Turso
+  `Result0` pragma. They run on the calling connection and route the hidden
+  schema argument.
+- `pragma-list-group-commit-fts-threshold`: `PRAGMA pragma_list`,
+  `mvcc_group_commit` and `fts_merge_threshold`.
+- `pragma-list-types-columns`: `PRAGMA list_types` uses Turso's columns and
+  lists registered types.
+- `func-cdc-record-decoders`: `table_columns_json_array`,
+  `bin_record_json_object` and `conn_txn_id`.
+- `parser-attach-detach-name-expressions`: string and expression database
+  names in ATTACH and DETACH.
+- `mvcc-logical-log-chained-crc`: version 5 MVCC logs with chained frame CRCs,
+  on the desktop and in the browser.
+- `compile-index-directive-blocks-hash-join`: INDEXED BY / NOT INDEXED rule
+  out hash joins and temporary indexes.
+- `pragma-journal-mode-change-while-cdc-active`: a recorded intentional
+  divergence. Ahtola keeps capturing across the change, where Turso rejects it.
+
+Items that exist only in Turso's C binding, CLI, JavaScript binding or sync
+internals are classified as out of scope for this port. MVCC group commit and
+the product-scale projects stay open. Both lists are in
+`turso-remaining-gap-plan.md`. The expected-failures ledger is unchanged.
 
 
 ## Appendix A — Inventory JSON schema

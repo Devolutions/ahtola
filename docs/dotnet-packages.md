@@ -127,7 +127,12 @@ using var replica = new SqliteConnection(
 Local-only APIs (user-defined functions/aggregates, custom collations, hooks,
 extensions, backup, and incremental blobs) fail explicitly when the selected
 remote mode cannot provide them. Inspect `connection.Capabilities` before using
-an optional surface.
+an optional surface. A managed embedded replica runs every statement on its
+local database, so it accepts user-defined functions, aggregates and
+collations, as Turso does. Registrations made before or after `Open` apply to
+the local database, and are applied again when a sync publication reopens it.
+A direct remote connection, or a replica opened through a registered native
+sync companion, does not.
 
 ### Standard SQLite files
 
@@ -212,7 +217,7 @@ require `Replica Path`; on a local data source they throw
 | `Pull Bytes Threshold` | `PullBytesThreshold` | `0` pulls the bootstrap image in one request |
 | `Automatic Sync Mode` | `AutomaticSyncMode` | Ahtola-specific: `PushAndPull` (default) or `PullOnly` (Turso's behavior) |
 | `Force Logical MVCC Pull` | — | Only `False` is supported; `True` fails closed because the managed provider always auto-detects the pull protocol |
-| `Sync Experimental Features` | — | Validated comma-separated names; no effect on the managed engine, which does not gate features behind them |
+| `Sync Experimental Features` | `ExperimentalFeatures` | Turso feature names, passed unchanged to a registered sync companion. A managed replica accepts the names its engine always provides (`strict`, `index_method`, `vacuum`, `encryption`, `attach`, `generated_columns`, `without_rowid`, `multiprocess_wal`). `custom_types` enables the restricted TYPE/DOMAIN subset. `views`, `autovacuum` and `mvcc_passive_checkpoint` fail with `NotSupportedException`. Unknown names fail with `ArgumentException` (Turso ignores them). |
 
 Hrana WebSocket keywords, used only by `ws://`/`wss://` data sources (see
 [Hrana over WebSocket](#hrana-over-websocket-wswss)):

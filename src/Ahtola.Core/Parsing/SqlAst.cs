@@ -423,11 +423,36 @@ internal sealed record PragmaMvccCheckpointThresholdStatement(long? Value, strin
 
 internal sealed record PragmaMvccGcThresholdStatement(long? Value, string? Schema = null) : ParsedStatement;
 
+/// <summary><c>PRAGMA mvcc_group_commit</c> (Turso <c>PragmaName::MvccGroupCommit</c>).</summary>
+internal sealed record PragmaMvccGroupCommitStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
+
+/// <summary><c>PRAGMA fts_merge_threshold</c> (Turso <c>PragmaName::FtsMergeThreshold</c>).</summary>
+internal sealed record PragmaFtsMergeThresholdStatement(long? Value, string? Schema = null) : ParsedStatement;
+
+/// <summary><c>PRAGMA pragma_list</c>: every pragma name this engine recognizes.</summary>
+internal sealed record PragmaListStatement(string? Schema = null) : ParsedStatement;
+
 internal sealed record PragmaListTypesStatement(string? Schema = null) : ParsedStatement;
 
 internal sealed record PragmaFunctionListStatement(string? Schema = null) : ParsedStatement;
 
 internal sealed record PragmaModuleListStatement(string? Schema = null) : ParsedStatement;
+
+internal enum PragmaEncryptionSetting
+{
+    HexKey,
+    Cipher,
+}
+
+/// <summary>
+/// <c>PRAGMA hexkey</c> / <c>PRAGMA cipher</c> (Turso <c>PragmaName::EncryptionKey</c> /
+/// <c>EncryptionCipher</c>). The query form reports the session's encryption state; the
+/// assignment form is rejected because a managed connection fixes its encryption at open.
+/// </summary>
+internal sealed record PragmaEncryptionStatement(
+    PragmaEncryptionSetting Setting,
+    string? Value,
+    string? Schema = null) : ParsedStatement;
 
 /// <summary>
 /// An unrecognized pragma: SQLite silently ignores unknown pragmas (Turso's
@@ -473,12 +498,20 @@ internal sealed record DropSequenceStatement(string Name, bool IfExists) : Parse
 
 internal sealed record VacuumStatement(string? Schema, Expression? Into) : ParsedStatement;
 
+/// <summary>
+/// <c>ATTACH path AS name [KEY key]</c>. An identifier or string literal name is resolved
+/// when parsing; any other expression (a bound parameter, say) is kept in
+/// <see cref="AliasExpression"/> and evaluated when the statement runs, as Turso does
+/// (<c>translate/attach.rs</c>).
+/// </summary>
 internal sealed record AttachDatabaseStatement(
     Expression Path,
     string Alias,
-    Expression? Key) : ParsedStatement;
+    Expression? Key,
+    Expression? AliasExpression = null) : ParsedStatement;
 
-internal sealed record DetachDatabaseStatement(string Alias) : ParsedStatement;
+/// <summary><c>DETACH name</c>; see <see cref="AttachDatabaseStatement"/> for the name forms.</summary>
+internal sealed record DetachDatabaseStatement(string Alias, Expression? AliasExpression = null) : ParsedStatement;
 
 internal sealed record ExplainStatement(ParsedStatement Inner) : ParsedStatement;
 

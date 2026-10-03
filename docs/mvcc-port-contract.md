@@ -6,8 +6,28 @@ Companion to [`wal-interoperability-contract.md`](wal-interoperability-contract.
 ## Upstream reference
 
 Behavioral baseline: Turso **v0.7.2** (`046e9cbf6`). The read-only submodule
-now pins **v0.8.0-pre.7** (`277ddd050`) for browser-WASM work; retrieve the
-original baseline with `git -C turso-src show v0.7.2:<path>`.
+now pins **v0.8.1** (`8549c1659`); retrieve the original baseline with
+`git -C turso-src show v0.7.2:<path>`.
+
+**v0.8.x status** (2026-10-02 audit; see `turso-remaining-gap-plan.md`):
+
+- **Chained frame CRCs: ported.** New and checkpoint-truncated logs are
+  version 5: V4 typed-key frames whose CRC32C continues the previous frame's,
+  seeded by `crc32c(salt)`, as in Turso's `logical_log.rs`. A reordered,
+  replaced or dropped frame no longer validates. V3 and V4 logs stay readable
+  and appendable with independent CRCs until a checkpoint truncates them. The
+  browser's encrypted mirror chains both its persisted (encrypted) frames and
+  the plaintext frames it hands the engine.
+- **Not applicable:** MVEX extension frames, `OP_UPDATE_HEADER`, portable
+  changes and the `LogTxFrameInfo` commit hook. They belong to Turso's own log
+  layout and sync engine. Ahtola's log is not file-compatible with Turso's (it
+  has typed keys and object names), so these have nothing to interoperate with.
+- **Group commit: not ported.** Turso turns it on by default
+  (`mvcc/database/group_commit.rs`). Ahtola syncs each commit's frame before
+  the commit returns, so `PRAGMA mvcc_group_commit` reports 0 and refuses ON.
+  This affects throughput only, never results or durability.
+- **Passive checkpoint: not ported.** `mvcc_passive_checkpoint` is rejected by
+  `Sync Experimental Features`.
 
 | Turso | Ahtola |
 | --- | --- |

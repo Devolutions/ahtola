@@ -239,3 +239,33 @@ in use:
 Both produce the same `NotSupportedException` text, naming the cipher and its
 nonce width, so desktop and browser cannot disagree about which databases may
 enter MVCC.
+
+## 9. SQL configuration surface
+
+A managed connection fixes its encryption when it opens: page 1 is read and
+authenticated before the first statement runs. Turso can instead key a
+connection whose pager has not read page 1 yet, with `PRAGMA cipher` and
+`PRAGMA hexkey`. Ahtola matches what it can and refuses the rest. It never
+accepts a key it will not use.
+
+- `PRAGMA hexkey` (query form) returns Turso's session message, either
+  `encryption key is set for this session` or
+  `encryption key is not set for this session`. It never returns the key.
+- `PRAGMA cipher` (query form) returns the Turso cipher name
+  (`aes256gcm`, `aegis256`, …), or no row when the session is unencrypted.
+- The assignment forms first validate the value with Turso's diagnostics
+  (`Unknown cipher name: …`, `Invalid hex string…`, `Hex string must decode to
+  exactly 16 or 32 bytes…`). They then always fail:
+  - On an encrypted session, with Turso's `cannot reset encryption attributes
+    if already set in the session`.
+  - On an unencrypted session, with a message to configure encryption when the
+    database is opened (`Encryption Key`/`Encryption Cipher`).
+- `ATTACH 'file:…?cipher=…&hexkey=…'` opens the attachment through its own
+  `AhtolaEncryptionFileSystem`. Both options are required, with Turso's
+  messages when one is missing. They cannot be combined with `ATTACH … KEY`.
+- Invariant 6 applies here too. The SQL authorizer receives no argument for
+  `hexkey`, and an invalid ATTACH URI is reported without its query string.
+
+Before 2026-10-02 these pragmas fell through to the unrecognised-pragma no-op,
+and the URI options were skipped. A caller could ask for encryption and get a
+plaintext file with no error.

@@ -527,8 +527,10 @@ internal static class JoinOrderEnumerator
             rightRows,
             output);
 
-        // Ties keep hash-build-right, the executor's default shape.
-        var best = buildLeftCost < buildRightCost - CostEpsilon
+        // Ties keep hash-build-right, the executor's default shape. A directive on either side
+        // keeps the access path the SQL named rather than building the left input.
+        var directive = segment.Members[member].HasIndexDirective || DirectiveInMask(segment, placedMask);
+        var best = !directive && buildLeftCost < buildRightCost - CostEpsilon
             ? new StepEvaluation(JoinStepShape.HashBuildLeft, buildLeftCost, output, null)
             : new StepEvaluation(JoinStepShape.HashBuildRight, buildRightCost, output, null);
         if (indexAccess is null)
@@ -651,6 +653,17 @@ internal static class JoinOrderEnumerator
 
     private static bool HasForcedIndexCandidate(JoinSegmentMember member)
         => member.IndexCandidates?.Any(static candidate => candidate.Forced) == true;
+
+    private static bool DirectiveInMask(JoinSegment segment, ulong mask)
+    {
+        for (var index = 0; index < segment.Members.Count; index++)
+        {
+            if ((mask & (1UL << index)) != 0 && segment.Members[index].HasIndexDirective)
+                return true;
+        }
+
+        return false;
+    }
 
     private static bool CanBindIndexColumn(
         JoinPredicateTerm term,
@@ -962,7 +975,8 @@ internal static class JoinOrderEnumerator
         // The temporary index is only considered over a plain full scan and never for a FULL
         // join, which has no nested-loop form (access_method.rs:903-987).
         var hashableKeys = joinEqualities.Where(static equality => equality.Hashable).ToArray();
-        if (bestShape == JoinStepShape.NestedLoop && !forcedOnly && hashableKeys.Length != 0
+        if (bestShape == JoinStepShape.NestedLoop && !forcedOnly && !target.HasIndexDirective
+            && hashableKeys.Length != 0
             && outerJoin != TursoOuterJoin.Full)
         {
             var consumed = hashableKeys.Select(static equality => equality.Term).ToArray();
@@ -1008,6 +1022,8 @@ internal static class JoinOrderEnumerator
             && bestShape != JoinStepShape.IndexSeekRight
             && !rowidSeek
             && !forcedOnly
+            && !target.HasIndexDirective
+            && !segment.Members[buildMember].HasIndexDirective
             && !buildKeys.Any(key => target.IndexLeadingColumnOrdinals.Contains(key.Ordinal))
             && (!materialize || inputCardinality <= MaximumMaterializedBuildRows || outerJoin == TursoOuterJoin.Full))
         {

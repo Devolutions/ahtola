@@ -305,6 +305,48 @@ internal sealed class TableValuedFunctionVirtualTable(
 /// </summary>
 internal static class TableValuedFunctionRegistry
 {
+    /// <summary>
+    /// The rest of Turso's <c>Result0</c> pragmas (<c>core/pragma.rs</c> <c>pragma_for</c>), with
+    /// its column names and whether the pragma takes a schema (<c>SchemaOpt</c>/<c>SchemaReq</c>).
+    /// </summary>
+    private static readonly (string Pragma, string[] Columns, bool HasSchema)[] QueryPragmas =
+    [
+        ("application_id", ["application_id"], false),
+        ("auto_vacuum", ["auto_vacuum"], false),
+        ("busy_timeout", ["busy_timeout"], false),
+        ("cache_spill", ["cache_spill"], false),
+        ("capture_data_changes_conn", ["mode", "table", "version"], true),
+        ("cipher", ["cipher"], true),
+        ("count_changes", ["count_changes"], false),
+        ("data_sync_retry", ["data_sync_retry"], false),
+        ("database_list", ["seq", "name", "file"], false),
+        ("encoding", ["encoding"], false),
+        ("foreign_keys", ["foreign_keys"], false),
+        ("freelist_count", ["freelist_count"], false),
+        ("fts_merge_threshold", ["fts_merge_threshold"], false),
+        ("hexkey", ["hexkey"], true),
+        ("i_am_a_dummy", ["require_where"], false),
+        ("ignore_check_constraints", ["ignore_check_constraints"], false),
+        ("integrity_check", ["message"], false),
+        ("list_types", ["type", "parent", "encode", "decode", "default", "operators"], false),
+        ("locking_mode", ["locking_mode"], false),
+        ("max_page_count", ["max_page_count"], true),
+        ("mvcc_checkpoint_threshold", ["mvcc_checkpoint_threshold"], false),
+        ("mvcc_gc_threshold", ["mvcc_gc_threshold"], false),
+        ("mvcc_group_commit", ["mvcc_group_commit"], false),
+        ("page_count", ["page_count"], true),
+        ("page_size", ["page_size"], true),
+        ("query_only", ["query_only"], false),
+        ("quick_check", ["message"], false),
+        ("require_where", ["require_where"], false),
+        ("schema_version", ["schema_version"], false),
+        ("synchronous", ["synchronous"], false),
+        ("temp_store", ["temp_store"], false),
+        ("unstable_capture_data_changes_conn", ["mode", "table", "version"], true),
+        ("user_version", ["user_version"], false),
+        ("vdbe_trace", ["vdbe_trace"], false),
+    ];
+
     private static readonly Dictionary<string, TableValuedFunctionModule> Modules =
         Create();
 
@@ -371,6 +413,9 @@ internal static class TableValuedFunctionRegistry
         {
             modules.Add(module.Name, module);
         }
+
+        foreach (var (pragma, columns, hasSchema) in QueryPragmas)
+            modules.Add("pragma_" + pragma, new PragmaQueryModule(pragma, columns, hasSchema));
 
         return modules;
     }

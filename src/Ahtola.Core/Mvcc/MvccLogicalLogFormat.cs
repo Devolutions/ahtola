@@ -10,6 +10,9 @@ internal static class MvccLogicalLogFormat
 {
     internal const uint LogMagic = 0x4C4D4C32; // "LML2"
     internal const int LogHeaderSize = 56;
+
+    /// <summary>The first log version whose frame CRCs are chained (see <c>MvccLogicalLog</c>).</summary>
+    internal const byte ChainedVersion = 5;
     internal const int LogHeaderSaltStart = 8;
     internal const int LogHeaderCrcStart = 52;
     internal const uint FrameMagic = 0x5854564D; // "MVTX"
@@ -81,7 +84,7 @@ internal static class MvccLogicalLogFormat
             throw new InvalidDataException("Invalid MVCC logical log magic.");
 
         var version = header[4];
-        if (version is not (2 or 3 or 4))
+        if (version is not (2 or 3 or 4 or 5))
             throw new InvalidDataException($"Unsupported MVCC logical log version {version}.");
         if (BinaryPrimitives.ReadUInt16LittleEndian(header[6..]) != LogHeaderSize)
             throw new InvalidDataException("Invalid MVCC logical log header length.");
@@ -118,14 +121,18 @@ internal static class MvccLogicalLogFormat
     /// <summary>
     /// Determines whether bytes beginning at a frame header contain any complete
     /// CRC-valid frame boundary. This does not trust the unauthenticated payload
-    /// length, so an enlarged length cannot masquerade as a torn append.
+    /// length, so an enlarged length cannot masquerade as a torn append. A chained
+    /// (version 5) frame's CRC continues <paramref name="previousCrc"/>.
     /// </summary>
-    internal static bool ContainsCompleteFrameBoundary(ReadOnlySpan<byte> frameBytes)
+    internal static bool ContainsCompleteFrameBoundary(
+        ReadOnlySpan<byte> frameBytes,
+        byte version,
+        uint previousCrc)
     {
         if (frameBytes.Length < TxHeaderSize + TxTrailerSize)
             return false;
 
-        var crc = Crc32C.InitialState;
+        var crc = version >= ChainedVersion ? previousCrc ^ 0xFFFFFFFFu : Crc32C.InitialState;
         for (var index = 0; index < TxHeaderSize; index++)
             crc = Crc32C.Update(crc, frameBytes[index]);
 

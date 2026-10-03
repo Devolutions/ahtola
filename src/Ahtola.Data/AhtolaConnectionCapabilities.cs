@@ -157,7 +157,23 @@ public sealed class AhtolaConnectionCapabilities
         supportsTransactions: true,
         supportsSavepoints: true);
 
+    // A managed embedded replica executes every statement on its local managed database, so
+    // client-side functions, aggregates and collations register there (Turso
+    // bindings/dotnet RegisterManagedReplicaCallbacks). A replica opened through a registered
+    // native sync companion has no managed callback surface.
     private static readonly AhtolaConnectionCapabilities SqliteEmbeddedReplica = new(
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.EmbeddedReplica,
+        canCreateBatch: true,
+        supportsAsyncOperations: true,
+        supportsTransactions: true,
+        supportsSavepoints: true,
+        supportsUserDefinedFunctions: true,
+        supportsUserDefinedAggregates: true,
+        supportsCustomCollations: true,
+        supportsSync: true);
+
+    private static readonly AhtolaConnectionCapabilities SqliteNativeEmbeddedReplica = new(
         AhtolaConnectionFacade.Sqlite,
         AhtolaConnectionMode.EmbeddedReplica,
         canCreateBatch: true,
@@ -251,13 +267,16 @@ public sealed class AhtolaConnectionCapabilities
             : SqliteNativeLocal;
 
     internal static AhtolaConnectionCapabilities ForSqliteRemote(bool isReplica)
-        => isReplica ? SqliteEmbeddedReplica : SqliteRemoteHrana;
+        => isReplica ? ForSqliteReplica(managed: !AhtolaReplicaProvider.HasRegisteredFactory) : SqliteRemoteHrana;
+
+    internal static AhtolaConnectionCapabilities ForSqliteReplica(bool managed)
+        => managed ? SqliteEmbeddedReplica : SqliteNativeEmbeddedReplica;
 
     internal static AhtolaConnectionCapabilities ForSqliteMode(AhtolaConnectionMode mode)
         => mode switch
         {
             AhtolaConnectionMode.RemoteHrana => SqliteRemoteHrana,
-            AhtolaConnectionMode.EmbeddedReplica => SqliteEmbeddedReplica,
+            AhtolaConnectionMode.EmbeddedReplica => ForSqliteRemote(isReplica: true),
             AhtolaConnectionMode.ManagedLocal => SqliteManagedLocal,
             AhtolaConnectionMode.NativeLocal => SqliteNativeLocal,
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown Ahtola connection mode."),

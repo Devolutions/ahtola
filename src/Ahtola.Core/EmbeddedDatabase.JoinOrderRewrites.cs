@@ -337,6 +337,7 @@ public sealed partial class EmbeddedDatabase
                 infos[index].Width,
                 indexCandidates)
             {
+                HasIndexDirective = sources[index] is NamedTableSource { IndexDirective: not null },
                 RowidAliasOrdinal = memberTable?.RowidAliasColumnIndex ?? -1,
                 IndexedColumnOrdinals = memberTable is null
                     ? []
@@ -450,6 +451,7 @@ public sealed partial class EmbeddedDatabase
             var memberTable = infos[index].Table;
             members[index] = new JoinSegmentMember(index, infos[index].RowCount, infos[index].Width, infos[index].IndexCandidates)
             {
+                HasIndexDirective = sources[index] is NamedTableSource { IndexDirective: not null },
                 RowidAliasOrdinal = memberTable?.RowidAliasColumnIndex ?? -1,
                 IndexedColumnOrdinals = memberTable is null
                     ? []

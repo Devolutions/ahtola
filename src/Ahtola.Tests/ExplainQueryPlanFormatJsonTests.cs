@@ -880,20 +880,24 @@ public class ExplainQueryPlanFormatJsonTests
 
         const string query = """
             SELECT s.label, b.label
-            FROM small AS s JOIN big AS b NOT INDEXED ON s.k = b.k
+            FROM small AS s JOIN big AS b ON s.k = b.k
             ORDER BY s.k;
             """;
         ReadValues(connection, query).Should().HaveCount(3);
         ReadValues(connection, "EXPLAIN " + query)
             .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText()
             .Should().Contain("hash-build left");
+        // NOT INDEXED would rule the hash join out (access_method.rs has_indexed_by_directives).
+        ReadValues(connection, "EXPLAIN " + query.Replace("big AS b", "big AS b NOT INDEXED", StringComparison.Ordinal))
+            .Single(row => row[1].AsText() == "OpenJoinCursor")[5].AsText()
+            .Should().NotContain("hash-build left");
         ReadPlanDetails(connection, "EXPLAIN QUERY PLAN " + query)
-            .Should().Equal("MANAGED COMPILED VDBE");
+            .Should().Equal("HASH JOIN small AS s", "SCAN big AS b", "USE SORTER FOR ORDER BY");
 
         using var document = JsonDocument.Parse(
             ReadAll(connection, "EXPLAIN QUERY PLAN FORMAT=JSON " + query).Single());
         var nodes = document.RootElement.GetProperty("nodes");
-        nodes.GetArrayLength().Should().Be(2);
+        nodes.GetArrayLength().Should().Be(3);
         // Turso's hash cost charges a build row (hash_cpu_cost + hash_insert_cost) less than a
         // probe row (hash_cpu_cost + hash_lookup_cost), so the 40-row table is scanned first and
         // hashed, and the 3-row table streams as the probe (access_method.rs
@@ -906,6 +910,7 @@ public class ExplainQueryPlanFormatJsonTests
         nodes[1].GetProperty("op").GetProperty("table").GetString().Should().Be("big");
         nodes[1].GetProperty("op").GetProperty("alias").GetString().Should().Be("b");
         nodes[1].GetProperty("op").TryGetProperty("join", out _).Should().BeFalse();
+        nodes[2].GetProperty("detail").GetString().Should().Be("USE SORTER FOR ORDER BY");
         nodes.EnumerateArray().Should().OnlyContain(static node =>
             node.GetProperty("parent").ValueKind == JsonValueKind.Null);
     }

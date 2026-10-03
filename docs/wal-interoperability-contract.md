@@ -203,7 +203,10 @@ Phase 2 scope and limits:
   log layout; salt, payload length, operation count, commit timestamp, and chunk
   index are authenticated while framing metadata remains visible. Ahtola also
   binds the logical-log version and rejects trailing decoded payload bytes, so a
-  recomputed unkeyed header CRC cannot reinterpret V4 row bytes as V3. New logs
+  recomputed unkeyed header CRC cannot reinterpret V4 row bytes as V3. Version 5
+  (the current version for new and checkpoint-truncated logs) keeps the V4
+  frame layout but chains each frame's CRC32C from the previous one, seeded by
+  `crc32c(salt)`, as Turso does. New logs
   use V4 typed-key frames and include their logical object name so recovery
   restores the object-id mapping. V3 rowid-only logs are upgraded only by an
   exclusive materializing checkpoint; a cold V3 log whose table identities
