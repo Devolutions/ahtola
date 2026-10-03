@@ -10,15 +10,18 @@ public partial class SqliteConnection
     {
         ArgumentNullException.ThrowIfNull(name);
         if (!Capabilities.SupportsCustomCollations)
-            throw new NotSupportedException("Custom collations are supported only for local database connections.");
-            // Shared-memory catalogs are process-wide for the named database. Collation
-            // registrations are therefore catalog-scoped (visible to every lease), which is
-            // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.
-            if (comparison is null)
+            throw new NotSupportedException("Custom collations are supported only for local database and managed embedded replica connections.");
+        // Shared-memory catalogs are process-wide for the named database. Collation
+        // registrations are therefore catalog-scoped (visible to every lease), which is
+        // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.
+        if (comparison is null)
         {
             _collations.Remove(name);
-            if (IsManagedConnection)
-                ManagedConnection.UnregisterCollation(name);
+            if (CallbackConnection is { } managedConnection)
+            {
+                using var replicaOperation = EnterCallbackRegistration();
+                managedConnection.UnregisterCollation(name);
+            }
             else if (_database is not null)
                 SqliteNativeProvider.Current.UnregisterCollation(NativeDatabase, name);
             return;
@@ -26,18 +29,23 @@ public partial class SqliteConnection
 
         var registration = new CollationRegistration(name, comparison);
         _collations[name] = registration;
-        if (IsManagedConnection)
-            registration.RegisterManaged(ManagedConnection);
+        if (CallbackConnection is { } connection)
+        {
+            using var replicaOperation = EnterCallbackRegistration();
+            registration.RegisterManaged(connection);
+        }
         else if (_database is not null)
             registration.RegisterNative(NativeDatabase);
     }
 
-    private void RegisterCollations()
+    private void RegisterCollations() => RegisterCollations(CallbackConnection);
+
+    private void RegisterCollations(IManagedConnectionAdapter? managedConnection)
     {
-        if (IsManagedConnection)
+        if (managedConnection is not null)
         {
             foreach (var registration in _collations.Values)
-                registration.RegisterManaged(ManagedConnection);
+                registration.RegisterManaged(managedConnection);
             return;
         }
 

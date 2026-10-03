@@ -73,11 +73,13 @@ public class AhtolaSqliteRelationalConnection : SqliteRelationalConnection
         if (_commandTimeout.HasValue)
             connection.DefaultTimeout = _commandTimeout.Value;
 
-        // Direct remote Hrana and embedded-replica connections cannot register client-side
-        // functions, aggregates, or collations (the facade throws NotSupportedException for
-        // them); the remote/replica endpoint's own SQLite-compatible engine supplies its own
-        // built-ins (e.g. `instr`) instead. Skip registration entirely for those modes rather
-        // than attempting it and failing.
+        // Direct remote Hrana connections (and replicas opened through a native sync
+        // companion) cannot register client-side functions, aggregates, or collations (the
+        // facade throws NotSupportedException for them); the remote endpoint's own
+        // SQLite-compatible engine supplies its own built-ins (e.g. `instr`) instead. Skip
+        // registration entirely for those modes rather than attempting it and failing. A
+        // managed embedded replica runs statements on its local managed database, so it
+        // registers these like a local connection.
         if (!connection.Capabilities.SupportsUserDefinedFunctions)
             return;
 

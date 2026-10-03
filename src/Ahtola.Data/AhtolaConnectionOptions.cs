@@ -91,7 +91,8 @@ public class AhtolaConnectionOptions
                 + "protocol is always auto-detected from the remote and persisted in the replica metadata.");
         }
 
-        ValidateExperimentalFeatures(_builder.SyncExperimentalFeatures);
+        var experimentalFeatures = _builder.SyncExperimentalFeatures;
+        ValidateExperimentalFeatures(experimentalFeatures);
         var clientName = _builder.SyncClientName;
         var longPollMilliseconds = _builder.SyncLongPollTimeout;
         var pushOperationsThreshold = _builder.PushOperationsThreshold;
@@ -112,6 +113,7 @@ public class AhtolaConnectionOptions
             PullBytesThreshold = pullBytesThreshold == 0 ? null : pullBytesThreshold,
             AuthTokenProvider = authTokenProvider,
             HttpPolicy = new AhtolaSyncHttpPolicy(messageHandler),
+            ExperimentalFeatures = string.IsNullOrWhiteSpace(experimentalFeatures) ? null : experimentalFeatures,
         };
     }
 

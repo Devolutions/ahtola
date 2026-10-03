@@ -1,5 +1,223 @@
 # Remaining Turso gap closure plan
 
+## v0.8.1 gap audit (2026-10-02)
+
+This audit compared four areas of the pinned `v0.8.1` source with Ahtola:
+
+- functions and modules;
+- SQL syntax and pragmas;
+- storage, MVCC and CDC;
+- bindings and sync.
+
+Most of the surface matches. The gaps already listed in this plan are
+confirmed. They are typed values, incremental materialized views, the
+PostgreSQL frontend, autovacuum, replica pooling, and the serverless and
+Platform clients. The audit also found the gaps below, which no doc tracked.
+The first pass fixed three of them. A second pass closed eight more, recorded
+two deliberate differences, and reclassified the rest as outside this port's
+parity target (see "Second pass" below). The inventory records every fix as a
+closed entry.
+
+### Fixed
+
+- **`PRAGMA hexkey` / `PRAGMA cipher` and ATTACH URI `cipher`/`hexkey`**
+  (`pragma-encryption-hexkey-cipher-silent-noop`).
+  - **Before:** the pragmas fell through to the no-op for unknown pragmas, and
+    ATTACH skipped the URI options. A caller asking for encryption got a
+    plaintext file with no error.
+  - **Query forms:** these now report Turso's session state.
+  - **Assignment forms:** these validate the value and then fail, because a
+    managed connection fixes its encryption at open.
+  - **ATTACH URIs:** `cipher` and `hexkey` now encrypt the attachment.
+
+  See `docs/page-encryption-contract.md` §9.
+- **Custom functions, aggregates and collations on managed replicas**
+  (`sync-replica-client-callbacks-rejected`).
+  - **Before:** these threw `NotSupportedException` on every replica.
+  - **Now:** they register on the replica's local managed database, as Turso
+    does. Registrations made before or after open both apply. A sync
+    publication that reopens the database re-registers them.
+  - **EF Core:** the provider now registers its own helper functions on
+    replicas.
+- **`Sync Experimental Features`** (`sync-experimental-features-silently-ignored`).
+  - **Before:** the value was format-checked and dropped.
+  - **Forwarding:** it now reaches `AhtolaReplicaOptions.ExperimentalFeatures`,
+    unchanged for a sync companion.
+  - **Managed replica:** it accepts the names its engine always provides.
+    `custom_types` turns on the TYPE/DOMAIN subset. It rejects `views`
+    (materialized views), `autovacuum`, `mvcc_passive_checkpoint`, and any
+    unknown name.
+  - **Behaviour change:** a connection string that lists `views` used to open
+    and now fails.
+
+### First-pass findings (as reported)
+
+Kept as first reported. The second-pass sections below resolve each item.
+
+1. **MVCC logical log differs from Turso, and there is no group commit.**
+   - **Checksums:** Turso 0.8 chains CRC32C from frame to frame, starting from
+     the log salt. It also passes `LogTxFrameInfo` to the commit hook.
+     `MvccLogicalLog` checksums each frame on its own, so a frame that is
+     reordered or replaced is not detected.
+   - **Log features:** there are no MVEX extension frames, no
+     `OP_UPDATE_HEADER`, and no portable changes.
+   - **Group commit:** Turso turns it on by default (`group_commit.rs`). Ahtola
+     does one fsync per commit, and `PRAGMA mvcc_group_commit` is a silent
+     no-op.
+   - **What is documented:** only the V4 layout divergence
+     (`wal-interoperability-contract.md`).
+2. **CDC is missing 0.8 pieces:**
+   - the `table_columns_json_array` and `bin_record_json_object` decoders;
+   - `conn_txn_id`;
+   - the guard that rejects a `journal_mode` change while capture is active
+     (`vdbe/execute.rs`). Without it, capture silently stops.
+3. **SQL surface:**
+   - **Table-valued pragma functions:** only 11 exist. Turso registers one for
+     every pragma that returns a result (about 40). `pragma_database_list`,
+     `pragma_page_count`, `pragma_user_version` and `pragma_integrity_check`
+     fail with "no such table".
+   - **Silent no-ops:** `PRAGMA pragma_list`, `mvcc_group_commit` and
+     `fts_merge_threshold`.
+   - **Missing aggregate:** `stddev()`, which Turso registers by default.
+   - **ATTACH/DETACH names:** a string or bound parameter is not accepted
+     where Turso takes an expression.
+4. **No WAL frame API and no `sqlite_dbpage`.** Turso's sync engine is built on
+   `wal_get_frame`, `wal_insert_*`, `wal_changed_pages_after` and watermark
+   reads. Ahtola has none of them, which blocks frame-level sync with Turso
+   and page-level tooling.
+5. **Remote protocol and browser:**
+   - **Plain HTTP:** the Hrana client sends only `execute`, `batch` and
+     `close`. `describe`, `sequence`, `store_sql`/`close_sql` and
+     `get_autocommit` need WebSocket.
+     `sync-remote-execute-stream-only-two-request-kinds` was closed by citing
+     the v0.7.2 sync engine, not `serverless/PROTOCOL.md`.
+   - **Browser:** the browser package has no sync or remote support. Turso's
+     `sync-wasm` offers push/pull over OPFS.
+6. **Smaller API gaps:**
+   - statement status counters;
+   - a busy-handler callback;
+   - a `db_config` equivalent;
+   - push row transforms and ignored tables (Turso exposes these only in its
+     JavaScript binding).
+7. **Optional or out of scope:**
+   - the extension crates that load separately: crypto, fuzzy, ipaddr, csv
+     and completion;
+   - Turso's optional XXH3 per-page checksum;
+   - `sqlite_turso_types` and the `numeric_*` functions, which belong to typed
+     values;
+   - the Legacy sync protocol;
+   - `upper_bound_inclusive` checkpoints;
+   - the sorter's normalized key prefix.
+
+### Second pass: fixed
+
+A second pass re-assessed every item the audit left open and closed the ones
+that have a Turso counterpart Ahtola can match. Each one has its own tests, and
+the inventory records each one as a closed entry.
+
+- **`stddev()`** (`func-stddev-aggregate`). This is the sample standard
+  deviation from Turso's `core/percentile.rs`, computed with Welford's
+  algorithm. Text that parses as a number counts, NULL and BLOB are skipped,
+  and fewer than two values give NULL.
+- **`pragma_*` table-valued functions** (`pragma-table-valued-function-family`).
+  Every pragma Turso flags `Result0` now has a function, with Turso's column
+  names. That adds 34 to the 11 that existed. Each one runs the query form of
+  the pragma on the calling connection, so it reports that connection's own
+  settings and can never change a value. The hidden `schema` argument is
+  routed to the attached database; Turso rejects it with "not supported yet".
+- **`PRAGMA pragma_list`, `mvcc_group_commit` and `fts_merge_threshold`**
+  (`pragma-list-group-commit-fts-threshold`).
+  - **`pragma_list`:** lists Turso's pragma names in `PragmaName` order,
+    followed by the three only Ahtola has.
+  - **`fts_merge_threshold`:** uses Turso's default (32) and validation. It is
+    kept as connection state, because Ahtola's FTS index merges by size tier on
+    its own and the setting never changes a result.
+  - **`mvcc_group_commit`:** like Turso, it requires MVCC. It reports 0 and
+    refuses ON, which is the truth about the managed log.
+- **`PRAGMA list_types` shape** (`pragma-list-types-columns`). The columns are
+  now Turso's `type, parent, encode, decode, default, operators`; Ahtola had
+  borrowed `table_info`'s names. Registered TYPE and DOMAIN definitions are
+  listed after the built-in types.
+- **CDC helpers** (`func-cdc-record-decoders`). `table_columns_json_array`,
+  `bin_record_json_object` and `conn_txn_id` match Turso's results and error
+  messages. With capture on, `conn_txn_id` returns the same id the capture
+  stamps on change rows.
+- **ATTACH/DETACH names** (`parser-attach-detach-name-expressions`). The name
+  can be a string literal, a bound parameter or any expression, as in Turso's
+  `translate/attach.rs`.
+- **Chained MVCC log CRCs** (`mvcc-logical-log-chained-crc`). Version 5 logs
+  chain each frame's CRC32C from the previous one, seeded by `crc32c(salt)`, so
+  a frame that is reordered or replaced is detected. This covers the desktop
+  log, the browser's persisted encrypted frames and its plaintext mirror. V3
+  and V4 logs stay readable and adopt V5 when a checkpoint truncates them.
+- **INDEXED BY / NOT INDEXED rule out hash joins**
+  (`compile-index-directive-blocks-hash-join`). A directive on either join
+  side keeps the access path the SQL named. The planner no longer hash-joins
+  such a table or builds it a temporary index (`access_method.rs`
+  `has_indexed_by_directives`). This closes the known follow-up listed below.
+
+### Second pass: deliberate differences
+
+- **`journal_mode` changes while CDC is on are allowed.** Turso 0.8 rejects
+  them because its capture would silently stop. Ahtola's capture writes
+  through the catalog in every journal mode and keeps recording across the
+  switch; a test covers this. Adding Turso's rejection would remove a working
+  capability to imitate a limitation.
+- **`Sync Experimental Features` rejects unknown names.** Turso ignores them.
+  This is the first-pass fix, recorded here for completeness.
+
+### Second pass: not a gap for this port
+
+Ahtola's API target is Turso's .NET binding (`bindings/dotnet`). The items
+below exist only in Turso surfaces outside it, so they are recorded as out of
+scope rather than as open work:
+
+- **C binding (sqlite3 compatibility):** statement status counters, the
+  busy-handler callback, `db_config`, and the WAL frame import/export calls
+  (`wal_get_frame`, `wal_insert_*`, `wal_changed_pages_after`). The .NET
+  binding exposes none of them.
+- **CLI-only virtual tables:** `sqlite_dbpage` and `btree_dump` (`cli_only`
+  feature).
+- **JavaScript binding:** sync in the browser (`sync-wasm` over OPFS), and push
+  row transforms and ignored tables. Turso's .NET binding has no browser
+  package; Ahtola's browser package is an extension.
+- **Turso's own log and sync internals:** MVEX extension frames,
+  `OP_UPDATE_HEADER`, portable changes, the `LogTxFrameInfo` commit hook,
+  `sequence_watermark_experimental` (which reads Turso's MVCC per-transaction
+  allocation tracking for its sync engine), and the Legacy sync protocol.
+  Ahtola's log is not file-compatible with Turso's, so these have nothing to
+  interoperate with.
+- **Separately loaded extension crates:** crypto, fuzzy, ipaddr, csv and
+  completion. Default Turso builds don't include them either.
+- **HTTP Hrana `describe`/`sequence`/`store_sql`/`get_autocommit`:** nothing
+  public in Ahtola issues them. They would be needed by a port of
+  `Turso.Serverless.Client`, which stays a separate package decision.
+
+### Still open
+
+- **MVCC group commit.** Turso batches commits behind one fsync by default.
+  Doing that safely in Ahtola means changing when a commit becomes visible
+  relative to its sync. It affects throughput only.
+- **Typed values and their functions:** `array_*`, `struct_*`/`union_*`,
+  `numeric_*`, `sqlite_turso_types`, and the 29 corpus files that were never
+  copied in. Incremental materialized views, the PostgreSQL frontend,
+  autovacuum, replica pooling, the serverless and Platform clients, and
+  `Force Logical MVCC Pull` also stay open. Each is a product-scale project
+  already tracked below.
+- **Planner shapes the evaluator route cannot report, and window memory
+  bounding (WBOUND).** These are unchanged and tracked below.
+
+### Doc corrections made in this audit
+
+- The number of upstream sqltest files that were never copied into the corpus
+  is **29**: 23 typed-value files and 6 materialized-view files. The table
+  below said 28.
+- `turso-gap-analysis.md` §9.1 and `mvcc-port-contract.md` now name the
+  `v0.8.1` pin.
+- `sync-remote-encryption-header-not-wired-for-remote-client` was listed as
+  "missing" in the §9 table. It is closed in the inventory, and the client
+  sends the header.
+
 ## v0.8.1 refresh (2026-09-30)
 
 The `turso-src` pin moved to `v0.8.1` (`8549c1659`), and the vendored corpus
@@ -136,8 +354,8 @@ plus two older generated-column integrity markers. The ledger now holds
   later row of an equal group, as the pinned corpus expects.
 - Pre-existing, noticed while testing: a stored `-0.0` loses its sign, and
   `quote()` renders 9007199254740992.0 as `9.007199254740992e+15`.
-- INDEXED BY / NOT INDEXED should rule out hash joins and ephemeral indexes,
-  as in Turso.
+- Fixed (2026-10-02 second pass): INDEXED BY / NOT INDEXED now rule out hash
+  joins and ephemeral indexes, as in Turso.
 - At page size 1024, large index keys pack less tightly than in SQLite, which
   shows in `page_count`.
 
@@ -512,7 +730,7 @@ stale, not a new implementation task.
 | 1 | Extend the browser's opt-in bounded read profile in small, explicitly classified shapes | **Current slices:** an `INTEGER PRIMARY KEY = integer literal` or unshadowed hidden `rowid`/`_rowid_`/`oid` predicate uses a page-bounded rowid point seek; integer-literal range comparisons and inclusive `BETWEEN` seek the starting bound and stop at the other, in ascending or descending rowid order. Explicit hidden-rowid projections retain SQLite's declared-column shadowing and `*` omission. Literal `OFFSET` skips matched rows before `LIMIT` counts emitted rows; unsupported predicates reject before scan I/O. Registered secondary indexes do not block base-table rowid scans or seeks. `WITHOUT ROWID` tables with ascending BINARY primary keys stream index interior/leaf records forward or backward under the same page budget, with logical column remapping and overflow checks; explicit uniformly ASC/DESC PK prefixes need no sort. INTEGER/TEXT first-key comparisons and BETWEEN seek the strongest starting bound, filter before LIMIT/OFFSET, and stop past the far bound; counted-page regressions guard against whole-tree scans for distant prefixes. Equality on every declared INTEGER/TEXT PK column with matching literal storage type uses direct B-tree page descent. Later-key ranges, implicit type conversions, other declared key types, joins, secondary-index access, and collated/mixed-direction ordering remain open. |
 | 2 | Bound the entire buffered-window evaluator, not only its input | Charge partition keys, frame positions, function inputs, results, and spill indexes *before* allocation; compute/drain partitions incrementally; release reservations even on exceptions. Demonstrate a finite `cache_size` peak with large partitions, both spill modes and evaluator/compiled routes; do not treat output-only spilling as closure. |
 | 3 | Complete physical working-set and query-plan depth | Avoid mandatory whole-b-tree validation/first-touch whole-table hydration where safe while retaining explicit corruption detection; make each JSON EQP operation come from the executed access path, including view/CTE materialization, rather than fabricate missing nodes. |
-| 4 | Adopt Turso-specific SQL families as distinct product projects | The 28 pinned Turso-specific files originally omitted cover TYPE/DOMAIN/typed values (23) and incremental materialized views (5). A gated, durable INTEGER TYPE/DOMAIN registry now supports restricted STRICT INTEGER-domain columns (inherited DEFAULT/NOT NULL/CHECK) and identity INTEGER TYPE columns through validated writes/reopen; CAST to an identity type preserves its input value. General typed values and incremental materialized views remain unsupported. Expand encode/decode, planner/runtime behavior, transaction maintenance and recovery before enabling their full `@requires` capabilities; keep the corpus byte-faithful. |
+| 4 | Adopt Turso-specific SQL families as distinct product projects | The 29 pinned Turso-specific files never copied into the corpus cover TYPE/DOMAIN/typed values (23) and incremental materialized views (6). A gated, durable INTEGER TYPE/DOMAIN registry now supports restricted STRICT INTEGER-domain columns (inherited DEFAULT/NOT NULL/CHECK) and identity INTEGER TYPE columns through validated writes/reopen; CAST to an identity type preserves its input value. General typed values and incremental materialized views remain unsupported. Expand encode/decode, planner/runtime behavior, transaction maintenance and recovery before enabling their full `@requires` capabilities; keep the corpus byte-faithful. |
 | 5 | Deepen sync and platform compatibility | A SHA-pinned, immutable sync-history root permits sparse original/committed revert segments across generations with v4/v5 compatibility, leases, and crash/reopen tests. The root still costs one full image; high-change generations fall back to full captures. AHTLA-encrypted bounded browser reads now authenticate main/WAL pages with a WAL-location metadata budget; further portable locale tailoring and browser SQL shapes still require deterministic persisted ordering and bounded async operation. Native loadable extensions/raw sqlite3 handles and the PostgreSQL server are separate product-scope decisions, not hidden SQLite failures. |
 
 ### Live TODOs (not all represented by expected-failure cases)

@@ -159,6 +159,15 @@ public sealed class AhtolaReplicaOptions
     public Func<CancellationToken, ValueTask<string?>>? AuthTokenProvider { get; init; }
 
     /// <summary>
+    /// Gets or initializes the comma-separated experimental feature names of
+    /// <c>Sync Experimental Features</c>, mirroring Turso's <c>ExperimentalFeatures</c>. A
+    /// registered sync companion receives them verbatim. The managed replica accepts the
+    /// names its engine always provides, enables its TYPE/DOMAIN subset for
+    /// <c>custom_types</c>, and rejects every other name when the connection opens.
+    /// </summary>
+    public string? ExperimentalFeatures { get; init; }
+
+    /// <summary>
     /// Gets or initializes the HTTP transport policy.
     /// </summary>
     public AhtolaSyncHttpPolicy HttpPolicy { get; init; } = new();

@@ -158,7 +158,11 @@ Its 56-byte log header, 24-byte transaction headers, and 8-byte trailers remain
 visible for recovery framing. Each transaction payload is split into 32-KiB
 chunks and encrypted with AES-GCM. Associated data binds the log salt, final
 plaintext payload length, operation count, commit timestamp, chunk index, and
-logical-log version. The trailer CRC covers the encrypted bytes. Recovery also
+logical-log version. The trailer CRC covers the encrypted bytes; in a version 5
+log it is chained, continuing the previous frame's CRC (the first frame
+continues `crc32c(salt)`). The mirror keeps the persisted chain per log, so the
+plaintext frames the engine sees and the encrypted frames on disk are each
+chained over their own bytes. Recovery also
 requires the decoded operation count to consume the authenticated payload
 exactly; trailing bytes are corruption rather than forward-compatible padding.
 

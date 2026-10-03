@@ -15,7 +15,7 @@ internal static class SqliteBuiltinFunctions
         // Built-in aggregates (IsBuiltInAggregate) and managed percentile aggregates.
         "COUNT", "SUM", "TOTAL", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "ARRAY_AGG",
         "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT", "JSONB_GROUP_ARRAY", "JSONB_GROUP_OBJECT",
-        "MEDIAN", "MODE", "PERCENTILE", "PERCENTILE_CONT", "PERCENTILE_DISC",
+        "MEDIAN", "MODE", "PERCENTILE", "PERCENTILE_CONT", "PERCENTILE_DISC", "STDDEV",
         // Built-in window functions (ValidateWindowFunction).
         "ROW_NUMBER", "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST", "NTILE",
         "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE",
@@ -44,6 +44,7 @@ internal static class SqliteBuiltinFunctions
         "SQLITE_VERSION", "TURSO_VERSION", "SQLITE_SOURCE_ID", "CHANGES", "TOTAL_CHANGES", "TIMEDIFF",
         "TIME_DATE",
         "IS_AUTOCOMMIT",
+        "CONN_TXN_ID", "TABLE_COLUMNS_JSON_ARRAY", "BIN_RECORD_JSON_OBJECT",
         "COALESCE", "DATE", "DATETIME", "GLOB", "HEX", "IFNULL", "INSTR",
         "JSON", "JSONB", "JSON_ARRAY", "JSONB_ARRAY", "JSON_ARRAY_LENGTH", "JSON_ERROR_POSITION",
         "JSON_EXTRACT", "JSONB_EXTRACT", "JSON_INSERT", "JSONB_INSERT", "JSON_OBJECT", "JSONB_OBJECT",
@@ -78,7 +79,7 @@ internal static class SqliteBuiltinFunctions
     {
         "COUNT", "SUM", "TOTAL", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "ARRAY_AGG",
         "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT", "JSONB_GROUP_ARRAY", "JSONB_GROUP_OBJECT",
-        "MEDIAN", "MODE", "PERCENTILE", "PERCENTILE_CONT", "PERCENTILE_DISC",
+        "MEDIAN", "MODE", "PERCENTILE", "PERCENTILE_CONT", "PERCENTILE_DISC", "STDDEV",
     };
 
     // Function names whose result can change between invocations even when the underlying
@@ -95,6 +96,7 @@ internal static class SqliteBuiltinFunctions
         "TOTAL_CHANGES",
         "LAST_INSERT_ROWID",
         "IS_AUTOCOMMIT",
+        "CONN_TXN_ID",
         "SQLITE_VERSION",
         "TURSO_VERSION",
         "SQLITE_SOURCE_ID",
@@ -248,7 +250,7 @@ internal static class SqliteBuiltinFunctions
             or "PERCENTILE" or "PERCENTILE_CONT" or "PERCENTILE_DISC" or "NTH_VALUE"
             or "ATAN2" or "POW" or "POWER" or "GCD" or "LCM" or "MOD" or "REPEAT"
             or "GLOB" or "INSTR" or "STRPOS" or "NULLIF" or "IFNULL" or "LIKELIHOOD" or "TIMEDIFF"
-            or "JSON_PATCH" or "JSONB_PATCH"
+            or "JSON_PATCH" or "JSONB_PATCH" or "BIN_RECORD_JSON_OBJECT"
             or "VECTOR_DISTANCE_COS" or "VECTOR_DISTANCE_L2" or "VECTOR_DISTANCE_JACCARD"
             or "VECTOR_DISTANCE_DOT" or "RTREENODE")
         {

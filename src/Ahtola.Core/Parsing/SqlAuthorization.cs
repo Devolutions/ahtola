@@ -324,6 +324,14 @@ internal static class SqlAuthorization
                 PragmaListTypesStatement => ("list_types", null),
                 PragmaFunctionListStatement => ("function_list", null),
                 PragmaModuleListStatement => ("module_list", null),
+                PragmaMvccGroupCommitStatement pragma => ("mvcc_group_commit", Flag(pragma.Enabled)),
+                PragmaFtsMergeThresholdStatement pragma => (
+                    "fts_merge_threshold",
+                    pragma.Value?.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                PragmaListStatement => ("pragma_list", null),
+                // The key itself is never handed to the authorizer.
+                PragmaEncryptionStatement { Setting: PragmaEncryptionSetting.HexKey } => ("hexkey", null),
+                PragmaEncryptionStatement pragma => ("cipher", pragma.Value),
                 PragmaHeaderIntegerStatement pragma => (
                     pragma.Kind switch
                     {

@@ -339,7 +339,7 @@ public sealed partial class ManagedEmbeddedReplicaConnectionTests
             using var replica = new Ahtola.Data.Sqlite.SqliteConnection(
                 $"Data Source=https://example.test/cluster;Replica Path={path};Local Provider=Managed;Pooling=False;"
                 + "Sync Client Name=facade;Sync Long Poll Timeout=250;Push Operations Threshold=1;"
-                + "Automatic Sync Mode=PullOnly;Sync Experimental Features=views,strict")
+                + "Automatic Sync Mode=PullOnly;Sync Experimental Features=custom_types,strict")
             {
                 AuthTokenProvider = _ => ValueTask.FromResult<string?>(
                     "facade-" + Interlocked.Increment(ref tokens).ToString(System.Globalization.CultureInfo.InvariantCulture)),

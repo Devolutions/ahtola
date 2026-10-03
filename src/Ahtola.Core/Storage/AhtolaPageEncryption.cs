@@ -37,6 +37,44 @@ public enum AhtolaEncryptionCipher : byte
 }
 
 /// <summary>
+/// SQL-facing cipher names, matching Turso's <c>CipherMode</c> <c>TryFrom&lt;&amp;str&gt;</c>
+/// aliases and <c>Display</c> output (<c>core/storage/encryption.rs</c>).
+/// </summary>
+internal static class AhtolaEncryptionCipherNames
+{
+    public static bool TryParse(string? value, out AhtolaEncryptionCipher cipher)
+    {
+        AhtolaEncryptionCipher? parsed = value?.Trim().ToLowerInvariant() switch
+        {
+            "aes128gcm" or "aes-128-gcm" or "aes_128_gcm" => AhtolaEncryptionCipher.Aes128Gcm,
+            "aes256gcm" or "aes-256-gcm" or "aes_256_gcm" => AhtolaEncryptionCipher.Aes256Gcm,
+            "aegis256" or "aegis-256" or "aegis_256" => AhtolaEncryptionCipher.Aegis256,
+            "aegis128l" or "aegis-128l" or "aegis_128l" => AhtolaEncryptionCipher.Aegis128L,
+            "aegis128x2" or "aegis-128x2" or "aegis_128x2" => AhtolaEncryptionCipher.Aegis128X2,
+            "aegis128x4" or "aegis-128x4" or "aegis_128x4" => AhtolaEncryptionCipher.Aegis128X4,
+            "aegis256x2" or "aegis-256x2" or "aegis_256x2" => AhtolaEncryptionCipher.Aegis256X2,
+            "aegis256x4" or "aegis-256x4" or "aegis_256x4" => AhtolaEncryptionCipher.Aegis256X4,
+            _ => null,
+        };
+        cipher = parsed.GetValueOrDefault();
+        return parsed.HasValue;
+    }
+
+    public static string Format(AhtolaEncryptionCipher cipher) => cipher switch
+    {
+        AhtolaEncryptionCipher.Aes128Gcm => "aes128gcm",
+        AhtolaEncryptionCipher.Aes256Gcm => "aes256gcm",
+        AhtolaEncryptionCipher.Aegis256 => "aegis256",
+        AhtolaEncryptionCipher.Aegis128L => "aegis128l",
+        AhtolaEncryptionCipher.Aegis128X2 => "aegis128x2",
+        AhtolaEncryptionCipher.Aegis128X4 => "aegis128x4",
+        AhtolaEncryptionCipher.Aegis256X2 => "aegis256x2",
+        AhtolaEncryptionCipher.Aegis256X4 => "aegis256x4",
+        _ => throw new ArgumentOutOfRangeException(nameof(cipher), cipher, null),
+    };
+}
+
+/// <summary>
 /// Supplies the page-encryption key for a Ahtola encrypted SQLite database.
 /// AES-GCM is provided by .NET; the AEGIS variants are implemented in managed
 /// code so their page bytes match the Rust engine exactly on every target,

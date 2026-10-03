@@ -7,7 +7,7 @@
       "repo": "tursodatabase/turso",
       "tag": "v0.7.2",
       "commit": "046e9cbf6",
-      "submodule": "historical analysis baseline; current read-only submodule is v0.8.0-pre.7 (277ddd050)"
+      "submodule": "historical analysis baseline; current read-only submodule is v0.8.1 (8549c1659)"
     },
     "ahtola_ref": {
       "branch": "copilot/ahtola-turso-gap-analysis",
@@ -17,40 +17,40 @@
     "current_conformance_expected_failures": 109,
     "current_conformance_expected_failures_note": "Integrated work closes the original SQL/window/CTE correctness groups, 24 new SQL-extension, 14 generated-column/reserved-name, three legacy-view, safe ATTACH routing/CDC/sequence behavior, and the cycling-sequence commit failure. Non-cycling watermarks are repaired; its private row-count representation remains different. Multiple memory-only databases can commit atomically; any physical database write must be the transaction's sole database mutation. The planner and Plan/EXPLAIN parity work closes 31 additional conformance markers, including JSON EQP, grouped-derived probes, and correlated-IN automatic-index cursor allocation. Other assigned gaps and intentional feature/representation/eager-corruption differences remain. Executing the previously CLI-gated turso/fts.sqltest corpus adds five markers, all the CLI \"Parse error:\" prefix on otherwise identical MATCH-context errors. Refreshing the corpus to the pinned v0.8.1 content (33 new and 41 refreshed files) exposed 113 markers; the v0.8.1 parity work closed 80 of them (and two older generated-column integrity markers), and the remaining 33 are planner/EQP shapes the evaluator route does not execute plus documented storage-mode and message policies. These are not 109 independent bugs. The remaining-gap plan tracks current work; the 217 closed records below are historical dispositions.",
     "current_execution_plan": "docs/turso-remaining-gap-plan.md",
-    "last_reconciled": "2026-09-23",
-    "entry_count": 217,
+    "last_reconciled": "2026-10-02",
+    "entry_count": 229,
     "counts": {
       "by_layer": {
         "vdbe": 38,
-        "compilation": 68,
-        "parser": 29,
-        "functions": 26,
+        "compilation": 69,
+        "parser": 30,
+        "functions": 28,
         "storage": 23,
-        "mvcc": 14,
-        "sync": 18,
-        "pragma": 1
+        "mvcc": 15,
+        "sync": 20,
+        "pragma": 6
       },
       "by_kind": {
-        "missing": 69,
-        "partial": 8,
-        "divergent": 73,
+        "missing": 73,
+        "partial": 10,
+        "divergent": 78,
         "extension": 9,
         "parity": 57,
-        "intentional-divergence": 1
+        "intentional-divergence": 2
       },
       "by_severity": {
-        "s1-correctness": 39,
-        "s2-capability": 90,
+        "s1-correctness": 41,
+        "s2-capability": 99,
         "s3-perf": 33,
-        "s4-intentional": 55
+        "s4-intentional": 56
       },
       "by_effort": {
-        "S": 101,
-        "M": 76,
+        "S": 111,
+        "M": 78,
         "L": 40
       },
       "by_status": {
-        "closed": 217
+        "closed": 229
       }
     },
     "schema": {
@@ -3174,6 +3174,150 @@
       "effort": "L",
       "conformance_links": [],
       "notes": "Opened and closed 2026-08-24 by managed-vector-index as a recorded divergence, completed for the exact managed subset on 2026-08-26. Dense float32/float64/float8/float1bit l2/cosine/dot uses Ahtola's exact-certificate IVF-Flat design. float32_sparse/Jaccard now uses a separate versioned inverted index with bounded state decoding and candidate accumulation, deterministic rowid tie ordering, transactional DML/savepoint/rollback maintenance, REINDEX/Optimize, reopen/WAL/VACUUM recovery, and exhaustive exact fallback. It deliberately does not port Turso toy_vector_sparse_ivf's unbounded delta/scan_portion/scan_order approximations or two-private-btree layout. exact=0 remains rejected, so no supported configuration returns a different row set from the scalar query. See docs/managed-vector-index.md.",
+      "status": "closed"
+    },
+    {
+      "id": "pragma-encryption-hexkey-cipher-silent-noop",
+      "layer": "pragma",
+      "kind": "divergent",
+      "turso_ref": "turso-src/core/translate/pragma.rs (PragmaName::EncryptionKey/EncryptionCipher update and query arms); turso-src/core/connection.rs::set_encryption_key/ensure_can_change_encryption_settings; turso-src/core/connection.rs::from_uri_attached (cipher/hexkey URI options)",
+      "ahtola_ref": "src/Ahtola.Core/Parsing/SqlParser.cs::ParsePragma; src/Ahtola.Core/EmbeddedDatabase.cs::ExecutePragmaEncryption/ResolveAttachmentPath/ExecuteAttach; src/Ahtola.Core/Storage/AhtolaPageEncryption.cs::AhtolaEncryptionCipherNames; src/Ahtola.Tests/ManagedEncryptionPragmaTests.cs",
+      "severity": "s1-correctness",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 by the v0.8.1 gap audit. PRAGMA hexkey/cipher fell through to the unrecognized-pragma no-op, and ATTACH file: URI cipher/hexkey options were skipped, so a caller asking for encryption silently got a plaintext database. The query forms now report Turso's session state (the hexkey message never echoes the key; cipher returns its Turso name or no row). The assignment forms validate the value with Turso's diagnostics, then fail: an encrypted session reports Turso's 'cannot reset encryption attributes if already set in the session'; an unencrypted managed connection, which validates its file at open, reports that encryption must be configured when the database is opened. ATTACH URI cipher+hexkey now opens the attachment through its own AhtolaEncryptionFileSystem, requires both options (Turso's messages), and cannot be combined with ATTACH ... KEY.",
+      "status": "closed"
+    },
+    {
+      "id": "sync-replica-client-callbacks-rejected",
+      "layer": "sync",
+      "kind": "missing",
+      "turso_ref": "turso-src/bindings/dotnet/src/Turso.Data.Sqlite/SqliteConnection.cs::RegisterManagedReplicaCallbacks; SqliteConnection.Functions.cs (ThrowIfDirectRemote only)",
+      "ahtola_ref": "src/Ahtola.Data/AhtolaConnectionCapabilities.cs::ForSqliteReplica; src/Ahtola.Data.Sqlite/SqliteConnection.cs::CallbackConnection/ApplyReplicaConnectionOptions; src/Ahtola.Data/AhtolaConnection.cs::ManagedReplicaDatabaseRestored; src/Ahtola.Tests/ManagedReplicaCallbackAndFeatureTests.cs",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 by the v0.8.1 gap audit. CreateFunction/CreateAggregate/CreateCollation threw NotSupportedException on every embedded replica, although a managed replica executes all statements on its local managed database (and Turso registers them on the replica's local handle). Managed replicas now advertise the three capabilities, apply registrations made before or after open to the local database under the replica operation lease, and re-register them when a sync publication reopens that database. EF Core's InitializeAhtolaConnection therefore registers its regexp/instr helpers on replicas too. Replicas opened through a registered native sync companion keep the capabilities off.",
+      "status": "closed"
+    },
+    {
+      "id": "sync-experimental-features-silently-ignored",
+      "layer": "sync",
+      "kind": "divergent",
+      "turso_ref": "turso-src/bindings/dotnet/src/Turso.Data/TursoSyncDatabase.cs (ExperimentalFeatures forwarded); turso-src/sdk-kit/src/rsapi.rs::TursoDatabaseConfig::database_opts",
+      "ahtola_ref": "src/Ahtola.Data/AhtolaSyncExperimentalFeatures.cs; src/Ahtola.Data/AhtolaReplicaProvider.cs::AhtolaReplicaOptions.ExperimentalFeatures; src/Ahtola.Data/AhtolaConnection.cs::ApplyManagedReplicaFeatures; src/Ahtola.Core/ManagedLocalAdapters.cs::IManagedConnectionAdapter.ExperimentalCustomTypesEnabled",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 by the v0.8.1 gap audit. 'Sync Experimental Features' was format-checked and dropped, although the managed engine does gate custom types. AhtolaReplicaOptions.ExperimentalFeatures now carries the list (verbatim for a registered sync companion, as Turso forwards it). The managed replica accepts the names its engine always provides (strict, index_method, vacuum, encryption, attach, generated_columns, without_rowid, multiprocess_wal), enables the restricted TYPE/DOMAIN subset for custom_types (reapplied after publication reopen), and rejects views (incremental materialized views), autovacuum and mvcc_passive_checkpoint with NotSupportedException. Unknown names are rejected with ArgumentException, which is stricter than Turso's silent ignore by design.",
+      "status": "closed"
+    },
+    {
+      "id": "func-stddev-aggregate",
+      "layer": "functions",
+      "kind": "missing",
+      "turso_ref": "turso-src/core/percentile.rs::StandardDeviation (registered by core/ext/mod.rs)",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::EvaluateStandardDeviationAggregate; src/Ahtola.Tests/TursoV081PragmaAndAggregateGapTests.cs",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass). stddev(X) is the sample standard deviation by Welford's algorithm over integer, real and numeric-text arguments; NULL and BLOB are skipped and fewer than two values give NULL, matching Turso.",
+      "status": "closed"
+    },
+    {
+      "id": "pragma-table-valued-function-family",
+      "layer": "pragma",
+      "kind": "partial",
+      "turso_ref": "turso-src/core/pragma.rs::PragmaVirtualTable (one function per Result0/Result1 pragma)",
+      "ahtola_ref": "src/Ahtola.Core/TableValuedFunctions.cs::QueryPragmas; src/Ahtola.Core/TableValuedFunctionModules.cs::PragmaQueryModule/ConnectionScope; src/Ahtola.Core/EmbeddedDatabase.cs::QueryPragmaForSchema",
+      "severity": "s2-capability",
+      "effort": "M",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass). Only 11 pragma_* functions existed. Every Turso Result0 pragma now has one with Turso's column names and its hidden schema argument when the pragma takes a schema. Each runs the query form on the calling connection (connection settings are per connection, and the function can never set a value). The schema argument routes to an attached database, which Turso rejects as not supported yet.",
+      "status": "closed"
+    },
+    {
+      "id": "pragma-list-group-commit-fts-threshold",
+      "layer": "pragma",
+      "kind": "missing",
+      "turso_ref": "turso-src/core/translate/pragma.rs::list_pragmas, PragmaName::MvccGroupCommit, PragmaName::FtsMergeThreshold",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::PragmaListNames/ExecutePragmaMvccGroupCommit/ExecutePragmaFtsMergeThreshold",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass). These were silent no-ops. pragma_list returns Turso's names in PragmaName order (non-Apple build) plus Ahtola's three extra pragmas. fts_merge_threshold uses Turso's default (32) and validation and is connection state: Ahtola's FTS index merges by size tier on its own. mvcc_group_commit requires MVCC like Turso, reports 0 and refuses ON because the managed log syncs each commit.",
+      "status": "closed"
+    },
+    {
+      "id": "pragma-list-types-columns",
+      "layer": "pragma",
+      "kind": "divergent",
+      "turso_ref": "turso-src/core/pragma.rs::pragma_for(ListTypes); core/translate/pragma.rs ListTypes query",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::ExecutePragmaListTypes/ListTypesColumns",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass). PRAGMA list_types used table_info's column names. It now reports Turso's type/parent/encode/decode/default/operators and lists registered TYPE and DOMAIN definitions (base type and literal default) after the five built-in types.",
+      "status": "closed"
+    },
+    {
+      "id": "func-cdc-record-decoders",
+      "layer": "functions",
+      "kind": "missing",
+      "turso_ref": "turso-src/core/vdbe/execute.rs::ScalarFunc::TableColumnsJsonArray/BinRecordJsonObject/ConnTxnId",
+      "ahtola_ref": "src/Ahtola.Core/EmbeddedDatabase.cs::EvaluateTableColumnsJsonArray/EvaluateBinRecordJsonObject/EvaluateConnTxnId; src/Ahtola.Tests/TursoV081ChangeDataCaptureGapTests.cs",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass). table_columns_json_array and bin_record_json_object decode CDC before/after records into JSON with Turso's results and error messages. conn_txn_id(candidate) keeps the first candidate for the transaction (the statement in autocommit mode); with capture on it is the id capture stamps on change rows.",
+      "status": "closed"
+    },
+    {
+      "id": "parser-attach-detach-name-expressions",
+      "layer": "parser",
+      "kind": "partial",
+      "turso_ref": "turso-src/core/translate/attach.rs (database name is an expression)",
+      "ahtola_ref": "src/Ahtola.Core/Parsing/SqlParser.cs::ParseDatabaseNameOperand; src/Ahtola.Core/EmbeddedDatabase.cs::EvaluateDatabaseName",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass). ATTACH ... AS name and DETACH name required an identifier. A string literal or bare identifier is now the name itself and any other expression (a bound parameter, a concatenation) is evaluated when the statement runs, as in Turso.",
+      "status": "closed"
+    },
+    {
+      "id": "mvcc-logical-log-chained-crc",
+      "layer": "mvcc",
+      "kind": "divergent",
+      "turso_ref": "turso-src/core/mvcc/persistent_storage/logical_log.rs (crc32c_append chaining, derive_initial_crc)",
+      "ahtola_ref": "src/Ahtola.Core/Mvcc/MvccLogicalLog.cs (ChainedLogVersion, EnsureRunningCrc); src/Ahtola.Data.Sqlite.Browser/Storage/BrowserEncryptedPersistence.cs (_mvccChains); src/Ahtola.Tests/MvccLogicalLogChainedCrcTests.cs",
+      "severity": "s1-correctness",
+      "effort": "M",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass). Each frame's CRC was computed on its own, so a reordered or replaced frame still validated. Version 5 logs (new and checkpoint-truncated) chain the CRC from the previous frame, seeded by crc32c(salt) as Turso does, on the desktop log, the browser's persisted encrypted frames and its plaintext mirror. V3 and V4 logs stay readable and appendable and adopt V5 when truncated. MVEX frames, OP_UPDATE_HEADER, portable changes and LogTxFrameInfo stay out of scope: Ahtola's log is not file-compatible with Turso's.",
+      "status": "closed"
+    },
+    {
+      "id": "compile-index-directive-blocks-hash-join",
+      "layer": "compilation",
+      "kind": "divergent",
+      "turso_ref": "turso-src/core/translate/optimizer/access_method.rs::should_not_use_hash_join (has_indexed_by_directives), lines 916/991",
+      "ahtola_ref": "src/Ahtola.Core/Compilation/JoinOrdering/JoinOrderModel.cs::JoinSegmentMember.HasIndexDirective; src/Ahtola.Core/Compilation/JoinOrdering/JoinOrderEnumerator.cs",
+      "severity": "s2-capability",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Opened and closed 2026-10-02 (v0.8.1 audit, second pass); listed as a known follow-up in turso-remaining-gap-plan.md. INDEXED BY / NOT INDEXED on either side of a join now rules out the hash join and the temporary index, so the access path the SQL named is kept.",
+      "status": "closed"
+    },
+    {
+      "id": "pragma-journal-mode-change-while-cdc-active",
+      "layer": "pragma",
+      "kind": "intentional-divergence",
+      "turso_ref": "turso-src/core/vdbe/execute.rs (JournalMode: 'cannot change journal_mode ... while CDC capture is active')",
+      "ahtola_ref": "src/Ahtola.Core/ChangeDataCapture.cs; src/Ahtola.Tests/TursoV081ChangeDataCaptureGapTests.cs::CaptureKeepsRecordingAcrossJournalModeChanges",
+      "severity": "s4-intentional",
+      "effort": "S",
+      "conformance_links": [],
+      "notes": "Recorded 2026-10-02 (v0.8.1 audit, second pass). Turso 0.8 rejects a journal_mode change while capture is on because its capture would silently stop. Ahtola's capture writes through the catalog in every mode and keeps recording across the change (covered by a test), so Ahtola allows it rather than imitating the limitation.",
       "status": "closed"
     }
   ]

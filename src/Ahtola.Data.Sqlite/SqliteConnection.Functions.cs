@@ -14,15 +14,18 @@ public partial class SqliteConnection
     {
         ArgumentNullException.ThrowIfNull(name);
         if (!Capabilities.SupportsUserDefinedFunctions)
-            throw new NotSupportedException("User-defined functions are supported only for local database connections.");
-            // Shared-memory catalogs are process-wide for the named database. Scalar
-            // registrations are therefore catalog-scoped (visible to every lease), which is
-            // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.
-            if (function is null)
+            throw new NotSupportedException("User-defined functions are supported only for local database and managed embedded replica connections.");
+        // Shared-memory catalogs are process-wide for the named database. Scalar
+        // registrations are therefore catalog-scoped (visible to every lease), which is
+        // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.
+        if (function is null)
         {
             RemoveFunctionRegistrations(_scalarFunctions, name);
-            if (IsManagedConnection)
-                ManagedConnection.UnregisterScalarFunctions(name);
+            if (CallbackConnection is { } managedConnection)
+            {
+                using var replicaOperation = EnterCallbackRegistration();
+                managedConnection.UnregisterScalarFunctions(name);
+            }
             else if (_database is not null)
                 SqliteNativeProvider.Current.UnregisterFunctions(NativeDatabase, name);
             return;
@@ -30,26 +33,29 @@ public partial class SqliteConnection
 
         var registration = new ScalarFunctionRegistration(name, argc, isDeterministic, function);
         _scalarFunctions[new FunctionSignature(name, argc)] = registration;
-        if (IsManagedConnection)
+        if (CallbackConnection is { } connection)
         {
-            ManagedConnection.UnregisterScalarFunctions(name);
+            using var replicaOperation = EnterCallbackRegistration();
+            connection.UnregisterScalarFunctions(name);
             foreach (var registeredFunction in _scalarFunctions.Where(
                          pair => string.Equals(pair.Key.Name, name, StringComparison.OrdinalIgnoreCase))
                      .Select(static pair => pair.Value))
             {
-                registeredFunction.RegisterManaged(ManagedConnection);
+                registeredFunction.RegisterManaged(connection);
             }
         }
         else if (_database is not null)
             registration.RegisterNative(NativeDatabase);
     }
 
-    private void RegisterScalarFunctions()
+    private void RegisterScalarFunctions() => RegisterScalarFunctions(CallbackConnection);
+
+    private void RegisterScalarFunctions(IManagedConnectionAdapter? managedConnection)
     {
-        if (IsManagedConnection)
+        if (managedConnection is not null)
         {
             foreach (var registration in _scalarFunctions.Values)
-                registration.RegisterManaged(ManagedConnection);
+                registration.RegisterManaged(managedConnection);
             return;
         }
 

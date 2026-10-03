@@ -388,7 +388,7 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
                             + MvccLogicalLogFormat.GetEncryptedPayloadSize(plaintextSize);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
             log.AsSpan(trailerOffset),
-            Crc32C.Compute(log.AsSpan(
+            MvccLogTestCrc.FirstFrame(log, log.AsSpan(
                 frameOffset,
                 trailerOffset - frameOffset)));
         store.Seed(logPath, log);
@@ -426,6 +426,17 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
             log.AsSpan(MvccLogicalLogFormat.LogHeaderCrcStart),
             Crc32C.Compute(log.AsSpan(0, MvccLogicalLogFormat.LogHeaderSize)));
+        // Forge the unkeyed frame CRC for the downgraded version as well, so only the
+        // authenticated version byte can reject the frame.
+        var versionFrameOffset = MvccLogicalLogFormat.LogHeaderSize;
+        var versionPlaintextSize = checked((int)System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(
+            log.AsSpan(versionFrameOffset + 4)));
+        var versionTrailerOffset = versionFrameOffset
+                                   + MvccLogicalLogFormat.TxHeaderSize
+                                   + MvccLogicalLogFormat.GetEncryptedPayloadSize(versionPlaintextSize);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+            log.AsSpan(versionTrailerOffset),
+            MvccLogTestCrc.FirstFrame(log, log.AsSpan(versionFrameOffset, versionTrailerOffset - versionFrameOffset)));
         store.Seed(logPath, log);
 
         var failure = await Capture(() => BrowserHarness.CreateAsync(store, Aes256Key));
@@ -469,7 +480,7 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
             checked((ulong)(originalSize + delta)));
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
             log.AsSpan(originalTrailerOffset),
-            Crc32C.Compute(log.AsSpan(
+            MvccLogTestCrc.FirstFrame(log, log.AsSpan(
                 frameOffset,
                 originalTrailerOffset - frameOffset)));
         store.Seed(logPath, log);
@@ -591,6 +602,7 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
         _ = MvccLogicalLogFormat.ValidateHeader(image);
         var position = MvccLogicalLogFormat.LogHeaderSize;
         var count = 0;
+        var runningCrc = MvccLogTestCrc.InitialCrc(image);
         while (position < image.Length)
         {
             var (payloadSize, _, _) = MvccLogicalLogFormat.ReadFrameHeader(
@@ -600,11 +612,12 @@ public sealed class AhtolaBrowserEncryptedStorageHardeningTests
                     image.AsSpan(trailerOffset + sizeof(uint)))
                 .Should()
                 .Be(MvccLogicalLogFormat.EndMagic);
-            System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(image.AsSpan(trailerOffset))
-                .Should()
-                .Be(Crc32C.Compute(image.AsSpan(
+            var storedCrc = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(image.AsSpan(trailerOffset));
+            storedCrc.Should()
+                .Be(MvccLogTestCrc.Frame(image, runningCrc, image.AsSpan(
                     position,
                     MvccLogicalLogFormat.TxHeaderSize + payloadSize)));
+            runningCrc = storedCrc;
             position = trailerOffset + MvccLogicalLogFormat.TxTrailerSize;
             count++;
         }

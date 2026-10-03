@@ -261,8 +261,9 @@ public sealed class TursoJson5FunctionAndPragmaGapTests
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
+        // Turso core/pragma.rs pragma_for(ListTypes).
         ColumnNames(connection, "PRAGMA list_types;")
-            .Should().Equal("name", "type", "notnull", "dflt_value", "pk", "hidden");
+            .Should().Equal("type", "parent", "encode", "decode", "default", "operators");
 
         var rows = ReadRows(connection, "PRAGMA list_types;");
         rows.Should().HaveCount(5);

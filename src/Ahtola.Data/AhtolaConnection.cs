@@ -23,6 +23,7 @@ public class AhtolaConnection :
     private AhtolaNativeDatabase? _nativeDatabase;
     private AhtolaReplicaDatabase? _replicaDatabase;
     private ManagedReplicaConnectionHost? _managedReplicaHost;
+    private bool _managedReplicaCustomTypes;
     private IManagedDatabaseAdapter? _managedDatabase;
     private readonly IManagedDatabaseFactory? _managedDatabaseFactory;
     private ManagedConnectionPoolLease? _managedPoolLease;
@@ -347,6 +348,7 @@ public class AhtolaConnection :
                 _nativeDatabase = null;
                 _replicaDatabase = null;
                 _managedReplicaHost = null;
+                _managedReplicaCustomTypes = false;
                 _managedDatabase = null;
                 _managedPoolLease = null;
                 _managedEncryptionFileSystem = null;
@@ -1188,13 +1190,31 @@ public class AhtolaConnection :
 
     }
 
+    /// <summary>
+    /// Invoked after a publication reopened this connection's managed replica database, so a
+    /// facade can re-register client callbacks (functions, aggregates, collations) on the new
+    /// adapter. Runs inside the publication; it must not enter a replica operation.
+    /// </summary>
+    internal Action<IManagedConnectionAdapter>? ManagedReplicaDatabaseRestored { get; set; }
+
+    /// <summary>
+    /// The local managed connection of an open managed embedded replica, or null for any
+    /// other mode (including a replica opened through a native sync companion).
+    /// </summary>
+    internal IManagedConnectionAdapter? ManagedReplicaConnection
+        => _managedReplicaHost is not null ? _managedDatabase?.Connection : null;
+
+    internal ManagedReplicaConnectionHost? ManagedReplicaHostForTesting => _managedReplicaHost;
+
     internal void RestoreManagedReplicaDatabase(IManagedDatabaseAdapter database)
     {
         ArgumentNullException.ThrowIfNull(database);
         _managedDatabase = database;
         try
         {
+            ApplyManagedReplicaFeatures(database.Connection);
             ApplyManagedConnectionOptions(database.Connection);
+            ManagedReplicaDatabaseRestored?.Invoke(database.Connection);
         }
         catch
         {
@@ -1773,10 +1793,13 @@ public class AhtolaConnection :
 
     private void OpenManagedReplica(AhtolaReplicaOptions options)
     {
+        var customTypes = AhtolaSyncExperimentalFeatures.ResolveManaged(options.ExperimentalFeatures);
         var replicaHost = ManagedReplicaConnectionHost.Open(options);
         try
         {
             SetManagedReplicaHost(replicaHost);
+            _managedReplicaCustomTypes = customTypes;
+            ApplyManagedReplicaFeatures(replicaHost.Database.Connection);
             ApplyManagedConnectionOptions();
             StartAutomaticManagedReplicaSync(replicaHost);
         }
@@ -1791,10 +1814,13 @@ public class AhtolaConnection :
 
     private async Task OpenManagedReplicaAsync(AhtolaReplicaOptions options, CancellationToken cancellationToken)
     {
+        var customTypes = AhtolaSyncExperimentalFeatures.ResolveManaged(options.ExperimentalFeatures);
         var replicaHost = await ManagedReplicaConnectionHost.OpenAsync(options, cancellationToken).ConfigureAwait(false);
         try
         {
             SetManagedReplicaHost(replicaHost);
+            _managedReplicaCustomTypes = customTypes;
+            ApplyManagedReplicaFeatures(replicaHost.Database.Connection);
             await ApplyManagedConnectionOptionsAsync(cancellationToken).ConfigureAwait(false);
             StartAutomaticManagedReplicaSync(replicaHost);
         }
@@ -2235,6 +2261,16 @@ public class AhtolaConnection :
                 + (_connectionOptions.RecursiveTriggers ? "1" : "0")
                 + ";");
         }
+    }
+
+    /// <summary>
+    /// Applies the <c>Sync Experimental Features</c> the managed replica resolved at open. Runs
+    /// again after a publication reopens the local database, which starts with defaults.
+    /// </summary>
+    private void ApplyManagedReplicaFeatures(IManagedConnectionAdapter connection)
+    {
+        if (_managedReplicaCustomTypes)
+            connection.ExperimentalCustomTypesEnabled = true;
     }
 
     private void ApplyManagedConnectionOptions(IManagedConnectionAdapter connection)

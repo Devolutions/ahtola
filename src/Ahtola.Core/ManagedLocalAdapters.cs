@@ -192,6 +192,21 @@ public interface IManagedConnectionAdapter : IDisposable, IAsyncDisposable
         set { }
     }
 
+    /// <summary>
+    /// Opts the connection into the engine's experimental TYPE/DOMAIN declarations
+    /// (<see cref="EmbeddedConnection.ExperimentalCustomTypesEnabled"/>). Adapters without
+    /// that switch reject enabling it rather than silently ignoring the request.
+    /// </summary>
+    bool ExperimentalCustomTypesEnabled
+    {
+        get => false;
+        set
+        {
+            if (value)
+                throw new NotSupportedException("Experimental custom types are not supported by this connection adapter.");
+        }
+    }
+
     void ResetForPooling()
         => throw new NotSupportedException("This managed connection adapter does not support pooling.");
 
@@ -562,6 +577,12 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     {
         get => GetConnection().BusyTimeout;
         set => GetConnection().BusyTimeout = value;
+    }
+
+    public bool ExperimentalCustomTypesEnabled
+    {
+        get => GetConnection().ExperimentalCustomTypesEnabled;
+        set => GetConnection().ExperimentalCustomTypesEnabled = value;
     }
 
     public IManagedStatementAdapter Prepare(string sql)

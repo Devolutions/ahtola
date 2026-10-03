@@ -41,7 +41,8 @@ internal sealed class BrowserPlaintextCapture(
     int pageSize,
     uint journalChecksumNonce,
     ulong mvccSalt = 0,
-    byte mvccVersion = 0)
+    byte mvccVersion = 0,
+    uint mvccPreviousCrc = 0)
 {
     internal BrowserPersistedFileKind Kind { get; } = kind;
 
@@ -60,6 +61,12 @@ internal sealed class BrowserPlaintextCapture(
 
     /// <summary>The authenticated logical-log format version, valid only for MVCC captures.</summary>
     internal byte MvccVersion { get; } = mvccVersion;
+
+    /// <summary>
+    /// For a chained (version 5) MVCC frame, the plaintext CRC it continues: the previous
+    /// frame's, or <c>crc32c(salt)</c> for the first frame.
+    /// </summary>
+    internal uint MvccPreviousCrc { get; } = mvccPreviousCrc;
 }
 
 /// <summary>
@@ -71,7 +78,8 @@ internal sealed class BrowserPersistedWrite(
     byte[] bytes,
     string path,
     BrowserWalChainUpdate? walUpdate,
-    long? persistedLength = null)
+    long? persistedLength = null,
+    BrowserMvccChainUpdate? mvccUpdate = null)
 {
     internal long Position { get; } = position;
 
@@ -83,7 +91,16 @@ internal sealed class BrowserPersistedWrite(
 
     /// <summary>A transformed file length to publish after this write succeeds.</summary>
     internal long? PersistedLength { get; } = persistedLength;
+
+    /// <summary>The persisted MVCC log CRC chain state to commit once this write succeeds.</summary>
+    internal BrowserMvccChainUpdate? MvccUpdate { get; } = mvccUpdate;
 }
+
+/// <summary>
+/// The persisted (encrypted) MVCC log's chained CRC after one write: the persisted length
+/// the next frame starts at and the CRC it continues.
+/// </summary>
+internal sealed record BrowserMvccChainUpdate(long PersistedEnd, uint Crc);
 
 /// <summary>The WAL rolling-checksum state produced by transforming one WAL region.</summary>
 internal sealed class BrowserWalChainUpdate(
@@ -157,6 +174,9 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     private const int RoleProbeLength = 16;
 
     private readonly Dictionary<string, WalChain> _walChains = new(StringComparer.Ordinal);
+
+    // Persisted MVCC log CRC chains (version 5 logs), keyed like _walChains.
+    private readonly Dictionary<string, BrowserMvccChainUpdate> _mvccChains = new(StringComparer.Ordinal);
     private readonly BrowserPersistedFileRoles _roles = new();
     private Func<string, bool>? _basePathExists;
 
@@ -220,7 +240,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     {
         var kind = ClassifyForWrite(path, file);
         return kind == BrowserPersistedFileKind.MvccLog
-            ? GetMvccPersistedLength(path, file, logicalLength)
+            ? GetMvccPersistedLength(path, file, logicalLength, out _)
             : logicalLength;
     }
 
@@ -250,6 +270,8 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     /// <summary>Commits WAL chain state after its transformed bytes reached OPFS.</summary>
     internal void CommitWrite(BrowserPersistedWrite write)
     {
+        if (write.MvccUpdate is { } mvccUpdate)
+            _mvccChains[write.Path] = mvccUpdate;
         if (write.WalUpdate is not { } update)
             return;
 
@@ -277,12 +299,17 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     }
 
     /// <summary>Forgets any cached state for a recreated file.</summary>
-    internal void NotifyCreated(string path) => _walChains.Remove(path);
+    internal void NotifyCreated(string path)
+    {
+        _walChains.Remove(path);
+        _mvccChains.Remove(path);
+    }
 
     /// <summary>Forgets any cached state for a deleted file.</summary>
     internal void NotifyDeleted(string path)
     {
         _walChains.Remove(path);
+        _mvccChains.Remove(path);
         _roles.Forget(path);
     }
 
@@ -293,12 +320,21 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             _walChains[destinationPath] = chain;
         else
             _walChains.Remove(destinationPath);
+        if (_mvccChains.Remove(sourcePath, out var mvccChain))
+            _mvccChains[destinationPath] = mvccChain;
+        else
+            _mvccChains.Remove(destinationPath);
         _roles.Rename(sourcePath, destinationPath);
     }
 
     /// <summary>Drops WAL frame checksums that a truncation removed.</summary>
     internal void NotifyLengthSet(string path, long length)
     {
+        // Lengths here are persisted lengths. A truncation that cuts into the recorded MVCC
+        // chain (to the header after a checkpoint) forgets it; the next header write resets it.
+        if (_mvccChains.TryGetValue(path, out var mvccChain) && length < mvccChain.PersistedEnd)
+            _mvccChains.Remove(path);
+
         if (!_walChains.TryGetValue(path, out var chain) || !chain.Initialized || chain.FrameSize <= 0)
             return;
         if (length < WalHeaderSize)
@@ -431,6 +467,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     public ValueTask DisposeAsync()
     {
         _walChains.Clear();
+        _mvccChains.Clear();
         return pages.DisposeAsync();
     }
 
@@ -494,9 +531,9 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
 
         var logHeader = ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path);
         var (salt, version) = MvccLogicalLogFormat.ValidateHeader(logHeader);
-        var persistedPosition = GetMvccPersistedLength(path, file, position);
+        var persistedPosition = GetMvccPersistedLength(path, file, position, out var previousCrc);
         var frame = ReadFileRegion(file, position, length, path);
-        ValidatePlaintextMvccFrame(frame, path);
+        ValidatePlaintextMvccFrame(frame, path, version, previousCrc);
         return new BrowserPlaintextCapture(
             BrowserPersistedFileKind.MvccLog,
             persistedPosition,
@@ -504,11 +541,26 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             pageSize: 0,
             journalChecksumNonce: 0,
             salt,
-            version);
+            version,
+            previousCrc);
     }
 
-    private static long GetMvccPersistedLength(string path, IFile file, long logicalLength)
+    /// <summary>Turso <c>derive_initial_crc</c>: the CRC the first chained frame continues.</summary>
+    private static uint InitialMvccCrc(ulong salt)
     {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, salt);
+        return Crc32C.Compute(bytes);
+    }
+
+    private static uint ComputeMvccFrameCrc(byte version, uint previousCrc, ReadOnlySpan<byte> frameBytes)
+        => version >= MvccLogicalLogFormat.ChainedVersion
+            ? Crc32C.Append(previousCrc, frameBytes)
+            : Crc32C.Compute(frameBytes);
+
+    private static long GetMvccPersistedLength(string path, IFile file, long logicalLength, out uint runningCrc)
+    {
+        runningCrc = 0;
         if (logicalLength is 0)
             return 0;
         if (logicalLength < MvccLogicalLogFormat.LogHeaderSize)
@@ -517,7 +569,8 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             throw new InvalidDataException($"MVCC logical length exceeds the mirror image for '{path}'.");
 
         var logHeader = ReadFileRegion(file, 0, MvccLogicalLogFormat.LogHeaderSize, path);
-        _ = MvccLogicalLogFormat.ValidateHeader(logHeader);
+        var (salt, version) = MvccLogicalLogFormat.ValidateHeader(logHeader);
+        runningCrc = InitialMvccCrc(salt);
         long logicalPosition = MvccLogicalLogFormat.LogHeaderSize;
         long persistedPosition = MvccLogicalLogFormat.LogHeaderSize;
         while (logicalPosition < logicalLength)
@@ -539,7 +592,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                 throw new InvalidDataException($"MVCC logical length cuts through a transaction frame in '{path}'.");
 
             var frame = ReadFileRegion(file, logicalPosition, logicalFrameSize, path);
-            ValidatePlaintextMvccFrame(frame, path);
+            runningCrc = ValidatePlaintextMvccFrame(frame, path, version, runningCrc);
             logicalPosition += logicalFrameSize;
             persistedPosition += checked(
                 MvccLogicalLogFormat.TxHeaderSize
@@ -550,7 +603,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         return persistedPosition;
     }
 
-    private static void ValidatePlaintextMvccFrame(ReadOnlySpan<byte> frame, string path)
+    private static uint ValidatePlaintextMvccFrame(ReadOnlySpan<byte> frame, string path, byte version, uint previousCrc)
     {
         var (payloadSize, _, _) = MvccLogicalLogFormat.ReadFrameHeader(frame);
         var expectedLength = checked(
@@ -568,8 +621,9 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         }
 
         var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame[trailerOffset..]);
-        if (expectedCrc != Crc32C.Compute(frame[..trailerOffset]))
+        if (expectedCrc != ComputeMvccFrameCrc(version, previousCrc, frame[..trailerOffset]))
             throw new InvalidDataException($"MVCC logical-log frame CRC is invalid in '{path}'.");
+        return expectedCrc;
     }
 
     private BrowserPlaintextCapture CaptureWal(
@@ -851,17 +905,34 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
     {
         if (capture.Position == 0)
         {
+            BrowserMvccChainUpdate? reset = null;
             if (capture.Bytes.Length >= MvccLogicalLogFormat.LogHeaderSize)
-                _ = MvccLogicalLogFormat.ValidateHeader(capture.Bytes);
+            {
+                var (headerSalt, _) = MvccLogicalLogFormat.ValidateHeader(capture.Bytes);
+                reset = new BrowserMvccChainUpdate(MvccLogicalLogFormat.LogHeaderSize, InitialMvccCrc(headerSalt));
+            }
+
             return new BrowserPersistedWrite(
                 0,
                 capture.Bytes,
                 path,
                 walUpdate: null,
-                persistedLength: capture.Bytes.LongLength);
+                persistedLength: capture.Bytes.LongLength,
+                mvccUpdate: reset);
         }
 
-        ValidatePlaintextMvccFrame(capture.Bytes, path);
+        ValidatePlaintextMvccFrame(capture.Bytes, path, capture.MvccVersion, capture.MvccPreviousCrc);
+        var persistedPreviousCrc = 0u;
+        if (capture.MvccVersion >= MvccLogicalLogFormat.ChainedVersion)
+        {
+            if (!_mvccChains.TryGetValue(path, out var chain) || chain.PersistedEnd != capture.Position)
+            {
+                throw new InvalidDataException(
+                    $"Encrypted browser MVCC log '{path}' has no persisted CRC chain at offset {capture.Position}.");
+            }
+
+            persistedPreviousCrc = chain.Crc;
+        }
         var (payloadSize, opCount, commitTs) = MvccLogicalLogFormat.ReadFrameHeader(capture.Bytes);
         var encryptedPayloadSize = MvccLogicalLogFormat.GetEncryptedPayloadSize(payloadSize);
         var encryptedFrame = new byte[checked(
@@ -909,18 +980,24 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         }
 
         var trailerOffset = MvccLogicalLogFormat.TxHeaderSize + encryptedPayloadSize;
-        BinaryPrimitives.WriteUInt32LittleEndian(
-            encryptedFrame.AsSpan(trailerOffset),
-            Crc32C.Compute(encryptedFrame.AsSpan(0, trailerOffset)));
+        var persistedCrc = ComputeMvccFrameCrc(
+            capture.MvccVersion,
+            persistedPreviousCrc,
+            encryptedFrame.AsSpan(0, trailerOffset));
+        BinaryPrimitives.WriteUInt32LittleEndian(encryptedFrame.AsSpan(trailerOffset), persistedCrc);
         BinaryPrimitives.WriteUInt32LittleEndian(
             encryptedFrame.AsSpan(trailerOffset + sizeof(uint)),
             MvccLogicalLogFormat.EndMagic);
+        var persistedEnd = checked(capture.Position + encryptedFrame.LongLength);
         return new BrowserPersistedWrite(
             capture.Position,
             encryptedFrame,
             path,
             walUpdate: null,
-            persistedLength: checked(capture.Position + encryptedFrame.LongLength));
+            persistedLength: persistedEnd,
+            mvccUpdate: capture.MvccVersion >= MvccLogicalLogFormat.ChainedVersion
+                ? new BrowserMvccChainUpdate(persistedEnd, persistedCrc)
+                : null);
     }
 
     private async ValueTask<byte[]> DecryptMvccLogImageAsync(
@@ -935,6 +1012,8 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         using var plaintext = new MemoryStream(encryptedImage.Length);
         plaintext.Write(encryptedImage, 0, MvccLogicalLogFormat.LogHeaderSize);
         var position = MvccLogicalLogFormat.LogHeaderSize;
+        var persistedCrc = InitialMvccCrc(salt);
+        var plaintextCrc = persistedCrc;
         while (position < encryptedImage.Length)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -952,14 +1031,16 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
                 + MvccLogicalLogFormat.TxTrailerSize);
             if (position + encryptedFrameSize > encryptedImage.Length)
             {
-                if (IsCompletePlaintextMvccFrame(encryptedImage, position, payloadSize))
+                if (IsCompletePlaintextMvccFrame(encryptedImage, position, payloadSize, version, persistedCrc))
                 {
                     throw new InvalidDataException(
                         $"Encrypted browser storage contains a plaintext MVCC logical-log frame in '{path}'. "
                         + "Automatic migration is not safe.");
                 }
                 if (MvccLogicalLogFormat.ContainsCompleteFrameBoundary(
-                        encryptedImage.AsSpan(position)))
+                        encryptedImage.AsSpan(position),
+                        version,
+                        persistedCrc))
                 {
                     throw new InvalidDataException(
                         $"MVCC logical-log payload length does not match its complete frame boundary in '{path}'. "
@@ -978,12 +1059,15 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
 
             var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(
                 encryptedImage.AsSpan(trailerOffset));
-            var actualCrc = Crc32C.Compute(
+            var actualCrc = ComputeMvccFrameCrc(
+                version,
+                persistedCrc,
                 encryptedImage.AsSpan(
                     position,
                     MvccLogicalLogFormat.TxHeaderSize + encryptedPayloadSize));
             if (expectedCrc != actualCrc)
                 throw new InvalidDataException($"MVCC logical-log frame CRC is invalid in '{path}'.");
+            persistedCrc = actualCrc;
 
             var payload = new byte[payloadSize];
             var plaintextOffset = 0;
@@ -1043,10 +1127,13 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
 
             plaintext.Write(frameHeader);
             plaintext.Write(payload);
-            var plaintextFrameCrc = Crc32C.Compute(
+            var plaintextFrameCrc = ComputeMvccFrameCrc(
+                version,
+                plaintextCrc,
                 plaintext.GetBuffer().AsSpan(
                     checked((int)plaintext.Position - payload.Length - MvccLogicalLogFormat.TxHeaderSize),
                     MvccLogicalLogFormat.TxHeaderSize + payload.Length));
+            plaintextCrc = plaintextFrameCrc;
             var trailer = new byte[MvccLogicalLogFormat.TxTrailerSize];
             BinaryPrimitives.WriteUInt32LittleEndian(trailer, plaintextFrameCrc);
             BinaryPrimitives.WriteUInt32LittleEndian(
@@ -1057,13 +1144,17 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
             position += encryptedFrameSize;
         }
 
+        if (version >= MvccLogicalLogFormat.ChainedVersion)
+            _mvccChains[path] = new BrowserMvccChainUpdate(position, persistedCrc);
         return plaintext.ToArray();
     }
 
     private static bool IsCompletePlaintextMvccFrame(
         ReadOnlySpan<byte> image,
         int position,
-        int payloadSize)
+        int payloadSize,
+        byte version,
+        uint previousCrc)
     {
         var frameSize = checked(
             MvccLogicalLogFormat.TxHeaderSize
@@ -1076,7 +1167,7 @@ internal sealed class BrowserEncryptedPersistence(AhtolaAsyncPageTransformer pag
         return BinaryPrimitives.ReadUInt32LittleEndian(image[(trailerOffset + sizeof(uint))..])
                    == MvccLogicalLogFormat.EndMagic
                && BinaryPrimitives.ReadUInt32LittleEndian(image[trailerOffset..])
-                   == Crc32C.Compute(image.Slice(
+                   == ComputeMvccFrameCrc(version, previousCrc, image.Slice(
                        position,
                        MvccLogicalLogFormat.TxHeaderSize + payloadSize));
     }

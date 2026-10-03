@@ -11,15 +11,18 @@ public partial class SqliteConnection
     {
         ArgumentNullException.ThrowIfNull(name);
         if (!Capabilities.SupportsUserDefinedAggregates)
-            throw new NotSupportedException("User-defined aggregates are supported only for local database connections.");
-            // Shared-memory catalogs are process-wide for the named database. Aggregate
-            // registrations are therefore catalog-scoped (visible to every lease), which is
-            // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.
-            if (step is null)
+            throw new NotSupportedException("User-defined aggregates are supported only for local database and managed embedded replica connections.");
+        // Shared-memory catalogs are process-wide for the named database. Aggregate
+        // registrations are therefore catalog-scoped (visible to every lease), which is
+        // what EF Core needs when multiple connections share Mode=Memory;Cache=Shared.
+        if (step is null)
         {
             RemoveFunctionRegistrations(_aggregateFunctions, name);
-            if (IsManagedConnection)
-                ManagedConnection.UnregisterAggregateFunctions(name);
+            if (CallbackConnection is { } managedConnection)
+            {
+                using var replicaOperation = EnterCallbackRegistration();
+                managedConnection.UnregisterAggregateFunctions(name);
+            }
             else if (_database is not null)
                 SqliteNativeProvider.Current.UnregisterFunctions(NativeDatabase, name);
             return;
@@ -27,26 +30,29 @@ public partial class SqliteConnection
 
         var registration = new AggregateFunctionRegistration(name, argc, isDeterministic, seed, step, resultSelector);
         _aggregateFunctions[new FunctionSignature(name, argc)] = registration;
-        if (IsManagedConnection)
+        if (CallbackConnection is { } connection)
         {
-            ManagedConnection.UnregisterAggregateFunctions(name);
+            using var replicaOperation = EnterCallbackRegistration();
+            connection.UnregisterAggregateFunctions(name);
             foreach (var registeredFunction in _aggregateFunctions.Where(
                          pair => string.Equals(pair.Key.Name, name, StringComparison.OrdinalIgnoreCase))
                      .Select(static pair => pair.Value))
             {
-                registeredFunction.RegisterManaged(ManagedConnection);
+                registeredFunction.RegisterManaged(connection);
             }
         }
         else if (_database is not null)
             registration.RegisterNative(NativeDatabase);
     }
 
-    private void RegisterAggregateFunctions()
+    private void RegisterAggregateFunctions() => RegisterAggregateFunctions(CallbackConnection);
+
+    private void RegisterAggregateFunctions(IManagedConnectionAdapter? managedConnection)
     {
-        if (IsManagedConnection)
+        if (managedConnection is not null)
         {
             foreach (var registration in _aggregateFunctions.Values)
-                registration.RegisterManaged(ManagedConnection);
+                registration.RegisterManaged(managedConnection);
             return;
         }
 

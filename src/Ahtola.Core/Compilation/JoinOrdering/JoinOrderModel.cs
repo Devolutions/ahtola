@@ -37,6 +37,13 @@ internal sealed record JoinSegmentMember(
     /// <c>probe_index_can_seek_join_key</c>, access_method.rs:1563-1592).
     /// </summary>
     public IReadOnlyCollection<int> IndexLeadingColumnOrdinals { get; init; } = [];
+
+    /// <summary>
+    /// The member carries <c>INDEXED BY</c> or <c>NOT INDEXED</c>. Turso never hash-joins such a
+    /// table or builds it a temporary index, because either would bypass the access path the
+    /// SQL asked for (access_method.rs <c>has_indexed_by_directives</c>, lines 916 and 991).
+    /// </summary>
+    public bool HasIndexDirective { get; init; }
 }
 
 /// <summary>
