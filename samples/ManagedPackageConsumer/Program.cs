@@ -466,7 +466,9 @@ static void VerifyPublicCapabilityContract()
         sqliteReplica.CanCreateBatch,
         AhtolaConnectionFacade.Sqlite,
         AhtolaConnectionMode.EmbeddedReplica,
-        [true, true, true, true, false, false, false, false, false, false, false, false, true]);
+        // A managed embedded replica runs statements on its local database, so it accepts
+        // user-defined functions, aggregates and collations (no sync companion is registered).
+        [true, true, true, true, false, false, true, true, true, false, false, false, true]);
 }
 
 static void AssertCapabilities(
