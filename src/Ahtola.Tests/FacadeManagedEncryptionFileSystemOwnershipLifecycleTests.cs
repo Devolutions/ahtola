@@ -88,7 +88,7 @@ public sealed class FacadeManagedEncryptionFileSystemOwnershipLifecycleTests
     }
 
     private static string CreateConnectionString(string path, string key)
-        => $"Data Source={path};Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key={key}";
+        => $"Data Source={path};Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key={key};Pooling=False";
 
     private static AhtolaEncryptionFileSystem GetOwnedEncryptionFileSystem(object connection)
         => GetOwnedEncryptionFileSystemOrNull(connection)

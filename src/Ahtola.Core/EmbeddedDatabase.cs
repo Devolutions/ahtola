@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
@@ -447,6 +448,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _ownedViewToken = foreignReadOnly
             ? default
             : fileStore.CaptureCommittedViewToken();
+        _fileCatalogVersionViewToken = foreignReadOnly ? null : _ownedViewToken;
         _tables = catalog.Tables;
         _views = catalog.Views;
         _triggers = catalog.Triggers;
@@ -520,9 +522,57 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     /// <summary>Releases the backing file store, if any.</summary>
+    /// <summary>Turso's auto-checkpoint threshold (<c>core/storage/wal.rs</c>, <c>checkpoint_threshold: 1000</c>).</summary>
+    internal const int DefaultDeferredCheckpointFrames = 1000;
+
+    // See EmbeddedFileStore.DeferredCheckpointFrameThreshold; zero checkpoints after every commit.
+    // It lives here rather than on the store because a catalog reload replaces _fileStore.
+    private int _deferredCheckpointFrameThreshold;
+
+    /// <summary>
+    /// Adopts Turso's checkpoint policy for this database: an ordinary commit checkpoints only once
+    /// more than <paramref name="frames"/> committed WAL frames await a checkpoint, and closing the
+    /// database checkpoints what is left when no other connection holds the WAL. The ADO.NET
+    /// providers enable it for local file connections; embedded replicas and other internal
+    /// openers keep checkpointing after every commit.
+    /// </summary>
+    internal void EnableDeferredCheckpoints(int frames = DefaultDeferredCheckpointFrames)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(frames);
+        lock (_gate)
+            _deferredCheckpointFrameThreshold = frames;
+    }
+
+    private void TryCheckpointDeferredFramesBeforeClose()
+    {
+        if (_deferredCheckpointFrameThreshold <= 0
+            || _readOnly
+            || _foreignReadOnly
+            || _mvStore is not null
+            || _fileStore is null
+            || _fileCatalogWriteLock is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // Never wait at close: a connection that is persisting will checkpoint when due.
+            using (_fileCatalogWriteLock.Enter(TimeSpan.Zero))
+            {
+                _fileStore.DeferredCheckpointFrameThreshold = _deferredCheckpointFrameThreshold;
+                _fileStore.TryCheckpointDeferredFramesOnClose();
+            }
+        }
+        catch (Exception exception) when (exception is TimeoutException or ObjectDisposedException)
+        {
+        }
+    }
+
     public void Dispose()
     {
         ThrowIfRecursiveTriggerCallbackReentry();
+        TryCheckpointDeferredFramesBeforeClose();
         lock (_gate)
         {
             DisconnectVirtualTables(_virtualTables.Values);
@@ -4997,6 +5047,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
             EnsureFileCatalogVersionCurrent(busyTimeout);
             using var writeRegistration = RegisterCatalogWrite(_databasePath);
+            _fileStore.DeferredCheckpointFrameThreshold = _mvStore is null ? _deferredCheckpointFrameThreshold : 0;
             try
             {
                 var committedVersion = checkpointAfterCommit
@@ -5071,6 +5122,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (_fileStore?.IsExclusiveLockingMode == true)
         {
             version = _fileStore.CommittedCatalogVersion;
+            return true;
+        }
+
+        if (IsOwnedCommittedViewUnchanged())
+        {
+            version = _fileCatalogVersion;
             return true;
         }
 
@@ -5351,8 +5408,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _fileStore = replacement;
                     replacement = null;
                     RefreshCollationResolverBinding();
-                    _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
-                    PublishCatalog(replacementCatalog);
+                    // No physical catalog lock is held here, so a peer may commit between the
+                    // version probe and the token PublishCatalog captures. Bracket the probe with
+                    // the token and only let the version vouch for it when nothing moved.
+                    var tokenBeforeVersion = _fileStore.CaptureCommittedViewToken();
+                    PublishCatalog(replacementCatalog, ReadFileCatalogVersion(_fileSystem, _databasePath));
+                    if (tokenBeforeVersion != _ownedViewToken)
+                        _fileCatalogVersionViewToken = null;
                     previous.Dispose();
                 }
                 finally
@@ -5363,6 +5425,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// The race-free gate <see cref="RefreshOwnedCatalogForStatementIfNeeded"/> uses: when no
+    /// managed connection published a new storage generation and the durable view token (header
+    /// counters, WAL frames/salts, file write stamps) is unchanged since this connection last
+    /// published its catalog, nothing has committed since, so the published file catalog version
+    /// is still the durable one. Probing that version directly opens a second pager on the file.
+    /// </summary>
+    private bool IsOwnedCommittedViewUnchanged()
+        => !_foreignReadOnly
+           && _fileCatalogVersionViewToken is { } versionToken
+           && _fileStore is { } fileStore
+           && fileStore.CommittedViewGeneration == _ownedCommittedGeneration
+           && fileStore.CaptureCommittedViewToken() == versionToken;
+
+    // The durable view token observed when _fileCatalogVersion was last known to be the durable
+    // version. Only PublishCatalog with an explicit version (and the constructor) set it, so a path
+    // that refreshes _ownedViewToken without the version (incremental blob writes) or changes the
+    // version without the token (journal-mode, page-size and header pragmas) cannot satisfy
+    // IsOwnedCommittedViewUnchanged until the next versioned publish.
+    private SqlitePagerViewToken? _fileCatalogVersionViewToken;
 
     /// <summary>
     /// Convoy-rotation refresh for a mutating autocommit write. When another
@@ -5400,6 +5483,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             using (_fileCatalogWriteLock.Enter(Timeout.InfiniteTimeSpan))
             {
+                // Probing the durable version below opens a second pager on the file, which
+                // dominated every pooled Open/Close; skip it when nothing has committed since.
+                if (IsOwnedCommittedViewUnchanged())
+                    return;
+
                 using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
                 var durableVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
                 if (durableVersion == _fileCatalogVersion)
@@ -5489,7 +5577,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             _ownedCommittedGeneration = _fileStore.CommittedViewGeneration;
             if (!_foreignReadOnly)
+            {
                 _ownedViewToken = _fileStore.CaptureCommittedViewToken();
+                _fileCatalogVersionViewToken = fileCatalogVersion is null
+                    ? null
+                    : _ownedViewToken;
+            }
         }
     }
 
@@ -14988,7 +15081,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         List<SqlValue[]> rowsToInsert,
         List<long> insertedRowIds)
     {
-        ValidateInserts(context, tableName, table, rowsToInsert, insertedRowIds);
+        var extendedUniqueKeySets = ValidateInserts(context, tableName, table, rowsToInsert, insertedRowIds);
         MarkTriggerStatementRollbackRequirement(
             context,
             table,
@@ -14999,6 +15092,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         table.RowIds.AddRange(insertedRowIds);
         table.RecordAppendedRowIds(rowIdsBefore, insertedRowIds);
         SortWithoutRowid(table);
+        // The unique-index key sets validation built already include the appended rows.
+        foreach (var (signature, keys) in extendedUniqueKeySets)
+            table.RecordUniqueIndexKeySet(signature, keys);
         if (table.HasRowid)
         {
             foreach (var rowId in insertedRowIds)
@@ -15009,7 +15105,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             context.ReportRowChange(SqliteChangeOperation.Insert, tableName, table, rowId);
     }
 
-    private void ValidateInserts(
+    // Returns the unique-index key sets extended with rowsToInsert, for the caller to cache once
+    // it has appended them; callers that do not append may ignore it.
+    private List<(string Signature, ImmutableDictionary<string, ImmutableArray<SqlValue[]>> Keys)> ValidateInserts(
         QueryContext context,
         string tableName,
         EmbeddedTable table,
@@ -15027,9 +15125,22 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ValidateColumnUniqueConstraints(table, allRows, skipColumnIndex: rowidAliasColumn);
         ValidatePrimaryKey(tableName, table, allRows);
         // Stored rows' index keys were evaluated when those rows were written; an INSERT can only
-        // introduce a key-evaluation error in the rows it adds.
-        ValidateUniqueIndexes(tableName, table, allRows, rowsToInsert);
+        // introduce a key-evaluation error in the rows it adds. Unique indexes check the new rows
+        // against the stored rows' cached key set instead of re-hashing every stored row, which
+        // made a multi-row import quadratic.
+        var extendedUniqueKeySets = new List<(string, ImmutableDictionary<string, ImmutableArray<SqlValue[]>>)>();
+        foreach (var index in table.Indexes)
+        {
+            if (!index.Unique)
+                ValidateIndexExpressions(table, index, rowsToInsert);
+            else if (TryValidateUniqueIndexAppend(tableName, table, index, rowsToInsert, out var signature, out var keys))
+                extendedUniqueKeySets.Add((signature, keys));
+            else
+                ValidateUniqueIndex(tableName, table, index, allRows);
+        }
+
         ValidateForeignKeysAfterInsert(context, tableName, table, rowsToInsert, allRows);
+        return extendedUniqueKeySets;
     }
 
     private static void ValidateRowids(
@@ -15553,6 +15664,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 context,
                 fromMatches,
                 updateFromValidationRow);
+        if (fromMatches is null
+            && selectedPositions is null
+            && CanUpdateMatchedRowsInPlace(statement, table, plan, context))
+        {
+            return PerformUpdateInPlace(statement, table, plan, parameters, context);
+        }
+
         var rows = table.Rows.Select(row => row.ToArray()).ToList();
         var rowIds = table.RowIds.Count == table.Rows.Count
             ? table.RowIds.ToList()
@@ -15566,6 +15684,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var updateOrder = table.HasRowid
             ? Enumerable.Range(0, table.Rows.Count).OrderBy(position => rowIds[position]).ToArray()
             : Enumerable.Range(0, table.Rows.Count).ToArray();
+        var equalityCandidates = fromMatches is null && selectedPositions is null
+            ? TryGetDmlEqualityCandidatePositions(statement, table, parameters, context)
+            : null;
         foreach (var position in updateOrder)
         {
             var row = table.Rows[position];
@@ -15585,6 +15706,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             else if (statement.Where is not null)
             {
+                if (equalityCandidates is not null && !equalityCandidates.Contains(position))
+                    continue;
+
                 var source = CreateDmlTargetRow(table, statement.TargetQualifier, row, rowid);
                 if (!IsTrue(Evaluate(statement.Where, parameters, source, context)))
                     continue;
@@ -15698,6 +15822,507 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return returningResult!;
 
         return new ExecutionResult([], [], rowsAffected, rowsAffected > 0);
+    }
+
+    /// <summary>
+    /// Whether <see cref="PerformUpdateInPlace"/> can serve this UPDATE. It covers the plain
+    /// <c>UPDATE t SET ... WHERE ...</c> shape on a rowid table that keeps every rowid; UPDATE ...
+    /// FROM, LIMIT/ORDER BY, RETURNING, rowid rewrites, WITHOUT ROWID tables, method indexes and
+    /// assignments that enforced foreign keys must check (whose checks and actions read
+    /// whole-table before/after images) keep the full-table path.
+    /// </summary>
+    private bool CanUpdateMatchedRowsInPlace(
+        UpdateStatement statement,
+        EmbeddedTable table,
+        UpdatePlan plan,
+        QueryContext context)
+        => statement.From is null
+           && statement.Returning is null
+           && statement.Limit is null
+           && statement.EffectiveOrderBy.Count == 0
+           && !UpdateAssignsForeignKeyColumns(statement.TableName, table, plan, context)
+           && table.HasRowid
+           && !table.WithoutRowid
+           && !table.HasMethodIndexes
+           && table.RowIds.Count == table.Rows.Count
+           && plan.RowidAssignment is null
+           && (plan.AliasIndex < 0
+               || plan.ColumnAssignments.All(assignment => assignment.Index != plan.AliasIndex));
+
+    /// <summary>
+    /// Applies an UPDATE to the matched rows only. The full-table path copies every row, sorts
+    /// every position, re-validates every stored row after each updated row and then rewrites the
+    /// whole row list, so updating one row cost O(table rows) in time and allocation. This path
+    /// visits rows in the same rowid order and evaluates WHERE and SET in the same interleaving,
+    /// but checks constraints against an overlay of the stored rows, validates unique indexes
+    /// incrementally against their cached key sets, and replaces just the changed rows.
+    /// </summary>
+    /// <remarks>
+    /// Only the written row is checked for NOT NULL, as SQLite does; the stored rows were
+    /// validated when they were written. Conflict handling mirrors the full path: a row that
+    /// fails is left untouched, OR IGNORE skips it, OR FAIL publishes the rows updated so far.
+    /// </remarks>
+    private ExecutionResult PerformUpdateInPlace(
+        UpdateStatement statement,
+        EmbeddedTable table,
+        UpdatePlan plan,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var tableName = statement.TableName;
+        var candidates = TryGetDmlEqualityCandidatePositions(statement, table, parameters, context);
+        var updateOrder = candidates is null
+            ? Enumerable.Range(0, table.Rows.Count).ToArray()
+            : candidates.ToArray();
+        if (!IsAscendingRowIdOrder(table, updateOrder))
+            Array.Sort(updateOrder, (left, right) => table.RowIds[left].CompareTo(table.RowIds[right]));
+
+        var replaced = new Dictionary<int, SqlValue[]>();
+        var currentRows = new RowOverlay(table.Rows, replaced);
+        var uniqueIndexes = new InPlaceUniqueIndexTracker(this, tableName, table);
+        var updates = new List<(int Position, SqlValue[] Original, SqlValue[] Updated)>();
+        var rowsAffected = 0;
+        foreach (var position in updateOrder)
+        {
+            context.CheckInterrupt();
+            var row = table.Rows[position];
+            var rowid = table.RowIds[position];
+            if (statement.Where is not null)
+            {
+                var source = CreateDmlTargetRow(table, statement.TargetQualifier, row, rowid);
+                if (!IsTrue(Evaluate(statement.Where, parameters, source, context)))
+                    continue;
+            }
+
+            SqlValue[] updated;
+            try
+            {
+                (updated, _) = BuildUpdatedRow(
+                    statement,
+                    table,
+                    plan,
+                    row,
+                    rowid,
+                    parameters,
+                    context);
+                replaced[position] = updated;
+                table.ValidateRows(tableName, currentRows, [updated], skipUniqueColumnIndex: plan.AliasIndex);
+                ValidateColumnUniqueConstraints(table, currentRows, skipColumnIndex: plan.AliasIndex);
+                ValidatePrimaryKey(tableName, table, currentRows);
+                uniqueIndexes.Validate(row, updated, currentRows);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                replaced.Remove(position);
+                // A trigger body ignores its own OR clause: the statement that fired the trigger
+                // supplies the policy. Outside a trigger the statement's OR clause wins over any
+                // schema-level ON CONFLICT recorded on the violated constraint.
+                var statementAlgorithm = context.InsideTrigger
+                    ? context.TriggerConflictAlgorithm
+                    : statement.ConflictAlgorithm;
+                if (statementAlgorithm is not null && !IsConflictAlgorithmConstraint(exception))
+                    throw;
+                var algorithm = statementAlgorithm ?? exception.ConflictAlgorithm;
+                if (algorithm == InsertConflictAlgorithm.Ignore)
+                    continue;
+                if (statementAlgorithm == InsertConflictAlgorithm.Fail)
+                {
+                    if (rowsAffected > 0)
+                        CommitUpdatesInPlace(context, tableName, table, plan, updates, uniqueIndexes);
+
+                    throw new EmbeddedUpsertConflictFailException(
+                        exception,
+                        context.LastInsertRowId);
+                }
+                if (algorithm == InsertConflictAlgorithm.Rollback)
+                    throw new EmbeddedConflictRollbackException(exception);
+                if (algorithm is InsertConflictAlgorithm.Fail
+                    or InsertConflictAlgorithm.Replace)
+                {
+                    throw new EmbeddedSqlException(
+                        "Managed UPDATE cannot apply schema-level ON CONFLICT "
+                        + $"{algorithm.Value.ToString().ToUpperInvariant()} until the pending "
+                        + "row-update engine supports partial publication, transaction rollback, and replacement.");
+                }
+                throw;
+            }
+
+            uniqueIndexes.Apply(row, updated);
+            updates.Add((position, row, updated));
+            rowsAffected++;
+        }
+
+        CommitUpdatesInPlace(context, tableName, table, plan, updates, uniqueIndexes);
+        return new ExecutionResult([], [], rowsAffected, rowsAffected > 0);
+    }
+
+    /// <summary>
+    /// Whether <see cref="ValidateForeignKeysAfterUpdate"/> would do any work for this UPDATE:
+    /// with foreign keys enforced, an assigned column (or a generated column derived from one) is a
+    /// child column of one of this table's foreign keys, or a parent column another table's
+    /// foreign key references. Unresolvable foreign-key metadata counts as yes, so the full path
+    /// keeps reporting it exactly as before.
+    /// </summary>
+    private bool UpdateAssignsForeignKeyColumns(
+        string tableName,
+        EmbeddedTable table,
+        UpdatePlan plan,
+        QueryContext context)
+    {
+        if (!context.ForeignKeysEnabled)
+            return false;
+
+        var assignedColumns = plan.ColumnAssignments
+            .Select(assignment => assignment.Index)
+            .ToHashSet();
+        table.ExpandAssignedColumnsThroughGeneratedColumns(assignedColumns);
+        try
+        {
+            foreach (var foreignKey in table.ForeignKeys)
+            {
+                if (ResolveForeignKeyChildColumns(table, tableName, foreignKey).Any(assignedColumns.Contains))
+                    return true;
+            }
+
+            foreach (var (childTableName, childTable) in context.Tables)
+            {
+                foreach (var foreignKey in childTable.ForeignKeys)
+                {
+                    if (string.Equals(foreignKey.ParentTable, tableName, StringComparison.OrdinalIgnoreCase)
+                        && ResolveForeignKeyParent(context.Tables, childTableName, foreignKey)
+                            .ColumnIndices.Any(assignedColumns.Contains))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (EmbeddedSqlException)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsAscendingRowIdOrder(EmbeddedTable table, int[] positions)
+    {
+        for (var index = 1; index < positions.Length; index++)
+        {
+            if (table.RowIds[positions[index - 1]] > table.RowIds[positions[index]])
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// The in-place counterpart of <see cref="CommitUpdates"/>: replaces only the updated rows and
+    /// reports the same per-row blob mutations and change notifications. Every row was validated
+    /// against the statement's running state as it was written, so no whole-table pass is needed.
+    /// </summary>
+    private void CommitUpdatesInPlace(
+        QueryContext context,
+        string tableName,
+        EmbeddedTable table,
+        UpdatePlan plan,
+        IReadOnlyList<(int Position, SqlValue[] Original, SqlValue[] Updated)> updates,
+        InPlaceUniqueIndexTracker uniqueIndexes)
+    {
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Update,
+            plan);
+        if (updates.Count == 0)
+            return;
+
+        var revisionBefore = table.Rows.Revision;
+        var rowIds = new long[updates.Count];
+        for (var index = 0; index < updates.Count; index++)
+        {
+            var (position, _, updated) = updates[index];
+            table.Rows[position] = updated;
+            rowIds[index] = table.RowIds[position];
+        }
+
+        table.RecordMethodIndexBulkMutation(rowIds, revisionBefore);
+        uniqueIndexes.RecordKeySets();
+        foreach (var rowId in rowIds)
+        {
+            // The full path records the old and the new rowid; they are the same row here.
+            RecordBlobMutation(tableName, rowId);
+            RecordBlobMutation(tableName, rowId);
+        }
+
+        for (var index = 0; index < updates.Count; index++)
+        {
+            ReportUpdateChange(
+                context,
+                tableName,
+                table,
+                rowIds[index],
+                rowIds[index],
+                updates[index].Original,
+                updates[index].Updated);
+        }
+    }
+
+    /// <summary>The stored rows with the statement's pending replacements applied.</summary>
+    private sealed class RowOverlay(
+        IReadOnlyList<SqlValue[]> rows,
+        Dictionary<int, SqlValue[]> replaced) : IReadOnlyList<SqlValue[]>
+    {
+        public int Count => rows.Count;
+
+        public SqlValue[] this[int index]
+            => replaced.TryGetValue(index, out var row) ? row : rows[index];
+
+        public IEnumerator<SqlValue[]> GetEnumerator()
+        {
+            for (var index = 0; index < rows.Count; index++)
+                yield return this[index];
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>
+    /// Unique-index validation for <see cref="PerformUpdateInPlace"/>. A plain unique index with
+    /// hashable collations keeps a working copy of its cached key set: each updated row is checked
+    /// for a conflict with every other row's key and then moves its own key. Any other index, or
+    /// a key without a canonical form, is validated over the full overlay instead.
+    /// </summary>
+    private sealed class InPlaceUniqueIndexTracker(EmbeddedDatabase database, string tableName, EmbeddedTable table)
+    {
+        private sealed class Entry
+        {
+            public required EmbeddedIndex Index { get; init; }
+            public string? Signature { get; init; }
+            public string?[]? Collations { get; init; }
+            public ImmutableDictionary<string, ImmutableArray<SqlValue[]>>.Builder? Keys { get; set; }
+            public bool Tracked => Keys is not null;
+        }
+
+        private List<Entry>? _entries;
+
+        public void Validate(SqlValue[] original, SqlValue[] updated, IReadOnlyList<SqlValue[]> currentRows)
+        {
+            foreach (var entry in GetEntries())
+            {
+                if (!entry.Index.Unique)
+                {
+                    database.ValidateIndexExpressions(table, entry.Index, [updated]);
+                    continue;
+                }
+
+                if (entry.Tracked)
+                {
+                    var newKey = ProjectKey(entry, updated);
+                    if (HasNull(newKey))
+                        continue;
+
+                    var canonical = BuildUniqueCanonicalKeyFromValues(newKey, entry.Collations!);
+                    var oldKey = ProjectKey(entry, original);
+                    if (canonical is not null
+                        && (HasNull(oldKey) || BuildUniqueCanonicalKeyFromValues(oldKey, entry.Collations!) is not null))
+                    {
+                        var movesWithinItself = !HasNull(oldKey) && KeysEqual(entry, oldKey, newKey);
+                        if (!movesWithinItself
+                            && entry.Keys!.TryGetValue(canonical, out var bucket)
+                            && bucket.Any(existing => KeysEqual(entry, existing, newKey)))
+                        {
+                            throw CreateConflict(entry.Index);
+                        }
+
+                        continue;
+                    }
+
+                    // No canonical form: stop tracking this index for the rest of the statement.
+                    entry.Keys = null;
+                }
+
+                database.ValidateUniqueIndex(tableName, table, entry.Index, currentRows);
+            }
+        }
+
+        public void Apply(SqlValue[] original, SqlValue[] updated)
+        {
+            foreach (var entry in GetEntries())
+            {
+                if (!entry.Tracked)
+                    continue;
+
+                var oldKey = ProjectKey(entry, original);
+                if (!HasNull(oldKey))
+                {
+                    var canonical = BuildUniqueCanonicalKeyFromValues(oldKey, entry.Collations!)!;
+                    var position = -1;
+                    if (entry.Keys!.TryGetValue(canonical, out var bucket))
+                    {
+                        for (var candidate = 0; candidate < bucket.Length && position < 0; candidate++)
+                        {
+                            if (KeysEqual(entry, bucket[candidate], oldKey))
+                                position = candidate;
+                        }
+                    }
+
+                    if (position < 0)
+                    {
+                        // The cached set does not hold this row's key: it cannot be trusted.
+                        entry.Keys = null;
+                        continue;
+                    }
+
+                    bucket = bucket.RemoveAt(position);
+                    if (bucket.IsEmpty)
+                        entry.Keys.Remove(canonical);
+                    else
+                        entry.Keys[canonical] = bucket;
+                }
+
+                var newKey = ProjectKey(entry, updated);
+                if (!HasNull(newKey))
+                {
+                    var canonical = BuildUniqueCanonicalKeyFromValues(newKey, entry.Collations!)!;
+                    entry.Keys![canonical] = entry.Keys.TryGetValue(canonical, out var bucket)
+                        ? bucket.Add(newKey)
+                        : [newKey];
+                }
+            }
+        }
+
+        /// <summary>Caches every still-tracked key set against the table's new row-store state.</summary>
+        public void RecordKeySets()
+        {
+            if (_entries is null)
+                return;
+
+            foreach (var entry in _entries)
+            {
+                if (entry.Tracked)
+                    table.RecordUniqueIndexKeySet(entry.Signature!, entry.Keys!.ToImmutable());
+            }
+        }
+
+        private List<Entry> GetEntries()
+        {
+            if (_entries is not null)
+                return _entries;
+
+            _entries = [];
+            foreach (var index in table.Indexes)
+            {
+                if (!index.Unique || !database.TryGetUniqueIndexKeySetSignature(table, index, out var signature, out var collations))
+                {
+                    _entries.Add(new Entry { Index = index });
+                    continue;
+                }
+
+                ImmutableDictionary<string, ImmutableArray<SqlValue[]>>.Builder? keys;
+                if (table.TryGetCurrentUniqueIndexKeySet(signature) is { } cached)
+                {
+                    keys = cached.Keys.ToBuilder();
+                }
+                else
+                {
+                    keys = ImmutableDictionary.CreateBuilder<string, ImmutableArray<SqlValue[]>>(StringComparer.Ordinal);
+                    if (!database.TryAddUniqueIndexKeys(tableName, table, index, collations, table.Rows, keys))
+                        keys = null;
+                }
+
+                _entries.Add(new Entry { Index = index, Signature = signature, Collations = collations, Keys = keys });
+            }
+
+            return _entries;
+        }
+
+        private SqlValue[] ProjectKey(Entry entry, SqlValue[] row)
+            => IndexExpressionSemantics.ProjectKey(
+                entry.Index,
+                table,
+                row,
+                rowId: null,
+                database.EvaluateIndexExpression);
+
+        private static bool HasNull(SqlValue[] key)
+            => key.Any(static value => value.Kind == SqlValueKind.Null);
+
+        private bool KeysEqual(Entry entry, SqlValue[] left, SqlValue[] right)
+        {
+            for (var column = 0; column < entry.Index.Columns.Count; column++)
+            {
+                if (database.Compare(left[column], right[column], entry.Collations![column]) != 0)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private EmbeddedSqlException CreateConflict(EmbeddedIndex index)
+            => new(
+                "UNIQUE constraint failed: "
+                    + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}")),
+                index.ConflictAlgorithm,
+                constraintViolation: true,
+                UniqueIndexConflictCode(index));
+    }
+
+    /// <summary>
+    /// The positions of the target rows that can satisfy an equality conjunct of the UPDATE's
+    /// WHERE (<c>id = @id</c>), found by canonicalizing only that column instead of building an
+    /// evaluation row and running the whole WHERE for every row. The candidates still evaluate
+    /// the full WHERE; <see langword="null"/> means no usable equality, so every row is evaluated.
+    /// </summary>
+    /// <remarks>
+    /// Uses the same canonical-key equality as the SELECT transient lookup, with
+    /// <c>preserveErrors</c> so a conjunct that could raise an error on a skipped row disables it.
+    /// </remarks>
+    private HashSet<int>? TryGetDmlEqualityCandidatePositions(
+        UpdateStatement statement,
+        EmbeddedTable table,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (statement.Where is null
+            || !TryCreateTransientEqualityLookup(
+                new NamedTableSource(statement.TableName, statement.Alias),
+                table,
+                statement.Where,
+                context,
+                outerRow: null,
+                out var lookup,
+                preserveErrors: true))
+        {
+            return null;
+        }
+
+        var probe = Evaluate(lookup.ValueExpression, parameters, null, context);
+        if (probe.Kind == SqlValueKind.Null)
+            return [];
+
+        var key = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+            probe,
+            lookup.ValueConvertsTextToNumeric,
+            lookup.ValueConvertsNumericToText,
+            lookup.Collation);
+        if (key is null)
+            return [];
+
+        var candidates = new HashSet<int>();
+        for (var position = 0; position < table.Rows.Count; position++)
+        {
+            context.CheckInterrupt();
+            var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                table.Rows[position][lookup.ColumnOrdinal],
+                lookup.ColumnConvertsTextToNumeric,
+                lookup.ColumnConvertsNumericToText,
+                lookup.Collation);
+            if (string.Equals(segment, key, StringComparison.Ordinal))
+                candidates.Add(position);
+        }
+
+        return candidates;
     }
 
     // Pairs each target row with the FROM row that drives its assignments. SQLite compiles
@@ -17831,6 +18456,137 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             seenKeys.Add(key);
         }
+    }
+
+    /// <summary>
+    /// Validates appending <paramref name="rowsToInsert"/> to <paramref name="table"/> against a plain
+    /// unique index using the stored rows' cached key set, so an INSERT costs O(new rows) rather than
+    /// O(table rows). Returns <see langword="false"/> (the caller then validates every row) for
+    /// partial, expression or method indexes and for collations without a canonical hash key.
+    /// </summary>
+    private bool TryValidateUniqueIndexAppend(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<SqlValue[]> rowsToInsert,
+        out string signature,
+        out ImmutableDictionary<string, ImmutableArray<SqlValue[]>> keys)
+    {
+        keys = ImmutableDictionary<string, ImmutableArray<SqlValue[]>>.Empty;
+        if (!TryGetUniqueIndexKeySetSignature(table, index, out signature, out var collations))
+            return false;
+
+        ImmutableDictionary<string, ImmutableArray<SqlValue[]>>.Builder builder;
+        if (table.TryGetCurrentUniqueIndexKeySet(signature) is { } cached)
+        {
+            builder = cached.Keys.ToBuilder();
+        }
+        else
+        {
+            builder = ImmutableDictionary.CreateBuilder<string, ImmutableArray<SqlValue[]>>(StringComparer.Ordinal);
+            if (!TryAddUniqueIndexKeys(tableName, table, index, collations, table.Rows, builder))
+                return false;
+        }
+
+        if (!TryAddUniqueIndexKeys(tableName, table, index, collations, rowsToInsert, builder))
+            return false;
+
+        keys = builder.ToImmutable();
+        return true;
+    }
+
+    /// <summary>
+    /// Whether a unique index can use a cached key set (plain columns, no partial predicate, no
+    /// method, hashable collations), and the signature that set is cached under. The key set
+    /// depends only on which columns are indexed and how they compare; the row-store identity it
+    /// is cached against covers the rows themselves.
+    /// </summary>
+    private bool TryGetUniqueIndexKeySetSignature(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        out string signature,
+        out string?[] collations)
+    {
+        signature = string.Empty;
+        collations = [];
+        if (index.IsPartial
+            || index.IsMethodIndex
+            || index.Columns.Count == 0
+            || index.Columns.Any(static column => column.IsExpression))
+        {
+            return false;
+        }
+
+        var resolved = index.Columns
+            .Select(column => (string?)IndexExpressionSemantics.GetCollationName(table, column))
+            .ToArray();
+        if (!resolved.All(IsUniqueKeyCollationHashable))
+            return false;
+
+        collations = resolved;
+        signature = index.Name + "\0" + string.Join(
+            "\0",
+            index.Columns.Select((column, position) => column.ColumnIndex + ":" + resolved[position]));
+        return true;
+    }
+
+    private bool TryAddUniqueIndexKeys(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        string?[] collations,
+        IReadOnlyList<SqlValue[]> rows,
+        ImmutableDictionary<string, ImmutableArray<SqlValue[]>>.Builder keys)
+    {
+        foreach (var row in rows)
+        {
+            var key = IndexExpressionSemantics.ProjectKey(
+                index,
+                table,
+                row,
+                rowId: null,
+                EvaluateIndexExpression);
+            // SQLite treats NULLs in a UNIQUE index as distinct, so such rows never conflict.
+            if (key.Any(static value => value.Kind == SqlValueKind.Null))
+                continue;
+
+            var canonicalKey = BuildUniqueCanonicalKeyFromValues(key, collations);
+            if (canonicalKey is null)
+                return false;
+
+            if (!keys.TryGetValue(canonicalKey, out var bucket))
+            {
+                keys[canonicalKey] = [key];
+                continue;
+            }
+
+            foreach (var existing in bucket)
+            {
+                var conflict = true;
+                for (var column = 0; column < index.Columns.Count; column++)
+                {
+                    if (Compare(existing[column], key[column], collations[column]) != 0)
+                    {
+                        conflict = false;
+                        break;
+                    }
+                }
+
+                if (conflict)
+                {
+                    throw new EmbeddedSqlException(
+                        "UNIQUE constraint failed: "
+                            + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}")),
+                        index.ConflictAlgorithm,
+                        constraintViolation: true,
+                        UniqueIndexConflictCode(index));
+                }
+            }
+
+            keys[canonicalKey] = bucket.Add(key);
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -32909,14 +33665,32 @@ out bool hasReturning)
                 maximumRows);
         }
 
+        var qualifier = plan.Source.Alias ?? plan.Source.Name;
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
+        if (TrySeekManagedIndexEquality(
+                plan,
+                context,
+                outerRow,
+                predicate,
+                parameters,
+                qualifier,
+                qualifiedColumns,
+                out var seekRows))
+        {
+            IEnumerable<SourceRow> sought = seekRows;
+            if (plan.Reverse)
+                sought = sought.Reverse();
+            if (maximumRows is { } seekMaximum)
+                sought = sought.Take(checked((int)Math.Min(seekMaximum, int.MaxValue)));
+            return new SourceData(table.Columns, sought.ToArray());
+        }
+
         var visibleRows = GetNamedTableRows(
             plan.Source,
             context,
             maximumRows: null,
             outerRow).Rows;
         var entries = GetManagedIndexEntries(table, plan.Index, visibleRows, context);
-        var qualifier = plan.Source.Alias ?? plan.Source.Name;
-        var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
         // An outer-row equality is scan-constant for a correlated subquery. Narrow the
         // declared index traversal before aggregate evaluation instead of merely reporting a
         // SEARCH in EQP while filtering a full index scan afterward.
@@ -32967,6 +33741,125 @@ out bool hasReturning)
         var rows = projected.ToArray();
 
         return new SourceData(table.Columns, rows);
+    }
+
+    /// <summary>
+    /// Serves a SEARCH whose leading index column is bound by equality to a scan-constant value
+    /// (a literal, a parameter, or an outer-row column) from the durable index b-tree, instead of
+    /// materializing every visible row and sorting the whole index on each execution. The rows
+    /// equal to the probe come back in index order, which is exactly the order the materialized
+    /// path yields after filtering, so callers observe identical results.
+    /// </summary>
+    /// <remarks>
+    /// Uses the same durable accessors, and therefore the same safety gates, as the compiled join
+    /// seek: outside a transaction the heap table must still be the committed one, and inside a
+    /// classic transaction the pinned snapshot is merged with the transaction's own writes. Any
+    /// case those accessors cannot serve falls back to the materialized path.
+    /// </remarks>
+    private bool TrySeekManagedIndexEquality(
+        ManagedIndexScanPlan plan,
+        QueryContext context,
+        SourceRow? outerRow,
+        Expression? predicate,
+        SqlValue[]? parameters,
+        string qualifier,
+        IReadOnlyDictionary<string, int> qualifiedColumns,
+        out SourceRow[] rows)
+    {
+        rows = [];
+        var table = plan.Table;
+        // Rowid tables only: a WITHOUT ROWID source row's identity is not a durable rowid. Tables
+        // with method indexes keep the materialized path, which binds their per-row method source.
+        if (!plan.Search
+            || !table.HasRowid
+            || table.HasMethodIndexes
+            || predicate is null
+            || parameters is null
+            || _fileStore is null
+            || context.ConcurrentMvStore is not null
+            || context.ConcurrentMvccTxId is not null
+            || plan.Index.Columns.Count == 0
+            || !TryCreateTransientEqualityLookup(
+                plan.Source,
+                table,
+                predicate,
+                context,
+                outerRow,
+                out var lookup)
+            || plan.Index.Columns[0].ColumnIndex != lookup.ColumnOrdinal
+            || lookup.ColumnConvertsTextToNumeric
+            || lookup.ColumnConvertsNumericToText
+            || !string.Equals(
+                IndexExpressionSemantics.GetCollationName(table, plan.Index.Columns[0]),
+                lookup.Collation,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var probe = Evaluate(lookup.ValueExpression, parameters, outerRow, context);
+        if (probe.Kind == SqlValueKind.Null)
+            return true;
+        if (lookup.ValueConvertsTextToNumeric)
+            probe = ApplyComparisonNumericAffinity(probe);
+        else if (lookup.ValueConvertsNumericToText
+                 && probe.Kind is SqlValueKind.Integer or SqlValueKind.Real)
+            probe = SqlValue.Text(ToSqlText(probe));
+
+        EmbeddedFileIndexAccessor? accessor = null;
+        if (context.InTransaction)
+        {
+            if (TryOpenTransactionIndexAccessor(
+                    table,
+                    plan.Index,
+                    prefixLength: 1,
+                    covering: false,
+                    context,
+                    out var transactionAccessor))
+            {
+                accessor = transactionAccessor;
+            }
+        }
+        else if (_fileStore.TryOpenIndexAccessor(
+                     table,
+                     plan.Index,
+                     prefixLength: 1,
+                     covering: false,
+                     sharedSnapshot: null,
+                     out var committedAccessor))
+        {
+            accessor = committedAccessor;
+        }
+
+        if (accessor is null)
+            return false;
+
+        var qualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
+            qualifier,
+            table.ColumnDefinitions);
+        using (accessor)
+        {
+            rows = accessor.Seek(
+                    [probe],
+                    _plannerAccessPathMetrics.IndexEqualitySeekPageRead)
+                .Select(row =>
+                {
+                    context.CheckInterrupt();
+                    return new SourceRow(
+                        table.Columns,
+                        row.Values,
+                        qualifiedColumns,
+                        outerRow,
+                        RowId: row.RowId,
+                        RowIdQualifier: qualifier,
+                        ColumnDefinitions: table.ColumnDefinitions,
+                        QualifiedColumnDefinitions: qualifiedColumnDefinitions);
+                })
+                .ToArray();
+        }
+
+        _plannerAccessPathMetrics.IndexEqualitySeekExecuted();
+        return true;
     }
 
     private SourceData GetConcurrentMvccIndexRows(
@@ -59289,10 +60182,11 @@ public sealed partial class EmbeddedConnection : IDisposable
                 allowTemporaryFileSpill: false);
         }
 
+        // Leave the spill directory unresolved: VdbeExecutionOptions looks up the (cached)
+        // process temp path only if an operator of this statement actually needs it.
         return new VdbeExecutionOptions(
             PhysicalFileSystem.Instance,
-            budget,
-            temporaryDirectory: Path.GetTempPath());
+            budget);
     }
 
     /// <summary>
@@ -69584,6 +70478,32 @@ internal sealed class EmbeddedTable
                 : null;
     }
 
+    // Unique-index key sets, cached against the row store's identity exactly like _rowIdSet and
+    // keyed by an index-definition signature (a clone rebuilds its PRIMARY KEY/UNIQUE autoindex
+    // objects, so the index reference cannot be the key). Immutable so clones share them.
+    private ImmutableDictionary<string, UniqueIndexKeySet> _uniqueIndexKeySets =
+        ImmutableDictionary<string, UniqueIndexKeySet>.Empty;
+
+    /// <summary>The cached key set for <paramref name="signature"/> if it is still current.</summary>
+    internal UniqueIndexKeySet? TryGetCurrentUniqueIndexKeySet(string signature)
+    {
+        var rows = Rows;
+        return _uniqueIndexKeySets.TryGetValue(signature, out var cached)
+            && cached.LineageId == _rowsStore.LineageId
+            && cached.Revision == _rowsStore.Revision
+            && cached.Count == rows.Count
+                ? cached
+                : null;
+    }
+
+    /// <summary>Caches <paramref name="keys"/> as the key set of the table's current rows.</summary>
+    internal void RecordUniqueIndexKeySet(
+        string signature,
+        ImmutableDictionary<string, ImmutableArray<SqlValue[]>> keys)
+        => _uniqueIndexKeySets = _uniqueIndexKeySets.SetItem(
+            signature,
+            new UniqueIndexKeySet(_rowsStore.LineageId, _rowsStore.Revision, Rows.Count, keys));
+
     /// <summary>
     /// Extends <paramref name="before"/>, the set that was current immediately before
     /// <paramref name="inserted"/> were appended, so the next statement does not rebuild it.
@@ -70167,6 +71087,7 @@ internal sealed class EmbeddedTable
             Rows.ReplaceContentsPreservingRevision(source.Rows);
             RowIds.ShareFrom(source.RowIds);
             _rowIdSet = source._rowIdSet;
+            _uniqueIndexKeySets = source._uniqueIndexKeySets;
         }
 
         Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
@@ -71435,6 +72356,7 @@ internal sealed class EmbeddedTable
             clone.Rows.ReplaceContentsPreservingRevision(Rows);
             clone.RowIds.ShareFrom(RowIds);
             clone._rowIdSet = _rowIdSet;
+            clone._uniqueIndexKeySets = _uniqueIndexKeySets;
         }
 
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);

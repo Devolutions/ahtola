@@ -439,6 +439,29 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
     private bool _truncatedAfterCheckpoint;
     private bool _disposed;
 
+    /// <summary>
+    /// The validated prefix of the WAL up to its last committed frame, so a later scan resumes
+    /// after it instead of re-validating every frame. Every wal-index read validates against a
+    /// scan, which made each statement cost O(WAL frames) once the WAL was no longer reset after
+    /// every commit.
+    /// </summary>
+    /// <remarks>
+    /// Committed frames are never rewritten within one WAL incarnation: SQLite, Turso and Ahtola
+    /// only overwrite frames after the last commit, and a restart rewrites the WAL header first.
+    /// The prefix is therefore trusted only while the on-disk WAL header and the boundary commit
+    /// frame's header are byte-identical to when it was recorded; every local truncation or
+    /// header rewrite discards it.
+    /// </remarks>
+    private ScanPrefix? _scanPrefix;
+
+    private sealed record ScanPrefix(
+        SqliteWalHeader Seed,
+        byte[] WalHeaderBytes,
+        long CommittedFrameNumber,
+        (uint First, uint Second) ChecksumAfterCommit,
+        uint DatabaseSizeInPages,
+        byte[] CommitFrameHeaderBytes);
+
     private SqliteWalFile(
         IFile file,
         SqliteWalHeader header,
@@ -980,7 +1003,10 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
                 // commit marker, so recovery still discards the whole batch,
                 // and a peer sees exactly the boundary the per-frame path left.
                 if (GetSyncFile().Length != writeOffset)
+                {
+                    _scanPrefix = null;
                     GetSyncFile().SetLength(writeOffset);
+                }
             }
             catch (Exception rollbackException)
             {
@@ -1075,7 +1101,10 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             try
             {
                 if (await file.GetLengthAsync(CancellationToken.None).ConfigureAwait(false) != writeOffset)
+                {
+                    _scanPrefix = null;
                     await file.SetLengthAsync(writeOffset, CancellationToken.None).ConfigureAwait(false);
+                }
             }
             catch (Exception rollbackException)
             {
@@ -1489,13 +1518,14 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         ThrowIfReadOnly();
 
         var file = GetSyncFile();
-        var scan = ScanCore();
+        var scan = ScanCore(trustValidatedPrefix: false);
         if (_truncatedAfterCheckpoint && file.Length == 0)
             return scan.Info;
 
         var targetLength = scan.Info.LastCommittedByteLength;
         if (file.Length != targetLength)
         {
+            _scanPrefix = null;
             file.SetLength(targetLength);
             if (file.Length != targetLength)
                 throw new InvalidDataException("SQLite WAL recovery truncation did not reach its requested boundary.");
@@ -1525,6 +1555,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         var targetLength = scan.Info.LastCommittedByteLength;
         if (length != targetLength)
         {
+            _scanPrefix = null;
             await file.SetLengthAsync(targetLength, cancellationToken).ConfigureAwait(false);
             if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != targetLength)
                 throw new InvalidDataException("SQLite WAL recovery truncation did not reach its requested boundary.");
@@ -1577,6 +1608,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         if (length <= targetLength)
             return;
 
+        _scanPrefix = null;
         await file.SetLengthAsync(targetLength, cancellationToken).ConfigureAwait(false);
         if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != targetLength)
             throw new InvalidDataException("SQLite WAL rollback truncation did not reach its requested boundary.");
@@ -1599,7 +1631,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         ThrowIfReadOnly();
 
-        var scan = ScanCore();
+        var scan = ScanCore(trustValidatedPrefix: false);
         if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile
             || scan.Info.LastValidFrameNumber != scan.Info.LastCommittedFrameNumber)
         {
@@ -1611,6 +1643,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             return;
 
         var file = GetSyncFile();
+        _scanPrefix = null;
         file.SetLength(SqliteWalHeader.Size);
         if (file.Length != SqliteWalHeader.Size)
             throw new InvalidDataException("SQLite WAL reset did not reach its header boundary.");
@@ -1654,6 +1687,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         if (scan.Info.LastCommittedFrameNumber == 0)
             return;
 
+        _scanPrefix = null;
         await file.SetLengthAsync(SqliteWalHeader.Size, cancellationToken).ConfigureAwait(false);
         if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != SqliteWalHeader.Size)
             throw new InvalidDataException("SQLite WAL reset did not reach its header boundary.");
@@ -1688,7 +1722,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         ThrowIfReadOnly();
 
-        var scan = ScanCore();
+        var scan = ScanCore(trustValidatedPrefix: false);
         if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile
             || scan.Info.LastValidFrameNumber != scan.Info.LastCommittedFrameNumber)
         {
@@ -1697,6 +1731,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         }
 
         var file = GetSyncFile();
+        _scanPrefix = null;
         file.SetLength(0);
         if (file.Length != 0)
             throw new InvalidDataException("SQLite WAL truncation did not reach zero bytes.");
@@ -1724,6 +1759,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
                 "Cannot truncate a SQLite WAL with a partial, corrupt, or uncommitted frame tail.");
         }
 
+        _scanPrefix = null;
         await file.SetLengthAsync(0, cancellationToken).ConfigureAwait(false);
         if (await file.GetLengthAsync(cancellationToken).ConfigureAwait(false) != 0)
             throw new InvalidDataException("SQLite WAL truncation did not reach zero bytes.");
@@ -1763,7 +1799,9 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         PageCodecSupport.DisposeOwned(_pageCodec, _ownsPageCodec);
     }
 
-    private ScanState ScanCore()
+    // trustValidatedPrefix: false re-validates every frame. Destructive operations (reset,
+    // truncation, tail recovery) use it so they never discard frames on a cached verdict.
+    private ScanState ScanCore(bool trustValidatedPrefix = true)
     {
         var file = GetSyncFile();
         var length = file.Length;
@@ -1798,6 +1836,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         var lastCommittedDatabaseSizeInPages = 0U;
         if (fullFrameCount == 0)
         {
+            _scanPrefix = null;
             return CreateScanState(
                 lastValidFrameNumber,
                 lastCommittedFrameNumber,
@@ -1806,6 +1845,25 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
                 previousChecksum);
         }
 
+        var walHeaderBytes = new byte[SqliteWalHeader.Size];
+        var walHeaderRead = file.Read(0, walHeaderBytes) == walHeaderBytes.Length;
+        var firstFrameNumber = 1L;
+        if (walHeaderRead
+            && trustValidatedPrefix
+            && TryResumeScanPrefix(file, fullFrameCount, walHeaderBytes) is { } prefix)
+        {
+            firstFrameNumber = prefix.CommittedFrameNumber + 1;
+            previousChecksum = prefix.ChecksumAfterCommit;
+            lastValidFrameNumber = prefix.CommittedFrameNumber;
+            lastCommittedFrameNumber = prefix.CommittedFrameNumber;
+            lastCommittedDatabaseSizeInPages = prefix.DatabaseSizeInPages;
+        }
+
+        if (!walHeaderRead)
+            _scanPrefix = null;
+        var committedChecksum = previousChecksum;
+        byte[]? committedFrameHeader = null;
+
         // One rented buffer for the whole scan: allocating per frame turned every
         // recovery scan into megabytes of garbage on large WALs.
         var frameSize = checked((int)FrameSize);
@@ -1813,7 +1871,7 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         try
         {
             var frame = rented.AsSpan(0, frameSize);
-            for (var frameNumber = 1L; frameNumber <= fullFrameCount; frameNumber++)
+            for (var frameNumber = firstFrameNumber; frameNumber <= fullFrameCount; frameNumber++)
             {
                 if (file.Read(FrameOffset(frameNumber), frame) != frame.Length)
                 {
@@ -1847,12 +1905,24 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
                 {
                     lastCommittedFrameNumber = frameNumber;
                     lastCommittedDatabaseSizeInPages = frameHeader.DatabaseSizeInPages;
+                    committedChecksum = checksum;
+                    committedFrameHeader = frame[..SqliteWalFrameHeader.Size].ToArray();
                 }
             }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(rented);
+            if (committedFrameHeader is not null && walHeaderRead)
+            {
+                _scanPrefix = new ScanPrefix(
+                    _header,
+                    walHeaderBytes,
+                    lastCommittedFrameNumber,
+                    committedChecksum,
+                    lastCommittedDatabaseSizeInPages,
+                    committedFrameHeader);
+            }
         }
 
         return CreateScanState(
@@ -1861,6 +1931,51 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             lastCommittedDatabaseSizeInPages,
             hasPartialFrame ? SqliteWalRecoveryStopReason.PartialFrame : SqliteWalRecoveryStopReason.EndOfFile,
             previousChecksum);
+    }
+
+    /// <summary>
+    /// Returns the header of commit frame <paramref name="frameNumber"/>. When the most recent
+    /// scan ended its validated prefix at exactly that commit frame, the header bytes that scan
+    /// authenticated (and re-checked against the file) are reused instead of reading and decoding
+    /// the whole frame; otherwise the frame is read.
+    /// </summary>
+    /// <remarks>
+    /// Callers validate a wal-index header right after <see cref="ScanRecovery"/>, so the boundary
+    /// frame is almost always the prefix's own. Reading the full frame on every validation cost a
+    /// page-sized read for every page access once the WAL kept committed frames between checkpoints.
+    /// </remarks>
+    internal SqliteWalFrameHeader ReadValidatedCommitFrameHeader(long frameNumber)
+    {
+        ThrowIfDisposed();
+        if (_scanPrefix is { } prefix && prefix.CommittedFrameNumber == frameNumber)
+            return SqliteWalFrameHeader.Parse(prefix.CommitFrameHeaderBytes);
+
+        return ReadFrame(frameNumber).Header;
+    }
+
+    /// <summary>
+    /// Returns the recorded <see cref="_scanPrefix"/> when it still describes this WAL: same
+    /// in-memory header seed, the prefix fits in the file, and both the on-disk WAL header and the
+    /// boundary commit frame's header are unchanged. Anything else discards it.
+    /// </summary>
+    private ScanPrefix? TryResumeScanPrefix(IFile file, long fullFrameCount, ReadOnlySpan<byte> walHeaderBytes)
+    {
+        var prefix = _scanPrefix;
+        if (prefix is null)
+            return null;
+
+        Span<byte> commitFrameHeader = stackalloc byte[SqliteWalFrameHeader.Size];
+        if (prefix.Seed != _header
+            || prefix.CommittedFrameNumber > fullFrameCount
+            || !walHeaderBytes.SequenceEqual(prefix.WalHeaderBytes)
+            || file.Read(FrameOffset(prefix.CommittedFrameNumber), commitFrameHeader) != commitFrameHeader.Length
+            || !commitFrameHeader.SequenceEqual(prefix.CommitFrameHeaderBytes))
+        {
+            _scanPrefix = null;
+            return null;
+        }
+
+        return prefix;
     }
 
     private async ValueTask<ScanState> ScanCoreAsync(
@@ -2048,7 +2163,10 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             try
             {
                 if (GetSyncFile().Length != offset)
+                {
+                    _scanPrefix = null;
                     GetSyncFile().SetLength(offset);
+                }
             }
             catch (Exception rollbackException)
             {
@@ -2079,7 +2197,10 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
             try
             {
                 if (await file.GetLengthAsync(CancellationToken.None).ConfigureAwait(false) != offset)
+                {
+                    _scanPrefix = null;
                     await file.SetLengthAsync(offset, CancellationToken.None).ConfigureAwait(false);
+                }
             }
             catch (Exception rollbackException)
             {

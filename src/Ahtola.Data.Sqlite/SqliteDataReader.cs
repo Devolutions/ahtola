@@ -750,10 +750,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         schema.Columns.Add(SchemaTableColumn.IsLong, typeof(bool));
         schema.Columns.Add(SchemaTableColumn.ProviderType, typeof(int));
 
-        var hasSources = TryGetSelectSources(out var sources, out var selections);
-        var sourceColumns = hasSources
-            ? GetSelectSourceColumns(sources)
-            : new Dictionary<string, Dictionary<string, SchemaColumnInfo>>(StringComparer.OrdinalIgnoreCase);
+        var hasSources = TryGetResolvedSelectSources(out var sources, out var selections, out var sourceColumns);
 
         for (var i = 0; i < FieldCount; i++)
         {
@@ -1746,7 +1743,74 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
     }
 
+    /// <summary>
+    /// Declared-type metadata for the result set the reader is positioned on. Resolving it
+    /// parses the SQL and runs PRAGMA table_info/index_list/index_info for every source table,
+    /// so it is computed once per result set instead of once per GetValue/GetFieldType call.
+    /// Keyed on the statement and SQL references, which every NextResult replaces.
+    /// </summary>
+    private sealed class ResultSetSchema(SqliteStatementAdapter? statement, string sql, int fieldCount)
+    {
+        public SqliteStatementAdapter? Statement { get; } = statement;
+        public string Sql { get; } = sql;
+        public string?[] DeclaredTypes { get; } = new string?[fieldCount];
+        public bool?[] UndeclaredSourceColumns { get; } = new bool?[fieldCount];
+        public bool SelectSourcesResolved { get; set; }
+        public bool HasSelectSources { get; set; }
+        public List<SelectSource> Sources { get; set; } = [];
+        public List<string> Selections { get; set; } = [];
+        public Dictionary<string, Dictionary<string, SchemaColumnInfo>> SourceColumns { get; set; } = [];
+    }
+
+    private ResultSetSchema? _resultSetSchema;
+
+    private ResultSetSchema GetResultSetSchema()
+    {
+        var schema = _resultSetSchema;
+        if (schema is not null
+            && ReferenceEquals(schema.Statement, _statement)
+            && ReferenceEquals(schema.Sql, _currentSql))
+        {
+            return schema;
+        }
+
+        return _resultSetSchema = new ResultSetSchema(_statement, _currentSql, FieldCount);
+    }
+
+    private bool TryGetResolvedSelectSources(
+        out List<SelectSource> sources,
+        out List<string> selections,
+        out Dictionary<string, Dictionary<string, SchemaColumnInfo>> sourceColumns)
+    {
+        var schema = GetResultSetSchema();
+        if (!schema.SelectSourcesResolved)
+        {
+            if (TryGetSelectSources(out var resolvedSources, out var resolvedSelections))
+            {
+                schema.SourceColumns = GetSelectSourceColumns(resolvedSources);
+                schema.Sources = resolvedSources;
+                schema.HasSelectSources = true;
+            }
+
+            schema.Selections = resolvedSelections;
+            schema.SelectSourcesResolved = true;
+        }
+
+        sources = schema.Sources;
+        selections = schema.Selections;
+        sourceColumns = schema.SourceColumns;
+        return schema.HasSelectSources;
+    }
+
     private string GetDeclaredTypeName(int ordinal)
+    {
+        var declaredTypes = GetResultSetSchema().DeclaredTypes;
+        return (uint)ordinal < (uint)declaredTypes.Length
+            ? declaredTypes[ordinal] ??= ResolveDeclaredTypeName(ordinal)
+            : ResolveDeclaredTypeName(ordinal);
+    }
+
+    private string ResolveDeclaredTypeName(int ordinal)
     {
         if (_command.Connection is { RequiresAsyncExecution: true } browserConnection)
         {
@@ -1780,9 +1844,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             }
         }
 
-        if (TryGetSelectSources(out var sources, out var selections))
+        if (TryGetResolvedSelectSources(out var sources, out var selections, out var sourceColumns))
         {
-            var sourceColumns = GetSelectSourceColumns(sources);
             var columnName = GetName(ordinal);
             var selection = ordinal < selections.Count ? selections[ordinal] : columnName;
             var resolvedColumn = ResolveSelectColumn(selection, columnName, sources, sourceColumns);
@@ -1814,10 +1877,17 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     private bool HasUndeclaredSelectSourceColumn(int ordinal)
     {
-        if (!TryGetSelectSources(out var sources, out var selections))
+        var cache = GetResultSetSchema().UndeclaredSourceColumns;
+        return (uint)ordinal < (uint)cache.Length
+            ? cache[ordinal] ??= ResolveHasUndeclaredSelectSourceColumn(ordinal)
+            : ResolveHasUndeclaredSelectSourceColumn(ordinal);
+    }
+
+    private bool ResolveHasUndeclaredSelectSourceColumn(int ordinal)
+    {
+        if (!TryGetResolvedSelectSources(out var sources, out var selections, out var sourceColumns))
             return false;
 
-        var sourceColumns = GetSelectSourceColumns(sources);
         var columnName = GetName(ordinal);
         var selection = ordinal < selections.Count ? selections[ordinal] : columnName;
         var resolvedColumn = ResolveSelectColumn(selection, columnName, sources, sourceColumns);

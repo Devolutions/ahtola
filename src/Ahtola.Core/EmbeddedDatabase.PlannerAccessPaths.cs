@@ -948,6 +948,8 @@ internal sealed class PlannerAccessPathMetrics
     private long _intersectionCandidateRows;
     private long _intersectionIndexPagesRead;
     private long _intersectionKeyComparisons;
+    private long _indexEqualitySeeksExecuted;
+    private long _indexEqualitySeekPagesRead;
     private long _stat4EstimatesUsed;
     private long _stat4SampleRowIdLookups;
     private long _stat4RowIdCacheRebuilds;
@@ -966,6 +968,11 @@ internal sealed class PlannerAccessPathMetrics
     public long IntersectionIndexPagesRead => Interlocked.Read(ref _intersectionIndexPagesRead);
 
     public long IntersectionKeyComparisons => Interlocked.Read(ref _intersectionKeyComparisons);
+
+    /// <summary>Single-table index equality SEARCHes served by a durable b-tree seek.</summary>
+    public long IndexEqualitySeeksExecuted => Interlocked.Read(ref _indexEqualitySeeksExecuted);
+
+    public long IndexEqualitySeekPagesRead => Interlocked.Read(ref _indexEqualitySeekPagesRead);
 
     public long Stat4EstimatesUsed => Interlocked.Read(ref _stat4EstimatesUsed);
 
@@ -994,6 +1001,10 @@ internal sealed class PlannerAccessPathMetrics
     internal void IntersectionIndexPageRead() => Interlocked.Increment(ref _intersectionIndexPagesRead);
 
     internal void IntersectionKeyCompared() => Interlocked.Increment(ref _intersectionKeyComparisons);
+
+    internal void IndexEqualitySeekExecuted() => Interlocked.Increment(ref _indexEqualitySeeksExecuted);
+
+    internal void IndexEqualitySeekPageRead() => Interlocked.Increment(ref _indexEqualitySeekPagesRead);
 
     internal void Stat4EstimateUsed(double estimatedRows)
     {

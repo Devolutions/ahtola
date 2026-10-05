@@ -157,7 +157,7 @@ public sealed class SqlitePageStore : IDisposable
                 if (encryption is not null)
                 {
                     throw new InvalidDataException(
-                        "Encryption was requested, but the database contains a plaintext SQLite header. Plaintext fallback is not permitted.");
+                        AhtolaEncryptedPageFormat.DescribeNonAhtolaHeader(rawHeader, "the database"));
                 }
 
                 header = SqliteDatabaseHeader.Parse(rawHeader);

@@ -1566,16 +1566,16 @@ public sealed class SqliteWalIndexSharedMemory
                 "SQLite WAL-index database page count does not match the independently validated WAL.");
         }
 
-        var committedFrame = wal.ReadFrame(header.MaximumFrame);
-        if (!committedFrame.Header.IsCommit)
+        var committedFrame = wal.ReadValidatedCommitFrameHeader(header.MaximumFrame);
+        if (!committedFrame.IsCommit)
             throw new InvalidDataException("SQLite WAL-index maximum frame is not a WAL commit frame.");
-        if (committedFrame.Header.DatabaseSizeInPages != header.DatabasePageCount)
+        if (committedFrame.DatabaseSizeInPages != header.DatabasePageCount)
         {
             throw new InvalidDataException(
                 "SQLite WAL-index database page count does not match its maximum WAL frame.");
         }
-        if (committedFrame.Header.Checksum1 != header.FrameChecksum1
-            || committedFrame.Header.Checksum2 != header.FrameChecksum2)
+        if (committedFrame.Checksum1 != header.FrameChecksum1
+            || committedFrame.Checksum2 != header.FrameChecksum2)
         {
             throw new InvalidDataException(
                 "SQLite WAL-index frame checksum does not match its maximum WAL frame.");
@@ -1628,7 +1628,7 @@ public sealed class SqliteWalIndexSharedMemory
         if (selectedHeader.MaximumFrame == 0)
             return;
 
-        var selectedFrame = wal.ReadFrame(selectedHeader.MaximumFrame).Header;
+        var selectedFrame = wal.ReadValidatedCommitFrameHeader(selectedHeader.MaximumFrame);
         if (!selectedFrame.IsCommit
             || selectedFrame.DatabaseSizeInPages != selectedHeader.DatabasePageCount
             || selectedFrame.Checksum1 != selectedHeader.FrameChecksum1

@@ -274,7 +274,83 @@ public sealed class ManagedConnectionPoolingTests
     }
 
     [Test]
-    public void MemoryEncryptionAndCallbacksAreNotPooled()
+    public void EncryptedConnectionsArePooledPerCipherAndKey()
+    {
+        const string key = "000102030405060708090A0B0C0D0E0F"
+                           + "101112131415161718191A1B1C1D1E1F";
+        const string otherKey = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+                                + "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        var path = CreateDatabasePath();
+        var otherPath = CreateDatabasePath();
+        string ConnectionString(string databasePath, string hexKey)
+            => $"Data Source={databasePath};Pooling=True;Local Provider=Managed;"
+               + $"Encryption Cipher=AES256GCM;Encryption Key={hexKey}";
+        try
+        {
+            using (var encrypted = new SqliteConnection(ConnectionString(path, key)))
+            {
+                encrypted.Open();
+                var first = encrypted.ManagedConnection;
+                using (var command = encrypted.CreateCommand())
+                {
+                    command.CommandText = "CREATE TABLE secrets(value TEXT); INSERT INTO secrets VALUES ('kept');";
+                    command.ExecuteNonQuery();
+                }
+
+                encrypted.Close();
+                encrypted.Open();
+                encrypted.ManagedConnection.Should().BeSameAs(first);
+                using var read = encrypted.CreateCommand();
+                read.CommandText = "SELECT value FROM secrets;";
+                read.ExecuteScalar().Should().Be("kept");
+            }
+
+            // The pool keeps the file open, so read the header with sharing allowed.
+            using (var raw = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                var header = new byte[5];
+                raw.ReadExactly(header);
+                header.Should().Equal("AHTLA"u8.ToArray());
+            }
+
+            // A wrong key is never handed the database pooled under the right one.
+            using (var wrongKey = new SqliteConnection(ConnectionString(path, otherKey)))
+            {
+                var open = () => wrongKey.Open();
+                open.Should().Throw<Exception>().Which.Message.Should().Contain("failed authentication");
+            }
+
+            // A different key on another file gets its own pool.
+            using (var other = new SqliteConnection(ConnectionString(otherPath, otherKey)))
+            {
+                other.Open();
+                var otherFirst = other.ManagedConnection;
+                other.Close();
+                other.Open();
+                other.ManagedConnection.Should().BeSameAs(otherFirst);
+            }
+
+            // ClearPool computes the same key, so it drops the pooled encrypted database.
+            using (var cleared = new SqliteConnection(ConnectionString(path, key)))
+            {
+                cleared.Open();
+                var before = cleared.ManagedConnection;
+                cleared.Close();
+                SqliteConnection.ClearPool(cleared);
+                cleared.Open();
+                cleared.ManagedConnection.Should().NotBeSameAs(before);
+            }
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+            DeleteDatabase(otherPath);
+        }
+    }
+
+    [Test]
+    public void MemoryAndCallbacksAreNotPooled()
     {
         using (var memory = new SqliteConnection("Data Source=:memory:;Pooling=True;Local Provider=Managed"))
         {
@@ -298,35 +374,20 @@ public sealed class ManagedConnectionPoolingTests
         }
 
         var callbackPath = CreateDatabasePath();
-        var encryptedPath = CreateDatabasePath();
         try
         {
-            using (var callback = new SqliteConnection(
-                       $"Data Source={callbackPath};Pooling=True;Local Provider=Managed"))
-            {
-                callback.CreateFunction("pool_callback", static () => 1L);
-                callback.Open();
-                var first = callback.ManagedConnection;
-                callback.Close();
-                callback.Open();
-                callback.ManagedConnection.Should().NotBeSameAs(first);
-            }
-
-            const string key = "000102030405060708090A0B0C0D0E0F"
-                               + "101112131415161718191A1B1C1D1E1F";
-            using var encrypted = new SqliteConnection(
-                $"Data Source={encryptedPath};Pooling=True;Local Provider=Managed;"
-                + $"Encryption Cipher=AES256GCM;Encryption Key={key}");
-            encrypted.Open();
-            var encryptedFirst = encrypted.ManagedConnection;
-            encrypted.Close();
-            encrypted.Open();
-            encrypted.ManagedConnection.Should().NotBeSameAs(encryptedFirst);
+            using var callback = new SqliteConnection(
+                $"Data Source={callbackPath};Pooling=True;Local Provider=Managed");
+            callback.CreateFunction("pool_callback", static () => 1L);
+            callback.Open();
+            var first = callback.ManagedConnection;
+            callback.Close();
+            callback.Open();
+            callback.ManagedConnection.Should().NotBeSameAs(first);
         }
         finally
         {
             DeleteDatabase(callbackPath);
-            DeleteDatabase(encryptedPath);
         }
     }
 
@@ -394,6 +455,40 @@ public sealed class ManagedConnectionPoolingTests
         }
         finally
         {
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void AhtolaConnectionOptInPoolingAcceptsEncryptedFilesPerKey()
+    {
+        const string key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+        const string wrongKey = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var connection = new AhtolaConnection(
+                       $"Data Source={path};Pooling=True;Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key={key}"))
+            {
+                connection.Open();
+                connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+                connection.ExecuteNonQuery("INSERT INTO data VALUES (7);");
+                connection.Close();
+
+                connection.Open();
+                using var read = connection.CreateCommand();
+                read.CommandText = "SELECT value FROM data;";
+                read.ExecuteScalar().Should().Be(7L);
+            }
+
+            using var wrong = new AhtolaConnection(
+                $"Data Source={path};Pooling=True;Local Provider=Managed;Encryption Cipher=Aes256Gcm;Encryption Key={wrongKey}");
+            var open = () => wrong.Open();
+            open.Should().Throw<Exception>().Which.Message.Should().Contain("failed authentication");
+        }
+        finally
+        {
+            AhtolaConnection.ClearAllPools();
             DeleteDatabase(path);
         }
     }

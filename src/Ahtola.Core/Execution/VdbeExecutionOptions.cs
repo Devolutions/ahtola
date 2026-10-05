@@ -54,10 +54,12 @@ public sealed class VdbeExecutionOptions
         SorterMergeFanIn = sorterMergeFanIn;
         AllowTemporaryFileSpill = allowTemporaryFileSpill;
         Metrics = metrics ?? new VdbeExecutionMetrics();
-        TemporaryDirectory = string.IsNullOrWhiteSpace(temporaryDirectory)
-            ? Path.GetTempPath()
+        _temporaryDirectory = string.IsNullOrWhiteSpace(temporaryDirectory)
+            ? null
             : temporaryDirectory;
     }
+
+    private string? _temporaryDirectory;
 
     /// <summary>The file-system abstraction that stores transient execution spill files.</summary>
     public IFileSystem TemporaryFileSystem { get; }
@@ -85,7 +87,11 @@ public sealed class VdbeExecutionOptions
     public VdbeExecutionMetrics Metrics { get; }
 
     /// <summary>The existing directory or logical path prefix used for temporary spill names.</summary>
-    public string TemporaryDirectory { get; }
+    /// <remarks>
+    /// When none was supplied, the process temporary directory is resolved on first use, so
+    /// statements that never create a spill-capable operator do not pay for the lookup.
+    /// </remarks>
+    public string TemporaryDirectory => _temporaryDirectory ??= Execution.TemporaryDirectory.Get();
 
     internal static VdbeExecutionOptions Default { get; } =
         new(PhysicalFileSystem.Instance);

@@ -173,7 +173,7 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 | `Data Source` (`Filename`) | File path, `:memory:`, or a Turso/Hrana URL (`turso://…`, `libsql://…`, `https://…`, `wss://…`) |
 | `Mode` | `ReadWriteCreate` (default), `ReadWrite`, `ReadOnly`, `Memory` |
 | `Cache` | `Private` (default) / `Shared` |
-| `Pooling` | Connection pooling (default `true`) |
+| `Pooling` | Connection pooling (default `true`). Encrypted files are pooled per cipher and key: only a connection with the same key reuses a pooled database, and an idle pooled database keeps its key and decrypted page cache in process memory until `ClearPool`/`ClearAllPools` or `Pooling=False` |
 | `Foreign Keys` | `PRAGMA foreign_keys` |
 | `Recursive Triggers` | `PRAGMA recursive_triggers` |
 | `Default Timeout` / `Command Timeout` | Busy timeout in seconds |
@@ -183,6 +183,19 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 | `Local Provider` | `Managed` (default) or `Native`. `Native` requires the optional, non-shipped native companion to have called `AhtolaNativeProvider.Register(factory)` (typically from a `[ModuleInitializer]`); nothing is loaded by assembly name, so without a registration the connection fails closed with `NotSupportedException`. |
 | `Foreign Read Only` | Read another engine's open database without taking main-file locks (`Mode=ReadOnly` + `Pooling=False`) |
 | `DateTimeKind`, `BinaryGUID` | Facade-only ADO.NET conversion behavior |
+
+> **WAL checkpoints.** Local file connections opened through `SqliteConnection`
+> or `AhtolaConnection` follow Turso's checkpoint policy (`core/storage/pager.rs`
+> `commit_wal`, `core/storage/wal.rs` `should_checkpoint`): an ordinary commit is
+> checkpointed into the main database file only once more than 1000 committed
+> frames are waiting in the `-wal`, and closing the database (the last pooled
+> connection, `ClearPool`/`ClearAllPools`, or `Pooling=False` close) checkpoints
+> what is left when no other connection holds the WAL. Between checkpoints the
+> `.db` file alone does not contain the latest commits, exactly as with SQLite and
+> Turso in WAL mode, so copy or back up the `-wal` with it (or run
+> `PRAGMA wal_checkpoint(TRUNCATE)` first). Structural changes (schema rewrites,
+> `VACUUM`, page-size and journal-mode changes) and embedded replicas still
+> checkpoint immediately.
 
 > **Companion compatibility.** Earlier versions activated `Local Provider=Native`
 > by loading `Turso.Data.Native` reflectively and invoking its

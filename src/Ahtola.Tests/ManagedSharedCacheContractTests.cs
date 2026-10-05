@@ -90,7 +90,7 @@ public sealed class ManagedSharedCacheContractTests
         using var connection = new AhtolaConnection(connectionString);
         connection.Invoking(static connection => connection.Open())
             .Should().Throw<NotSupportedException>()
-            .WithMessage("Pooling=True is supported only for unencrypted managed local file databases.");
+            .WithMessage("Pooling=True is supported only for managed local file databases.");
     }
 
     [Test]

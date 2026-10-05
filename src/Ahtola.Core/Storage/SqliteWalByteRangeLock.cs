@@ -388,6 +388,17 @@ public sealed partial class SqliteWalByteRangeLock
                 ownsHandle: false);
         }
 
+        // A carrier with a live managed mapping lends an idle lock-free handle instead of
+        // opening the file again; the lease's lifetime returns it after unlocking.
+        if (PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry
+                .TryRentLeaseHandle(LockFilePath, requireWritable) is { } rented)
+        {
+            brokeredHandleBorrow = rented;
+            return new SafeFileHandle(
+                rented.Handle.DangerousGetHandle(),
+                ownsHandle: false);
+        }
+
         return File.OpenHandle(
             LockFilePath,
             FileMode.Open,
@@ -850,9 +861,11 @@ public sealed class SqliteWalByteRangeLockLease : IDisposable
         if (handle is null)
             return;
 
+        var unlocked = false;
         try
         {
             SqliteWalByteRangeLock.Unlock(handle, _offset, _length);
+            unlocked = true;
         }
         finally
         {
@@ -864,7 +877,16 @@ public sealed class SqliteWalByteRangeLockLease : IDisposable
             }
             finally
             {
-                Interlocked.Exchange(ref _handleLifetime, null)?.Dispose();
+                var lifetime = Interlocked.Exchange(ref _handleLifetime, null);
+                // A pooled handle may only be reused once its lock is provably released;
+                // otherwise close it, which releases the lock as the dedicated path does.
+                if (!unlocked
+                    && lifetime is PhysicalSqliteWalSharedMemoryMapping.SqliteWalSharedMemoryLifecycleRegistry.PooledLeaseHandle pooled)
+                {
+                    pooled.Discard();
+                }
+
+                lifetime?.Dispose();
             }
         }
     }

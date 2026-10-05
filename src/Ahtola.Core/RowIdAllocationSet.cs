@@ -14,6 +14,16 @@ internal sealed record RowIdSet(
     long Max);
 
 /// <summary>
+/// One unique index's keys over a table's rows, bucketed by canonical key, valid for exactly one
+/// row-store state (see <see cref="EmbeddedTable.TryGetCurrentUniqueIndexKeySet"/>).
+/// </summary>
+internal sealed record UniqueIndexKeySet(
+    long LineageId,
+    long Revision,
+    int Count,
+    ImmutableDictionary<string, ImmutableArray<SqlValue[]>> Keys);
+
+/// <summary>
 /// The rowids an INSERT statement must treat as taken: the table's rowids when the statement
 /// started, plus the ones it has allocated since, minus any allocation it gave back.
 /// </summary>

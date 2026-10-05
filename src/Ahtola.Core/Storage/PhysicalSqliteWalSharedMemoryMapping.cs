@@ -764,6 +764,128 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
             }
         }
 
+        /// <summary>
+        /// Upper bound on idle lease handles kept per carrier and access mode. Each live lease
+        /// needs its own handle (byte-range locks belong to the open file object, so leases must
+        /// not share one), so this only caps how many released handles wait for reuse.
+        /// </summary>
+        private const int MaximumIdleLeaseHandles = 16;
+
+        /// <summary>
+        /// Rents a lock-free handle on a registered carrier for a byte-range lease, so a lease
+        /// does not open and close the carrier file each time. On Windows every file open passes
+        /// through file-system filters (antivirus), which made each lease cost milliseconds while
+        /// the lock itself costs microseconds.
+        /// </summary>
+        /// <remarks>
+        /// Only carriers with a live managed mapping are pooled: the mapping already keeps the
+        /// carrier open and holds its dead-man-switch lock, so an idle handle never extends the
+        /// carrier's lifetime, and <see cref="RemoveAndDisposeEntry"/> closes every idle handle
+        /// when the final mapping goes away. A handle is pooled only after its file identity was
+        /// checked against the carrier. macOS keeps its brokered descriptors instead: closing any
+        /// descriptor there releases the process's fcntl locks for the whole inode.
+        /// </remarks>
+        internal static PooledLeaseHandle? TryRentLeaseHandle(string fullPath, bool writable)
+        {
+            if (OperatingSystem.IsMacOS())
+                return null;
+
+            SqliteWalSharedMemoryCarrierIdentity identity;
+            lock (Gate)
+            {
+                if (!MappingsByPath.TryGetValue(fullPath, out var entry))
+                    return null;
+
+                identity = entry.Identity;
+                var idle = entry.GetIdleLeaseHandles(writable);
+                if (idle.Count > 0)
+                    return new PooledLeaseHandle(identity, idle.Pop(), writable);
+            }
+
+            var handle = File.OpenHandle(
+                fullPath,
+                FileMode.Open,
+                writable ? FileAccess.ReadWrite : FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                FileOptions.None);
+            try
+            {
+                if (SqliteWalSharedMemoryCarrierIdentity.FromHandle(handle) != identity)
+                {
+                    // The path no longer names the mapped carrier; lock whatever it names now,
+                    // exactly as an unpooled lease would, but never pool that handle.
+                    return new PooledLeaseHandle(identity, handle, writable) { Poolable = false };
+                }
+
+                return new PooledLeaseHandle(identity, handle, writable);
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+
+        private static void ReturnLeaseHandle(PooledLeaseHandle lease)
+        {
+            if (lease.Poolable)
+            {
+                lock (Gate)
+                {
+                    if (Mappings.TryGetValue(lease.Identity, out var entry))
+                    {
+                        var idle = entry.GetIdleLeaseHandles(lease.Writable);
+                        if (idle.Count < MaximumIdleLeaseHandles)
+                        {
+                            idle.Push(lease.Handle);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            lease.Handle.Dispose();
+        }
+
+        internal static int GetIdleLeaseHandleCountForTesting(string path)
+        {
+            lock (Gate)
+            {
+                return MappingsByPath.TryGetValue(Path.GetFullPath(path), out var entry)
+                    ? entry.GetIdleLeaseHandles(writable: false).Count + entry.GetIdleLeaseHandles(writable: true).Count
+                    : 0;
+            }
+        }
+
+        /// <summary>
+        /// One rented lease handle. Disposing it returns the handle to its carrier's idle pool, or
+        /// closes it when the carrier is gone, the pool is full, or <see cref="Discard"/> was called
+        /// because the lease could not prove the handle's lock was released.
+        /// </summary>
+        internal sealed class PooledLeaseHandle(
+            SqliteWalSharedMemoryCarrierIdentity identity,
+            SafeFileHandle handle,
+            bool writable) : IDisposable
+        {
+            private int _disposed;
+
+            internal SqliteWalSharedMemoryCarrierIdentity Identity { get; } = identity;
+
+            internal SafeFileHandle Handle { get; } = handle;
+
+            internal bool Writable { get; } = writable;
+
+            internal bool Poolable { get; set; } = true;
+
+            internal void Discard() => Poolable = false;
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                    ReturnLeaseHandle(this);
+            }
+        }
+
         private static void RemoveAndDisposeEntry(
             SqliteWalSharedMemoryCarrierIdentity identity,
             Entry entry)
@@ -786,6 +908,7 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
             {
                 foreach (var brokeredHandle in entry.BrokeredHandles)
                     brokeredHandle.Dispose();
+                entry.DisposeIdleLeaseHandles();
             }
         }
 
@@ -815,8 +938,21 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
             internal SafeFileHandle? ReadOnlyHandle { get; private set; }
             internal SafeFileHandle? WritableHandle { get; private set; }
             internal List<SafeFileHandle> BrokeredHandles { get; } = [];
+            private readonly Stack<SafeFileHandle> _idleReadLeaseHandles = [];
+            private readonly Stack<SafeFileHandle> _idleWritableLeaseHandles = [];
             internal HashSet<string> Paths { get; } =
                 new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+            internal Stack<SafeFileHandle> GetIdleLeaseHandles(bool writable)
+                => writable ? _idleWritableLeaseHandles : _idleReadLeaseHandles;
+
+            internal void DisposeIdleLeaseHandles()
+            {
+                while (_idleReadLeaseHandles.TryPop(out var handle))
+                    handle.Dispose();
+                while (_idleWritableLeaseHandles.TryPop(out var handle))
+                    handle.Dispose();
+            }
 
             internal void AddPath(string path)
             {

@@ -312,6 +312,52 @@ public sealed class SqliteWalReadSnapshotCoordinator : IDisposable
     }
 
     /// <summary>
+    /// After a commit, advances one idle read mark (1..4) to the new committed boundary unless a
+    /// mark already names it. A reader whose shared-memory mapping is read-only (a read-only
+    /// connection, a backup snapshot) can share an existing mark but cannot publish one, so once
+    /// commits stay in the WAL between checkpoints it would otherwise find no mark to read through.
+    /// SQLite readers set idle marks the same way; an unlocked mark never holds back a checkpoint.
+    /// </summary>
+    internal void TryPublishCommittedBoundaryReadMark()
+    {
+        try
+        {
+            var region = _index.ReadValidatedHeader(_wal);
+            var maximumFrame = region.Header.MaximumFrame;
+            if (maximumFrame == 0)
+                return;
+
+            for (var readMarkIndex = 1; readMarkIndex < ReadMarkCount; readMarkIndex++)
+            {
+                if (region.CheckpointInfo.GetReadMark(readMarkIndex) == maximumFrame)
+                    return;
+            }
+
+            for (var readMarkIndex = 1; readMarkIndex < ReadMarkCount; readMarkIndex++)
+            {
+                if (!_locks.TryAcquireExclusive(GetReadMarkLockOffset(readMarkIndex), length: 1, out var exclusiveLease))
+                    continue;
+
+                using (exclusiveLease)
+                {
+                    var confirmation = _index.ReadValidatedHeader(_wal);
+                    if (confirmation.Header.MaximumFrame == maximumFrame)
+                        _index.PublishReadMark(readMarkIndex, maximumFrame);
+                }
+
+                return;
+            }
+        }
+        catch (Exception exception) when (exception is InvalidDataException
+                                              or IOException
+                                              or InvalidOperationException)
+        {
+            // Best effort: the commit is already durable, and a reader that finds no shared mark
+            // still publishes one itself when its mapping is writable.
+        }
+    }
+
+    /// <summary>
     /// Pins a fully backfilled boundary with read-marks 1..4 while read-mark 0 is busy: share a
     /// mark already at <c>mxFrame</c>, or advance an idle one to it.
     /// </summary>
