@@ -1914,13 +1914,12 @@ public class AhtolaConnection :
         var eligibleManagedFile = Capabilities.SupportsPooling
             && !string.IsNullOrWhiteSpace(dataSource)
             && !dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
-            && !mode.Equals("Memory", StringComparison.OrdinalIgnoreCase)
-            && !_connectionOptions.GetEncryptionCipher().HasValue
-                        && string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]);
+            && !mode.Equals("Memory", StringComparison.OrdinalIgnoreCase);
         if (!eligibleManagedFile)
         {
+            // Encrypted files are eligible: they are pooled under their cipher-and-key identity.
             throw new NotSupportedException(
-                "Pooling=True is supported only for unencrypted managed local file databases.");
+                "Pooling=True is supported only for managed local file databases.");
         }
     }
 
@@ -2144,21 +2143,29 @@ public class AhtolaConnection :
             _managedSharedMemory = true;
         }
         else if (_connectionOptions.Pooling
-            && options.Encryption is null
             && PageCodec is null
             && !options.ForeignReadOnly
             && !options.DataSource.Equals(":memory:", StringComparison.Ordinal))
         {
-            var poolKey = ManagedConnectionPoolKey.Create(options.DataSource, options.ReadOnly);
+            // An encrypted database is pooled under its cipher-and-key identity, so only a
+            // connection with the same key reuses it.
+            var encryption = options.Encryption;
+            var poolKey = ManagedConnectionPoolKey.Create(
+                options.DataSource,
+                options.ReadOnly,
+                encryption?.CreatePoolIdentity());
             _managedPoolLease = ManagedConnectionPool.Rent(
                 poolKey,
-                () => OpenUnencryptedManagedDatabase(poolKey.DataSource, options.ReadOnly));
+                () => encryption is null
+                    ? new ManagedPooledDatabase(OpenUnencryptedManagedDatabase(poolKey.DataSource, options.ReadOnly))
+                    : OpenEncryptedManagedDatabase(poolKey.DataSource, options.ReadOnly, encryption));
             _managedDatabase = _managedPoolLease.Database;
             _managedPoolKey = poolKey;
         }
         else if (options.Encryption is null && PageCodec is null && !options.ReadOnly)
         {
             var managedDatabase = ManagedDatabaseAdapter.Open(options.DataSource);
+            managedDatabase.EnableDeferredCheckpoints();
             try
             {
                 _ = managedDatabase.Connect();
@@ -2199,11 +2206,13 @@ public class AhtolaConnection :
                     fileSystem = managedPageCodecFileSystem;
                 }
 
-                managedDatabase = ManagedDatabaseAdapter.OpenFile(
+                var fileAdapter = ManagedDatabaseAdapter.OpenFile(
                     options.DataSource,
                     fileSystem,
                     readOnly: options.ReadOnly,
                     foreignReadOnly: options.ForeignReadOnly);
+                fileAdapter.EnableDeferredCheckpoints();
+                managedDatabase = fileAdapter;
                 try
                 {
                     _ = managedDatabase.Connect();
@@ -2325,11 +2334,40 @@ public class AhtolaConnection :
         }
     }
 
+    /// <summary>
+    /// Opens an encrypted database for the connection pool. The pooled entry owns the encryption
+    /// file system, which copies the key, so it outlives the caller's encryption options.
+    /// </summary>
+    private static ManagedPooledDatabase OpenEncryptedManagedDatabase(
+        string dataSource,
+        bool readOnly,
+        AhtolaEncryptionOptions encryption)
+    {
+        var fileSystem = new AhtolaEncryptionFileSystem(PhysicalFileSystem.Instance, encryption);
+        IManagedDatabaseAdapter? managedDatabase = null;
+        try
+        {
+            var adapter = ManagedDatabaseAdapter.OpenFile(dataSource, fileSystem, readOnly: readOnly);
+            managedDatabase = adapter;
+            adapter.EnableDeferredCheckpoints();
+            _ = managedDatabase.Connect();
+            return new ManagedPooledDatabase(managedDatabase, fileSystem);
+        }
+        catch
+        {
+            managedDatabase?.Dispose();
+            fileSystem.Dispose();
+            throw;
+        }
+    }
+
     private static IManagedDatabaseAdapter OpenUnencryptedManagedDatabase(string dataSource, bool readOnly)
     {
         var managedDatabase = readOnly
             ? ManagedDatabaseAdapter.OpenFile(dataSource, PhysicalFileSystem.Instance, readOnly: true)
             : ManagedDatabaseAdapter.Open(dataSource);
+        // Turso's checkpoint policy: checkpoint once the WAL passes its threshold.
+        managedDatabase.EnableDeferredCheckpoints();
         try
         {
             _ = managedDatabase.Connect();

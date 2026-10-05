@@ -447,6 +447,15 @@ public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
         _databaseOwner = databaseOwner;
     }
 
+    /// <summary>
+    /// Adopts Turso's checkpoint policy (see <see cref="EmbeddedDatabase.EnableDeferredCheckpoints"/>).
+    /// </summary>
+    internal void EnableDeferredCheckpoints()
+    {
+        lock (_gate)
+            _databaseOwner?.EnableDeferredCheckpoints();
+    }
+
     public static ManagedDatabaseAdapter Open(string path)
     {
         ArgumentNullException.ThrowIfNull(path);

@@ -835,7 +835,7 @@ public sealed class SqlitePager : IDisposable
                             }
                             else if (pager._walIndex is not null)
                             {
-                                pager.PublishWalIndexFromCurrentWal();
+                                pager.PublishWalIndexOnOpen();
                             }
                         }
                         else
@@ -2723,7 +2723,13 @@ public sealed class SqlitePager : IDisposable
 
                                     _pageCache.Clear();
                                     ObserveCurrentWalStamp();
-                                    _lockGeneration = unchecked(_lockGeneration + 1);
+                                    // The checkpoint rebuilt this pager's committed view in place
+                                    // (overlay, recovery info, wal-index identity, WAL stamp) and
+                                    // cleared the page cache, so it keeps its generation. Bumping it
+                                    // locally forced a full rescan (header and WAL reopen) after
+                                    // every checkpoint, and could land exactly on a peer's newly
+                                    // published generation and so skip the rescan that peer's commit
+                                    // needs; a peer publish already leaves the generations unequal.
                                     if (committedPageOne is not null)
                                         _pageCache.Add(1, _lockGeneration, committedPageOne);
                                     _state = SqlitePagerState.Ready;
@@ -3313,6 +3319,22 @@ public sealed class SqlitePager : IDisposable
         => _foreignReadOnly
            || (_lockManager.UsesFileBackedWalLocks
                && (_clientOwnership is null || _journalMode == SqliteJournalMode.Delete));
+
+    /// <summary>
+    /// The committed WAL frames this pager's view holds that a checkpoint has not yet reset
+    /// away. Ahtola's checkpoints restart the WAL once they backfill it, so this is the count
+    /// Turso's <c>should_checkpoint</c> compares (<c>max_frame - nbackfills</c>).
+    /// </summary>
+    internal long CommittedWalFrameCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return UsesWalStorage(_journalMode) ? _committedFrameCount : 0;
+            }
+        }
+    }
 
     /// <summary>
     /// The shared per-file storage generation, published after any WAL commit or
@@ -4187,7 +4209,39 @@ public sealed class SqlitePager : IDisposable
     {
         AttachWalIndexMapping(readOnly);
         if (!readOnly && _walIndex is not null)
-            PublishWalIndexFromCurrentWal();
+            PublishWalIndexOnOpen();
+    }
+
+    /// <summary>
+    /// Open-time WAL-index publication. A WAL-index whose header already validates against this
+    /// WAL's committed boundary is current and is kept, as SQLite only recovers the index when its
+    /// header is invalid (<c>walIndexReadHdr</c>). Rebuilding a valid index reset the read marks
+    /// live readers hold, discarded the backfill count, re-read every frame and bumped iChange for
+    /// every peer; harmless only while every commit also emptied the WAL.
+    /// </summary>
+    private void PublishWalIndexOnOpen()
+    {
+        if (_walIndex is not null
+            && _wal is not null
+            && _walIndexMapping is { IsReadOnly: false })
+        {
+            try
+            {
+                var region = _walIndex.ReadValidatedHeader(_wal);
+                var mainPageCount = _committedPageCount != 0 ? _committedPageCount : _pageStore.PageCount;
+                if (region.Header.MaximumFrame != 0 || region.Header.DatabasePageCount == mainPageCount)
+                {
+                    ObserveWalIndexIdentity(region.Header);
+                    return;
+                }
+            }
+            catch (InvalidDataException)
+            {
+                // Torn, stale or foreign index: rebuild it from the WAL below.
+            }
+        }
+
+        PublishWalIndexFromCurrentWal();
     }
 
     private void AttachWalIndexMapping(bool readOnly)
@@ -4322,10 +4376,12 @@ public sealed class SqlitePager : IDisposable
                 commitFrame.Checksum2);
             _walIndex.PublishCommittedFrames(priorHeader, frames, committedHeader, wal);
             ObserveWalIndexIdentity(committedHeader);
+            PublishCommittedBoundaryReadMark();
             return;
         }
 
         PublishWalIndexFromCurrentWal();
+        PublishCommittedBoundaryReadMark();
     }
 
     private uint GetWalIndexMainPageCount()
@@ -4365,6 +4421,13 @@ public sealed class SqlitePager : IDisposable
     private void DisposeWalIndex(bool deletePhysicalIfLast = false)
     {
         ReplaceWalIndex(mapping: null, index: null, deletePhysicalIfLast);
+    }
+
+    // Lets read-only readers share a mark at the new boundary (see the coordinator method).
+    private void PublishCommittedBoundaryReadMark()
+    {
+        EnsureReadSnapshotCoordinatorLocked();
+        _readSnapshotCoordinator?.TryPublishCommittedBoundaryReadMark();
     }
 
     private void EnsureReadSnapshotCoordinatorLocked()

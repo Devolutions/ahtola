@@ -402,7 +402,7 @@ public sealed class ManagedEncryptionFormatInteropTests
     }
 
     private static string CreateConnectionString(string path, string cipher, string key)
-        => $"Data Source={path};Local Provider=Managed;Encryption Cipher={cipher};Encryption Key={key}";
+        => $"Data Source={path};Local Provider=Managed;Encryption Cipher={cipher};Encryption Key={key};Pooling=False";
 
     private static string CreateDatabasePath(string name)
     {

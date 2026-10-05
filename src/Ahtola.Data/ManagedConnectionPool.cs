@@ -2,10 +2,36 @@ using Ahtola.Core;
 
 namespace Ahtola;
 
-internal readonly record struct ManagedConnectionPoolKey(string DataSource, bool ReadOnly)
+/// <param name="DataSource">The full path of the pooled database file.</param>
+/// <param name="ReadOnly">Whether the pooled databases were opened read-only.</param>
+/// <param name="Encryption">
+/// The cipher-and-key identity of an encrypted database (<c>AhtolaEncryptionOptions.CreatePoolIdentity</c>),
+/// so a pooled encrypted database is only ever handed to a connection configured with the same key;
+/// <see langword="null"/> for a plain database.
+/// </param>
+internal readonly record struct ManagedConnectionPoolKey(string DataSource, bool ReadOnly, string? Encryption = null)
 {
-    public static ManagedConnectionPoolKey Create(string dataSource, bool readOnly)
-        => new(Path.GetFullPath(dataSource), readOnly);
+    public static ManagedConnectionPoolKey Create(string dataSource, bool readOnly, string? encryption = null)
+        => new(Path.GetFullPath(dataSource), readOnly, encryption);
+}
+
+/// <summary>
+/// One pooled database together with the resources that must live exactly as long as it, such as
+/// the encryption file system an encrypted database reads its pages through.
+/// </summary>
+internal readonly record struct ManagedPooledDatabase(IManagedDatabaseAdapter Database, IDisposable? Companion = null)
+{
+    public void Dispose()
+    {
+        try
+        {
+            Database.Dispose();
+        }
+        finally
+        {
+            Companion?.Dispose();
+        }
+    }
 }
 
 internal static class ManagedConnectionPool
@@ -18,6 +44,14 @@ internal static class ManagedConnectionPool
     public static ManagedConnectionPoolLease Rent(
         ManagedConnectionPoolKey key,
         Func<IManagedDatabaseAdapter> factory)
+    {
+        ArgumentNullException.ThrowIfNull(factory);
+        return Rent(key, () => new ManagedPooledDatabase(factory()));
+    }
+
+    public static ManagedConnectionPoolLease Rent(
+        ManagedConnectionPoolKey key,
+        Func<ManagedPooledDatabase> factory)
     {
         ArgumentNullException.ThrowIfNull(factory);
 
@@ -42,14 +76,14 @@ internal static class ManagedConnectionPool
             }
 
             evictedPool?.Clear();
-            if (!pool.TryRent(out var database))
+            if (!pool.TryRent(out var pooled))
                 continue;
-            if (database is null)
+            if (pooled is not { } database)
                 return new ManagedConnectionPoolLease(pool, factory());
 
             try
             {
-                database.Connection.ResetForPooling();
+                database.Database.Connection.ResetForPooling();
                 return new ManagedConnectionPoolLease(pool, database);
             }
             catch
@@ -101,10 +135,10 @@ internal static class ManagedConnectionPool
     internal sealed class Pool
     {
         private readonly object _gate = new();
-        private readonly Stack<IManagedDatabaseAdapter> _idle = [];
+        private readonly Stack<ManagedPooledDatabase> _idle = [];
         private bool _cleared;
 
-        public bool TryRent(out IManagedDatabaseAdapter? database)
+        public bool TryRent(out ManagedPooledDatabase? database)
         {
             lock (_gate)
             {
@@ -119,7 +153,7 @@ internal static class ManagedConnectionPool
             }
         }
 
-        public void Return(IManagedDatabaseAdapter database)
+        public void Return(ManagedPooledDatabase database)
         {
             var dispose = false;
             lock (_gate)
@@ -136,7 +170,7 @@ internal static class ManagedConnectionPool
 
         public void Clear()
         {
-            IManagedDatabaseAdapter[] idle;
+            ManagedPooledDatabase[] idle;
             lock (_gate)
             {
                 if (_cleared)
@@ -173,50 +207,63 @@ internal static class ManagedConnectionPool
 
         public bool Equals(ManagedConnectionPoolKey left, ManagedConnectionPoolKey right)
             => left.ReadOnly == right.ReadOnly
-               && PathComparer.Equals(left.DataSource, right.DataSource);
+               && PathComparer.Equals(left.DataSource, right.DataSource)
+               && string.Equals(left.Encryption, right.Encryption, StringComparison.Ordinal);
 
         public int GetHashCode(ManagedConnectionPoolKey key)
-            => HashCode.Combine(PathComparer.GetHashCode(key.DataSource), key.ReadOnly);
+            => HashCode.Combine(
+                PathComparer.GetHashCode(key.DataSource),
+                key.ReadOnly,
+                key.Encryption is null ? 0 : StringComparer.Ordinal.GetHashCode(key.Encryption));
     }
 }
 
 internal sealed class ManagedConnectionPoolLease
 {
+    private readonly object _gate = new();
     private ManagedConnectionPool.Pool? _pool;
-    private IManagedDatabaseAdapter? _database;
+    private ManagedPooledDatabase? _database;
 
     internal ManagedConnectionPoolLease(
         ManagedConnectionPool.Pool pool,
-        IManagedDatabaseAdapter database)
+        ManagedPooledDatabase database)
     {
         _pool = pool;
         _database = database;
     }
 
     public IManagedDatabaseAdapter Database
-        => _database ?? throw new ObjectDisposedException(nameof(ManagedConnectionPoolLease));
+        => _database?.Database ?? throw new ObjectDisposedException(nameof(ManagedConnectionPoolLease));
 
     public void Release(bool reusable)
     {
-        var database = Interlocked.Exchange(ref _database, null);
-        var pool = Interlocked.Exchange(ref _pool, null);
-        if (database is null)
+        ManagedPooledDatabase? database;
+        ManagedConnectionPool.Pool? pool;
+        lock (_gate)
+        {
+            database = _database;
+            pool = _pool;
+            _database = null;
+            _pool = null;
+        }
+
+        if (database is not { } released)
             return;
 
         if (!reusable || pool is null)
         {
-            database.Dispose();
+            released.Dispose();
             return;
         }
 
         try
         {
-            database.Connection.ResetForPooling();
-            pool.Return(database);
+            released.Database.Connection.ResetForPooling();
+            pool.Return(released);
         }
         catch
         {
-            database.Dispose();
+            released.Dispose();
             throw;
         }
     }

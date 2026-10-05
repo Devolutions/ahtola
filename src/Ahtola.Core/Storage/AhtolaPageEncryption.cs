@@ -186,6 +186,23 @@ public sealed class AhtolaEncryptionOptions : IDisposable
         return new AhtolaPageEncryption(Cipher, key, pageSize);
     }
 
+    /// <summary>
+    /// A stable identity for this cipher and key, used to key connection pools so a pooled
+    /// encrypted database is only ever handed to a connection configured with the same key. It is
+    /// a SHA-256 digest, never the key itself.
+    /// </summary>
+    internal string CreatePoolIdentity()
+    {
+        var key = _key ?? throw new ObjectDisposedException(nameof(AhtolaEncryptionOptions));
+        Span<byte> material = stackalloc byte[key.Length + 1];
+        material[0] = (byte)Cipher;
+        key.CopyTo(material[1..]);
+        Span<byte> digest = stackalloc byte[SHA256.HashSizeInBytes];
+        SHA256.HashData(material, digest);
+        CryptographicOperations.ZeroMemory(material);
+        return "ahtola-encryption:" + Convert.ToHexString(digest);
+    }
+
     internal AhtolaEncryptionOptions CreateOwnedCopy()
     {
         var key = _key ?? throw new ObjectDisposedException(nameof(AhtolaEncryptionOptions));

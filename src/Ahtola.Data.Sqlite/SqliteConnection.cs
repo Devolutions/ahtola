@@ -290,17 +290,28 @@ public partial class SqliteConnection :
                     _managedDatabase = ManagedSharedMemoryDatabase.Open(filename);
                     _managedSharedMemory = true;
                 }
-                else if (CanUseManagedPooling(filename, managedEncryption))
+                else if (CanUseManagedPooling(filename))
                 {
-                    var poolKey = ManagedConnectionPoolKey.Create(filename, readOnly);
+                    // An encrypted database is pooled under its cipher-and-key identity, so only a
+                    // connection with the same key reuses it; the pooled entry owns the encryption
+                    // file system its pages are read through.
+                    var poolKey = ManagedConnectionPoolKey.Create(
+                        filename,
+                        readOnly,
+                        managedEncryption?.CreatePoolIdentity());
+                    var encryption = managedEncryption;
                     _managedPoolLease = ManagedConnectionPool.Rent(
                         poolKey,
-                        () => OpenManagedDatabase(
-                            filename,
-                            readOnly,
-                            encryption: null,
-                            out _,
-                            out _));
+                        () =>
+                        {
+                            var database = OpenManagedDatabase(
+                                filename,
+                                readOnly,
+                                encryption,
+                                out var encryptionFileSystem,
+                                out _);
+                            return new ManagedPooledDatabase(database, encryptionFileSystem);
+                        });
                     _managedDatabase = _managedPoolLease.Database;
                 }
                 else
@@ -1652,7 +1663,10 @@ public partial class SqliteConnection :
 
             if (encryption is null && PageCodec is null && !readOnly)
             {
-                database = ManagedDatabaseAdapter.Open(filename);
+                var adapter = ManagedDatabaseAdapter.Open(filename);
+                database = adapter;
+                // Turso's checkpoint policy: checkpoint once the WAL passes its threshold.
+                adapter.EnableDeferredCheckpoints();
                 _ = database.Connect();
                 return database;
             }
@@ -1673,11 +1687,13 @@ public partial class SqliteConnection :
                 fileSystem = managedPageCodecFileSystem;
             }
 
-            database = ManagedDatabaseAdapter.OpenFile(
+            var fileAdapter = ManagedDatabaseAdapter.OpenFile(
                 filename,
                 fileSystem,
                 readOnly: readOnly,
                 foreignReadOnly: foreignReadOnly);
+            database = fileAdapter;
+            fileAdapter.EnableDeferredCheckpoints();
             _ = database.Connect();
             return database;
         }
@@ -1976,9 +1992,8 @@ public partial class SqliteConnection :
         }
     }
 
-    private bool CanUseManagedPooling(string filename, AhtolaEncryptionOptions? encryption)
+    private bool CanUseManagedPooling(string filename)
         => _connectionOptions.Pooling
-           && encryption is null
                && PageCodec is null
                && !HasManagedCallbacks
                && !_connectionOptions.ForeignReadOnly
@@ -1990,7 +2005,6 @@ public partial class SqliteConnection :
         key = default;
         if (_connectionOptions.EffectiveLocalProvider != AhtolaLocalProvider.Managed
             || !_connectionOptions.Pooling
-            || _connectionOptions.HasEncryptionOptions
             || PageCodec is not null
             || _connectionOptions.Mode == SqliteOpenMode.Memory
             || _connectionOptions.Cache == SqliteCacheMode.Shared)
@@ -2002,9 +2016,25 @@ public partial class SqliteConnection :
         if (filename.Equals(":memory:", StringComparison.Ordinal))
             return false;
 
+        string? encryption = null;
+        if (_connectionOptions.HasEncryptionOptions)
+        {
+            try
+            {
+                using var options = _connectionOptions.CreateManagedEncryptionOptions();
+                encryption = options?.CreatePoolIdentity();
+            }
+            catch (ArgumentException)
+            {
+                // A malformed key never opened a pooled database, so there is nothing to clear.
+                return false;
+            }
+        }
+
         key = ManagedConnectionPoolKey.Create(
             filename,
-            _connectionOptions.Mode == SqliteOpenMode.ReadOnly);
+            _connectionOptions.Mode == SqliteOpenMode.ReadOnly,
+            encryption);
         return true;
     }
 

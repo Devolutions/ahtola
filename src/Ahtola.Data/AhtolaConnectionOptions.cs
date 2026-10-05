@@ -437,16 +437,31 @@ public class AhtolaConnectionOptions
         var dataSource = string.IsNullOrEmpty(DataSource) ? ":memory:" : DataSource;
         if (mode == ManagedLocalOpenMode.Memory
             || dataSource.Equals(":memory:", StringComparison.Ordinal)
-            || GetEncryptionCipher().HasValue
-                    || _builder.GetOption("Encryption Key") is not null
-                    || !string.IsNullOrWhiteSpace(_builder.GetOption("Password")))
+            || !string.IsNullOrWhiteSpace(_builder.GetOption("Password")))
         {
             return false;
         }
 
+        // Encrypted databases are pooled under their cipher-and-key identity (see OpenManagedDatabase).
+        string? encryption = null;
+        if (GetEncryptionCipher().HasValue || _builder.GetOption("Encryption Key") is not null)
+        {
+            try
+            {
+                using var options = CreateManagedEncryptionOptions(mode, dataSource);
+                encryption = options?.CreatePoolIdentity();
+            }
+            catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or NotSupportedException)
+            {
+                // Options that cannot open a database never opened a pooled one either.
+                return false;
+            }
+        }
+
         key = ManagedConnectionPoolKey.Create(
             dataSource,
-            mode == ManagedLocalOpenMode.ReadOnly);
+            mode == ManagedLocalOpenMode.ReadOnly,
+            encryption);
         return true;
     }
 

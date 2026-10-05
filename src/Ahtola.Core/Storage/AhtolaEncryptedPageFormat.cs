@@ -82,6 +82,21 @@ internal static class AhtolaEncryptedPageFormat
         => header.Length >= AhtolaHeaderMagic.Length
            && header[..AhtolaHeaderMagic.Length].SequenceEqual(AhtolaHeaderMagic);
 
+    /// <summary>Whether <paramref name="header"/> starts with the plaintext SQLite magic.</summary>
+    internal static bool IsPlaintextSqlite(ReadOnlySpan<byte> header)
+        => header.StartsWith(SqliteHeaderMagic);
+
+    /// <summary>
+    /// Explains why an encrypted open rejected a file that does not carry the AHTLA magic. Only a
+    /// genuine plaintext SQLite header is reported as such; anything else (another codec's
+    /// ciphertext, such as SQLite SEE or SQLCipher, or a non-database file) is not plaintext.
+    /// </summary>
+    internal static string DescribeNonAhtolaHeader(ReadOnlySpan<byte> header, string subject)
+        => IsPlaintextSqlite(header)
+            ? $"Encryption was requested, but {subject} contains a plaintext SQLite header. Plaintext fallback is not permitted."
+            : $"Encryption was requested, but {subject} is not in the Ahtola encrypted page format; "
+              + "it may be encrypted by another codec or not be a database.";
+
     /// <summary>
     /// Reports the key, nonce and metadata sizes for <paramref name="cipher"/>.
     /// The numeric enum values are the Turso cipher ids, so the header byte and

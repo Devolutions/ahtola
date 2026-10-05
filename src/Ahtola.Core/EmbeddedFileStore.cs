@@ -4220,7 +4220,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         _header = newHeader;
         if (checkpointAfterCommit)
-            CheckpointCommittedMutation(reclaimTrailingPages: false);
+            CheckpointRowMutationIfDue();
         return true;
     }
 
@@ -5036,7 +5036,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         _header = newHeader;
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        CheckpointRowMutationIfDue();
         return true;
     }
 
@@ -10230,6 +10230,63 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
 
             previousNonNullKey = key;
+        }
+    }
+
+    /// <summary>
+    /// When greater than zero, an ordinary row mutation checkpoints only once more than this many
+    /// committed WAL frames await a checkpoint, as Turso's auto-checkpoint does after commit
+    /// (<c>core/storage/pager.rs</c> <c>commit_wal</c>, <c>core/storage/wal.rs</c>
+    /// <c>should_checkpoint</c>, threshold 1000). Zero checkpoints after every commit. Structural
+    /// mutations (full rewrites, page-size migration, journal-mode changes, VACUUM) always
+    /// checkpoint immediately. <see cref="EmbeddedDatabase"/> sets this before each persist.
+    /// </summary>
+    internal int DeferredCheckpointFrameThreshold { get; set; }
+
+    /// <summary>The committed WAL frames no checkpoint has reset away yet.</summary>
+    internal long CommittedWalFrameCount => _pager.CommittedWalFrameCount;
+
+    private void CheckpointRowMutationIfDue()
+    {
+        // MVCC keeps its own logical-log checkpoint policy (Turso's mvcc_checkpoint_threshold),
+        // and its page-WAL checkpoints assume the WAL holds no deferred row frames.
+        if (DeferredCheckpointFrameThreshold > 0
+            && JournalMode != SqliteJournalMode.Mvcc
+            && _pager.CommittedWalFrameCount <= DeferredCheckpointFrameThreshold)
+        {
+            return;
+        }
+
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
+    }
+
+    /// <summary>
+    /// Best-effort checkpoint when the database is closed, mirroring Turso's checkpoint on
+    /// connection shutdown, so deferred frames do not stay in the WAL indefinitely. A busy WAL
+    /// (another connection's reader) or any failure leaves the frames in place; they remain
+    /// durable and are checkpointed by a later writer or open.
+    /// </summary>
+    internal void TryCheckpointDeferredFramesOnClose()
+    {
+        if (_disposed
+            || DeferredCheckpointFrameThreshold <= 0
+            || _postCommitMaintenanceFailure is not null
+            || _pager.CommittedWalFrameCount == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _pager.CheckpointToMainStoreAndResetWal(synchronousMode: _synchronousMode);
+        }
+        catch (Exception exception) when (exception is SqlitePagerBusyException
+                                              or IOException
+                                              or UnauthorizedAccessException
+                                              or InvalidDataException
+                                              or InvalidOperationException
+                                              or NotSupportedException)
+        {
         }
     }
 
