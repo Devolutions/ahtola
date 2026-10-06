@@ -56110,7 +56110,7 @@ out bool hasReturning)
         if (TryGetExactWindowInteger(value, out var integer))
             return integer;
         if (value.Kind == SqlValueKind.Real)
-            return (long)value.AsReal();
+            return SaturatingToInt64(value.AsReal());
         if (value.Kind == SqlValueKind.Text
             && double.TryParse(
                 EmbeddedTable.TrimAsciiWhitespace(value.AsText()),
@@ -56118,10 +56118,24 @@ out bool hasReturning)
                 CultureInfo.InvariantCulture,
                 out var real))
         {
-            return (long)real;
+            return SaturatingToInt64(real);
         }
 
         return 0;
+    }
+
+    // SQLite's doubleToInt64: out-of-range values clamp to the int64 limits and NaN becomes 0. A
+    // plain cast is runtime-dependent there (.NET 9+ saturates; .NET 8 on x64 yields long.MinValue
+    // for any out-of-range value, which turned substr('abc', 1.8e19) into the whole string).
+    private static long SaturatingToInt64(double value)
+    {
+        if (double.IsNaN(value))
+            return 0;
+        if (value <= long.MinValue)
+            return long.MinValue;
+        if (value >= long.MaxValue)
+            return long.MaxValue;
+        return (long)value;
     }
 
     private int CompareRows(
