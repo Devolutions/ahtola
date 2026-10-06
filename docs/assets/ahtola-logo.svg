@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="ahtola-logo-title">
+  <title id="ahtola-logo-title">Ahtola</title>
+  <defs>
+    <linearGradient id="ahtola-sea" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#512BD4"/>
+      <stop offset="1" stop-color="#0A7E9E"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#ahtola-sea)"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <!-- water level inside the database -->
+    <path d="M28 58q9-7.5 18 0t18 0t18 0t18 0V90a36 12 0 0 1-72 0Z" fill="#FFFFFF" fill-opacity="0.22" stroke="none"/>
+    <!-- cylinder body and lid -->
+    <path d="M28 36V90a36 12 0 0 0 72 0V36"/>
+    <ellipse cx="64" cy="36" rx="36" ry="12" fill="#FFFFFF" fill-opacity="0.12"/>
+    <!-- surface wave in place of the classic disk line -->
+    <path d="M28 58q9-7.5 18 0t18 0t18 0t18 0"/>
+  </g>
+  <!-- Sampo fragments: the treasure of Ahtola -->
+  <g fill="#F2B53A">
+    <path d="M44 83l6-7.5l6 7.5l-6 7.5Z"/>
+    <path d="M58 89l6-7l6 7l-6 7Z"/>
+    <path d="M72 81l7-8.5l7 8.5l-7 8.5Z"/>
+    <path d="M106 8q2 9 11 11q-9 2-11 11q-2-9-11-11q9-2 11-11Z"/>
+  </g>
+  <g fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-opacity="0.7">
+    <circle cx="38" cy="73" r="3"/>
+    <circle cx="43" cy="65" r="2"/>
+  </g>
+</svg>

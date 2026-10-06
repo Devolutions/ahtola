@@ -1,3 +1,5 @@
+![Ahtola logo](https://raw.githubusercontent.com/Devolutions/ahtola/master/docs/assets/ahtola-logo.png)
+
 # Ahtola .NET
 
 An experimental pure managed (C#) port of [Turso](https://turso.tech)’s
@@ -21,6 +23,7 @@ or run.
 - [What this is good for](#what-this-is-good-for)
 - [Important limits](#important-limits)
 - [Building from source](#building-from-source)
+- [The name](#the-name)
 
 ## Install
 
@@ -522,6 +525,15 @@ live in [AGENTS.md](AGENTS.md) and [docs/](docs).
 The consolidated [performance suite](src/Benchmarks/README.md) ports applicable
 workloads from the pinned Turso benchmark corpus, compares managed Ahtola with
 Microsoft.Data.Sqlite, and supports historical Ahtola regression reports.
+
+## The name
+
+Turso is named after Iku-Turso, the sea monster of the Finnish epic
+*Kalevala*. Ahtola is the undersea hall of Ahti, the Kalevala’s king of the
+sea, where the shattered Sampo sinks to become the sea’s treasure. The logo
+is that hall as a database: a cylinder holding the water and the gold
+fragments. Brand assets (SVG, horizontal and dark-mode wordmarks, and the
+NuGet icon PNG) live in [docs/assets](docs/assets).
 
 ## License
 

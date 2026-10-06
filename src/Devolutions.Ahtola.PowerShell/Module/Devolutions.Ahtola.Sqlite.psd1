@@ -51,6 +51,7 @@
             Tags = @('SQLite', 'Ahtola', 'Database', 'CRUD', 'Devolutions')
             LicenseUri = 'https://opensource.org/licenses/MIT'
             ProjectUri = 'https://github.com/Devolutions/ahtola'
+            IconUri = 'https://raw.githubusercontent.com/Devolutions/ahtola/master/docs/assets/ahtola-logo.png'
             ReleaseNotes = 'Initial Ahtola-backed clone of the synedgy.PSSqlite C# port.'
         }
     }

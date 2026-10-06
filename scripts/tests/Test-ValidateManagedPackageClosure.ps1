@@ -65,10 +65,11 @@ function New-TestPackage(
     [switch]$ExtraCoreDependency,
     [switch]$DuplicateEfProviderDependency,
     [switch]$BadMetadata,
+    [switch]$MissingIcon,
     [switch]$RidLeak,
     [switch]$NativeLeak
 ) {
-    $source = Join-Path $scratchRoot "source-$($PackageId.Replace('.', '-'))"
+    $source =Join-Path $scratchRoot "source-$($PackageId.Replace('.', '-'))"
     New-Item -ItemType Directory -Path $source -Force | Out-Null
 
     $groups = foreach ($framework in $frameworks) {
@@ -116,6 +117,11 @@ $($dependencies -join [Environment]::NewLine)
     }
 
     Set-Content -LiteralPath (Join-Path $source 'README.md') -Value '# Test'
+    $omitIcon = $MissingIcon -and $PackageId -eq 'Devolutions.Ahtola.Core'
+    if (-not $omitIcon) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/assets/ahtola-logo.png') -Destination $source
+    }
+    $iconElement = if ($omitIcon) { '' } else { '<icon>ahtola-logo.png</icon>' }
     $authors = if ($BadMetadata -and $PackageId -eq 'Devolutions.Ahtola.Core') { '' } else { 'Devolutions' }
     $nuspec = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -127,6 +133,7 @@ $($dependencies -join [Environment]::NewLine)
     <authors>$authors</authors>
     <license type="expression">MIT</license>
     <readme>README.md</readme>
+    $iconElement
     <projectUrl>https://github.com/Devolutions/ahtola</projectUrl>
     <description>Package closure validation fixture.</description>
     <copyright>Copyright (c) 2026 Devolutions</copyright>
@@ -149,6 +156,7 @@ function New-TestPackageSet(
     [switch]$ExtraCoreDependency,
     [switch]$DuplicateEfProviderDependency,
     [switch]$BadMetadata,
+    [switch]$MissingIcon,
     [switch]$RidLeak,
     [switch]$NativeLeak
 ) {
@@ -159,6 +167,7 @@ function New-TestPackageSet(
             -ExtraCoreDependency:$ExtraCoreDependency `
             -DuplicateEfProviderDependency:$DuplicateEfProviderDependency `
             -BadMetadata:$BadMetadata `
+            -MissingIcon:$MissingIcon `
             -RidLeak:$RidLeak `
             -NativeLeak:$NativeLeak
     }
@@ -267,6 +276,9 @@ try {
     $badMetadata = New-TestPackageSet 'bad-metadata' -BadMetadata
     Invoke-Validator @('-PackageDirectory', $badMetadata) $false "'authors'"
 
+    $missingIcon = New-TestPackageSet 'missing-icon' -MissingIcon
+    Invoke-Validator @('-PackageDirectory', $missingIcon) $false "'icon'"
+
     $ridPackages = New-TestPackageSet 'rid-leak' -RidLeak
     Invoke-Validator @('-PackageDirectory', $ridPackages) $false 'RID-specific'
 
@@ -339,7 +351,7 @@ try {
     Set-Content -LiteralPath (Join-Path $nativeStage 'Native.dll') -Value 'not a managed PE image'
     Invoke-Validator @('-StagedBinaryDirectory', (Split-Path -Parent $nativeStage)) $false 'native PE image'
 
-    Write-Host 'Test-ValidateManagedPackageClosure passed (15 checks).' -ForegroundColor Green
+    Write-Host 'Test-ValidateManagedPackageClosure passed (16 checks).' -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $scratchRoot) {
