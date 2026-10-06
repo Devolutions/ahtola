@@ -290,6 +290,47 @@ public sealed class ManagedIncrementalPagerTests
     }
 
     [Test]
+    public void InsertManyMatchesRowByRowInsertsAcrossLeavesAndAppends()
+    {
+        var pageIo = new CountingPageIo(pageSize: 4096, usableSpace: 4096, initialPageCount: 2);
+        pageIo.WritePage(2u, SqliteTableLeafPageBuilderImage(pageIo));
+        var writer = new SqliteIncrementalTableBtree(pageIo);
+        var records = new Dictionary<long, byte[]>();
+        for (var rowId = 3L; rowId <= 6000; rowId += 3)
+        {
+            records[rowId] = Record(rowId);
+            writer.Insert(2, rowId, records[rowId]);
+        }
+
+        // Gap fills spread over many leaves, a run of appends past the maximum, and one
+        // overflow-sized record, all in one ascending batch.
+        var batch = new List<(long RowId, byte[] Record)>();
+        for (var rowId = 1L; rowId <= 6000; rowId += 7)
+        {
+            if (rowId % 3 != 0)
+                batch.Add((rowId, Record(rowId)));
+        }
+        for (var rowId = 6001L; rowId <= 7500; rowId++)
+            batch.Add((rowId, rowId == 7000 ? new byte[10_000] : Record(rowId)));
+        foreach (var (rowId, record) in batch)
+            records[rowId] = record;
+
+        writer.InsertMany(2, batch);
+
+        var cursor = new SqliteTableBtreeCursor(pageIo);
+        for (var rowId = 0L; rowId <= 7600; rowId++)
+        {
+            var found = cursor.TrySeek(2, rowId, out var record);
+            found.Should().Be(records.ContainsKey(rowId), $"rowid {rowId}");
+            if (found)
+                record.Should().Equal(records[rowId], $"rowid {rowId}");
+        }
+
+        Assert.Throws<SqliteBtreeMaintenanceRequiredException>(
+            () => writer.InsertMany(2, [(9, Record(9))]));
+    }
+
+    [Test]
     public void ColumnReadsRejectNonByteValuesAndMalformedHeaders()
     {
         var pageIo = new CountingPageIo(pageSize: 4096, usableSpace: 4096, initialPageCount: 2);

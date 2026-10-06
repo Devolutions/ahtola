@@ -70,6 +70,76 @@ public sealed class SqliteIncrementalTableBtree
     }
 
     /// <summary>
+    /// Inserts <paramref name="rows"/>, in strictly ascending rowid order, at rowids the tree must
+    /// not already contain.
+    /// </summary>
+    /// <remarks>
+    /// Equivalent to calling <see cref="Insert"/> for each row, but every row that lands in the
+    /// same leaf is merged into one write of that leaf (split as needed), instead of re-reading,
+    /// re-parsing and rewriting the leaf once per row. A leaf reached for one row receives every
+    /// following row up to the smallest separator on its path: separators are inclusive upper
+    /// bounds of their left subtrees, and earlier rows already bound the range from below.
+    /// </remarks>
+    public void InsertMany(uint rootPage, IReadOnlyList<(long RowId, byte[] Record)> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        var next = 0;
+        while (next < rows.Count)
+        {
+            var path = Descend(rootPage, rows[next].RowId);
+            var bound = long.MaxValue;
+            for (var level = 0; level < path.Count - 1; level++)
+            {
+                var interior = ParseInterior(path[level].PageNumber);
+                var childIndex = path[level].ChildIndex;
+                if (childIndex < interior.Cells.Count)
+                    bound = Math.Min(bound, interior.Cells[childIndex].Cell.RowId);
+            }
+
+            var view = ParseLeaf(path[^1].PageNumber);
+            var cells = view.Cells.Select(cell => cell.Cell).ToList();
+            var appendedAtEnd = true;
+            do
+            {
+                var (rowId, record) = rows[next];
+                if (next > 0 && rowId <= rows[next - 1].RowId)
+                    throw new ArgumentException("Rows must be in strictly ascending rowid order.", nameof(rows));
+
+                var index = FindCellIndex(cells, rowId, out var exact);
+                if (exact)
+                {
+                    throw new SqliteBtreeMaintenanceRequiredException(
+                        $"Rowid {rowId} already exists, so the caller's view of the committed table is stale.");
+                }
+
+                appendedAtEnd &= index == cells.Count;
+                cells.Insert(index, CreateLeafCell(rowId, record));
+                next++;
+            }
+            while (next < rows.Count && rows[next].RowId <= bound);
+
+            WriteLeafAndPropagate(path, cells, appendedAtEnd);
+        }
+    }
+
+    private static int FindCellIndex(List<SqliteTableLeafCell> cells, long rowId, out bool exact)
+    {
+        var low = 0;
+        var high = cells.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) / 2);
+            if (cells[middle].RowId < rowId)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        exact = low < cells.Count && cells[low].RowId == rowId;
+        return low;
+    }
+
+    /// <summary>
     /// Replaces the record stored at a <paramref name="rowId"/> the tree must
     /// already contain.
     /// </summary>

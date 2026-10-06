@@ -258,7 +258,7 @@ internal sealed class ManagedConnectionPoolLease
 
         try
         {
-            released.Database.Connection.ResetForPooling();
+            released.Database.Connection.ResetForPoolReturn();
             pool.Return(released);
         }
         catch

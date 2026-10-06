@@ -291,6 +291,9 @@ public sealed class EmbeddedPostCommitMaintenanceException : EmbeddedSqlExceptio
 public sealed partial class EmbeddedDatabase : IDisposable
 {
     private const int MaximumTriggerDepth = 1_000;
+    // A join whose left side has at most this many rows (or at most an eighth of the right
+    // table) probes the right base table per left row instead of hashing all of it.
+    private const int SmallJoinProbeRows = 64;
     private const int MaximumForeignKeyActionDepth = 1_000;
     private const int RecursiveTriggerStackSize = 32 * 1024 * 1024;
 
@@ -382,6 +385,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private readonly bool _readOnly;
     private readonly bool _foreignReadOnly;
     private SqlitePagerViewToken _foreignViewToken;
+
+    // When _foreignViewToken was captured; see IsForeignViewTokenRacy.
+    private DateTimeOffset _foreignViewTokenCapturedAt;
     private SqlitePagerViewToken _ownedViewToken;
     private FileCatalogVersion _fileCatalogVersion;
     private long _ownedCommittedGeneration;
@@ -438,6 +444,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _fileCatalogWriteLock = fileCatalogWriteLock;
         _readOnly = readOnly;
         _foreignReadOnly = foreignReadOnly;
+        _foreignViewTokenCapturedAt = DateTimeOffset.UtcNow;
         _foreignViewToken = foreignReadOnly
             ? fileStore.CaptureCommittedViewToken()
             : default;
@@ -1334,12 +1341,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         /// <summary><c>conn_txn_id</c> for an autocommit statement; -1 until first set.</summary>
         public long ConnTxnId { get; set; } = -1;
 
-        // Automatic (transient) equality indexes built on demand for scans whose predicates
-        // equate a scan column to a scan-constant expression - the shape correlated
-        // subqueries and pushed-down join side predicates produce once per outer row.
-        // Entries validate against RowStore.Revision, so any table mutation rebuilds them.
-        public Dictionary<TransientLookupKey, TransientLookup> TransientLookups { get; } = [];
-
         // Collation-resolution memo. Without caching, every projection of a query over a
         // derived or compound source re-derives the full collation scope of the source
         // below it, multiplying cost by the column count at each nesting level - EF's
@@ -1409,24 +1410,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 key.LexicalCteCount);
     }
 
+    // Key of a shared equality lookup (EmbeddedTable.GetOrCreateDerived).
     // The comparison affinity SQLite applies to the *scanned column* is part of the bucket's
     // identity: `t.text_col = <integer expression>` buckets the column's stored text under its
     // numeric value, while `t.text_col = <text expression>` buckets it verbatim. Two probes
     // that disagree on that conversion must not share a cached index.
     internal readonly record struct TransientLookupKey(
-        EmbeddedTable Table,
         int ColumnOrdinal,
         string Collation,
         bool ColumnConvertsTextToNumeric,
         bool ColumnConvertsNumericToText);
-
-    internal sealed class TransientLookup
-    {
-        public long Revision { get; set; } = -1;
-
-        // Canonical key -> table row positions, appended in ascending scan order.
-        public Dictionary<string, List<int>> Buckets { get; } = new(StringComparer.Ordinal);
-    }
 
 
     internal sealed class ForeignKeyStatementState
@@ -5048,6 +5041,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             EnsureFileCatalogVersionCurrent(busyTimeout);
             using var writeRegistration = RegisterCatalogWrite(_databasePath);
             _fileStore.DeferredCheckpointFrameThreshold = _mvStore is null ? _deferredCheckpointFrameThreshold : 0;
+            // Without MVCC every commit goes through this store, so the committed catalog is
+            // exactly the file's content.
+            var unchangedRowsAreDurable = _mvStore is null;
             try
             {
                 var committedVersion = checkpointAfterCommit
@@ -5060,7 +5056,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         forceFullRewrite,
                         previousTables: _tables,
                         targetedIndexRebuild: targetedIndexRebuild,
-                        maximumPageCount: maxPageCount)
+                        maximumPageCount: maxPageCount,
+                        unchangedRowsAreDurable: unchangedRowsAreDurable)
                     : _fileStore.PersistForMvccCheckpoint(
                         catalog.Tables,
                         catalog.Views,
@@ -5305,7 +5302,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return;
 
         var token = _fileStore.CaptureCommittedViewToken();
-        if (token == _foreignViewToken)
+        if (token == _foreignViewToken && !IsForeignViewTokenRacy(token))
             return;
 
         var replacement = EmbeddedFileStore.Open(
@@ -5328,6 +5325,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             RefreshCollationResolverBinding();
             _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath, foreignReadOnly: true);
             PublishCatalog(replacementCatalog);
+            _foreignViewTokenCapturedAt = DateTimeOffset.UtcNow;
             _foreignViewToken = _fileStore.CaptureCommittedViewToken();
             previous.Dispose();
         }
@@ -5356,6 +5354,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RefreshForeignCatalogIfChangedLocked();
         }
     }
+
+    // File timestamps only advance with the system clock tick (15.6 ms on many Windows hosts,
+    // whole seconds on some file systems), and a peer that checkpoints a WAL-mode database and
+    // deletes its WAL changes nothing else a foreign reader can observe: the main file keeps its
+    // size and its change counter. A write landing in the same tick the token was captured in
+    // therefore leaves the token equal. Like git's "racily clean" index entries, a token whose
+    // database stamp is that close to its capture time does not prove the file unchanged, so the
+    // caller re-reads; once the file has been quiet for the window, the token is trusted again.
+    private static readonly TimeSpan ForeignStampRacyWindow = TimeSpan.FromSeconds(2);
+
+    private bool IsForeignViewTokenRacy(SqlitePagerViewToken token)
+        => token.DatabaseStamp is { } stamp
+            && stamp.LastWriteTimeUtc >= _foreignViewTokenCapturedAt - ForeignStampRacyWindow;
 
     /// <summary>
     /// Statement-boundary adoption for owned file-backed connections in autocommit.
@@ -5726,12 +5737,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (AhtolaEncryptionFileSystem.Unwrap(fileSystem) is not PhysicalFileSystem)
             return null;
 
-        var lockPath = Path.GetFullPath(path);
-        if (OperatingSystem.IsWindows())
-            lockPath = lockPath.ToUpperInvariant();
-        var name = "Ahtola.ManagedCatalog."
-            + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(lockPath)));
-        var mutex = new Mutex(initiallyOwned: false, name);
+        var mutex = new Mutex(initiallyOwned: false, GetFileCatalogMutexName(path));
         try
         {
             try
@@ -5752,6 +5758,30 @@ public sealed partial class EmbeddedDatabase : IDisposable
             mutex.Dispose();
             throw;
         }
+    }
+
+    // Every commit enters the catalog mutex; its name is a pure function of the path, and
+    // hashing the normalized path each time showed up on autocommit writes.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> s_fileCatalogMutexNames =
+        new(StringComparer.Ordinal);
+
+    private static string GetFileCatalogMutexName(string path)
+    {
+        if (s_fileCatalogMutexNames.TryGetValue(path, out var cached))
+            return cached;
+
+        var lockPath = Path.GetFullPath(path);
+        if (OperatingSystem.IsWindows())
+            lockPath = lockPath.ToUpperInvariant();
+        var name = "Ahtola.ManagedCatalog."
+            + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(lockPath)));
+        // A relative path resolves against the current directory, which can change.
+        if (!Path.IsPathFullyQualified(path))
+            return name;
+        if (s_fileCatalogMutexNames.Count >= 1024)
+            s_fileCatalogMutexNames.Clear();
+        s_fileCatalogMutexNames[path] = name;
+        return name;
     }
 
     private sealed class FileCatalogWriteLockScope
@@ -14586,8 +14616,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ? null
             : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
         var rowCount = sourceRows?.Count ?? statement.Rows.Count;
-        var originalRows = statement.Returning is null ? null : table.Rows.ToArray();
-        var originalRowIds = statement.Returning is null ? null : table.RowIds.ToArray();
+        var originalRows = ReturningReadsTableState(statement.Returning) ? table.Rows.ToArray() : null;
+        var originalRowIds = ReturningReadsTableState(statement.Returning) ? table.RowIds.ToArray() : null;
         var rowsToInsert = new List<SqlValue[]>(rowCount);
         var insertedRowIds = new List<long>(rowCount);
         if (sourceRows is not null)
@@ -14630,11 +14660,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 table.HasRowid
                     ? insertedRowIds.Cast<long?>().ToArray()
                     : null,
-                CaptureIncrementalInsertReturningSnapshots(
-                    originalRows!,
-                    originalRowIds!,
-                    rowsToInsert,
-                    insertedRowIds));
+                originalRows is null
+                    ? null
+                    : CaptureIncrementalInsertReturningSnapshots(
+                        originalRows,
+                        originalRowIds!,
+                        rowsToInsert,
+                        insertedRowIds));
         }
 
         return new ExecutionResult([], [], rowsToInsert.Count, rowsToInsert.Count > 0)
@@ -14654,8 +14686,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ? null
             : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
         var rowCount = sourceRows?.Count ?? statement.Rows.Count;
-        var originalRows = statement.Returning is null ? null : table.Rows.ToArray();
-        var originalRowIds = statement.Returning is null ? null : table.RowIds.ToArray();
+        var originalRows = ReturningReadsTableState(statement.Returning) ? table.Rows.ToArray() : null;
+        var originalRowIds = ReturningReadsTableState(statement.Returning) ? table.RowIds.ToArray() : null;
         var rowsToInsert = new List<SqlValue[]>(rowCount);
         var insertedRowIds = new List<long>(rowCount);
         var backup = CloneTablesShallow(context.Tables);
@@ -14719,11 +14751,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 table.HasRowid
                     ? insertedRowIds.Cast<long?>().ToArray()
                     : null,
-                CaptureIncrementalInsertReturningSnapshots(
-                    originalRows!,
-                    originalRowIds!,
-                    rowsToInsert,
-                    insertedRowIds));
+                originalRows is null
+                    ? null
+                    : CaptureIncrementalInsertReturningSnapshots(
+                        originalRows,
+                        originalRowIds!,
+                        rowsToInsert,
+                        insertedRowIds));
         }
 
         return new ExecutionResult([], [], rowsToInsert.Count, rowsToInsert.Count > 0)
@@ -15463,7 +15497,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 updatedRows.Add(updated);
                 updatedRowIds.Add(newRowId);
-                if (statement.Returning is not null)
+                if (ReturningReadsTableState(statement.Returning))
                 {
                     // RETURNING sees the row after the write but before the AFTER
                     // trigger fires (returning.sqltest update-returning-after-trigger
@@ -15518,7 +15552,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     updatedRows.Count > 0,
                     parameters,
                     context,
-                    returningTableSnapshots: returningSnapshots);
+                    returningTableSnapshots: ReturningReadsTableState(statement.Returning)
+                        ? returningSnapshots
+                        : null);
             }
             catch
             {
@@ -15675,8 +15711,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var rowIds = table.RowIds.Count == table.Rows.Count
             ? table.RowIds.ToList()
             : Enumerable.Range(1, table.Rows.Count).Select(position => (long)position).ToList();
-        var originalRows = statement.Returning is null ? null : table.Rows.ToArray();
-        var originalRowIds = statement.Returning is null ? null : rowIds.ToArray();
+        var originalRows = ReturningReadsTableState(statement.Returning) ? table.Rows.ToArray() : null;
+        var originalRowIds = ReturningReadsTableState(statement.Returning) ? rowIds.ToArray() : null;
         var updatedRows = statement.Returning is null ? null : new List<SqlValue[]>();
         var updatedRowIds = statement.Returning is null ? null : new List<long>();
         var updatedPositions = new List<int>();
@@ -15788,10 +15824,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             rowsAffected++;
         }
 
-        var returningSnapshots = statement.Returning is null
+        var returningSnapshots = originalRows is null
             ? null
             : CaptureIncrementalUpdateReturningSnapshots(
-                originalRows!,
+                originalRows,
                 originalRowIds!,
                 rows,
                 rowIds,
@@ -16283,12 +16319,30 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedTable table,
         SqlValue[] parameters,
         QueryContext context)
+        => TryGetDmlEqualityCandidatePositions(
+            statement.TableName,
+            statement.Alias,
+            statement.Where,
+            table,
+            parameters,
+            context);
+
+    // Positions of the rows a DML WHERE's leading scan-constant equality can match: a superset of
+    // the rows the full WHERE selects, so evaluating only these rows is exact (the same pruning
+    // the SELECT transient lookup applies). Null when the WHERE has no such equality.
+    private HashSet<int>? TryGetDmlEqualityCandidatePositions(
+        string tableName,
+        string? alias,
+        Expression? where,
+        EmbeddedTable table,
+        SqlValue[] parameters,
+        QueryContext context)
     {
-        if (statement.Where is null
+        if (where is null
             || !TryCreateTransientEqualityLookup(
-                new NamedTableSource(statement.TableName, statement.Alias),
+                new NamedTableSource(tableName, alias),
                 table,
-                statement.Where,
+                where,
                 context,
                 outerRow: null,
                 out var lookup,
@@ -16310,11 +16364,60 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return [];
 
         var candidates = new HashSet<int>();
-        for (var position = 0; position < table.Rows.Count; position++)
+        var rows = table.Rows;
+        // The rowid alias column holds each row's rowid, so a numeric probe that is exactly an
+        // integer (doubles are exact up to 2^53, where the scan below compares) can match only the
+        // row with that rowid; a non-integral probe matches none.
+        if (lookup.ColumnOrdinal == table.RowidAliasColumnIndex
+            && !lookup.ColumnConvertsTextToNumeric
+            && !lookup.ColumnConvertsNumericToText
+            && EquiJoinHashIndex.TryGetNumericKeyBits(key, out var rowidProbeBits))
+        {
+            var number = BitConverter.Int64BitsToDouble(rowidProbeBits);
+            if (double.IsFinite(number) && Math.Abs(number) <= 9007199254740992d)
+            {
+                if (Math.Floor(number) != number)
+                    return candidates;
+
+                var position = table.TryGetRowIdPosition((long)number, out _);
+                if (position >= 0
+                    && rows[position][lookup.ColumnOrdinal] is { Kind: SqlValueKind.Integer } cell
+                    && EquiJoinHashIndex.GetNumericKeyBits(cell.AsInteger()) == rowidProbeBits)
+                {
+                    candidates.Add(position);
+                    return candidates;
+                }
+            }
+        }
+
+        // A numeric probe against a column compared without conversion matches exactly the
+        // numeric cells whose canonical bits are equal (CanonicalizeJoinKeyValue's "N" key);
+        // comparing the bits directly avoids formatting a key string for every row, which made
+        // UPDATE/DELETE ... WHERE id = ? cost microseconds per table row.
+        if (!lookup.ColumnConvertsTextToNumeric
+            && !lookup.ColumnConvertsNumericToText
+            && EquiJoinHashIndex.TryGetNumericKeyBits(key, out var probeBits))
+        {
+            for (var position = 0; position < rows.Count; position++)
+            {
+                context.CheckInterrupt();
+                var cell = rows[position][lookup.ColumnOrdinal];
+                if (cell.Kind is SqlValueKind.Integer or SqlValueKind.Real
+                    && EquiJoinHashIndex.GetNumericKeyBits(
+                        cell.Kind == SqlValueKind.Integer ? cell.AsInteger() : cell.AsReal()) == probeBits)
+                {
+                    candidates.Add(position);
+                }
+            }
+
+            return candidates;
+        }
+
+        for (var position = 0; position < rows.Count; position++)
         {
             context.CheckInterrupt();
             var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
-                table.Rows[position][lookup.ColumnOrdinal],
+                rows[position][lookup.ColumnOrdinal],
                 lookup.ColumnConvertsTextToNumeric,
                 lookup.ColumnConvertsNumericToText,
                 lookup.Collation);
@@ -17831,6 +17934,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (selfReferential || parentRows is not RowStore parentRowStore)
             return ParentContainsLinear(parent, parentRows, childValues, childRow, selfReferential);
 
+        // A rowid-alias parent key is the rowid itself, so the parent lookup is a rowid seek, as
+        // SQLite's OP_NotExists: probe the table's cached rowid set, which is current for exactly
+        // this row-store state and extended in place by appends, instead of hashing every parent
+        // row per statement. Only an INTEGER child value (after the parent column's affinity) can
+        // equal a rowid; anything else takes the general path below.
+        if (ParentUsesRowidAlias(parent)
+            && ReferenceEquals(parentRowStore, parent.Table.Rows)
+            && parent.Table.RowIds.Count == parentRowStore.Count)
+        {
+            var parentColumn = parent.ColumnIndices[0];
+            var coercedChild = parent.Table.CoerceColumnAffinity(
+                parent.Table.ColumnDefinitions[parentColumn],
+                childValues[0]);
+            if (coercedChild.Kind == SqlValueKind.Integer)
+                return parent.Table.GetRowIdSet().Ids.Contains(coercedChild.AsInteger());
+        }
+
         // Fast path: hash the parent's FK key columns once and probe per child row, turning
         // N×parentRows comparisons into parentRows + N×O(1). Bucket hits are confirmed with
         // the exact ValuesMatchParent comparison, so the probe never yields a false positive.
@@ -17890,7 +18010,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         RowStore parentRowStore,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ForeignKeyParentProbe? probe)
     {
-        var probeKey = new ForeignKeyParentProbeKey(parent.Table, BuildForeignKeyColumnSignature(parent));
+        var probeKey = new ForeignKeyParentProbeKey(parent.TableName, BuildForeignKeyColumnSignature(parent));
         if (!_foreignKeyParentProbes.TryGetValue(probeKey, out probe))
         {
             probe = new ForeignKeyParentProbe();
@@ -17903,11 +18023,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return true;
         }
 
-        if (probe.Revision == parentRowStore.Revision)
+        if (ReferenceEquals(probe.Source, parentRowStore) && probe.Revision == parentRowStore.Revision)
             return true;
 
         // Parent mutated since the probe was built (e.g. a trigger inserted into the
-        // parent mid-statement): rebuild against the current rows.
+        // parent mid-statement), or this is another statement's working copy of the parent:
+        // rebuild against the current rows.
         probe.Buckets.Clear();
         if (!BuildForeignKeyParentProbe(parent, parentRowStore, probe))
         {
@@ -17923,6 +18044,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         RowStore parentRowStore,
         ForeignKeyParentProbe probe)
     {
+        probe.Source = parentRowStore;
         probe.Revision = parentRowStore.Revision;
         for (var position = 0; position < parent.ColumnIndices.Count; position++)
         {
@@ -17995,19 +18117,27 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private sealed class ForeignKeyParentProbe
     {
+        public RowStore? Source { get; set; }
+
         public long Revision { get; set; } = -1;
 
         public Dictionary<string, List<SqlValue[]>> Buckets { get; } = new(StringComparer.Ordinal);
     }
 
-    private readonly record struct ForeignKeyParentProbeKey(EmbeddedTable ParentTable, string ColumnSignature)
+    // Keyed by parent table name, not EmbeddedTable identity: every statement works on its own
+    // clone of the catalog, so an identity key added one never-reused probe per statement (an
+    // unbounded leak of whole-table hash maps). The probe's Source/Revision pair is what proves
+    // it current for the row store being probed.
+    private readonly record struct ForeignKeyParentProbeKey(string ParentTableName, string ColumnSignature)
     {
         public bool Equals(ForeignKeyParentProbeKey other)
-            => ReferenceEquals(ParentTable, other.ParentTable)
+            => string.Equals(ParentTableName, other.ParentTableName, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(ColumnSignature, other.ColumnSignature, StringComparison.Ordinal);
 
         public override int GetHashCode()
-            => HashCode.Combine(RuntimeHelpers.GetHashCode(ParentTable), StringComparer.Ordinal.GetHashCode(ColumnSignature));
+            => HashCode.Combine(
+                StringComparer.OrdinalIgnoreCase.GetHashCode(ParentTableName),
+                StringComparer.Ordinal.GetHashCode(ColumnSignature));
     }
 
     private bool ValuesMatchParent(
@@ -18959,33 +19089,46 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 statement.Returning,
                 parameters,
                 context);
-        var rows = new List<SqlValue[]>(table.Rows.Count);
-        var rowIds = new List<long>(table.Rows.Count);
         var originalRows = table.Rows.ToArray();
         var originalRowIds = table.RowIds.Count == table.Rows.Count
             ? table.RowIds.ToArray()
             : Enumerable.Range(1, table.Rows.Count).Select(position => (long)position).ToArray();
+        // A leading equality narrows the rows whose WHERE must be evaluated, as for UPDATE.
+        var candidatePositions = selectedPositions is null
+            ? TryGetDmlEqualityCandidatePositions(
+                statement.TableName,
+                statement.Alias,
+                statement.Where,
+                table,
+                parameters,
+                context)
+            : null;
         var deletedRows = new List<SqlValue[]>();
         var deletedRowIds = new List<long>();
+        var deletedPositions = new List<int>();
         var rowsAffected = 0;
-        for (var position = 0; position < table.Rows.Count; position++)
+        for (var position = 0; position < originalRows.Length; position++)
         {
-            var row = table.Rows[position];
-            var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
-            var source = CreateDmlTargetRow(table, statement.TargetQualifier, row, rowid);
+            if (candidatePositions is not null && !candidatePositions.Contains(position))
+                continue;
+
+            var row = originalRows[position];
+            var rowid = originalRowIds[position];
             var shouldDelete = selectedPositions is not null
                 ? selectedPositions.Contains(position)
-                : statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, source, context));
+                : statement.Where is null
+                    || IsTrue(Evaluate(
+                        statement.Where,
+                        parameters,
+                        CreateDmlTargetRow(table, statement.TargetQualifier, row, rowid),
+                        context));
             if (shouldDelete)
             {
                 rowsAffected++;
                 deletedRows.Add(row);
                 deletedRowIds.Add(rowid);
-                continue;
+                deletedPositions.Add(position);
             }
-
-            rows.Add(row);
-            rowIds.Add(rowid);
         }
 
         var returningResult = statement.Returning is null
@@ -19000,16 +19143,46 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 rowsAffected > 0,
                 parameters,
                 context,
-                returningTableSnapshots: CaptureIncrementalDeleteReturningSnapshots(
+                returningTableSnapshots: !ReturningReadsTableState(statement.Returning)
+                    ? null
+                    : CaptureIncrementalDeleteReturningSnapshots(
                     originalRows,
                     originalRowIds,
                     deletedRows,
                     deletedRowIds));
         var revisionBeforeSwap = table.Rows.Revision;
-        table.Rows.Clear();
-        table.Rows.AddRange(rows);
-        table.RowIds.Clear();
-        table.RowIds.AddRange(rowIds);
+        if (table.RowIds.Count == table.Rows.Count && deletedPositions.Count * 8 <= originalRows.Length)
+        {
+            // A few deletions: remove them in place (highest position first) instead of
+            // re-adding every surviving row, which rewrote the whole table per DELETE.
+            var rowIdsBefore = table.HasRowid ? table.TryGetCurrentRowIdSet() : null;
+            for (var index = deletedPositions.Count - 1; index >= 0; index--)
+            {
+                table.Rows.RemoveAt(deletedPositions[index]);
+                table.RowIds.RemoveAt(deletedPositions[index]);
+            }
+
+            if (deletedPositions.Count > 0)
+                table.RecordRemovedRowIds(rowIdsBefore, deletedRowIds);
+        }
+        else if (deletedPositions.Count > 0 || table.RowIds.Count != table.Rows.Count)
+        {
+            var deleted = deletedPositions.ToHashSet();
+            var rows = new List<SqlValue[]>(originalRows.Length - deletedPositions.Count);
+            var rowIds = new List<long>(originalRows.Length - deletedPositions.Count);
+            for (var position = 0; position < originalRows.Length; position++)
+            {
+                if (deleted.Contains(position))
+                    continue;
+                rows.Add(originalRows[position]);
+                rowIds.Add(originalRowIds[position]);
+            }
+
+            table.Rows.Clear();
+            table.Rows.AddRange(rows);
+            table.RowIds.Clear();
+            table.RowIds.AddRange(rowIds);
+        }
 
         // The swap re-adds every kept row; only the deleted rowids changed.
         table.RecordMethodIndexBulkMutation(deletedRowIds, revisionBeforeSwap);
@@ -19165,6 +19338,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
             LastInsertRowId = lastInsertRowId,
         };
     }
+
+    // RETURNING evaluates each projection against the affected row's own values; only a subquery
+    // reads the table, and only then does evaluation need the per-row table image. Capturing that
+    // image copied the whole table once per affected row (and swapped it in and out), which made
+    // INSERT ... RETURNING id, the shape EF Core issues for every insert, linear in table size.
+    private static bool ReturningReadsTableState(IReadOnlyList<Projection>? returning)
+        => returning is not null
+            && returning.Any(projection => ContainsSubqueryExpression(projection.Expression));
 
     private static IReadOnlyList<ReturningTableSnapshot> CaptureIncrementalInsertReturningSnapshots(
         IReadOnlyList<SqlValue[]> originalRows,
@@ -20310,7 +20491,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 context,
                 outerRow,
                 predicate: select.Where,
-                parameters: parameters);
+                parameters: parameters,
+                covering: CanSeekIndexCovering(select, plan));
             rows = indexed.Rows.Select(row => row.Values).ToArray();
             rowIds = plan.Table.HasRowid
                 ? indexed.Rows.Select(row =>
@@ -33255,6 +33437,190 @@ out bool hasReturning)
     }
 
     /// <summary>
+    /// Whether <paramref name="orderBy"/> is exactly ascending rowid order over a plain rowid base
+    /// table, which <see cref="GetNamedTableRows"/> scans in that order.
+    /// </summary>
+    private static bool IsAscendingRowidOrderScan(
+        SelectStatement statement,
+        IReadOnlyList<OrderByTerm> orderBy,
+        QueryContext context)
+    {
+        if (orderBy.Count != 1
+            || orderBy[0] is not { Descending: false, NullPlacement: NullPlacement.Default } term
+            || term.Expression is not ColumnExpression { BooleanKeyword: null } column
+            || statement.Source is not NamedTableSource source
+            || source.IndexDirective is not null
+            || IsSchemaTable(source.Name)
+            || IsCommonTableExpression(source, context)
+            || context.Views?.ContainsKey(source.Name) == true
+            || TryGetVirtualTable(context, source, out _)
+            || !context.Tables.TryGetValue(source.Name, out var table)
+            || !table.HasRowid
+            || table.HasMethodIndexes)
+        {
+            return false;
+        }
+
+        var name = column.UnqualifiedName ?? column.Name;
+        var separator = name.LastIndexOf('.');
+        if (separator >= 0)
+        {
+            if (!string.Equals(name[..separator], source.Alias ?? source.Name, StringComparison.OrdinalIgnoreCase))
+                return false;
+            name = name[(separator + 1)..];
+        }
+
+        return table.TryGetColumnIndex(name, out var columnIndex)
+            ? columnIndex == table.RowidAliasColumnIndex
+            : EmbeddedTable.IsRowidAliasName(name);
+    }
+
+    /// <summary>
+    /// Whether scanning <paramref name="plan"/>'s index (in its planned direction) already yields
+    /// rows in <paramref name="orderBy"/> order: each ORDER BY term is the matching leading index
+    /// column of a single-table SELECT, in the scan's effective direction, under the index
+    /// column's own built-in collation and default NULLS placement. Rows that tie on every term
+    /// keep index order, which is also what the evaluator's stable sort would have produced.
+    /// </summary>
+    private bool IndexPlanSatisfiesOrderBy(
+        SelectStatement statement,
+        ManagedIndexScanPlan plan,
+        IReadOnlyList<OrderByTerm> orderBy)
+    {
+        if (statement.Source is not NamedTableSource source
+            || !ReferenceEquals(source, plan.Source)
+            || orderBy.Count == 0
+            || orderBy.Count > plan.Index.Columns.Count
+            || plan.Index.IsMethodIndex)
+        {
+            return false;
+        }
+
+        var table = plan.Table;
+        var qualifier = source.Alias ?? source.Name;
+        for (var position = 0; position < orderBy.Count; position++)
+        {
+            var term = orderBy[position];
+            var indexTerm = plan.Index.Columns[position];
+            if (term.NullPlacement != NullPlacement.Default
+                || indexTerm.NullPlacement != NullPlacement.Default
+                || indexTerm.IsExpression
+                || indexTerm.ColumnIndex < 0
+                || term.Descending != (indexTerm.Descending != plan.Reverse))
+            {
+                return false;
+            }
+
+            var expression = term.Expression;
+            string? explicitCollation = null;
+            if (expression is CollationExpression collated)
+            {
+                explicitCollation = collated.Name;
+                expression = collated.Expression;
+            }
+
+            if (expression is not ColumnExpression { BooleanKeyword: null } column)
+                return false;
+
+            var name = column.UnqualifiedName ?? column.Name;
+            var separator = name.LastIndexOf('.');
+            if (separator >= 0)
+            {
+                if (!string.Equals(name[..separator], qualifier, StringComparison.OrdinalIgnoreCase))
+                    return false;
+                name = name[(separator + 1)..];
+            }
+
+            if (!table.TryGetColumnIndex(name, out var columnIndex) || columnIndex != indexTerm.ColumnIndex)
+                return false;
+
+            var termCollation = explicitCollation
+                ?? NormalizeDeclaredCollation(table.ColumnDefinitions[columnIndex].Collation)
+                ?? "BINARY";
+            var indexCollation = IndexExpressionSemantics.GetCollationName(table, indexTerm) ?? "BINARY";
+            if (!string.Equals(termCollation, indexCollation, StringComparison.OrdinalIgnoreCase)
+                || !IsBuiltInCollation(indexCollation)
+                || IsUnsafeCompiledCollation(indexCollation))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Whether an index equality seek may skip the table-row fetch: rows then carry only the
+    /// index's columns (and rowid), so this admits only statements that read nothing else.
+    /// Deliberately narrow (constant or COUNT(*) projections, a WHERE over plain index columns,
+    /// a non-partial index), which covers count and existence probes, the shapes ORMs issue most.
+    /// </summary>
+    private static bool CanSeekIndexCovering(SelectStatement select, ManagedIndexScanPlan plan)
+    {
+        if (select.GroupBy.Count != 0
+            || select.Having is not null
+            || select.OrderBy.Count != 0
+            || select.Distinct
+            || select.Where is null
+            || plan.Index.Where is not null
+            || plan.Index.Columns.Any(term => term.IsExpression || term.ColumnIndex < 0)
+            || !IndexCoversSelect(select, plan.Table, plan.Index))
+        {
+            return false;
+        }
+
+        foreach (var projection in select.Projections)
+        {
+            switch (projection.Expression)
+            {
+                case LiteralExpression:
+                case ParameterExpression:
+                case FunctionExpression { CountStar: true, Distinct: false, Filter: null, Window: null }:
+                    continue;
+                default:
+                    return false;
+            }
+        }
+
+        var covered = plan.Index.Columns.Select(term => term.ColumnIndex).ToHashSet();
+        return ReadsOnlyIndexedColumns(select.Where, plan.Table, covered);
+    }
+
+    // Stricter than ExpressionCoveredByIndex: covering seek rows hold only the index's own
+    // column values, so a rowid or rowid-alias reference is not satisfiable here either.
+    private static bool ReadsOnlyIndexedColumns(Expression expression, EmbeddedTable table, HashSet<int> covered)
+    {
+        switch (expression)
+        {
+            case LiteralExpression:
+            case ParameterExpression:
+                return true;
+            case ColumnExpression column:
+                var bare = column.UnqualifiedName ?? column.Name;
+                var name = bare.IndexOf('.') >= 0 ? bare[(bare.IndexOf('.') + 1)..] : bare;
+                return table.TryGetColumnIndex(name, out var columnIndex)
+                    && covered.Contains(columnIndex)
+                    && !(table.HasRowid && columnIndex == table.RowidAliasColumnIndex);
+            case BinaryExpression binary:
+                return ReadsOnlyIndexedColumns(binary.Left, table, covered)
+                    && ReadsOnlyIndexedColumns(binary.Right, table, covered);
+            case UnaryExpression unary:
+                return ReadsOnlyIndexedColumns(unary.Operand, table, covered);
+            case CollationExpression collation:
+                return ReadsOnlyIndexedColumns(collation.Expression, table, covered);
+            case InExpression inList:
+                return ReadsOnlyIndexedColumns(inList.Value, table, covered)
+                    && inList.Values.All(value => ReadsOnlyIndexedColumns(value, table, covered));
+            case BetweenExpression between:
+                return ReadsOnlyIndexedColumns(between.Value, table, covered)
+                    && ReadsOnlyIndexedColumns(between.Lower, table, covered)
+                    && ReadsOnlyIndexedColumns(between.Upper, table, covered);
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
     /// True when every column the <paramref name="select"/> needs is available from
     /// <paramref name="index"/> keys (plus the rowid for rowid tables). Used to emit
     /// COVERING INDEX and to skip redundant base-table projection work.
@@ -33650,7 +34016,9 @@ out bool hasReturning)
         SourceRow? outerRow,
         long? maximumRows = null,
         Expression? predicate = null,
-        SqlValue[]? parameters = null)
+        SqlValue[]? parameters = null,
+        bool covering = false,
+        bool lazy = false)
     {
         var table = plan.Table;
         if (context.ConcurrentMvStore is { } store
@@ -33667,6 +34035,49 @@ out bool hasReturning)
 
         var qualifier = plan.Source.Alias ?? plan.Source.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
+
+        // A sorted order shared across statements (EmbeddedTable.GetOrCreateDerived) serves the
+        // scan from the loaded rows: equality and leading-column ranges binary-search it, which
+        // beats a durable seek per matching row once the table is in memory. A cold order is
+        // still built below, after the durable seek has had its chance.
+        var orderSignature = TryGetManagedIndexOrderSignature(table, plan.Index);
+        ManagedIndexOrder? warmOrder = null;
+        if (orderSignature is not null
+            && !table.HasPendingRowLoad
+            && table.RowIds.Count == table.Rows.Count)
+        {
+            table.TryGetDerived(new ManagedIndexOrderKey(orderSignature), out warmOrder);
+
+            // A durable seek walks and re-validates b-tree pages on every statement, so a point
+            // lookup never built the order above. Once the unchanged table has served enough seeks
+            // on this index, build it: the count lives with the table's content, so any write
+            // restarts it and write-interleaved workloads keep seeking instead of rebuilding. Only
+            // the crossing attempts it, so a table whose visible rows cannot use the order (see
+            // TryGetManagedIndexOrder) is not re-checked on every later seek.
+            if (warmOrder is null
+                && CountDurableIndexSeek(table, orderSignature) == DurableSeeksBeforeWarmIndexOrder)
+            {
+                var loadedRows = GetNamedTableRows(plan.Source, context, maximumRows: null, outerRow).Rows;
+                warmOrder = TryGetManagedIndexOrder(table, plan.Index, orderSignature, loadedRows, context);
+            }
+        }
+
+        if (warmOrder is not null)
+        {
+            context.RegisterMethodIndexSource(qualifier, ResolveMethodIndexSourceName(plan.Source.Name), table);
+            return GetCachedManagedIndexRows(
+                plan,
+                warmOrder,
+                context,
+                outerRow,
+                maximumRows,
+                predicate,
+                parameters,
+                lazy,
+                qualifier,
+                qualifiedColumns);
+        }
+
         if (TrySeekManagedIndexEquality(
                 plan,
                 context,
@@ -33675,6 +34086,7 @@ out bool hasReturning)
                 parameters,
                 qualifier,
                 qualifiedColumns,
+                covering,
                 out var seekRows))
         {
             IEnumerable<SourceRow> sought = seekRows;
@@ -33690,6 +34102,22 @@ out bool hasReturning)
             context,
             maximumRows: null,
             outerRow).Rows;
+        if (orderSignature is not null
+            && TryGetManagedIndexOrder(table, plan.Index, orderSignature, visibleRows, context) is { } builtOrder)
+        {
+            return GetCachedManagedIndexRows(
+                plan,
+                builtOrder,
+                context,
+                outerRow,
+                maximumRows,
+                predicate,
+                parameters,
+                lazy,
+                qualifier,
+                qualifiedColumns);
+        }
+
         var entries = GetManagedIndexEntries(table, plan.Index, visibleRows, context);
         // An outer-row equality is scan-constant for a correlated subquery. Narrow the
         // declared index traversal before aggregate evaluation instead of merely reporting a
@@ -33724,16 +34152,44 @@ out bool hasReturning)
             }
         }
 
-        var projected = candidates.Select(entry => entry.Row with
+        var qualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
+            qualifier,
+            table.ColumnDefinitions);
+        SourceRow Project((SourceRow Row, SqlValue[] Key) entry) => entry.Row with
         {
             QualifiedColumns = qualifiedColumns,
             Parent = outerRow,
             RowIdQualifier = qualifier,
             ColumnDefinitions = table.ColumnDefinitions,
-            QualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
-                qualifier,
-                table.ColumnDefinitions),
-        });
+            QualifiedColumnDefinitions = qualifiedColumnDefinitions,
+        };
+
+        if (lazy)
+        {
+            // The caller consumes rows in order and may stop early (ORDER BY ... LIMIT over this
+            // index), so project on demand instead of materializing every entry first.
+            var ordered = candidates as IReadOnlyList<(SourceRow Row, SqlValue[] Key)> ?? candidates.ToList();
+            IEnumerable<SourceRow> EnumerateOrdered()
+            {
+                if (plan.Reverse)
+                {
+                    for (var index = ordered.Count - 1; index >= 0; index--)
+                        yield return Project(ordered[index]);
+                }
+                else
+                {
+                    for (var index = 0; index < ordered.Count; index++)
+                        yield return Project(ordered[index]);
+                }
+            }
+
+            IEnumerable<SourceRow> lazyRows = EnumerateOrdered();
+            if (maximumRows is { } lazyMaximum)
+                lazyRows = lazyRows.Take(checked((int)Math.Min(lazyMaximum, int.MaxValue)));
+            return new SourceData(table.Columns, new LazyReadOnlyList<SourceRow>(lazyRows));
+        }
+
+        var projected = candidates.Select(Project);
         if (plan.Reverse)
             projected = projected.Reverse();
         if (maximumRows is { } maximum)
@@ -33741,6 +34197,279 @@ out bool hasReturning)
         var rows = projected.ToArray();
 
         return new SourceData(table.Columns, rows);
+    }
+
+    /// <summary>
+    /// Serves an index scan from the shared sorted <paramref name="order"/>: the same rows, in the
+    /// same order, as projecting and filtering every index entry, but narrowed by binary search
+    /// to the run a leading-column equality or range can match. Only rows outside that run are
+    /// skipped, and only when the comparison is conversion-free under the index collation; the
+    /// caller still applies the whole WHERE.
+    /// </summary>
+    private SourceData GetCachedManagedIndexRows(
+        ManagedIndexScanPlan plan,
+        ManagedIndexOrder order,
+        QueryContext context,
+        SourceRow? outerRow,
+        long? maximumRows,
+        Expression? predicate,
+        SqlValue[]? parameters,
+        bool lazy,
+        string qualifier,
+        IReadOnlyDictionary<string, int> qualifiedColumns)
+    {
+        var table = plan.Table;
+        var keys = order.Keys;
+        var lower = 0;
+        var upper = keys.Length;
+        var leading = plan.Index.Columns[0];
+        var leadingCollation = IndexExpressionSemantics.GetCollationName(table, leading) ?? "BINARY";
+        // Ascending with default NULL placement: NULLs first, then values by Compare.
+        var ascending = !leading.Descending && leading.NullPlacement == NullPlacement.Default;
+        SqlValue? equalityFilter = null;
+
+        int FirstNonNull(int from, int to)
+        {
+            while (from < to)
+            {
+                var middle = (from + to) >>> 1;
+                if (keys[middle][0].Kind == SqlValueKind.Null)
+                    from = middle + 1;
+                else
+                    to = middle;
+            }
+
+            return from;
+        }
+
+        // First position in [from, to) whose key is above the probe (strict) or at least it.
+        int LowerBound(int from, int to, SqlValue probe, bool strict)
+        {
+            while (from < to)
+            {
+                var middle = (from + to) >>> 1;
+                var comparison = Compare(keys[middle][0], probe, leadingCollation);
+                if (strict ? comparison <= 0 : comparison < 0)
+                    from = middle + 1;
+                else
+                    to = middle;
+            }
+
+            return from;
+        }
+
+        if (plan.Search
+            && predicate is not null
+            && parameters is not null
+            && TryCreateTransientEqualityLookup(
+                plan.Source,
+                table,
+                predicate,
+                context,
+                outerRow,
+                out var lookup)
+            && leading.ColumnIndex == lookup.ColumnOrdinal
+            && string.Equals(leadingCollation, lookup.Collation, StringComparison.OrdinalIgnoreCase))
+        {
+            var probeValue = ConvertTransientProbe(
+                lookup,
+                Evaluate(lookup.ValueExpression, parameters, outerRow, context));
+            if (probeValue.Kind is SqlValueKind.Null)
+            {
+                upper = lower;
+            }
+            else if (!lookup.ColumnConvertsTextToNumeric && !lookup.ColumnConvertsNumericToText)
+            {
+                if (ascending)
+                {
+                    lower = LowerBound(FirstNonNull(lower, upper), upper, probeValue, strict: false);
+                    upper = LowerBound(lower, upper, probeValue, strict: true);
+                }
+                else
+                {
+                    equalityFilter = probeValue;
+                }
+            }
+        }
+
+        if (ascending && predicate is not null && parameters is not null && lower < upper)
+        {
+            var outputColumns = GetOutputColumns(plan.Source, context);
+            foreach (var (op, bound) in CollectLeadingIndexRangeBounds(
+                         plan, table, leadingCollation, predicate, parameters, outerRow, context, outputColumns))
+            {
+                if (bound.Kind == SqlValueKind.Null)
+                {
+                    // A comparison with NULL is never true.
+                    upper = lower;
+                    break;
+                }
+
+                lower = Math.Max(lower, FirstNonNull(lower, upper));
+                switch (op)
+                {
+                    case BinaryOperator.GreaterThan:
+                        lower = LowerBound(lower, upper, bound, strict: true);
+                        break;
+                    case BinaryOperator.GreaterThanOrEqual:
+                        lower = LowerBound(lower, upper, bound, strict: false);
+                        break;
+                    case BinaryOperator.LessThan:
+                        upper = LowerBound(lower, upper, bound, strict: false);
+                        break;
+                    default:
+                        upper = LowerBound(lower, upper, bound, strict: true);
+                        break;
+                }
+
+                if (lower >= upper)
+                    break;
+            }
+        }
+
+        var scanOrder = table.GetRowidScanOrder();
+        var qualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(qualifier, table.ColumnDefinitions);
+        SourceRow Project(int index)
+        {
+            var position = scanOrder[order.Permutation[index]];
+            return new SourceRow(
+                table.Columns,
+                table.Rows[position],
+                qualifiedColumns,
+                outerRow,
+                RowId: table.RowIds[position],
+                RowIdQualifier: qualifier,
+                ColumnDefinitions: table.ColumnDefinitions,
+                QualifiedColumnDefinitions: qualifiedColumnDefinitions);
+        }
+
+        var first = lower;
+        var last = upper;
+        IEnumerable<SourceRow> Enumerate()
+        {
+            if (plan.Reverse)
+            {
+                for (var index = last - 1; index >= first; index--)
+                {
+                    if (equalityFilter is not { } probe || Compare(keys[index][0], probe, leadingCollation) == 0)
+                        yield return Project(index);
+                }
+            }
+            else
+            {
+                for (var index = first; index < last; index++)
+                {
+                    if (equalityFilter is not { } probe || Compare(keys[index][0], probe, leadingCollation) == 0)
+                        yield return Project(index);
+                }
+            }
+        }
+
+        IEnumerable<SourceRow> rows = Enumerate();
+        if (maximumRows is { } maximum)
+            rows = rows.Take(checked((int)Math.Min(maximum, int.MaxValue)));
+        return lazy
+            ? new SourceData(table.Columns, new LazyReadOnlyList<SourceRow>(rows))
+            : new SourceData(table.Columns, rows.ToArray());
+    }
+
+    // The comparison affinity SQLite applies to the value side of a transient lookup, applied to an
+    // evaluated probe (the same conversion TrySeekManagedIndexEquality makes before seeking).
+    private static SqlValue ConvertTransientProbe(TransientEqualityLookup lookup, SqlValue probe)
+    {
+        if (lookup.ValueConvertsTextToNumeric)
+            return ApplyComparisonNumericAffinity(probe);
+        if (lookup.ValueConvertsNumericToText && probe.Kind is SqlValueKind.Integer or SqlValueKind.Real)
+            return SqlValue.Text(ToSqlText(probe));
+        return probe;
+    }
+
+    // Bounds a WHERE puts on the index's leading column: `col op value` (either operand order) and
+    // `col BETWEEN low AND high`, with a literal or parameter value whose comparison needs no
+    // affinity conversion and uses the index collation, so the bound is exact against the keys.
+    private IEnumerable<(BinaryOperator Operator, SqlValue Bound)> CollectLeadingIndexRangeBounds(
+        ManagedIndexScanPlan plan,
+        EmbeddedTable table,
+        string leadingCollation,
+        Expression predicate,
+        SqlValue[] parameters,
+        SourceRow? outerRow,
+        QueryContext context,
+        IReadOnlyList<OutputColumn> outputColumns)
+    {
+        var leadingColumn = plan.Index.Columns[0].ColumnIndex;
+        bool TryBound(Expression column, Expression value, bool columnOnLeft, out SqlValue bound)
+        {
+            bound = SqlValue.Null;
+            var operand = value is UnaryExpression { Operator: UnaryOperator.Negate or UnaryOperator.Plus } unary
+                ? unary.Operand
+                : value;
+            if (operand is not (LiteralExpression or ParameterExpression)
+                || !TryMatchTransientEquality(
+                    column,
+                    value,
+                    columnOnLeft,
+                    plan.Source,
+                    table,
+                    outputColumns,
+                    outerRow,
+                    out var lookup)
+                || lookup.ColumnOrdinal != leadingColumn
+                || lookup.ColumnConvertsTextToNumeric
+                || lookup.ColumnConvertsNumericToText
+                || !string.Equals(lookup.Collation, leadingCollation, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            // Only the value side converts, so the converted bound compares against the stored keys
+            // exactly as the evaluator's comparison would.
+            bound = ConvertTransientProbe(lookup, Evaluate(value, parameters, outerRow, context));
+            return true;
+        }
+
+        var pending = new Stack<Expression>();
+        pending.Push(predicate);
+        while (pending.Count > 0)
+        {
+            var conjunct = pending.Pop();
+            if (conjunct is BinaryExpression { Operator: BinaryOperator.And } and)
+            {
+                pending.Push(and.Right);
+                pending.Push(and.Left);
+                continue;
+            }
+
+            if (conjunct is BinaryExpression
+                {
+                    Operator: BinaryOperator.LessThan or BinaryOperator.LessThanOrEqual
+                        or BinaryOperator.GreaterThan or BinaryOperator.GreaterThanOrEqual,
+                } comparison)
+            {
+                if (TryBound(comparison.Left, comparison.Right, columnOnLeft: true, out var bound))
+                {
+                    yield return (comparison.Operator, bound);
+                }
+                else if (TryBound(comparison.Right, comparison.Left, columnOnLeft: false, out bound))
+                {
+                    // `value op col` bounds the column from the other side.
+                    yield return (comparison.Operator switch
+                    {
+                        BinaryOperator.LessThan => BinaryOperator.GreaterThan,
+                        BinaryOperator.LessThanOrEqual => BinaryOperator.GreaterThanOrEqual,
+                        BinaryOperator.GreaterThan => BinaryOperator.LessThan,
+                        _ => BinaryOperator.LessThanOrEqual,
+                    }, bound);
+                }
+            }
+            else if (conjunct is BetweenExpression { Negated: false } between
+                && TryBound(between.Value, between.Lower, columnOnLeft: true, out var low)
+                && TryBound(between.Value, between.Upper, columnOnLeft: true, out var high))
+            {
+                yield return (BinaryOperator.GreaterThanOrEqual, low);
+                yield return (BinaryOperator.LessThanOrEqual, high);
+            }
+        }
     }
 
     /// <summary>
@@ -33764,6 +34493,7 @@ out bool hasReturning)
         SqlValue[]? parameters,
         string qualifier,
         IReadOnlyDictionary<string, int> qualifiedColumns,
+        bool covering,
         out SourceRow[] rows)
     {
         rows = [];
@@ -33813,7 +34543,7 @@ out bool hasReturning)
                     table,
                     plan.Index,
                     prefixLength: 1,
-                    covering: false,
+                    covering,
                     context,
                     out var transactionAccessor))
             {
@@ -33824,7 +34554,7 @@ out bool hasReturning)
                      table,
                      plan.Index,
                      prefixLength: 1,
-                     covering: false,
+                     covering,
                      sharedSnapshot: null,
                      out var committedAccessor))
         {
@@ -34098,6 +34828,135 @@ out bool hasReturning)
     }
 
     private List<(SourceRow Row, SqlValue[] Key)> GetManagedIndexEntries(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<SourceRow> visibleRows,
+        QueryContext context)
+    {
+        if (TryGetCachedManagedIndexEntries(table, index, visibleRows, context) is { } cachedEntries)
+            return cachedEntries;
+
+        return BuildManagedIndexEntries(table, index, visibleRows, context);
+    }
+
+    // The sorted index order over a table's full rowid-ordered scan is a pure function of its rows
+    // for a plain index under built-in collations, so it is shared across statements (and clones)
+    // through EmbeddedTable.GetOrCreateDerived instead of re-projecting and re-sorting every entry
+    // on each execution. The cached permutation indexes the scan order, and is applied only after
+    // proving the caller's visible rows are exactly that scan.
+    private List<(SourceRow Row, SqlValue[] Key)>? TryGetCachedManagedIndexEntries(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<SourceRow> visibleRows,
+        QueryContext context)
+    {
+        if (TryGetManagedIndexOrderSignature(table, index) is not { } signature
+            || TryGetManagedIndexOrder(table, index, signature, visibleRows, context) is not { } order)
+        {
+            return null;
+        }
+
+        var entries = new List<(SourceRow Row, SqlValue[] Key)>(order.Permutation.Length);
+        for (var position = 0; position < order.Permutation.Length; position++)
+            entries.Add((visibleRows[order.Permutation[position]], order.Keys[position]));
+        return entries;
+    }
+
+    // Null when the index order cannot be shared: partial, method or expression indexes, custom or
+    // overridden collations, and WITHOUT ROWID tables (whose scan is not the rowid order).
+    private string? TryGetManagedIndexOrderSignature(EmbeddedTable table, EmbeddedIndex index)
+    {
+        if (index.IsPartial
+            || index.IsMethodIndex
+            || !table.HasRowid
+            || table.HasMethodIndexes
+            || index.Columns.Count == 0)
+        {
+            return null;
+        }
+
+        var signature = new StringBuilder(index.Name).Append('|');
+        foreach (var term in index.Columns)
+        {
+            var collation = IndexExpressionSemantics.GetCollationName(table, term);
+            if (term.IsExpression
+                || term.ColumnIndex < 0
+                || !IsBuiltInCollation(collation)
+                || IsUnsafeCompiledCollation(collation))
+            {
+                return null;
+            }
+
+            signature.Append(term.ColumnIndex).Append(',')
+                .Append(collation?.ToUpperInvariant()).Append(',')
+                .Append(term.Descending ? 'D' : 'A').Append(',')
+                .Append((int)term.NullPlacement).Append(';');
+        }
+
+        return signature.ToString();
+    }
+
+    // The shared sorted order, built from the caller's visible rows only after proving they are
+    // exactly the table's rowid scan order (the permutation indexes that order).
+    private ManagedIndexOrder? TryGetManagedIndexOrder(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        string signature,
+        IReadOnlyList<SourceRow> visibleRows,
+        QueryContext context)
+    {
+        if (visibleRows.Count != table.Rows.Count || table.RowIds.Count != table.Rows.Count)
+            return null;
+
+        var scanOrder = table.GetRowidScanOrder();
+        for (var position = 0; position < visibleRows.Count; position++)
+        {
+            if (!ReferenceEquals(visibleRows[position].Values, table.Rows[scanOrder[position]]))
+                return null;
+        }
+
+        return table.GetOrCreateDerived(
+            new ManagedIndexOrderKey(signature),
+            () =>
+            {
+                var built = BuildManagedIndexEntries(table, index, visibleRows, context);
+                var positions = new Dictionary<SourceRow, int>(visibleRows.Count, ReferenceEqualityComparer.Instance);
+                for (var position = 0; position < visibleRows.Count; position++)
+                    positions[visibleRows[position]] = position;
+                var permutation = new int[built.Count];
+                var keys = new SqlValue[built.Count][];
+                for (var position = 0; position < built.Count; position++)
+                {
+                    permutation[position] = positions[built[position].Row];
+                    keys[position] = built[position].Key;
+                }
+
+                return new ManagedIndexOrder(permutation, keys);
+            });
+    }
+
+    private readonly record struct ManagedIndexOrderKey(string Signature);
+
+    private const int DurableSeeksBeforeWarmIndexOrder = 32;
+
+    private readonly record struct DurableIndexSeekCountKey(string Signature);
+
+    private sealed class DurableIndexSeekCount
+    {
+        public int Value;
+    }
+
+    private static int CountDurableIndexSeek(EmbeddedTable table, string orderSignature)
+    {
+        var count = table.GetOrCreateDerived(
+            new DurableIndexSeekCountKey(orderSignature),
+            static () => new DurableIndexSeekCount());
+        return Interlocked.Increment(ref count.Value);
+    }
+
+    private sealed record ManagedIndexOrder(int[] Permutation, SqlValue[][] Keys);
+
+    private List<(SourceRow Row, SqlValue[] Key)> BuildManagedIndexEntries(
         EmbeddedTable table,
         EmbeddedIndex index,
         IReadOnlyList<SourceRow> visibleRows,
@@ -34613,6 +35472,29 @@ out bool hasReturning)
             && !(context.ConcurrentMvStore is not null
                 && indexPlan is not null
                 && limit is >= 0);
+        // An index scan whose key order is the ORDER BY needs no sort, and with a LIMIT the scan
+        // can stop at the last row it keeps (SQLite's ORDER BY ... LIMIT over an index).
+        var indexPlanOrdersRows = indexPlan is not null
+            && statement.OrderBy.Count > 0
+            && context.ConcurrentMvStore is null
+            && IndexPlanSatisfiesOrderBy(statement, indexPlan, resolvedOrderBy);
+        // Likewise a plain unfiltered scan already walks the table in ascending rowid order, so
+        // ORDER BY rowid (the INTEGER PRIMARY KEY paging shape) reads only offset + limit rows.
+        var rowidScanOrdersRows = intersectionPlan is null
+            && indexPlan is null
+            && orUnionPlan is null
+            && statement.Where is null
+            && context.ConcurrentMvStore is null
+            && IsAscendingRowidOrderScan(statement, resolvedOrderBy, context);
+        if (rowidScanOrdersRows
+            && !hasAggregate
+            && !hasWindow
+            && statement.GroupBy.Count == 0
+            && !statement.Distinct
+            && limit is >= 0)
+        {
+            sourceLimit = limit.Value > long.MaxValue - offset ? null : offset + limit.Value;
+        }
         // A managed index plan wins over the transient probe: the index path defines
         // row order (SQLite parity, INDEXED BY), while the probe only prunes a plain scan.
         // Top-level OR equality branches can each SEARCH a different index and union positions.
@@ -34629,7 +35511,10 @@ out bool hasReturning)
                 outerRow,
                 sourceLimit,
                 statement.Where,
-                parameters)
+                parameters,
+                lazy: indexPlanOrdersRows && limit is >= 0) is var indexed && indexPlanOrdersRows
+                    ? indexed with { OrderByConsumed = true }
+                    : indexed
             : orUnionPlan is not null
                 ? GetManagedOrIndexUnionRows(orUnionPlan, parameters, context, outerRow)
             : TryGetTransientLookupRows(
@@ -34663,19 +35548,38 @@ out bool hasReturning)
                         // can prove a method may return just the rows its pushed-down LIMIT keeps.
                         AllowsMethodIndexRowTruncation(statement),
                         statement.Projections.Select(static projection => projection.Expression).ToArray()));
+        if (rowidScanOrdersRows)
+            source = source with { OrderByConsumed = true };
+
+        // The rowid-ordered scan is already the output order and has no WHERE, so the OFFSET is
+        // just a starting position: start there rather than build and discard the skipped rows.
+        IEnumerable<SourceRow> scannedRows = source.Rows;
+        if (rowidScanOrdersRows
+            && offset > 0
+            && !hasAggregate
+            && !hasWindow
+            && statement.GroupBy.Count == 0
+            && !statement.Distinct
+            && limit is >= 0
+            && source.Rows is IndexedSourceRowList indexedRows)
+        {
+            scannedRows = indexedRows.EnumerateFrom((int)Math.Min(offset, indexedRows.Count));
+            offset = 0;
+        }
+
         var selectedRows = new List<SourceRow>();
         var selectedRowLimit = !streamProjectionRows
             && !hasAggregate
             && !hasWindow
             && statement.GroupBy.Count == 0
-            && statement.OrderBy.Count == 0
+            && (statement.OrderBy.Count == 0 || source.OrderByConsumed)
             && !statement.Distinct
             && limit is >= 0
                 ? limit.Value > long.MaxValue - offset
                     ? long.MaxValue
                     : offset + limit.Value
                 : (long?)null;
-        foreach (var row in source.Rows)
+        foreach (var row in scannedRows)
         {
             context.CheckInterrupt();
             if (streamProjectionRows
@@ -39168,82 +40072,119 @@ out bool hasReturning)
     {
         if (source is not NamedTableSource named
             || predicate is null
-            || context.StatementState is not { } statementState
+            || context.StatementState is null
             || IsSchemaTable(named.Name)
             || IsCommonTableExpression(named, context)
             || context.Views?.ContainsKey(named.Name) == true
-            || !context.Tables.TryGetValue(named.Name, out var table)
-            || !TryCreateTransientEqualityLookup(
+            || !context.Tables.TryGetValue(named.Name, out var table))
+        {
+            return null;
+        }
+
+        IReadOnlyList<Expression>? inListValues = null;
+        if (!TryCreateTransientEqualityLookup(
                 named,
                 table,
                 predicate,
                 context,
                 outerRow,
                 out var lookup,
+                preserveErrors)
+            && !TryCreateTransientInListLookup(
+                named,
+                table,
+                predicate,
+                context,
+                outerRow,
+                out lookup,
+                out inListValues,
                 preserveErrors))
         {
-            return null;
-        }
-
-        var probeValue = Evaluate(lookup.ValueExpression, parameters, outerRow, context);
-        if (probeValue.Kind is SqlValueKind.Null)
-        {
-            // SQL equality against NULL never holds, so no row can match.
-            return new SourceData(table.Columns, []);
+            return TryGetRowidRangeRows(named, table, predicate, parameters, context, outerRow, preserveErrors);
         }
 
         // Both sides are canonicalized with exactly the conversion SQLite's comparison affinity
         // rules apply to that side, so the bucket a value lands in is the bucket the evaluator's
         // `=` would agree with. Applying the scanned column's affinity to the probe instead
         // would silently answer "no row" for `INTEGER 7 = TEXT '007'`.
-        var key = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
-            probeValue,
-            lookup.ValueConvertsTextToNumeric,
-            lookup.ValueConvertsNumericToText,
-            lookup.Collation);
-        if (key is null)
-            return new SourceData(table.Columns, []);
-
-        var lookups = statementState.TransientLookups;
-        var cacheKey = new TransientLookupKey(
-            table,
-            lookup.ColumnOrdinal,
-            lookup.Collation,
-            lookup.ColumnConvertsTextToNumeric,
-            lookup.ColumnConvertsNumericToText);
-        if (!lookups.TryGetValue(cacheKey, out var transient))
+        string? CanonicalizeProbe(Expression valueExpression)
         {
-            transient = new TransientLookup();
-            lookups[cacheKey] = transient;
+            var probeValue = Evaluate(valueExpression, parameters, outerRow, context);
+            // SQL equality against NULL never holds, so no row can match.
+            return probeValue.Kind is SqlValueKind.Null
+                ? null
+                : EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                    probeValue,
+                    lookup.ValueConvertsTextToNumeric,
+                    lookup.ValueConvertsNumericToText,
+                    lookup.Collation);
         }
 
-        if (transient.Revision != table.Rows.Revision)
-        {
-            transient.Buckets.Clear();
-            for (var position = 0; position < table.Rows.Count; position++)
+        var key = inListValues is null ? CanonicalizeProbe(lookup.ValueExpression) : null;
+        if (inListValues is null && key is null)
+            return new SourceData(table.Columns, []);
+
+        // The bucket map is derived from the table's rows alone, so it is shared by every clone
+        // holding the same rows (TableDerivedCache): a parameterized point query no longer
+        // re-hashes the whole table on every statement.
+        var columnOrdinal = lookup.ColumnOrdinal;
+        var columnConvertsTextToNumeric = lookup.ColumnConvertsTextToNumeric;
+        var columnConvertsNumericToText = lookup.ColumnConvertsNumericToText;
+        var collation = lookup.Collation;
+        var buckets = table.GetOrCreateDerived(
+            new TransientLookupKey(
+                columnOrdinal,
+                collation,
+                columnConvertsTextToNumeric,
+                columnConvertsNumericToText),
+            () =>
             {
-                context.CheckInterrupt();
-                var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
-                    table.Rows[position][lookup.ColumnOrdinal],
-                    lookup.ColumnConvertsTextToNumeric,
-                    lookup.ColumnConvertsNumericToText,
-                    lookup.Collation);
-                if (segment is null)
-                    continue;
-                if (!transient.Buckets.TryGetValue(segment, out var bucket))
+                var built = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+                var rows = table.Rows;
+                for (var position = 0; position < rows.Count; position++)
                 {
-                    bucket = [];
-                    transient.Buckets[segment] = bucket;
+                    context.CheckInterrupt();
+                    var segment = EquiJoinHashIndex.CanonicalizeJoinKeyValue(
+                        rows[position][columnOrdinal],
+                        columnConvertsTextToNumeric,
+                        columnConvertsNumericToText,
+                        collation);
+                    if (segment is null)
+                        continue;
+                    if (!built.TryGetValue(segment, out var bucket))
+                    {
+                        bucket = [];
+                        built[segment] = bucket;
+                    }
+
+                    bucket.Add(position);
                 }
 
-                bucket.Add(position);
+                return built;
+            });
+
+        List<int>? positions;
+        if (inListValues is null)
+        {
+            if (!buckets.TryGetValue(key!, out positions) || positions.Count == 0)
+                return new SourceData(table.Columns, []);
+        }
+        else
+        {
+            // `col IN (v1, v2, ...)` is `col = v1 OR col = v2 ...`: the union of the buckets,
+            // in table order like a single probe, with duplicate values contributing once.
+            var union = new HashSet<int>();
+            foreach (var value in inListValues)
+            {
+                if (CanonicalizeProbe(value) is { } valueKey && buckets.TryGetValue(valueKey, out var bucket))
+                    union.UnionWith(bucket);
             }
 
-            transient.Revision = table.Rows.Revision;
+            positions = [.. union];
+            positions.Sort();
+            if (positions.Count == 0)
+                return new SourceData(table.Columns, []);
         }
-
-        if (!transient.Buckets.TryGetValue(key, out var positions) || positions.Count == 0)
-            return new SourceData(table.Columns, []);
 
         var qualifier = named.Alias ?? named.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
@@ -39491,6 +40432,270 @@ out bool hasReturning)
         }
 
         lookup = null;
+        return false;
+    }
+
+    // A range over the INTEGER PRIMARY KEY (`id < ?`, `id >= ?`, `id BETWEEN ? AND ?`) selects a
+    // contiguous run of the table's rowid order, as SQLite's rowid-range SEARCH does: binary-search
+    // the shared rowid scan order instead of evaluating the predicate on every row. The run is a
+    // superset of the matches only when the bound compares exactly, so the probe value must be an
+    // INTEGER, or a REAL small enough to compare with every rowid without rounding. Rows come back
+    // in rowid order; the caller still applies the whole WHERE.
+    private SourceData? TryGetRowidRangeRows(
+        NamedTableSource source,
+        EmbeddedTable table,
+        Expression predicate,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        bool preserveErrors)
+    {
+        if (!table.HasRowid
+            || table.RowidAliasColumnIndex < 0
+            || table.HasMethodIndexes
+            || table.RowIds.Count != table.Rows.Count
+            || context.ConcurrentMvStore is not null)
+        {
+            return null;
+        }
+
+        var outputColumns = GetOutputColumns(source, context);
+        bool IsRowidColumn(Expression expression)
+            => expression is ColumnExpression { BooleanKeyword: null } column
+                && ResolveJoinSideColumn(column, outputColumns) is not null
+                && table.TryGetColumnIndex(column.UnqualifiedName ?? column.Name, out var ordinal)
+                && ordinal == table.RowidAliasColumnIndex;
+
+        bool TryEvaluateBound(Expression expression, out double bound)
+        {
+            bound = 0;
+            var operand = expression is UnaryExpression { Operator: UnaryOperator.Negate or UnaryOperator.Plus } unary
+                ? unary.Operand
+                : expression;
+            if (operand is not (LiteralExpression or ParameterExpression))
+                return false;
+            var value = Evaluate(expression, parameters, outerRow, context);
+            const double ExactLimit = 9007199254740992d; // 2^53
+            switch (value.Kind)
+            {
+                case SqlValueKind.Integer when Math.Abs((double)value.AsInteger()) < ExactLimit:
+                    bound = value.AsInteger();
+                    return true;
+                case SqlValueKind.Real when !double.IsNaN(value.AsReal()) && Math.Abs(value.AsReal()) < ExactLimit:
+                    bound = value.AsReal();
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        double? lower = null;
+        double? upper = null;
+        bool lowerInclusive = true, upperInclusive = true;
+        void TightenLower(double value, bool inclusive)
+        {
+            if (lower is null || value > lower || (value == lower && !inclusive))
+            {
+                lower = value;
+                lowerInclusive = inclusive;
+            }
+        }
+
+        void TightenUpper(double value, bool inclusive)
+        {
+            if (upper is null || value < upper || (value == upper && !inclusive))
+            {
+                upper = value;
+                upperInclusive = inclusive;
+            }
+        }
+
+        var pending = new Stack<Expression>();
+        pending.Push(predicate);
+        var found = false;
+        while (pending.Count > 0)
+        {
+            var conjunct = pending.Pop();
+            if (conjunct is BinaryExpression { Operator: BinaryOperator.And } and)
+            {
+                pending.Push(and.Right);
+                pending.Push(and.Left);
+                continue;
+            }
+
+            if (conjunct is BinaryExpression
+                {
+                    Operator: BinaryOperator.LessThan or BinaryOperator.LessThanOrEqual
+                        or BinaryOperator.GreaterThan or BinaryOperator.GreaterThanOrEqual,
+                } comparison)
+            {
+                var columnOnLeft = IsRowidColumn(comparison.Left);
+                var columnOnRight = !columnOnLeft && IsRowidColumn(comparison.Right);
+                if ((columnOnLeft || columnOnRight)
+                    && TryEvaluateBound(columnOnLeft ? comparison.Right : comparison.Left, out var bound))
+                {
+                    // Normalize to `rowid op bound`.
+                    var op = comparison.Operator;
+                    if (columnOnRight)
+                    {
+                        op = op switch
+                        {
+                            BinaryOperator.LessThan => BinaryOperator.GreaterThan,
+                            BinaryOperator.LessThanOrEqual => BinaryOperator.GreaterThanOrEqual,
+                            BinaryOperator.GreaterThan => BinaryOperator.LessThan,
+                            _ => BinaryOperator.LessThanOrEqual,
+                        };
+                    }
+
+                    switch (op)
+                    {
+                        case BinaryOperator.LessThan: TightenUpper(bound, inclusive: false); break;
+                        case BinaryOperator.LessThanOrEqual: TightenUpper(bound, inclusive: true); break;
+                        case BinaryOperator.GreaterThan: TightenLower(bound, inclusive: false); break;
+                        default: TightenLower(bound, inclusive: true); break;
+                    }
+
+                    found = true;
+                    continue;
+                }
+            }
+            else if (conjunct is BetweenExpression { Negated: false } between
+                && IsRowidColumn(between.Value)
+                && TryEvaluateBound(between.Lower, out var betweenLower)
+                && TryEvaluateBound(between.Upper, out var betweenUpper))
+            {
+                TightenLower(betweenLower, inclusive: true);
+                TightenUpper(betweenUpper, inclusive: true);
+                found = true;
+                continue;
+            }
+
+            if (preserveErrors && ExpressionCanFail(conjunct))
+                break;
+        }
+
+        if (!found)
+            return null;
+
+        var order = table.GetRowidScanOrder();
+        var rowIds = table.RowIds;
+        bool AboveLower(int orderIndex)
+            => lower is not { } bound || (lowerInclusive ? rowIds[order[orderIndex]] >= bound : rowIds[order[orderIndex]] > bound);
+        bool BelowUpper(int orderIndex)
+            => upper is not { } bound || (upperInclusive ? rowIds[order[orderIndex]] <= bound : rowIds[order[orderIndex]] < bound);
+
+        // First index at or above the lower bound, and first index past the upper bound.
+        int low = 0, high = order.Length;
+        while (low < high)
+        {
+            var middle = (low + high) >>> 1;
+            if (AboveLower(middle))
+                high = middle;
+            else
+                low = middle + 1;
+        }
+
+        var start = low;
+        high = order.Length;
+        while (low < high)
+        {
+            var middle = (low + high) >>> 1;
+            if (BelowUpper(middle))
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        var end = low;
+        var qualifier = source.Alias ?? source.Name;
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
+        var qualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(qualifier, table.ColumnDefinitions);
+        var rows = new SourceRow[Math.Max(0, end - start)];
+        for (var index = start; index < end; index++)
+        {
+            var position = order[index];
+            rows[index - start] = new SourceRow(
+                table.Columns,
+                table.Rows[position],
+                qualifiedColumns,
+                outerRow,
+                RowId: rowIds[position],
+                RowIdQualifier: qualifier,
+                ColumnDefinitions: table.ColumnDefinitions,
+                QualifiedColumnDefinitions: qualifiedColumnDefinitions);
+        }
+
+        return new SourceData(table.Columns, rows);
+    }
+
+    // The IN-list counterpart of TryCreateTransientEqualityLookup: the first conjunct shaped
+    // `column IN (literal or parameter, ...)` over the scanned table. Its values carry no affinity
+    // or collation (SQLite treats `a IN (x, y)` as `a = +x OR a = +y`), which literals and
+    // parameters already lack, so each value probes the same equality lookup as `a = value`.
+    private bool TryCreateTransientInListLookup(
+        NamedTableSource source,
+        EmbeddedTable table,
+        Expression predicate,
+        QueryContext context,
+        SourceRow? outerRow,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TransientEqualityLookup? lookup,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IReadOnlyList<Expression>? values,
+        bool preserveErrors = false)
+    {
+        var outputColumns = GetOutputColumns(source, context);
+        var pending = new Stack<Expression>();
+        pending.Push(predicate);
+        while (pending.Count > 0)
+        {
+            var conjunct = pending.Pop();
+            if (conjunct is BinaryExpression { Operator: BinaryOperator.And } and)
+            {
+                pending.Push(and.Right);
+                pending.Push(and.Left);
+                continue;
+            }
+
+            if (conjunct is InExpression { Negated: false, Values.Count: > 0 } inList
+                && inList.Values.All(value => value is LiteralExpression or ParameterExpression)
+                && TryMatchTransientEquality(
+                    inList.Value,
+                    inList.Values[0],
+                    columnSideIsLeftOperand: true,
+                    source,
+                    table,
+                    outputColumns,
+                    outerRow,
+                    out var first))
+            {
+                var consistent = true;
+                for (var index = 1; index < inList.Values.Count && consistent; index++)
+                {
+                    consistent = TryMatchTransientEquality(
+                            inList.Value,
+                            inList.Values[index],
+                            columnSideIsLeftOperand: true,
+                            source,
+                            table,
+                            outputColumns,
+                            outerRow,
+                            out var other)
+                        && other with { ValueExpression = first.ValueExpression } == first;
+                }
+
+                if (consistent)
+                {
+                    lookup = first;
+                    values = inList.Values;
+                    return true;
+                }
+            }
+
+            if (preserveErrors && ExpressionCanFail(conjunct))
+                break;
+        }
+
+        lookup = null;
+        values = null;
         return false;
     }
 
@@ -39766,6 +40971,7 @@ out bool hasReturning)
             ? TryGetManagedJoinSideIndexRows(
                     named,
                     sidePredicate,
+                    parameters,
                     context,
                     outerRow,
                     sourceOrderBy)
@@ -39801,6 +41007,7 @@ out bool hasReturning)
     private SourceData? TryGetManagedJoinSideIndexRows(
         NamedTableSource source,
         Expression predicate,
+        SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow,
         IReadOnlyList<OrderByTerm>? sourceOrderBy)
@@ -39816,8 +41023,10 @@ out bool hasReturning)
             OrderBy: sourceOrderBy ?? [],
             Limit: null,
             Offset: null);
+        // The side predicate and parameters let a SEARCH plan seek the durable index instead of
+        // materializing and sorting every entry of it; the caller still filters the result.
         return TryPlanManagedIndexScan(select, context) is { } plan
-            ? GetManagedIndexRows(plan, context, outerRow)
+            ? GetManagedIndexRows(plan, context, outerRow, predicate: predicate, parameters: parameters)
             : null;
     }
 
@@ -40278,9 +41487,32 @@ out bool hasReturning)
             && TryPlanDeclaredIndexLookup(rightNamedSource, source.Condition, context) is { } declaredLookup
             ? declaredLookup
             : null;
+        // A small left side probes a base-table right side per row through the shared equality
+        // lookup (TryGetTransientLookupRows), as SQLite's index nested loop does, instead of
+        // materializing every right row and hashing them all for a handful of probes. The probe
+        // only prunes: the full join condition and right predicate still run on each candidate.
+        var rightProbesPerLeftRow = !rightIsCorrelatedSource
+            && rightDeclaredLookup is null
+            && source.Kind is JoinKind.Inner or JoinKind.Left
+            && source.Condition is not null
+            && (sourceOrderBy is null || sourceOrderBy.Count == 0)
+            && left.Rows.Count > 0
+            && source.Right is NamedTableSource rightProbeSource
+            && !IsSchemaTable(rightProbeSource.Name)
+            && !IsCommonTableExpression(rightProbeSource, context)
+            && context.Views?.ContainsKey(rightProbeSource.Name) != true
+            && !TryGetVirtualTable(context, rightProbeSource, out _)
+            && context.Tables.TryGetValue(rightProbeSource.Name, out var rightProbeTable)
+            && left.Rows.Count <= Math.Max(SmallJoinProbeRows, rightProbeTable.Rows.Count / 8)
+            && TryGetTransientLookupRows(
+                source.Right,
+                source.Condition,
+                parameters,
+                context,
+                left.Rows[0] with { Parent = outerRow }) is not null;
         var right = rightIsCorrelatedSource
             ? new SourceData(GetSourceColumns(source.Right, context), [])
-            : rightDeclaredLookup is not null
+            : rightDeclaredLookup is not null || rightProbesPerLeftRow
                 ? new SourceData(GetSourceColumns(source.Right, context), [])
             : GetSideSourceRows(
                 source.Right,
@@ -40302,7 +41534,7 @@ out bool hasReturning)
         var ambiguousQualifiedColumns = GetAmbiguousQualifiedColumns(source, context);
         var leftWidth = left.Columns.Length;
         var joinPairs = BuildJoinPairs(source, context);
-        var joinHashIndex = rightIsCorrelatedSource
+        var joinHashIndex = rightIsCorrelatedSource || rightProbesPerLeftRow
             ? null
             : rightDeclaredLookup is null
                 ? TryBuildJoinHashIndex(source, right, parameters, context)
@@ -40334,30 +41566,63 @@ out bool hasReturning)
                 result,
                 OmittedVirtualTablePredicates: omittedPredicates);
 
+        // Rows drawn from the same pair of sources share their qualified-column map and column
+        // metadata, so the combined forms are reused while those inputs are the same instances
+        // instead of rebuilding a dictionary and an array for every joined row.
+        IReadOnlyDictionary<string, int>? combinedColumnsLeft = null;
+        IReadOnlyDictionary<string, int>? combinedColumnsRight = null;
+        IReadOnlyDictionary<string, int>? combinedColumns = null;
+        IReadOnlyList<EmbeddedColumn?>? combinedDefinitionsLeft = null;
+        IReadOnlyList<EmbeddedColumn?>? combinedDefinitionsRight = null;
+        IReadOnlyList<EmbeddedColumn?>? combinedDefinitions = null;
+        var hasCombinedDefinitions = false;
         SourceRow CreateJoinedRow(SourceRow leftRow, SourceRow rightRow)
-            => new(
-                columns,
-                leftRow.Values.Concat(rightRow.Values).ToArray(),
-                CombineQualifiedColumns(leftRow.QualifiedColumns, rightRow.QualifiedColumns, leftWidth),
-                outerRow,
-                outputColumns,
-                QualifiedRowIds: CombineQualifiedRowIds(
-                    GetQualifiedRowIds(leftRow),
-                    GetQualifiedRowIds(rightRow)),
-                ColumnDefinitions: CombineColumnDefinitions(
+        {
+            if (combinedColumns is null
+                || !ReferenceEquals(combinedColumnsLeft, leftRow.QualifiedColumns)
+                || !ReferenceEquals(combinedColumnsRight, rightRow.QualifiedColumns))
+            {
+                combinedColumnsLeft = leftRow.QualifiedColumns;
+                combinedColumnsRight = rightRow.QualifiedColumns;
+                combinedColumns = CombineQualifiedColumns(leftRow.QualifiedColumns, rightRow.QualifiedColumns, leftWidth);
+            }
+
+            if (!hasCombinedDefinitions
+                || !ReferenceEquals(combinedDefinitionsLeft, leftRow.ColumnDefinitions)
+                || !ReferenceEquals(combinedDefinitionsRight, rightRow.ColumnDefinitions))
+            {
+                combinedDefinitionsLeft = leftRow.ColumnDefinitions;
+                combinedDefinitionsRight = rightRow.ColumnDefinitions;
+                combinedDefinitions = CombineColumnDefinitions(
                     leftRow,
                     rightRow,
                     left.Columns.Length,
                     right.Columns.Length,
-                    columnDefinitions),
+                    columnDefinitions);
+                hasCombinedDefinitions = true;
+            }
+
+            return new(
+                columns,
+                ConcatRowValues(leftRow.Values, rightRow.Values),
+                combinedColumns,
+                outerRow,
+                outputColumns,
+                QualifiedRowIds: CombineQualifiedRowIds(leftRow, rightRow),
+                ColumnDefinitions: combinedDefinitions,
                 QualifiedColumnDefinitions: qualifiedColumnDefinitions,
                 AmbiguousQualifiedColumns: ambiguousQualifiedColumns,
-                QualifiedMethodIndexSources: CombineMethodIndexSources(
-                    GetMethodIndexSources(leftRow),
-                    GetMethodIndexSources(rightRow)),
-                QualifiedFts5Sources: CombineFts5Sources(
-                    GetFts5Sources(leftRow),
-                    GetFts5Sources(rightRow)));
+                QualifiedMethodIndexSources: HasNoMethodIndexSources(leftRow) && HasNoMethodIndexSources(rightRow)
+                    ? null
+                    : CombineMethodIndexSources(
+                        GetMethodIndexSources(leftRow),
+                        GetMethodIndexSources(rightRow)),
+                QualifiedFts5Sources: HasNoFts5Sources(leftRow) && HasNoFts5Sources(rightRow)
+                    ? null
+                    : CombineFts5Sources(
+                        GetFts5Sources(leftRow),
+                        GetFts5Sources(rightRow)));
+        }
 
         if (leftIsReverseCorrelatedSource)
         {
@@ -40397,6 +41662,26 @@ out bool hasReturning)
             return CreateResult(rows);
         }
 
+        SourceData ProbeRightRows(SourceRow leftRow)
+        {
+            var probed = TryGetTransientLookupRows(
+                    source.Right,
+                    source.Condition,
+                    parameters,
+                    context,
+                    leftRow with { Parent = outerRow })
+                ?? (rightLookupFallback ??= GetSideSourceRows(
+                    source.Right,
+                    rightPredicate,
+                    parameters,
+                    context,
+                    outerRow,
+                    sourceOrderBy));
+            return rightPredicate is null || ReferenceEquals(probed, rightLookupFallback)
+                ? probed
+                : FilterSourceRows(probed, rightPredicate, parameters, context);
+        }
+
         var rightMatched = new bool[right.Rows.Count];
         foreach (var leftRow in left.Rows)
         {
@@ -40423,12 +41708,14 @@ out bool hasReturning)
                             context,
                             outerRow,
                             sourceOrderBy))
+                : rightProbesPerLeftRow
+                    ? ProbeRightRows(leftRow)
                 : right;
             AddOmittedPredicates(rowsForLeft.OmittedVirtualTablePredicates);
             var matched = false;
             var candidateIndices = joinHashIndex is not null
                 ? joinHashIndex.Probe(leftRow)
-                : rightIsCorrelatedSource || rightDeclaredLookup is not null
+                : rightIsCorrelatedSource || rightDeclaredLookup is not null || rightProbesPerLeftRow
                     ? Enumerable.Range(0, rowsForLeft.Rows.Count)
                     : allRightIndices ??= Enumerable.Range(0, rowsForLeft.Rows.Count);
             foreach (var rightIndex in candidateIndices)
@@ -41386,10 +42673,27 @@ out bool hasReturning)
         }
 
         private static string ToNumericKeyBits(double number)
+            => GetNumericKeyBits(number).ToString("X16", CultureInfo.InvariantCulture);
+
+        /// <summary>The bits a numeric canonical key ("N" + 16 hex digits) encodes.</summary>
+        internal static long GetNumericKeyBits(double number)
         {
             if (number == 0)
                 number = 0; // normalize -0 so 0 and -0 share a bucket
-            return BitConverter.DoubleToInt64Bits(number).ToString("X16", CultureInfo.InvariantCulture);
+            return BitConverter.DoubleToInt64Bits(number);
+        }
+
+        /// <summary>Parses the bits back out of a numeric canonical key.</summary>
+        internal static bool TryGetNumericKeyBits(string key, out long bits)
+        {
+            bits = 0;
+            return key.Length == 17
+                && key[0] == 'N'
+                && long.TryParse(
+                    key.AsSpan(1),
+                    NumberStyles.AllowHexSpecifier,
+                    CultureInfo.InvariantCulture,
+                    out bits);
         }
 
         private static string CanonicalizeJoinKeyText(string text, string collation)
@@ -41447,6 +42751,50 @@ out bool hasReturning)
 
         return columns;
     }
+
+    private static SqlValue[] ConcatRowValues(SqlValue[] left, SqlValue[] right)
+    {
+        var values = new SqlValue[left.Length + right.Length];
+        left.CopyTo(values, 0);
+        right.CopyTo(values, left.Length);
+        return values;
+    }
+
+    // CombineQualifiedRowIds(GetQualifiedRowIds(left), GetQualifiedRowIds(right)) in one map. A join
+    // gives every row it produces the same qualifiers, so the map shares their layout and stores
+    // only this row's rowids (see JoinedRowIdMap); any other map shape takes the dictionary path.
+    private static IReadOnlyDictionary<string, long?> CombineQualifiedRowIds(SourceRow left, SourceRow right)
+    {
+        if (left.QualifiedRowIds is null or JoinedRowIdMap
+            && right.QualifiedRowIds is null or JoinedRowIdMap)
+        {
+            return JoinedRowIdMap.Combine(left, right);
+        }
+
+        var rowIds = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in (ReadOnlySpan<SourceRow>)[left, right])
+        {
+            if (row.QualifiedRowIds is not null)
+            {
+                foreach (var (qualifier, rowId) in row.QualifiedRowIds)
+                    rowIds.TryAdd(qualifier, rowId);
+            }
+
+            if (row.RowIdQualifier is not null)
+                rowIds.TryAdd(row.RowIdQualifier, row.RowId);
+        }
+
+        return rowIds;
+    }
+
+    // Whether GetMethodIndexSources / GetFts5Sources would return an empty map for the row.
+    private static bool HasNoMethodIndexSources(SourceRow row)
+        => (row.QualifiedMethodIndexSources is null || row.QualifiedMethodIndexSources.Count == 0)
+            && (row.MethodIndexSource is null || row.RowIdQualifier is null);
+
+    private static bool HasNoFts5Sources(SourceRow row)
+        => (row.QualifiedFts5Sources is null || row.QualifiedFts5Sources.Count == 0)
+            && (row.Fts5Source is null || row.RowIdQualifier is null);
 
     private static IReadOnlyDictionary<string, long?> CombineQualifiedRowIds(
         IReadOnlyDictionary<string, long?> left,
@@ -41673,14 +43021,31 @@ out bool hasReturning)
         }
     }
 
+    // Scans and DML build one evaluation row per table row, each asking for the same map; the
+    // last one built on this thread is reused while its qualifier and column names still match.
+    [ThreadStatic]
+    private static (string Qualifier, string[] Columns, IReadOnlyDictionary<string, int> Map)? t_lastQualifiedColumns;
+
     private static IReadOnlyDictionary<string, int> BuildQualifiedColumns(
         string qualifier,
         IReadOnlyList<string> columns)
     {
-        var qualifiedColumns = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (t_lastQualifiedColumns is { } last
+            && string.Equals(last.Qualifier, qualifier, StringComparison.Ordinal)
+            && last.Columns.Length == columns.Count)
+        {
+            var matches = true;
+            for (var index = 0; index < columns.Count && matches; index++)
+                matches = string.Equals(last.Columns[index], columns[index], StringComparison.Ordinal);
+            if (matches)
+                return last.Map;
+        }
+
+        var qualifiedColumns = new Dictionary<string, int>(columns.Count, StringComparer.OrdinalIgnoreCase);
         for (var index = 0; index < columns.Count; index++)
             qualifiedColumns.TryAdd($"{qualifier}.{columns[index]}", index);
 
+        t_lastQualifiedColumns = (qualifier, columns.ToArray(), qualifiedColumns);
         return qualifiedColumns;
     }
 
@@ -41983,22 +43348,18 @@ out bool hasReturning)
         if (maximumRows is { } maxRows && maxRows < rowCount)
             rowCount = (int)maxRows;
 
-        var rowOrder = Enumerable.Range(0, table.Rows.Count).ToArray();
-        if (table.HasRowid)
-        {
-            // A table B-tree cursor rewinds to its smallest integer key. Keep the evaluator's
-            // heap-backed table representation from leaking insertion order into physical scans.
-            Array.Sort(
-                rowOrder,
-                (left, right) => table.RowIds[left].CompareTo(table.RowIds[right]));
-        }
+        // A table B-tree cursor rewinds to its smallest integer key. Keep the evaluator's
+        // heap-backed table representation from leaking insertion order into physical scans.
+        // The rowid order is shared across statements (EmbeddedTable.GetRowidScanOrder).
+        var rowOrder = table.HasRowid && table.RowIds.Count == table.Rows.Count
+            ? table.GetRowidScanOrder()
+            : null;
 
-        var sourceRows = new SourceRow[rowCount];
-        for (var outputIndex = 0; outputIndex < rowCount; outputIndex++)
+        SourceRow CreateRow(int outputIndex)
         {
-            var index = rowOrder[outputIndex];
+            var index = rowOrder is null ? outputIndex : rowOrder[outputIndex];
             var rowid = index < table.RowIds.Count ? table.RowIds[index] : index + 1;
-            sourceRows[outputIndex] = new SourceRow(
+            return new SourceRow(
                 table.Columns,
                 table.Rows[index],
                 qualifiedColumns,
@@ -42009,6 +43370,15 @@ out bool hasReturning)
                 QualifiedColumnDefinitions: qualifiedColumnDefinitions,
                 MethodIndexSource: methodIndexSource);
         }
+
+        // A bounded scan (LIMIT/OFFSET paging) builds rows on first access, so a caller that
+        // starts at the OFFSET never builds the rows it skips (see ExecuteSelect).
+        if (maximumRows is not null)
+            return new SourceData(table.Columns, new IndexedSourceRowList(rowCount, CreateRow));
+
+        var sourceRows = new SourceRow[rowCount];
+        for (var outputIndex = 0; outputIndex < rowCount; outputIndex++)
+            sourceRows[outputIndex] = CreateRow(outputIndex);
 
         return new SourceData(table.Columns, sourceRows);
     }
@@ -51773,49 +53143,57 @@ out bool hasReturning)
         if (left.Kind == SqlValueKind.Real && right.Kind == SqlValueKind.Real)
             return left.AsReal().CompareTo(right.AsReal());
         if (left.Kind == SqlValueKind.Text && right.Kind == SqlValueKind.Text)
-        {
-            if (_collations.TryGetValue(collation ?? "BINARY", out var compare))
-            {
-                return InvokeManagedCallback(
-                    () => compare(left.AsText(), right.AsText()));
-            }
-
-            // Consult the external resolver BEFORE the built-in BINARY/NOCASE/RTRIM fallback.
-            // The own-registry check above only sees registrations made directly on this
-            // instance; the private index-expression/partial-predicate evaluator (see
-            // _externalCollationResolver) never registers anything of its own and relies
-            // entirely on this resolver to see the owning connection's actual collations —
-            // including an application override of a built-in name. Checking the hard-coded
-            // fallback first would let such a BINARY/NOCASE/RTRIM override silently miss inside
-            // a partial-index predicate or expression-index key while it is honored everywhere
-            // else. On the owning connection itself _externalCollationResolver is always null
-            // (it is only ever set via SetExternalCollationResolver on a throwaway evaluator
-            // instance) and any override is already caught by the own-registry check above, so
-            // this preserves ordinary EmbeddedDatabase.Compare precedence there. The resolver's
-            // own delegate already routes the invocation through the owning connection's
-            // InvokeManagedCallback (see BuildCollationResolver), so it is called directly
-            // rather than re-wrapped here.
-            var external = _externalCollationResolver?.Invoke(collation ?? "BINARY");
-            if (external is not null)
-                return external(left.AsText(), right.AsText());
-
-            if (collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase))
-                return string.CompareOrdinal(left.AsText(), right.AsText());
-            if (string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase))
-                return SqliteIndexRecordComparer.CompareNoCaseText(left.AsText(), right.AsText());
-            if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
-                return SqliteIndexRecordComparer.CompareRTrimText(left.AsText(), right.AsText());
-
-            if (LocaleCollationRegistry.TryResolve(collation, out var localeCompare))
-                return InvokeManagedCallback(() => localeCompare!(left.AsText(), right.AsText()));
-
-            throw new EmbeddedSqlException($"no such collation sequence: {collation}");
-        }
+            return CompareText(left.AsText(), right.AsText(), collation);
         if (left.Kind == SqlValueKind.Blob && right.Kind == SqlValueKind.Blob)
             return left.AsBlob().Span.SequenceCompareTo(right.AsBlob().Span);
 
         return left.Kind.CompareTo(right.Kind);
     }
+
+    // Separate from Compare because its callback lambdas capture the operands: C# allocates the
+    // closure on entry to the method that declares them, which made every comparison of any kind
+    // allocate.
+    private int CompareText(string leftText, string rightText, string? collation)
+    {
+        if (_collations.TryGetValue(collation ?? "BINARY", out var compare))
+        {
+            return InvokeCollation(compare, leftText, rightText);
+        }
+
+        // Consult the external resolver BEFORE the built-in BINARY/NOCASE/RTRIM fallback.
+        // The own-registry check above only sees registrations made directly on this
+        // instance; the private index-expression/partial-predicate evaluator (see
+        // _externalCollationResolver) never registers anything of its own and relies
+        // entirely on this resolver to see the owning connection's actual collations —
+        // including an application override of a built-in name. Checking the hard-coded
+        // fallback first would let such a BINARY/NOCASE/RTRIM override silently miss inside
+        // a partial-index predicate or expression-index key while it is honored everywhere
+        // else. On the owning connection itself _externalCollationResolver is always null
+        // (it is only ever set via SetExternalCollationResolver on a throwaway evaluator
+        // instance) and any override is already caught by the own-registry check above, so
+        // this preserves ordinary EmbeddedDatabase.Compare precedence there. The resolver's
+        // own delegate already routes the invocation through the owning connection's
+        // InvokeManagedCallback (see BuildCollationResolver), so it is called directly
+        // rather than re-wrapped here.
+        var external = _externalCollationResolver?.Invoke(collation ?? "BINARY");
+        if (external is not null)
+            return external(leftText, rightText);
+
+        if (collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase))
+            return string.CompareOrdinal(leftText, rightText);
+        if (string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase))
+            return SqliteIndexRecordComparer.CompareNoCaseText(leftText, rightText);
+        if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
+            return SqliteIndexRecordComparer.CompareRTrimText(leftText, rightText);
+
+        if (LocaleCollationRegistry.TryResolve(collation, out var localeCompare))
+            return InvokeCollation(localeCompare!, leftText, rightText);
+
+        throw new EmbeddedSqlException($"no such collation sequence: {collation}");
+    }
+
+    private int InvokeCollation(Func<string, string, int> compare, string leftText, string rightText)
+        => InvokeManagedCallback(() => compare(leftText, rightText));
 
     private static int CompareIntegerAndReal(long integer, double real)
     {
@@ -54750,7 +56128,7 @@ out bool hasReturning)
         if (TryGetExactWindowInteger(value, out var integer))
             return integer;
         if (value.Kind == SqlValueKind.Real)
-            return (long)value.AsReal();
+            return SaturatingToInt64(value.AsReal());
         if (value.Kind == SqlValueKind.Text
             && double.TryParse(
                 EmbeddedTable.TrimAsciiWhitespace(value.AsText()),
@@ -54758,10 +56136,24 @@ out bool hasReturning)
                 CultureInfo.InvariantCulture,
                 out var real))
         {
-            return (long)real;
+            return SaturatingToInt64(real);
         }
 
         return 0;
+    }
+
+    // SQLite's doubleToInt64: out-of-range values clamp to the int64 limits and NaN becomes 0. A
+    // plain cast is runtime-dependent there (.NET 9+ saturates; .NET 8 on x64 yields long.MinValue
+    // for any out-of-range value, which turned substr('abc', 1.8e19) into the whole string).
+    private static long SaturatingToInt64(double value)
+    {
+        if (double.IsNaN(value))
+            return 0;
+        if (value <= long.MinValue)
+            return long.MinValue;
+        if (value >= long.MaxValue)
+            return long.MaxValue;
+        return (long)value;
     }
 
     private int CompareRows(
@@ -61249,14 +62641,66 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         ThrowIfInsideHookCallback();
-        var parameterMap = SqlParameterMap.Parse(sql);
-        var statement = SqlParser.Parse(sql, parameterMap, IsKnownTableOrViewName);
+        var (parameterMap, statement) = ParseCached(sql);
         if (statement is CreateTypeStatement or CreateDomainStatement && !ExperimentalCustomTypesEnabled)
             throw new EmbeddedSqlException("Custom types are experimental and are not enabled for this connection.");
         if (_hooks.Authorizer is not null)
             statement = Authorize(statement);
 
         return new EmbeddedStatement(this, statement, parameterMap, sql);
+    }
+
+    private const int MaximumParseCacheEntries = 128;
+
+    // Parsed statements by SQL text. ADO.NET executes a command by preparing its text again (a
+    // reused or Prepare()d command included), so re-parsing showed up on every execution. The
+    // parse consults the schema only through IsKnownTableOrViewName, so an entry records each
+    // name it asked about with the answer, and is reused only while every answer is unchanged.
+    // Statement trees are immutable, so executions can share one.
+    private readonly Dictionary<string, CachedParse> _parseCache = new(StringComparer.Ordinal);
+
+    private sealed record CachedParse(
+        SqlParameterMap ParameterMap,
+        ParsedStatement Statement,
+        (string Name, bool Known)[] NameProbes);
+
+    private (SqlParameterMap ParameterMap, ParsedStatement Statement) ParseCached(string sql)
+    {
+        CachedParse? cached;
+        lock (_parseCache)
+            _parseCache.TryGetValue(sql, out cached);
+        if (cached is not null)
+        {
+            var current = true;
+            foreach (var (name, known) in cached.NameProbes)
+            {
+                if (IsKnownTableOrViewName(name) != known)
+                {
+                    current = false;
+                    break;
+                }
+            }
+
+            if (current)
+                return (cached.ParameterMap, cached.Statement);
+        }
+
+        var probes = new List<(string Name, bool Known)>();
+        var parameterMap = SqlParameterMap.Parse(sql);
+        var statement = SqlParser.Parse(sql, parameterMap, name =>
+        {
+            var known = IsKnownTableOrViewName(name);
+            probes.Add((name, known));
+            return known;
+        });
+        lock (_parseCache)
+        {
+            if (_parseCache.Count >= MaximumParseCacheEntries && !_parseCache.ContainsKey(sql))
+                _parseCache.Clear();
+            _parseCache[sql] = new CachedParse(parameterMap, statement, [.. probes]);
+        }
+
+        return (parameterMap, statement);
     }
 
     /// <summary>
@@ -61464,6 +62908,15 @@ public sealed partial class EmbeddedConnection : IDisposable
     }
 
     public void ResetForPooling()
+        => ResetForPooling(adoptCommittedChanges: true);
+
+    /// <summary>
+    /// Resets connection state like <see cref="ResetForPooling()"/>. With
+    /// <paramref name="adoptCommittedChanges"/> false it skips adopting other connections'
+    /// commits, which costs file-stat calls and is wasted on a connection going idle: renting it
+    /// adopts them again, as does every statement.
+    /// </summary>
+    internal void ResetForPooling(bool adoptCommittedChanges)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
@@ -61503,7 +62956,8 @@ public sealed partial class EmbeddedConnection : IDisposable
             attachment.Dispose();
         _attachedDatabases.Clear();
         ResetTemporaryDatabase();
-        _database.RefreshFileCatalogForPooling();
+        if (adoptCommittedChanges)
+            _database.RefreshFileCatalogForPooling();
     }
 
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)
@@ -61957,7 +63411,7 @@ public sealed partial class EmbeddedConnection : IDisposable
             BeginConcurrentSchemaChange();
         }
 
-        if (_transactionDatabases is null)
+        if (_transactionDatabases is null && !ReadsOnlyConnectionState(statement))
         {
             _database.RefreshForeignCatalogForStatementIfNeeded();
             _database.RefreshOwnedCatalogForStatementIfNeeded();
@@ -62889,6 +64343,19 @@ public sealed partial class EmbeddedConnection : IDisposable
 
     private EmbeddedDatabase ResolvePragmaDatabase(string? schema)
         => schema is null ? _database : ResolveSchemaDatabase(schema);
+
+    /// <summary>
+    /// Pragmas that only read or set this connection's own flags. Like SQLite, they never open a
+    /// read transaction, so they skip adopting peers' commits (which costs file-stat calls); the
+    /// next statement that reads the database still adopts them. Data source providers issue
+    /// <c>PRAGMA foreign_keys</c> on every pooled open.
+    /// </summary>
+    private static bool ReadsOnlyConnectionState(ParsedStatement statement)
+        => statement is PragmaForeignKeysStatement
+            or PragmaDeferForeignKeysStatement
+            or PragmaRecursiveTriggersStatement
+            or PragmaCountChangesStatement
+            or PragmaBusyTimeoutStatement;
 
     private void ValidatePragmaSchema(string? schema)
     {
@@ -63853,6 +65320,52 @@ Func<string, ParsedStatement> rewrite)
 
     private string ResolveExistingObjectSchema(string objectName, ManagedSchemaObjectKind kind)
         => FindExistingObjectSchema(objectName, kind) ?? "main";
+
+    /// <summary>
+    /// An identity for the base table an unqualified <paramref name="tableName"/> resolves to, as
+    /// <c>PRAGMA table_info</c>/<c>index_list</c> resolve it (temp, main, then attached schemas, each
+    /// through this connection's transaction catalog when one is open). Equal identities mean the
+    /// table's columns, declared types and indexes are unchanged, so metadata derived from those
+    /// pragmas can be reused. Null for anything else (views, virtual tables, qualified names),
+    /// which callers must resolve through the pragmas themselves.
+    /// </summary>
+    internal object? TryGetTableSchemaIdentity(string tableName)
+    {
+        if (tableName.Contains('.', StringComparison.Ordinal)
+            || FindExistingObjectSchema(tableName, ManagedSchemaObjectKind.Table) is not { } schema)
+        {
+            return null;
+        }
+
+        var database = schema switch
+        {
+            "temp" => _tempDatabase,
+            "main" => _database,
+            _ => _attachedDatabases.TryGetValue(schema, out var attached) ? attached.Database : null,
+        };
+        if (database is null)
+            return null;
+
+        var tables = GetTransactionState(database)?.Catalog.Tables ?? database.LiveCatalog.Tables;
+        if (!tables.TryGetValue(tableName, out var table))
+            return null;
+
+        var signature = new StringBuilder();
+        foreach (var column in table.ColumnDefinitions)
+            signature.Append(column.Name).Append(':').Append(column.DeclaredType).Append(column.NotNull ? "!" : string.Empty).Append(column.PrimaryKey ? "*" : string.Empty).Append(';');
+        signature.Append('|');
+        foreach (var index in table.Indexes)
+        {
+            signature.Append(index.Name).Append(index.Unique ? "+U" : string.Empty).Append(index.IsPartial ? "+P" : string.Empty).Append('(');
+            foreach (var term in index.Columns)
+                signature.Append(term.Name).Append(term.ExpressionSql).Append(',');
+            signature.Append(");");
+        }
+
+        return new TableSchemaIdentity(schema, table.ColumnDefinitions, signature.ToString());
+    }
+
+    private sealed record TableSchemaIdentity(string Schema, EmbeddedColumn[] Columns, string Signature);
 
     private string? FindExistingObjectSchema(string objectName, ManagedSchemaObjectKind kind)
     {
@@ -69498,6 +71011,17 @@ internal sealed class RowStore : IList<SqlValue[]>, IReadOnlyList<SqlValue[]>
 
     public int Count => _rows.Count;
 
+    /// <summary>
+    /// Process-unique identity of the current row contents (see
+    /// <see cref="CowChunkedList{T}.ContentStamp"/>). Unlike <see cref="Revision"/> it also changes
+    /// on <see cref="ReplaceRowPreservingRevision"/>, and it never repeats across diverging clones.
+    /// </summary>
+    public long ContentStamp => _rows.ContentStamp;
+
+    /// <summary>See <see cref="CowChunkedList{T}.SharesChunkWith"/>.</summary>
+    internal bool SharesChunkWith(RowStore other, int chunkIndex)
+        => _rows.SharesChunkWith(other._rows, chunkIndex);
+
     public bool IsReadOnly => false;
 
     public SqlValue[] this[int index]
@@ -69642,11 +71166,13 @@ internal sealed class EmbeddedTable
     private InsertConflictAlgorithm? _effectivePrimaryKeyConflictAlgorithm;
     private int[]? _cachedRowidScanOrder;
     private long _cachedRowidScanOrderRevision = -1;
-    private Dictionary<long, int>? _cachedRowIdPositions;
-    private long _cachedRowIdPositionsRevision = -1;
-    private int _cachedRowIdPositionsCount = -1;
+    private RowIdLookup? _cachedRowIdLookup;
+    private long _cachedRowIdLookupRowIdsStamp;
     private readonly Dictionary<string, (long Revision, int[] Order)> _cachedIndexScanOrders =
         new(StringComparer.OrdinalIgnoreCase);
+
+    // Shared with every Clone() of this table; see TableDerivedCache.
+    private TableDerivedCache _derivedCache = new();
 
     public EmbeddedTable(
         string name,
@@ -69734,6 +71260,44 @@ internal sealed class EmbeddedTable
 
         CreateConstraintIndexes();
         ValidateSchemaExpressions();
+    }
+
+    /// <summary>
+    /// Copies this table's already-validated schema state for <see cref="Clone"/> and
+    /// <see cref="CloneShallow"/>, which every statement runs for every table of its working
+    /// catalog. The public constructor re-derives and re-validates everything (generated-column
+    /// order, primary-key schema, foreign keys, constraint indexes, schema expressions) from the
+    /// definition, which made catalog cloning dominate small statements. Every value copied here
+    /// is either immutable or replaced (never mutated) by the instance methods that change it,
+    /// except the column-name map, which <see cref="AddColumn"/> mutates and is therefore copied.
+    /// Rows, rowids, caches and explicit indexes are left to the caller exactly as before.
+    /// </summary>
+    private EmbeddedTable(EmbeddedTable source)
+    {
+        Name = source.Name;
+        ColumnDefinitions = source.ColumnDefinitions;
+        Columns = source.Columns;
+        _columnIndices = new Dictionary<string, int>(source._columnIndices, StringComparer.OrdinalIgnoreCase);
+        WithoutRowid = source.WithoutRowid;
+        Strict = source.Strict;
+        TableLevelPrimaryKey = source.TableLevelPrimaryKey;
+        TableUniqueConstraints = source.TableUniqueConstraints;
+        CheckConstraints = source.CheckConstraints;
+        TableForeignKeys = source.TableForeignKeys;
+        TablePrimaryKeyConflictAlgorithm = source.TablePrimaryKeyConflictAlgorithm;
+        TablePrimaryKeyConstraintName = source.TablePrimaryKeyConstraintName;
+        TablePrimaryKeyDeclarationOrder = source.TablePrimaryKeyDeclarationOrder;
+        PrimaryKeyColumns = source.PrimaryKeyColumns;
+        PrimaryKeySchema = source.PrimaryKeySchema;
+        RowidAliasColumnIndex = source.RowidAliasColumnIndex;
+        IsAutoIncrement = source.IsAutoIncrement;
+        GeneratedColumnOrder = source.GeneratedColumnOrder;
+        ForeignKeys = source.ForeignKeys;
+        WithoutRowidPrimaryKeyIndexName = source.WithoutRowidPrimaryKeyIndexName;
+        PrimaryKeyConstraintOrdinal = source.PrimaryKeyConstraintOrdinal;
+        _hasEffectivePrimaryKeyConflictAlgorithm = source._hasEffectivePrimaryKeyConflictAlgorithm;
+        _effectivePrimaryKeyConflictAlgorithm = source._effectivePrimaryKeyConflictAlgorithm;
+        Indexes.AddRange(source.Indexes.Where(index => index.Origin != EmbeddedIndexOrigin.Explicit));
     }
 
     private void CreateConstraintIndexes()
@@ -70433,10 +71997,11 @@ internal sealed class EmbeddedTable
     /// </summary>
     internal (long LineageId, long Revision) RowStorageIdentity => (_rowsStore.LineageId, _rowsStore.Revision);
 
-    // The rowids as an immutable set, cached against the row store's identity. Every rowid change
-    // is paired with a row change that bumps RowStore.Revision (RowIds and Rows are index-aligned),
-    // so a matching lineage, revision and count proves the set current. It is immutable so a clone
-    // can share it and each side can extend it without affecting the other.
+    // The rowids as an immutable set, cached against the rowid list's content stamp, which changes
+    // exactly when a rowid does (CowChunkedList.ContentStamp): an UPDATE that rewrites row values
+    // keeps the set current, where keying it on the row store's revision rebuilt it after every
+    // write. It is immutable so a clone can share it and each side can extend it without
+    // affecting the other.
     private RowIdSet? _rowIdSet;
 
     /// <summary>The table's current rowids and their maximum, rebuilt only when stale.</summary>
@@ -70457,8 +72022,7 @@ internal sealed class EmbeddedTable
         }
 
         var built = new RowIdSet(
-            _rowsStore.LineageId,
-            _rowsStore.Revision,
+            rowIds.ContentStamp,
             rowIds.Count,
             builder.ToImmutable(),
             max);
@@ -70471,11 +72035,45 @@ internal sealed class EmbeddedTable
     {
         var rowIds = RowIds;
         return _rowIdSet is { } cached
-            && cached.LineageId == _rowsStore.LineageId
-            && cached.Revision == _rowsStore.Revision
+            && cached.RowIdsStamp == rowIds.ContentStamp
             && cached.Count == rowIds.Count
                 ? cached
                 : null;
+    }
+
+    /// <summary>
+    /// Narrows <paramref name="before"/>, the set that was current immediately before
+    /// <paramref name="removed"/> were deleted, so the next INSERT does not rebuild it.
+    /// </summary>
+    internal void RecordRemovedRowIds(RowIdSet? before, IReadOnlyList<long> removed)
+    {
+        if (before is null || before.Count - removed.Count != RowIds.Count)
+            return;
+
+        var builder = before.Ids.ToBuilder();
+        var removedMaximum = false;
+        foreach (var rowId in removed)
+        {
+            if (!builder.Remove(rowId))
+                return;
+            removedMaximum |= rowId == before.Max;
+        }
+
+        // The next allocated rowid is max + 1, so a removed maximum is recomputed exactly; a scan
+        // of the rowid list is far cheaper than rebuilding the immutable set.
+        var max = before.Max;
+        if (removedMaximum)
+        {
+            max = long.MinValue;
+            var rowIds = RowIds;
+            for (var index = 0; index < rowIds.Count; index++)
+            {
+                if (rowIds[index] > max)
+                    max = rowIds[index];
+            }
+        }
+
+        _rowIdSet = new RowIdSet(RowIds.ContentStamp, RowIds.Count, builder.ToImmutable(), max);
     }
 
     // Unique-index key sets, cached against the row store's identity exactly like _rowIdSet and
@@ -70523,8 +72121,7 @@ internal sealed class EmbeddedTable
         }
 
         _rowIdSet = new RowIdSet(
-            _rowsStore.LineageId,
-            _rowsStore.Revision,
+            RowIds.ContentStamp,
             RowIds.Count,
             builder.ToImmutable(),
             max);
@@ -70725,10 +72322,7 @@ internal sealed class EmbeddedTable
             if (RowIds.Count != Rows.Count)
                 throw new InvalidOperationException($"Table '{Name}' has inconsistent row identity metadata.");
 
-            _cachedRowidScanOrder = Enumerable.Range(0, Rows.Count).ToArray();
-            Array.Sort(
-                _cachedRowidScanOrder,
-                (left, right) => RowIds[left].CompareTo(RowIds[right]));
+            _cachedRowidScanOrder = GetSharedRowidScanOrder();
             _cachedRowidScanOrderRevision = Rows.Revision;
         }
 
@@ -70736,68 +72330,172 @@ internal sealed class EmbeddedTable
             yield return index;
     }
 
-    // STAT4 validates a small sample set repeatedly while planning. Cache the rowid map by
-    // RowStore revision, but verify the live slot so same-count rowid replacements fail closed.
+    /// <summary>
+    /// Row positions in ascending rowid order, shared with every table holding the same rows and
+    /// rowids. The returned array must not be modified.
+    /// </summary>
+    internal int[] GetRowidScanOrder() => GetSharedRowidScanOrder();
+
+    private int[] GetSharedRowidScanOrder()
+    {
+        var rowsStamp = Rows.ContentStamp;
+        var rowIdsStamp = RowIds.ContentStamp;
+        if (_derivedCache.TryGet<int[]>(DerivedCacheKind.RowidScanOrder, rowsStamp, rowIdsStamp, out var shared))
+            return shared;
+
+        var count = Rows.Count;
+        var order = new int[count];
+        var sorted = true;
+        var previous = long.MinValue;
+        for (var index = 0; index < count; index++)
+        {
+            order[index] = index;
+            var rowId = RowIds[index];
+            if (index > 0 && rowId < previous)
+                sorted = false;
+            previous = rowId;
+        }
+
+        // Rows are almost always stored in rowid order (page loads and appends); only sort when not.
+        if (!sorted)
+        {
+            var keys = new long[count];
+            for (var index = 0; index < count; index++)
+                keys[index] = RowIds[index];
+            Array.Sort(keys, order);
+        }
+
+        _derivedCache.Set(DerivedCacheKind.RowidScanOrder, rowsStamp, rowIdsStamp, order);
+        return order;
+    }
+
+    /// <summary>
+    /// A read-only structure derived from exactly this table's current rows and rowids, built by
+    /// any clone sharing them. Values must not be mutated (see <see cref="TableDerivedCache"/>).
+    /// </summary>
+    /// <summary>The derived structure for <paramref name="key"/> if one is current, without building it.</summary>
+    internal bool TryGetDerived<T>(object key, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out T? value)
+        where T : class
+        => _derivedCache.TryGet(key, Rows.ContentStamp, RowIds.ContentStamp, out value);
+
+    internal T GetOrCreateDerived<T>(object key, Func<T> build)
+        where T : class
+    {
+        var rowsStamp = Rows.ContentStamp;
+        var rowIdsStamp = RowIds.ContentStamp;
+        if (_derivedCache.TryGet<T>(key, rowsStamp, rowIdsStamp, out var shared))
+            return shared;
+
+        var built = build();
+        _derivedCache.Set(key, rowsStamp, rowIdsStamp, built);
+        return built;
+    }
+
+    private enum DerivedCacheKind
+    {
+        RowidScanOrder,
+        RowIdPositions,
+    }
+
+    // STAT4 validates a small sample set repeatedly while planning, and rowid lookups probe it
+    // once per statement. The lookup is shared across clones and keyed by the exact rowids content
+    // stamp, so a rowid replacement that bypasses RowStore.Revision still invalidates it; the live
+    // slot is verified anyway. Row contents do not affect positions (the counts are checked live),
+    // so an in-place UPDATE keeps it. Rowids are normally stored in ascending order, and then a
+    // binary search over them replaces the position map: confirming the order is one sequential
+    // pass, where rebuilding the map after every INSERT or DELETE hashed every rowid.
     internal int TryGetRowIdPosition(long rowId, out bool cacheRebuilt)
     {
         cacheRebuilt = false;
         if (!HasRowid || RowIds.Count != Rows.Count)
         {
-            InvalidateCache();
+            _cachedRowIdLookup = null;
             return -1;
         }
 
-        var builtThisCall = false;
-        if (_cachedRowIdPositions is null
-            || _cachedRowIdPositionsRevision != Rows.Revision
-            || _cachedRowIdPositionsCount != RowIds.Count)
+        const long rowsStamp = 0;
+        var rowIds = RowIds;
+        var rowIdsStamp = rowIds.ContentStamp;
+        if (_cachedRowIdLookup is null
+            || _cachedRowIdLookupRowIdsStamp != rowIdsStamp)
         {
-            RebuildCache();
-            cacheRebuilt = true;
-            builtThisCall = true;
-        }
-
-        if (TryReadLivePosition(rowId, out var position))
-            return position;
-        if (builtThisCall)
-            return -1;
-
-        // A same-count rowid replacement can bypass RowStore.Revision. Rebuild once on a stale
-        // hit or miss, then let the caller's live index-key validation decide whether to trust it.
-        RebuildCache();
-        cacheRebuilt = true;
-        return TryReadLivePosition(rowId, out position) ? position : -1;
-
-        bool TryReadLivePosition(long id, out int found)
-        {
-            if (_cachedRowIdPositions!.TryGetValue(id, out found)
-                && found >= 0
-                && found < RowIds.Count
-                && RowIds[found] == id)
+            if (!_derivedCache.TryGet<RowIdLookup>(
+                    DerivedCacheKind.RowIdPositions,
+                    rowsStamp,
+                    rowIdsStamp,
+                    out var lookup))
             {
-                return true;
+                lookup = RowIdsAreAscending(rowIds)
+                    ? RowIdLookup.Ascending
+                    : new RowIdLookup(BuildRowIdPositions(rowIds));
+                _derivedCache.Set(DerivedCacheKind.RowIdPositions, rowsStamp, rowIdsStamp, lookup);
+                cacheRebuilt = true;
             }
 
+            _cachedRowIdLookup = lookup;
+            _cachedRowIdLookupRowIdsStamp = rowIdsStamp;
+        }
+
+        int found;
+        if (_cachedRowIdLookup.Positions is { } positions)
+        {
+            if (!positions.TryGetValue(rowId, out found))
+                return -1;
+        }
+        else
+        {
+            var low = 0;
+            var high = rowIds.Count - 1;
             found = -1;
-            return false;
+            while (low <= high)
+            {
+                var middle = low + ((high - low) / 2);
+                var candidate = rowIds[middle];
+                if (candidate == rowId)
+                {
+                    found = middle;
+                    break;
+                }
+
+                if (candidate < rowId)
+                    low = middle + 1;
+                else
+                    high = middle - 1;
+            }
         }
 
-        void RebuildCache()
+        return found >= 0
+            && found < rowIds.Count
+            && rowIds[found] == rowId
+                ? found
+                : -1;
+    }
+
+    private static bool RowIdsAreAscending(CowChunkedList<long> rowIds)
+    {
+        for (var index = 1; index < rowIds.Count; index++)
         {
-            var positions = new Dictionary<long, int>(RowIds.Count);
-            for (var index = 0; index < RowIds.Count; index++)
-                positions.TryAdd(RowIds[index], index);
-            _cachedRowIdPositions = positions;
-            _cachedRowIdPositionsRevision = Rows.Revision;
-            _cachedRowIdPositionsCount = RowIds.Count;
+            if (rowIds[index] <= rowIds[index - 1])
+                return false;
         }
 
-        void InvalidateCache()
-        {
-            _cachedRowIdPositions = null;
-            _cachedRowIdPositionsRevision = -1;
-            _cachedRowIdPositionsCount = -1;
-        }
+        return true;
+    }
+
+    private static Dictionary<long, int> BuildRowIdPositions(CowChunkedList<long> rowIds)
+    {
+        var positions = new Dictionary<long, int>(rowIds.Count);
+        for (var index = 0; index < rowIds.Count; index++)
+            positions.TryAdd(rowIds[index], index);
+        return positions;
+    }
+
+    // Positions null: the rowids are strictly ascending and are binary-searched directly.
+    private sealed class RowIdLookup(Dictionary<long, int>? positions)
+    {
+        public static readonly RowIdLookup Ascending = new(null);
+
+        public Dictionary<long, int>? Positions { get; } = positions;
     }
 
     internal IReadOnlyList<int> GetOrCreateIndexScanOrder(
@@ -70956,6 +72654,33 @@ internal sealed class EmbeddedTable
     {
         var affinity = GetColumnAffinity(ColumnDefinitions[columnIndex]);
         return affinity is ColumnAffinity.Integer or ColumnAffinity.Real or ColumnAffinity.Numeric;
+    }
+
+    // Indexes of the REAL-affinity columns, derived from ColumnDefinitions (replaced, never
+    // mutated, by schema changes) and cached against that array instance.
+    private (EmbeddedColumn[] Definitions, int[] Columns)? _realAffinityColumns;
+
+    /// <summary>
+    /// The columns with REAL affinity. A stored record may hold an integral REAL value as an
+    /// integer (SQLite's on-disk form), which reads back as REAL; see
+    /// <see cref="EmbeddedFileStore.ApplyStoredRealAffinity"/>.
+    /// </summary>
+    internal int[] GetRealAffinityColumns()
+    {
+        var definitions = ColumnDefinitions;
+        if (_realAffinityColumns is { } cached && ReferenceEquals(cached.Definitions, definitions))
+            return cached.Columns;
+
+        var columns = new List<int>();
+        for (var index = 0; index < definitions.Length; index++)
+        {
+            if (GetColumnAffinity(definitions[index]) == ColumnAffinity.Real)
+                columns.Add(index);
+        }
+
+        var result = columns.ToArray();
+        _realAffinityColumns = (definitions, result);
+        return result;
     }
 
     public ColumnAffinity GetColumnAffinity(EmbeddedColumn column)
@@ -72337,18 +74062,7 @@ internal sealed class EmbeddedTable
 
     public EmbeddedTable Clone()
     {
-        var clone = new EmbeddedTable(
-            Name,
-            ColumnDefinitions,
-            WithoutRowid,
-            TableLevelPrimaryKey,
-            TableUniqueConstraints,
-            CheckConstraints,
-            TablePrimaryKeyConflictAlgorithm,
-            TablePrimaryKeyConstraintName,
-            TablePrimaryKeyDeclarationOrder,
-            TableForeignKeys,
-            Strict);
+        var clone = new EmbeddedTable(this);
         clone.SchemaSqlCompact = SchemaSqlCompact;
         clone.Sql = Sql;
         if (!TryCopyPendingRowLoadTo(clone))
@@ -72358,6 +74072,8 @@ internal sealed class EmbeddedTable
             clone._rowIdSet = _rowIdSet;
             clone._uniqueIndexKeySets = _uniqueIndexKeySets;
         }
+
+        clone._derivedCache = _derivedCache;
 
         clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
         clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
@@ -72458,18 +74174,7 @@ internal sealed class EmbeddedTable
     // that turned N-row bulk inserts into O(N^2) minute-long hangs.
     public EmbeddedTable CloneShallow()
     {
-        var clone = new EmbeddedTable(
-            Name,
-            ColumnDefinitions,
-            WithoutRowid,
-            TableLevelPrimaryKey,
-            TableUniqueConstraints,
-            CheckConstraints,
-            TablePrimaryKeyConflictAlgorithm,
-            TablePrimaryKeyConstraintName,
-            TablePrimaryKeyDeclarationOrder,
-            TableForeignKeys,
-            Strict);
+        var clone = new EmbeddedTable(this);
         clone.SchemaSqlCompact = SchemaSqlCompact;
         clone.Sql = Sql;
         clone.Rows.ShareRowsWithFreshIdentity(Rows);
@@ -73366,16 +75071,28 @@ internal sealed record SourceRow(
         // Columns joined with USING/NATURAL are coalesced: an unqualified reference to
         // such a column must resolve to COALESCE(left, right) so RIGHT/FULL joins report
         // the surviving side rather than the NULL-padded one.
-        var coalesced = OutputColumns?
-            .Where(output => string.Equals(output.Name, name, StringComparison.OrdinalIgnoreCase)
-                && (output.CoalesceIndex is not null
-                    || output.AdditionalCoalesceIndices is { Count: > 0 }))
-            .ToArray();
-        if (coalesced is { Length: > 1 })
-            ThrowAmbiguousColumn(name);
-        if (coalesced is { Length: 1 })
+        // A plain loop: a LINQ filter here captured the name, allocating on every lookup.
+        OutputColumn? coalescedOutput = null;
+        if (OutputColumns is not null)
         {
-            var output = coalesced[0];
+            for (var position = 0; position < OutputColumns.Count; position++)
+            {
+                var candidate = OutputColumns[position];
+                if (!string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase)
+                    || (candidate.CoalesceIndex is null
+                        && candidate.AdditionalCoalesceIndices is not { Count: > 0 }))
+                {
+                    continue;
+                }
+
+                if (coalescedOutput is not null)
+                    ThrowAmbiguousColumn(name);
+                coalescedOutput = candidate;
+            }
+        }
+
+        if (coalescedOutput is { } output)
+        {
             value = Values[output.Index];
             if (value.Kind != SqlValueKind.Null)
                 return true;
@@ -73441,6 +75158,175 @@ internal sealed record SourceRow(
     private static void ThrowAmbiguousColumn(string name)
         => throw new EmbeddedSqlException($"ambiguous column name: {name}");
 
+}
+
+/// <summary>
+/// A read-only qualifier-to-rowid map for one joined row. The qualifiers, their order and where each
+/// value comes from depend only on the joined sides' own layouts, so they live in a shared
+/// <see cref="Layout"/> and a row stores just its values. Keys compare case-insensitively and
+/// enumerate in insertion order, like the dictionary it replaces.
+/// </summary>
+internal sealed class JoinedRowIdMap : IReadOnlyDictionary<string, long?>
+{
+    private readonly Layout _layout;
+    private readonly long?[] _values;
+
+    private JoinedRowIdMap(Layout layout, long?[] values)
+    {
+        _layout = layout;
+        _values = values;
+    }
+
+    // The last few layouts built on this thread; nested joins alternate between a handful.
+    [ThreadStatic]
+    private static Layout?[]? t_layouts;
+
+    [ThreadStatic]
+    private static int t_nextLayout;
+
+    public static JoinedRowIdMap Combine(SourceRow left, SourceRow right)
+    {
+        var leftLayout = (left.QualifiedRowIds as JoinedRowIdMap)?._layout;
+        var rightLayout = (right.QualifiedRowIds as JoinedRowIdMap)?._layout;
+        var layout = FindLayout(leftLayout, left.RowIdQualifier, rightLayout, right.RowIdQualifier);
+        var values = new long?[layout.Keys.Count];
+        for (var slot = 0; slot < values.Length; slot++)
+        {
+            var (side, sourceSlot) = layout.Sources[slot];
+            var row = side == 0 ? left : right;
+            values[slot] = sourceSlot < 0 ? row.RowId : ((JoinedRowIdMap)row.QualifiedRowIds!)._values[sourceSlot];
+        }
+
+        return new JoinedRowIdMap(layout, values);
+    }
+
+    private static Layout FindLayout(Layout? leftLayout, string? leftQualifier, Layout? rightLayout, string? rightQualifier)
+    {
+        var layouts = t_layouts ??= new Layout?[4];
+        foreach (var candidate in layouts)
+        {
+            if (candidate is not null
+                && ReferenceEquals(candidate.LeftLayout, leftLayout)
+                && ReferenceEquals(candidate.RightLayout, rightLayout)
+                && string.Equals(candidate.LeftQualifier, leftQualifier, StringComparison.Ordinal)
+                && string.Equals(candidate.RightQualifier, rightQualifier, StringComparison.Ordinal))
+            {
+                return candidate;
+            }
+        }
+
+        var layout = new Layout(leftLayout, leftQualifier, rightLayout, rightQualifier);
+        layout.AddSide(0, leftLayout, leftQualifier);
+        layout.AddSide(1, rightLayout, rightQualifier);
+        layouts[t_nextLayout] = layout;
+        t_nextLayout = (t_nextLayout + 1) % layouts.Length;
+        return layout;
+    }
+
+    public long? this[string key]
+        => TryGetValue(key, out var value) ? value : throw new KeyNotFoundException(key);
+
+    public IEnumerable<string> Keys => _layout.Keys;
+
+    public IEnumerable<long?> Values => _values;
+
+    public int Count => _values.Length;
+
+    public bool ContainsKey(string key) => _layout.Slots.ContainsKey(key);
+
+    public bool TryGetValue(string key, out long? value)
+    {
+        if (_layout.Slots.TryGetValue(key, out var slot))
+        {
+            value = _values[slot];
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
+    public IEnumerator<KeyValuePair<string, long?>> GetEnumerator()
+    {
+        for (var slot = 0; slot < _values.Length; slot++)
+            yield return new KeyValuePair<string, long?>(_layout.Keys[slot], _values[slot]);
+    }
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+
+    private sealed class Layout(Layout? leftLayout, string? leftQualifier, Layout? rightLayout, string? rightQualifier)
+    {
+        public Layout? LeftLayout { get; } = leftLayout;
+
+        public string? LeftQualifier { get; } = leftQualifier;
+
+        public Layout? RightLayout { get; } = rightLayout;
+
+        public string? RightQualifier { get; } = rightQualifier;
+
+        public Dictionary<string, int> Slots { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public List<string> Keys { get; } = [];
+
+        // Per slot: the side it is read from (0 left, 1 right) and that side's slot, or -1 for
+        // the side row's own RowId.
+        public List<(int Side, int SourceSlot)> Sources { get; } = [];
+
+        public void AddSide(int side, Layout? mapLayout, string? qualifier)
+        {
+            if (mapLayout is not null)
+            {
+                for (var slot = 0; slot < mapLayout.Keys.Count; slot++)
+                    Add(mapLayout.Keys[slot], side, slot);
+            }
+
+            if (qualifier is not null)
+                Add(qualifier, side, -1);
+        }
+
+        private void Add(string key, int side, int sourceSlot)
+        {
+            if (Slots.TryAdd(key, Keys.Count))
+            {
+                Keys.Add(key);
+                Sources.Add((side, sourceSlot));
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Source rows built on first access and then kept, so every reader of a position sees the same
+/// <see cref="SourceRow"/> instance (callers key rows by reference).
+/// </summary>
+internal sealed class IndexedSourceRowList(int count, Func<int, SourceRow> create) : IReadOnlyList<SourceRow>
+{
+    private readonly SourceRow?[] _rows = new SourceRow?[count];
+
+    public int Count => _rows.Length;
+
+    public SourceRow this[int index]
+    {
+        get
+        {
+            var existing = Volatile.Read(ref _rows[index]);
+            if (existing is not null)
+                return existing;
+
+            var created = create(index);
+            return Interlocked.CompareExchange(ref _rows[index], created, null) ?? created;
+        }
+    }
+
+    public IEnumerable<SourceRow> EnumerateFrom(int start)
+    {
+        for (var index = start; index < _rows.Length; index++)
+            yield return this[index];
+    }
+
+    public IEnumerator<SourceRow> GetEnumerator() => EnumerateFrom(0).GetEnumerator();
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
 }
 
 internal sealed record SourceData(

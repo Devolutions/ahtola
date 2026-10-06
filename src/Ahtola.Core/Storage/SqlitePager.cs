@@ -72,9 +72,11 @@ public sealed class SqlitePager : IDisposable
 {
     /// <summary>
     /// Default maximum number of clean main-database page images retained by one
-    /// pager instance.
+    /// pager instance: SQLite's default <c>cache_size=-2000</c> (2000 KiB) in 4 KiB pages.
+    /// A smaller cache made every point query over a few-MiB database miss and re-read
+    /// (and re-stat) the main file for its interior and leaf pages.
     /// </summary>
-    public const int DefaultPageCacheCapacity = 64;
+    public const int DefaultPageCacheCapacity = 500;
 
     private readonly object _gate = new();
     private readonly IFileSystem _fileSystem;
@@ -110,6 +112,7 @@ public sealed class SqlitePager : IDisposable
     private uint _observedWalIndexSalt1;
     private uint _observedWalIndexSalt2;
     private bool _hasObservedWalStamp;
+    private bool _walStampVerifiedBySynchronization;
     private FileWriteStamp? _observedWalStamp;
     private bool _exclusiveLockingMode;
 
@@ -3394,8 +3397,54 @@ public sealed class SqlitePager : IDisposable
             _wal?.Header.Salt1 ?? 0,
             _wal?.Header.Salt2 ?? 0,
             _committedPageCount,
-            _fileSystem.GetWriteStamp(_databasePath),
-            _fileSystem.GetWriteStamp(_walPath));
+            GetDatabaseWriteStamp(),
+            ConsumeSynchronizedWalStamp());
+    }
+
+    // The stamps come from the pager's open handles when the file system supports it (see
+    // IFileWriteStampSource): the same length and last-write metadata without a path-based open.
+    // A peer cannot replace either file while this pager holds it open (the WAL is deleted only by
+    // its last connection), so the handle identifies the file the path names. Every WAL stamp read
+    // goes through GetWalWriteStamp, so observed and probed stamps always compare like with like.
+    private FileWriteStamp? GetDatabaseWriteStamp()
+    {
+        try
+        {
+            if (_pageStore.TryGetHandleWriteStamp() is { } stamp)
+                return stamp;
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        return _fileSystem.GetWriteStamp(_databasePath);
+    }
+
+    private FileWriteStamp? GetWalWriteStamp()
+    {
+        try
+        {
+            if (_wal?.TryGetHandleWriteStamp() is { } stamp)
+                return stamp;
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        return _fileSystem.GetWriteStamp(_walPath);
+    }
+
+    // The -wal stamp SynchronizeCommittedView just proved unchanged under the same locks, so a
+    // token captured right after it reuses that probe instead of querying the file again.
+    private FileWriteStamp? ConsumeSynchronizedWalStamp()
+    {
+        if (_walStampVerifiedBySynchronization)
+        {
+            _walStampVerifiedBySynchronization = false;
+            return _observedWalStamp;
+        }
+
+        return GetWalWriteStamp();
     }
 
     /// <summary>
@@ -3410,6 +3459,7 @@ public sealed class SqlitePager : IDisposable
 
     private void SynchronizeCommittedView(SqliteMainFileLockLease? mainFileLock = null)
     {
+        _walStampVerifiedBySynchronization = false;
         try
         {
             if (_journalMode == SqliteJournalMode.Delete
@@ -3433,7 +3483,12 @@ public sealed class SqlitePager : IDisposable
                 && !RequiresSharedStorageRescan
                 && !walIndexChanged
                 && !peerWalStampChanged)
+            {
+                _walStampVerifiedBySynchronization = UsesWalStorage(_journalMode)
+                    && _wal is not null
+                    && _hasObservedWalStamp;
                 return;
+            }
 
             CommittedViewRescanCount++;
             if (_fileSystem.FileExists(_journalPath)
@@ -3595,7 +3650,7 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     private bool TryDetectPeerWalStampChange()
     {
-        var stamp = _fileSystem.GetWriteStamp(_walPath);
+        var stamp = GetWalWriteStamp();
         if (!_hasObservedWalStamp)
         {
             ObserveWalStamp(stamp);
@@ -3606,7 +3661,7 @@ public sealed class SqlitePager : IDisposable
     }
 
     private void ObserveCurrentWalStamp()
-        => ObserveWalStamp(_fileSystem.GetWriteStamp(_walPath));
+        => ObserveWalStamp(GetWalWriteStamp());
 
     private void ObserveWalStamp(FileWriteStamp? stamp)
     {

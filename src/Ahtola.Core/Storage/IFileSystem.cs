@@ -45,6 +45,17 @@ public enum FileSystemOperation
 public readonly record struct FileWriteStamp(long Length, DateTimeOffset LastWriteTimeUtc);
 
 /// <summary>
+/// Optional capability of an open file that can report its <see cref="FileWriteStamp"/> from the
+/// handle itself. The pager probes its database and WAL stamps on every statement, and a
+/// path-based query opens the file by name each time, which file-system filters make cost
+/// tens of microseconds on Windows; the handle-based query reads the same metadata.
+/// </summary>
+internal interface IFileWriteStampSource
+{
+    FileWriteStamp GetWriteStamp();
+}
+
+/// <summary>
 /// Optional capability that gives a storage backend authority over canonical
 /// path identity. Host file systems can return absolute paths while browser or
 /// in-memory stores can retain logical keys.

@@ -207,7 +207,7 @@ public sealed class PlannerAccessPathDepthTests
     }
 
     [Test]
-    public void Stat4SampleValidationReusesOneRowIdMapPerTableRevision()
+    public void Stat4SampleValidationReusesOneRowIdMapPerRowIdSet()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -235,11 +235,20 @@ public sealed class PlannerAccessPathDepthTests
         database.PlannerAccessPathMetrics.Stat4SampleRowIdLookups.Should().Be(sampleCount * 2);
         database.PlannerAccessPathMetrics.Stat4RowIdCacheRebuilds.Should().Be(1);
 
+        // Positions depend only on the rowids: an in-place UPDATE keeps the map (sample keys are
+        // re-read from the live rows), while renumbering a row changes the rowid set and rebuilds it.
         Execute(connection, "UPDATE cached_stats SET payload='changed' WHERE id=1;");
         database.ResetJoinOrderDiagnostics();
         PlanDetail(connection, "SELECT id FROM cached_stats WHERE bucket=42;")
             .Should().Contain("cached_stats_bucket");
         database.PlannerAccessPathMetrics.Stat4SampleRowIdLookups.Should().Be(sampleCount);
+        database.PlannerAccessPathMetrics.Stat4RowIdCacheRebuilds.Should().Be(0);
+
+        Execute(connection, "UPDATE cached_stats SET id = 5000 WHERE id = 1;");
+        database.ResetJoinOrderDiagnostics();
+        PlanDetail(connection, "SELECT id FROM cached_stats WHERE bucket=42;")
+            .Should().Contain("cached_stats_bucket");
+        database.PlannerAccessPathMetrics.Stat4SampleRowIdLookups.Should().BePositive();
         database.PlannerAccessPathMetrics.Stat4RowIdCacheRebuilds.Should().Be(1);
     }
 

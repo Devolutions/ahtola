@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Ahtola.Core.Storage;
 
 namespace Ahtola.Core;
@@ -19,7 +20,9 @@ namespace Ahtola.Core;
 /// </remarks>
 internal sealed class TransactionTableOverlay
 {
-    private readonly Dictionary<long, SqlValue[]?>? _byRowId;
+    // Immutable so a checkpoint (taken before every statement of a transaction) captures it in
+    // O(1); copying a mutable map there made a long transaction quadratic in its row changes.
+    private ImmutableDictionary<long, SqlValue[]?>? _byRowId;
     private readonly List<(SqlValue[] Key, SqlValue[]? Current)>? _byPrimaryKey;
     private readonly SqliteIndexRecordComparer? _primaryKeyComparer;
 
@@ -28,7 +31,7 @@ internal sealed class TransactionTableOverlay
         HasRowid = hasRowid;
         if (hasRowid)
         {
-            _byRowId = new Dictionary<long, SqlValue[]?>();
+            _byRowId = ImmutableDictionary<long, SqlValue[]?>.Empty;
         }
         else
         {
@@ -48,7 +51,7 @@ internal sealed class TransactionTableOverlay
     {
         if (!HasRowid)
             throw new InvalidOperationException("This overlay tracks primary keys, not rowids.");
-        _byRowId![rowId] = current;
+        _byRowId = _byRowId!.SetItem(rowId, current);
     }
 
     public bool TryGetByRowId(long rowId, out SqlValue[]? current)
@@ -134,7 +137,7 @@ internal sealed class TransactionTableOverlay
     /// <summary>Captures a point-in-time copy of this table's overlay for a SAVEPOINT.</summary>
     public TransactionTableOverlayCheckpoint CreateCheckpoint()
         => HasRowid
-            ? new TransactionTableOverlayCheckpoint(true, new Dictionary<long, SqlValue[]?>(_byRowId!), null)
+            ? new TransactionTableOverlayCheckpoint(true, _byRowId, null)
             : new TransactionTableOverlayCheckpoint(
                 false,
                 null,
@@ -149,13 +152,7 @@ internal sealed class TransactionTableOverlay
     {
         if (HasRowid)
         {
-            _byRowId!.Clear();
-            if (checkpoint.ByRowId is { } byRowId)
-            {
-                foreach (var pair in byRowId)
-                    _byRowId[pair.Key] = pair.Value;
-            }
-
+            _byRowId = checkpoint.ByRowId ?? ImmutableDictionary<long, SqlValue[]?>.Empty;
             return;
         }
 
@@ -167,7 +164,8 @@ internal sealed class TransactionTableOverlay
     /// <summary>Discards all recorded mutations, used when restoring a checkpoint predating this table's first touch.</summary>
     public void Clear()
     {
-        _byRowId?.Clear();
+        if (_byRowId is not null)
+            _byRowId = ImmutableDictionary<long, SqlValue[]?>.Empty;
         _byPrimaryKey?.Clear();
     }
 }
@@ -175,7 +173,7 @@ internal sealed class TransactionTableOverlay
 /// <summary>An immutable point-in-time copy of one table's mutation overlay for SAVEPOINT support.</summary>
 internal sealed record TransactionTableOverlayCheckpoint(
     bool HasRowid,
-    Dictionary<long, SqlValue[]?>? ByRowId,
+    ImmutableDictionary<long, SqlValue[]?>? ByRowId,
     List<(SqlValue[] Key, SqlValue[]? Current)>? ByPrimaryKey);
 
 /// <summary>

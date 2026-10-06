@@ -13,8 +13,15 @@ namespace Ahtola.Core.Storage;
 public sealed class SqliteTableBtreeCursor
 {
     private const int MaximumDepth = 64;
+    private const int MaximumCachedInteriorPages = 16;
 
     private readonly ISqliteBtreePageIo _io;
+
+    // Validated interior views from earlier seeks. Every seek descends through the same root and
+    // upper interior pages, and a full parse re-validates every cell, freeblock and child; a view
+    // is reused only while the page image is byte-for-byte identical to the copy it was parsed
+    // from, so writes through any layer simply miss.
+    private Dictionary<uint, (byte[] Image, SqliteTableInteriorPageView View)>? _interiorViews;
 
     /// <summary>Creates a cursor over one page-access boundary.</summary>
     public SqliteTableBtreeCursor(ISqliteBtreePageIo pageIo)
@@ -345,7 +352,7 @@ public sealed class SqliteTableBtreeCursor
 
                 case SqliteBtreePageType.TableInterior:
                     {
-                        var interior = SqliteTableInteriorPageView.Parse(image, _io.UsableSpace, isFirstPage);
+                        var interior = GetInteriorView(pageNumber, image, isFirstPage);
                         pageNumber = interior.SearchChild(rowId).ChildPage;
                         break;
                     }
@@ -358,5 +365,22 @@ public sealed class SqliteTableBtreeCursor
 
         throw new InvalidDataException(
             $"SQLite table b-tree rooted at page {rootPage} is deeper than {MaximumDepth} levels.");
+    }
+
+    private SqliteTableInteriorPageView GetInteriorView(uint pageNumber, byte[] image, bool isFirstPage)
+    {
+        if (_interiorViews is not null
+            && _interiorViews.TryGetValue(pageNumber, out var cached)
+            && image.AsSpan().SequenceEqual(cached.Image))
+        {
+            return cached.View;
+        }
+
+        var view = SqliteTableInteriorPageView.Parse(image, _io.UsableSpace, isFirstPage);
+        _interiorViews ??= [];
+        if (_interiorViews.Count >= MaximumCachedInteriorPages && !_interiorViews.ContainsKey(pageNumber))
+            _interiorViews.Clear();
+        _interiorViews[pageNumber] = (image.ToArray(), view);
+        return view;
     }
 }

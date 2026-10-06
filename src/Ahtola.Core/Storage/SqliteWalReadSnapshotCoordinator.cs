@@ -570,6 +570,7 @@ public sealed class SqliteWalReadSnapshot : IDisposable
     private readonly SqliteWalIndexSharedMemory _index;
     private SqliteWalByteRangeLockLease? _readMarkLease;
     private Exception? _fault;
+    private SqliteWalIndexHeader? _walValidatedHeader;
 
     internal SqliteWalReadSnapshot(
         SqliteWalReadSnapshotCoordinator owner,
@@ -680,7 +681,18 @@ public sealed class SqliteWalReadSnapshot : IDisposable
     private void ValidatePinnedBoundary()
     {
         ThrowIfUnavailable();
-        var region = _index.ReadValidatedHeader(_wal);
+        // Readers re-check the pinned boundary on every page access. Cross-validating the header
+        // against the WAL rescans its tail and re-reads the commit frame (file I/O each time), so
+        // do it only when the header changed: an identical header (change counter, boundary,
+        // salts and the chained frame checksums) was already proven to describe this WAL's
+        // committed prefix, which frames appended after it cannot alter.
+        var region = _index.ReadStableHeader();
+        if (!Equals(region.Header, _walValidatedHeader))
+        {
+            region = _index.ReadValidatedHeader(_wal);
+            _walValidatedHeader = region.Header;
+        }
+
         if (region.Header.MaximumFrame < MaximumFrame)
         {
             throw new InvalidDataException(

@@ -233,7 +233,7 @@ internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSyste
 /// <summary>
 /// A host file handle exposing positional I/O over <see cref="RandomAccess"/>.
 /// </summary>
-public sealed class PhysicalFile : IFile
+public sealed class PhysicalFile : IFile, IFileWriteStampSource
 {
     private readonly SafeFileHandle _handle;
     private readonly string? _pagerLockPath;
@@ -255,6 +255,12 @@ public sealed class PhysicalFile : IFile
             ThrowIfDisposed();
             return RandomAccess.GetLength(_handle);
         }
+    }
+
+    FileWriteStamp IFileWriteStampSource.GetWriteStamp()
+    {
+        ThrowIfDisposed();
+        return new FileWriteStamp(RandomAccess.GetLength(_handle), File.GetLastWriteTimeUtc(_handle));
     }
 
     public int Read(long position, Span<byte> destination)

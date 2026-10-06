@@ -254,7 +254,12 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
         lock (_gate)
         {
             ThrowIfDisposed();
-            SynchronizeLengthLocked();
+            // Only a read past the current view needs the file's length: the -shm only ever
+            // grows while this carrier holds its dead-man-switch lock (SQLite truncates it only
+            // under the exclusive DMS lock), so a range inside the view is always backed. Readers
+            // probe the header on every page access, and a length query is a syscall each time.
+            if (!IsWithinMappedViewLocked(position, destination.Length))
+                SynchronizeLengthLocked();
             ValidateRange(position, destination.Length);
             if (destination.IsEmpty)
                 return;
@@ -442,6 +447,26 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
         throw new PlatformNotSupportedException(
             "Physical SQLite shared-memory mappings are supported only on Windows, 64-bit Linux, and macOS.");
     }
+
+    /// <summary>
+    /// Whether the mapping already covers <paramref name="requiredLength"/> bytes, querying the
+    /// file length only when the current view is shorter (see <see cref="Read"/>).
+    /// </summary>
+    internal bool Covers(long requiredLength)
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (_view is not null && requiredLength <= _length)
+                return true;
+
+            SynchronizeLengthLocked();
+            return requiredLength <= _length;
+        }
+    }
+
+    private bool IsWithinMappedViewLocked(long position, int byteCount)
+        => _view is not null && position <= _length && byteCount <= _length - position;
 
     private void SynchronizeLengthLocked()
     {

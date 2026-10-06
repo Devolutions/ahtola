@@ -150,6 +150,14 @@ internal static class IndexSqlFormatter
 
 internal static class IndexExpressionSemantics
 {
+    // Successful round-trip checks. The check is a pure function of the immutable index record and
+    // the table's name and column definitions (replaced, never mutated, by schema changes), and
+    // every statement's catalog clone shares both instances, so persisting a write no longer
+    // regenerates and re-parses every CREATE INDEX statement of the table.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<EmbeddedIndex, RoundTripProof> s_roundTripProofs = new();
+
+    private sealed record RoundTripProof(string TableName, EmbeddedColumn[] Columns);
+
     public static void ValidateRoundTrip(
         string tableName,
         EmbeddedTable table,
@@ -158,6 +166,22 @@ internal static class IndexExpressionSemantics
         if (index.Origin != EmbeddedIndexOrigin.Explicit)
             return;
 
+        if (s_roundTripProofs.TryGetValue(index, out var proof)
+            && ReferenceEquals(proof.Columns, table.ColumnDefinitions)
+            && string.Equals(proof.TableName, tableName, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        ValidateRoundTripCore(tableName, table, index);
+        s_roundTripProofs.AddOrUpdate(index, new RoundTripProof(tableName, table.ColumnDefinitions));
+    }
+
+    private static void ValidateRoundTripCore(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedIndex index)
+    {
         var sql = IndexSqlFormatter.BuildCreateIndexSql(tableName, index);
         if (SqlParser.Parse(sql, SqlParameterMap.Parse(sql)) is not CreateIndexStatement statement)
             throw new EmbeddedSqlException($"Index '{index.Name}' cannot be reconstructed.");

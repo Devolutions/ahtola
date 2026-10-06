@@ -4,11 +4,10 @@ namespace Ahtola.Core;
 
 /// <summary>
 /// The existing rowids of a table as an immutable set plus their maximum, valid for exactly one
-/// row-store state (see <see cref="EmbeddedTable.GetRowIdSet"/>).
+/// rowid-list state (see <see cref="EmbeddedTable.GetRowIdSet"/>).
 /// </summary>
 internal sealed record RowIdSet(
-    long LineageId,
-    long Revision,
+    long RowIdsStamp,
     int Count,
     ImmutableHashSet<long> Ids,
     long Max);
