@@ -48,7 +48,7 @@ public enum SqlitePagerBusyReason
 /// Raised when a SQLite pager lock cannot be acquired before its configured
 /// busy timeout expires.
 /// </summary>
-public sealed class SqlitePagerBusyException : InvalidOperationException
+public sealed class SqlitePagerBusyException : InvalidOperationException, ISqliteStorageBusyException
 {
     public SqlitePagerBusyException(
         SqlitePagerLockOperation operation,
@@ -156,6 +156,7 @@ public sealed class SqlitePagerLockManager
     private int _readerCount;
     private int _checkpointWaiterCount;
     private bool _writerActive;
+    private bool _writerReserved;
     private bool _writerExclusivePending;
     private bool _checkpointActive;
     private long _generation;
@@ -421,7 +422,7 @@ public sealed class SqlitePagerLockManager
                 while (!CanEnter(operation))
                 {
                     var remaining = RemainingTimeout(timeout, stopwatch);
-                    if (remaining == TimeSpan.Zero)
+                    if (remaining == TimeSpan.Zero || BlockedByWriterReservation(operation))
                         throw new SqlitePagerBusyException(operation, timeout);
 
                     Monitor.Wait(_gate, remaining);
@@ -520,7 +521,7 @@ public sealed class SqlitePagerLockManager
                     }
 
                     remaining = RemainingTimeout(timeout, stopwatch);
-                    if (remaining == TimeSpan.Zero)
+                    if (remaining == TimeSpan.Zero || BlockedByWriterReservation(operation))
                         throw new SqlitePagerBusyException(operation, timeout);
                     stateChanged = _stateChanged.Capture();
                 }
@@ -635,7 +636,14 @@ public sealed class SqlitePagerLockManager
             {
                 var remaining = RemainingTimeout(timeout, stopwatch);
                 if (remaining == TimeSpan.Zero)
+                {
+                    // Like the async path: a failed upgrade falls back to RESERVED, which does
+                    // not block readers, so a retried commit can find them drained.
+                    _writerExclusivePending = false;
+                    Monitor.PulseAll(_gate);
+                    _stateChanged.PulseAll();
                     throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, timeout);
+                }
                 Monitor.Wait(_gate, remaining);
             }
         }
@@ -801,6 +809,7 @@ public sealed class SqlitePagerLockManager
                         throw new InvalidOperationException("SQLite writer lock is not active.");
                     _writerExclusivePending = false;
                     _writerActive = false;
+                    _writerReserved = false;
                     break;
                 case SqlitePagerLockOperation.Checkpoint:
                     if (!_checkpointActive)
@@ -920,6 +929,27 @@ public sealed class SqlitePagerLockManager
 
         retained?.Dispose();
     }
+
+    /// <summary>
+    /// Marks the active writer as an explicit transaction's write reservation (see
+    /// <see cref="SqlitePagerWriterReservation"/>). The reservation is held until that
+    /// transaction ends and its owner takes the file-catalog gates only at commit, so a writer or
+    /// checkpoint that would queue behind it reports busy at once instead of waiting while it
+    /// possibly holds those gates itself.
+    /// </summary>
+    internal void SetWriterReserved()
+    {
+        lock (_gate)
+        {
+            if (!_writerActive)
+                throw new InvalidOperationException("The SQLite writer lease is no longer active.");
+            _writerReserved = true;
+        }
+    }
+
+    private bool BlockedByWriterReservation(SqlitePagerLockOperation operation)
+        => _writerReserved
+           && operation is SqlitePagerLockOperation.Writer or SqlitePagerLockOperation.Checkpoint;
 
     private bool CanEnter(SqlitePagerLockOperation operation)
         => operation switch

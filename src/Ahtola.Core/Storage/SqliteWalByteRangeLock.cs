@@ -20,7 +20,7 @@ public enum SqliteWalByteRangeLockMode
 /// Raised when a SQLite WAL byte-range lock remains unavailable for its requested
 /// acquisition timeout.
 /// </summary>
-public sealed class SqliteWalByteRangeLockBusyException : InvalidOperationException
+public sealed class SqliteWalByteRangeLockBusyException : InvalidOperationException, ISqliteStorageBusyException
 {
     internal SqliteWalByteRangeLockBusyException(
         string lockFilePath,

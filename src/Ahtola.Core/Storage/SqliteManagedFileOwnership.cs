@@ -7,7 +7,7 @@ namespace Ahtola.Core.Storage;
 /// Raised when a physical managed database cannot obtain its required main-file
 /// SQLite SHARED lock.
 /// </summary>
-public sealed class SqlitePagerClientOwnershipException : InvalidOperationException
+public sealed class SqlitePagerClientOwnershipException : InvalidOperationException, ISqliteStorageBusyException
 {
     internal SqlitePagerClientOwnershipException(
         string databasePath,
@@ -341,6 +341,35 @@ internal sealed class SqliteManagedFileOwnership
         }
     }
 
+    /// <summary>
+    /// Drops PENDING after a failed EXCLUSIVE upgrade, keeping RESERVED. The writer keeps its
+    /// write lock for a retried commit, while readers (including its own connection's next read)
+    /// are admitted again.
+    /// </summary>
+    internal void DowngradePendingToReserved(SqliteMainFileLockLease lease)
+    {
+        lock (_gate)
+        {
+            ThrowIfFailed();
+            ValidateLeaseOwner(lease);
+            if (!ReferenceEquals(_writer, lease) || lease.State != SqliteMainFileLockState.Pending)
+                return;
+
+            try
+            {
+                GetLockHandle().Unlock(PendingByte, length: 1);
+            }
+            catch (IOException exception)
+            {
+                _failure = exception;
+                throw;
+            }
+
+            lease.State = lease.HasReserved ? SqliteMainFileLockState.Reserved : SqliteMainFileLockState.Shared;
+            Monitor.PulseAll(_gate);
+        }
+    }
+
     internal bool IsReservedByAnotherProcess(SqliteMainFileLockLease lease)
     {
         lock (_gate)
@@ -434,9 +463,123 @@ internal sealed class SqliteManagedFileOwnership
             }
 
             CloseDeferredHandles();
+            if (_lockHandleWritable)
+                TryRemoveIdleSidecars();
             _lockHandle?.Dispose();
             _lockHandle = null;
             _lockHandleWritable = false;
+        }
+    }
+
+    /// <summary>
+    /// SQLite's last-close cleanup (<c>sqlite3WalClose</c>): when the last managed client in this
+    /// process lets go and an EXCLUSIVE lock on the database file proves no other connection in
+    /// any process has it open, an empty WAL and the WAL-index file are deleted, so the database
+    /// is left as a single file (as native SQLite leaves it). A WAL that still holds frames is
+    /// kept, and nothing is deleted while any handle still has the file open.
+    /// </summary>
+    private void TryRemoveIdleSidecars()
+    {
+        var lockHandle = _lockHandle;
+        if (lockHandle is null)
+            return;
+
+        var walPath = _databasePath + "-wal";
+        var sharedMemoryPath = _databasePath + "-shm";
+        try
+        {
+            if (!File.Exists(walPath) && !File.Exists(sharedMemoryPath))
+                return;
+            // A WAL without its main file is an orphan the next open discards, and embedded
+            // replicas keep WAL generations of their own next to the database: leave both alone.
+            if (!File.Exists(_databasePath) || HasReplicaArtifacts(_databasePath))
+                return;
+            if (!lockHandle.TryLock(PendingByte, length: 1, SqliteWalByteRangeLockMode.Exclusive, out _))
+                return;
+
+            try
+            {
+                if (!lockHandle.TryLock(SharedFirstByte, SharedSize, SqliteWalByteRangeLockMode.Exclusive, out _))
+                    return;
+
+                try
+                {
+                    var walInfo = new FileInfo(walPath);
+                    if (walInfo.Exists && walInfo.Length > SqliteWalHeader.Size)
+                        return;
+
+                    if (TryDeleteUnusedFile(walPath))
+                        TryDeleteUnusedFile(sharedMemoryPath);
+                }
+                finally
+                {
+                    lockHandle.Unlock(SharedFirstByte, SharedSize);
+                }
+            }
+            finally
+            {
+                lockHandle.Unlock(PendingByte, length: 1);
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private static bool HasReplicaArtifacts(string databasePath)
+    {
+        var directory = Path.GetDirectoryName(databasePath);
+        if (string.IsNullOrEmpty(directory))
+            return false;
+
+        return Directory.EnumerateFiles(directory, Path.GetFileName(databasePath) + ".ahtola-*").Any();
+    }
+
+    /// <summary>
+    /// Deletes <paramref name="path"/> only when no handle anywhere has it open: opening it
+    /// without sharing proves that, so the delete can never leave a delete-pending file behind
+    /// for the next opener. Returns true when the file is gone.
+    /// </summary>
+    private static bool TryDeleteUnusedFile(string path)
+    {
+        try
+        {
+            using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+            }
+
+            // Rename first: on Windows a deleted file another handle still has open (a scanner,
+            // a backup agent) stays delete-pending under its name, and opening that name again
+            // fails, while the renamed file frees the name at once.
+            var doomed = string.Concat(path, ".", Guid.NewGuid().ToString("N"), ".deleted");
+            File.Move(path, doomed);
+            try
+            {
+                File.Delete(doomed);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
         }
     }
 
@@ -815,6 +958,8 @@ internal sealed class SqliteMainFileLockLease : IDisposable
             timeout);
 
     internal void DowngradeToShared() => GetOwner().DowngradeToShared(this);
+
+    internal void DowngradePendingToReserved() => GetOwner().DowngradePendingToReserved(this);
 
     internal bool IsReservedByAnotherProcess() => GetOwner().IsReservedByAnotherProcess(this);
 

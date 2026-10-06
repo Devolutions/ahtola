@@ -93,6 +93,7 @@ public sealed class SqlitePager : IDisposable
     private readonly SqlitePagerReadCache _pageCache;
     private readonly HashSet<SqlitePagerReadTransaction> _activeReadTransactions = [];
     private SqlitePagerTransaction? _activeTransaction;
+    private SqlitePagerWriterReservation? _attachedWriterReservation;
     private SqliteWalRecoveryInfo _recoveryInfo;
     private SqliteWalRecoveryInfo _visibleRecoveryInfo;
     private uint _committedPageCount;
@@ -730,7 +731,8 @@ public sealed class SqlitePager : IDisposable
             var pageStore = openContext.PageStore;
             var journalMode = openContext.JournalMode;
             var useExternalCoordinator = openContext.UseExternalCoordinator;
-            using var recoveryLock = readOnly || !UsesWalStorage(journalMode)
+            var openedUnderReaderLock = openContext.OpenedUnderReaderLock;
+            using var recoveryLock = readOnly || openedUnderReaderLock || !UsesWalStorage(journalMode)
                             ? null
                             : effectiveLockManager.EnterRecoveryLock(
                                 SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
@@ -810,7 +812,11 @@ public sealed class SqlitePager : IDisposable
                             // repaired under Stage 5 exclusive locks before
                             // RebuildFromWal can authenticate the boundary.
                             pager.AttachWalIndexMapping(readOnly: false);
-                            if (HasUncommittedOrInvalidTail(recovery))
+                            if (openedUnderReaderLock)
+                            {
+                                pager.ObserveWalIndexWithoutPublishing();
+                            }
+                            else if (HasUncommittedOrInvalidTail(recovery))
                             {
                                 if (pager._walIndex is not null)
                                 {
@@ -855,7 +861,7 @@ public sealed class SqlitePager : IDisposable
                         pager.InitializeCleanWalView();
                     }
 
-                    pager._lockGeneration = readOnly
+                    pager._lockGeneration = readOnly || openedUnderReaderLock
                         ? effectiveLockManager.Generation
                         : openLock.PublishStorageChange();
                     pager._state = SqlitePagerState.Ready;
@@ -894,7 +900,8 @@ public sealed class SqlitePager : IDisposable
         SqlitePagerLockLease OpenLock,
         SqlitePageStore PageStore,
         SqliteJournalMode JournalMode,
-        bool UseExternalCoordinator) AcquireOpenContext(
+        bool UseExternalCoordinator,
+        bool OpenedUnderReaderLock) AcquireOpenContext(
             IFileSystem fileSystem,
             string databasePath,
             string walPath,
@@ -934,7 +941,7 @@ public sealed class SqlitePager : IDisposable
                     encryption,
                     pageCodec);
                 var journalMode = GetJournalMode(pageStore.Header);
-                return (null, openLock, pageStore, journalMode, UsesWalStorage(journalMode));
+                return (null, openLock, pageStore, journalMode, UsesWalStorage(journalMode), false);
             }
             catch
             {
@@ -975,6 +982,7 @@ public sealed class SqlitePager : IDisposable
                 var journalMode = GetJournalMode(pageStore.Header);
                 var useExternalCoordinator = UsesWalStorage(journalMode)
                     && (!readOnly || fileSystem.FileExists(walPath));
+                var openedUnderReaderLock = false;
                 try
                 {
                     openLock = EnterLockWithinBudget(
@@ -984,6 +992,18 @@ public sealed class SqlitePager : IDisposable
                         stopwatch: null,
                         pagerReadOnly: readOnly,
                         useExternalCoordinator);
+                }
+                catch (SqlitePagerBusyException)
+                    when (!readOnly
+                          && UsesWalStorage(journalMode)
+                          && TryEnterReaderOpenLock(lockManager, useExternalCoordinator) is { } readerOpenLock)
+                {
+                    // Another connection or process holds the WAL write lock, typically across an
+                    // explicit write transaction. Like SQLite, open as a reader instead of waiting
+                    // for it: the live writer owns the WAL tail and the WAL-index, so this open
+                    // neither repairs nor republishes them.
+                    openLock = readerOpenLock;
+                    openedUnderReaderLock = true;
                 }
                 catch (SqlitePagerBusyException exception)
                 {
@@ -1014,7 +1034,7 @@ public sealed class SqlitePager : IDisposable
                     continue;
                 }
 
-                return (mainFileLock, openLock, pageStore, journalMode, useExternalCoordinator);
+                return (mainFileLock, openLock, pageStore, journalMode, useExternalCoordinator, openedUnderReaderLock);
             }
             catch
             {
@@ -1023,6 +1043,26 @@ public sealed class SqlitePager : IDisposable
                 mainFileLock?.Dispose();
                 throw;
             }
+        }
+    }
+
+    private static SqlitePagerLockLease? TryEnterReaderOpenLock(
+        SqlitePagerLockManager lockManager,
+        bool useExternalCoordinator)
+    {
+        try
+        {
+            return EnterLockWithinBudget(
+                lockManager,
+                SqlitePagerLockOperation.Reader,
+                configuredTimeout: TimeSpan.Zero,
+                stopwatch: null,
+                pagerReadOnly: false,
+                useExternalCoordinator);
+        }
+        catch (SqlitePagerBusyException)
+        {
+            return null;
         }
     }
 
@@ -1438,6 +1478,138 @@ public sealed class SqlitePager : IDisposable
     }
 
     /// <summary>
+    /// Takes the write lock an explicit write transaction keeps until it ends: the WAL write
+    /// lock in WAL mode, or SHARED plus RESERVED on the main file in rollback-journal mode,
+    /// waiting up to the busy timeout for another connection or process to release it.
+    /// Attach it with <see cref="AttachedWriterReservation"/> so the commit's pager
+    /// transaction uses it instead of acquiring the lock again.
+    /// </summary>
+    internal SqlitePagerWriterReservation ReserveWriter(TimeSpan? busyTimeout = null)
+    {
+        var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
+        var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
+            ? null
+            : Stopwatch.StartNew();
+        var deleteMode = JournalMode == SqliteJournalMode.Delete;
+        var persistentExclusive = IsExclusiveLockingMode;
+        var writerLock = _lockManager.EnterWriter(
+            configuredBusyTimeout,
+            useExternalCoordinator: !deleteMode && !persistentExclusive);
+        SqliteMainFileLockLease? mainFileLock = null;
+        try
+        {
+            if (deleteMode && !persistentExclusive && _clientOwnership is not null)
+            {
+                // SQLite never busy-waits for RESERVED while holding SHARED: the RESERVED holder
+                // may itself be waiting for every SHARED lock to drain before its EXCLUSIVE
+                // commit. Try RESERVED without waiting and drop SHARED between attempts.
+                while (true)
+                {
+                    mainFileLock = _clientOwnership.AcquireShared(
+                        SqlitePagerLockOperation.Writer,
+                        SqlitePagerLockManager.RemainingFileLockTimeout(
+                            configuredBusyTimeout,
+                            lockStopwatch));
+                    try
+                    {
+                        mainFileLock.AcquireReserved(TimeSpan.Zero);
+                        break;
+                    }
+                    catch (SqlitePagerBusyException exception)
+                    {
+                        mainFileLock.Dispose();
+                        mainFileLock = null;
+                        if (!SqliteBusyBackoff.Wait(configuredBusyTimeout, lockStopwatch))
+                        {
+                            throw new SqlitePagerBusyException(
+                                SqlitePagerLockOperation.Writer,
+                                configuredBusyTimeout,
+                                exception);
+                        }
+                    }
+                }
+            }
+
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                ThrowIfReadOnly();
+            }
+
+            _lockManager.SetWriterReserved();
+            var reservation = new SqlitePagerWriterReservation(
+                _lockManager,
+                writerLock,
+                mainFileLock,
+                deleteMode,
+                persistentExclusive);
+            mainFileLock = null;
+            return reservation;
+        }
+        catch
+        {
+            mainFileLock?.Dispose();
+            writerLock.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The write reservation the next <see cref="BeginTransaction"/> borrows, if any. The
+    /// owning database attaches it for the duration of a commit.
+    /// </summary>
+    internal SqlitePagerWriterReservation? AttachedWriterReservation
+    {
+        get
+        {
+            lock (_gate)
+                return _attachedWriterReservation;
+        }
+        set
+        {
+            lock (_gate)
+                _attachedWriterReservation = value;
+        }
+    }
+
+    private SqlitePagerWriterReservation? TryBorrowWriterReservation(
+        bool deleteMode,
+        bool persistentExclusive,
+        out SqlitePagerLockLease? writerLock,
+        out SqliteMainFileLockLease? mainFileLock)
+    {
+        writerLock = null;
+        mainFileLock = null;
+        var reservation = AttachedWriterReservation;
+        if (reservation is null)
+            return null;
+
+        if (!ReferenceEquals(reservation.LockManager, _lockManager)
+            || reservation.DeleteMode != deleteMode
+            || reservation.PersistentExclusive != persistentExclusive)
+        {
+            // Taken under another lock manager or journal/locking mode: it cannot stand in for
+            // this transaction's lock, and holding it would block acquiring that lock.
+            reservation.Dispose();
+            return null;
+        }
+
+        if (!reservation.TryLend(out var lentWriterLock, out mainFileLock))
+            return null;
+
+        writerLock = lentWriterLock;
+        return reservation;
+    }
+
+    private void ReleaseAttachedWriterReservation()
+    {
+        SqlitePagerWriterReservation? reservation;
+        lock (_gate)
+            reservation = _attachedWriterReservation;
+        reservation?.Dispose();
+    }
+
+    /// <summary>
     /// Begins one in-memory transaction. New pages must be materialized before
     /// commit; pages are never implicitly zero-filled or skipped.
     /// </summary>
@@ -1456,14 +1628,24 @@ public sealed class SqlitePager : IDisposable
             var remaining = SqlitePagerLockManager.RemainingFileLockTimeout(
                 configuredBusyTimeout,
                 lockStopwatch);
-            var transactionLock = _lockManager.EnterWriter(
-                remaining,
-                useExternalCoordinator);
-            SqliteMainFileLockLease? mainFileLock = null;
+            var reservation = TryBorrowWriterReservation(
+                deleteMode,
+                persistentExclusive,
+                out var reservedWriterLock,
+                out var reservedMainFileLock);
+            var transactionLock = reservation is not null
+                ? reservedWriterLock!
+                : _lockManager.EnterWriter(
+                    remaining,
+                    useExternalCoordinator);
+            SqliteMainFileLockLease? mainFileLock = reservedMainFileLock;
             var retry = false;
             try
             {
-                if (deleteMode && !persistentExclusive && _clientOwnership is not null)
+                if (reservation is null
+                    && deleteMode
+                    && !persistentExclusive
+                    && _clientOwnership is not null)
                 {
                     mainFileLock = _clientOwnership.AcquireShared(
                         SqlitePagerLockOperation.Writer,
@@ -1521,7 +1703,8 @@ public sealed class SqlitePager : IDisposable
                             transactionLock,
                             mainFileLock,
                             configuredBusyTimeout,
-                            requiresExclusiveCommit: deleteMode && !persistentExclusive);
+                            requiresExclusiveCommit: deleteMode && !persistentExclusive,
+                            writerReservation: reservation);
                         mainFileLock = null;
                         _activeTransaction = transaction;
                         _state = SqlitePagerState.TransactionActive;
@@ -1531,13 +1714,30 @@ public sealed class SqlitePager : IDisposable
             }
             catch
             {
-                mainFileLock?.Dispose();
-                transactionLock.Dispose();
+                if (reservation is not null)
+                {
+                    reservation.Return(transactionLock, mainFileLock);
+                }
+                else
+                {
+                    mainFileLock?.Dispose();
+                    transactionLock.Dispose();
+                }
                 throw;
             }
 
-            mainFileLock?.Dispose();
-            transactionLock.Dispose();
+            if (reservation is not null)
+            {
+                // The journal or locking mode changed since the reservation was taken, so its
+                // leases no longer match what this transaction needs: drop it and acquire afresh.
+                reservation.Return(transactionLock, mainFileLock);
+                reservation.Dispose();
+            }
+            else
+            {
+                mainFileLock?.Dispose();
+                transactionLock.Dispose();
+            }
             if (!retry)
                 throw new InvalidOperationException("SQLite transaction lock selection did not produce a transaction.");
         }
@@ -1552,6 +1752,9 @@ public sealed class SqlitePager : IDisposable
         TimeSpan? busyTimeout = null)
     {
         ThrowIfCommitIsPlannedOrExceedsGrowthCeiling(targetDatabaseSizeInPages);
+        // A rewrite needs the checkpoint role, which excludes the writer role a held write
+        // reservation keeps; give the reservation up first.
+        ReleaseAttachedWriterReservation();
         var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
         var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
             ? null
@@ -3055,7 +3258,7 @@ public sealed class SqlitePager : IDisposable
                     _lockGeneration = transaction.PublishStorageChange();
                     _activeTransaction = null;
                     _state = SqlitePagerState.Ready;
-                    transaction.ReleaseWriterLock();
+                    transaction.ReleaseWriterLock(committed: true);
                     return;
                 }
 
@@ -3116,13 +3319,13 @@ public sealed class SqlitePager : IDisposable
                             synchronousMode: synchronousMode);
                     }
                 }
-                transaction.ReleaseWriterLock();
+                transaction.ReleaseWriterLock(committed: true);
             }
             catch
             {
                 _lockGeneration = transaction.PublishStorageChange();
                 TransitionToFaulted();
-                transaction.ReleaseWriterLock();
+                transaction.ReleaseWriterLock(committed: true);
                 throw;
             }
         }
@@ -4299,6 +4502,26 @@ public sealed class SqlitePager : IDisposable
         PublishWalIndexFromCurrentWal();
     }
 
+    /// <summary>
+    /// Adopts a valid WAL-index without rebuilding it, for an open that runs alongside a live
+    /// writer. A torn or stale index is left for the writer (or the next open that holds the
+    /// write lock) to rebuild; reads fall back to WAL scans meanwhile.
+    /// </summary>
+    private void ObserveWalIndexWithoutPublishing()
+    {
+        if (_walIndex is null || _wal is null)
+            return;
+
+        try
+        {
+            var region = _walIndex.ReadValidatedHeader(_wal);
+            ObserveWalIndexIdentity(region.Header);
+        }
+        catch (InvalidDataException)
+        {
+        }
+    }
+
     private void AttachWalIndexMapping(bool readOnly)
     {
         if (_foreignReadOnly
@@ -4940,6 +5163,7 @@ public sealed class SqlitePagerTransaction : IDisposable
     private readonly SqlitePager _pager;
     private SqlitePagerLockLease? _writerLock;
     private SqliteMainFileLockLease? _mainFileLock;
+    private readonly SqlitePagerWriterReservation? _writerReservation;
     private readonly TimeSpan _busyTimeout;
     private readonly Dictionary<uint, byte[]> _pageImages = [];
     private readonly List<uint> _writeOrder = [];
@@ -4952,11 +5176,13 @@ public sealed class SqlitePagerTransaction : IDisposable
         SqliteMainFileLockLease? mainFileLock,
         TimeSpan busyTimeout,
         bool requiresExclusiveCommit,
-        bool checkpointWalAfterCommit = false)
+        bool checkpointWalAfterCommit = false,
+        SqlitePagerWriterReservation? writerReservation = null)
     {
         _pager = pager;
         _writerLock = writerLock;
         _mainFileLock = mainFileLock;
+        _writerReservation = writerReservation;
         _busyTimeout = busyTimeout;
         RequiresExclusiveCommit = requiresExclusiveCommit;
         CheckpointWalAfterCommit = checkpointWalAfterCommit;
@@ -5152,7 +5378,12 @@ public sealed class SqlitePagerTransaction : IDisposable
         }
     }
 
-    internal void ReleaseWriterLock()
+    /// <summary>
+    /// Releases the writer locks. Locks borrowed from a write reservation go back to it unless
+    /// the transaction committed (or faulted): a failed commit keeps the explicit transaction's
+    /// lock so it can retry, exactly as SQLite keeps RESERVED/PENDING after a busy COMMIT.
+    /// </summary>
+    internal void ReleaseWriterLock(bool committed = false)
     {
         lock (_gate)
         {
@@ -5160,6 +5391,18 @@ public sealed class SqlitePagerTransaction : IDisposable
             var writerLock = _writerLock;
             _mainFileLock = null;
             _writerLock = null;
+            if (_writerReservation is { } reservation && writerLock is not null)
+            {
+                if (!committed && _pager.State != SqlitePagerState.Faulted)
+                {
+                    mainFileLock?.DowngradePendingToReserved();
+                    reservation.Return(writerLock, mainFileLock);
+                    return;
+                }
+
+                reservation.Consume();
+            }
+
             mainFileLock?.Dispose();
             writerLock?.Dispose();
         }
@@ -5180,6 +5423,8 @@ public sealed class SqlitePagerTransaction : IDisposable
             var writerLock = _writerLock;
             _mainFileLock = null;
             _writerLock = null;
+            if (writerLock is not null)
+                _writerReservation?.Consume();
             mainFileLock?.Dispose();
             writerLock?.Dispose();
         }

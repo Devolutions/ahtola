@@ -60,10 +60,11 @@ public sealed class ManagedDocumentedBoundaryTests
     }
 
     /// <summary>
-    /// P5-D: requesting FULL/INCREMENTAL autovacuum fails closed with Turso's own diagnostic
-    /// (translate/pragma.rs) since Ahtola has no <c>--experimental-autovacuum</c> flag/engine
-    /// support to turn it on — matches turso-sqltests/invalid-argument-error-message.sqltest,
-    /// which pins this exact message with no CLI-style prefix.
+    /// P5-D: requesting FULL/INCREMENTAL autovacuum on an empty database fails closed with
+    /// Turso's own diagnostic (translate/pragma.rs) since Ahtola has no
+    /// <c>--experimental-autovacuum</c> flag/engine support to turn it on — matches
+    /// turso-sqltests/invalid-argument-error-message.sqltest, which pins this exact message with
+    /// no CLI-style prefix.
     /// </summary>
     [Test]
     [TestCase("PRAGMA auto_vacuum=FULL")]
@@ -74,10 +75,29 @@ public sealed class ManagedDocumentedBoundaryTests
     [TestCase("PRAGMA auto_vacuum=bogus")]
     public void AutoVacuumNonNoneModeFailsClosedWithoutExperimentalFlag(string sql)
     {
-        using var connection = Open();
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
         var error = Assert.Throws<SqliteException>(() => Execute(connection, sql));
         error!.Message.Should().Contain(
             "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.");
+    }
+
+    /// <summary>
+    /// Once tables exist SQLite cannot switch auto-vacuum without a VACUUM, so it accepts the
+    /// request without an error and leaves the mode unchanged. Schema upgrade scripts (RDM step
+    /// 123) issue exactly this statement against populated databases.
+    /// </summary>
+    [Test]
+    [TestCase("PRAGMA auto_vacuum=FULL")]
+    [TestCase("PRAGMA auto_vacuum = INCREMENTAL;")]
+    [TestCase("PRAGMA auto_vacuum=1")]
+    public void AutoVacuumModeChangeOnAPopulatedDatabaseIsANoOp(string sql)
+    {
+        using var connection = Open();
+        Execute(connection, sql);
+        ExecuteScalarLong(connection, "PRAGMA auto_vacuum;").Should().Be(0L);
+        Execute(connection, "VACUUM;");
+        ExecuteScalarLong(connection, "PRAGMA auto_vacuum;").Should().Be(0L);
     }
 
     /// <summary>

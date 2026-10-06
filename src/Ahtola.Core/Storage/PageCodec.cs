@@ -56,6 +56,12 @@ public readonly record struct PageCodecContext(uint PageNumber, PageLocation Loc
 /// Must change whenever the codec could produce different on-disk bytes.
 /// Do not embed secrets.
 /// </summary>
+/// <remarks>
+/// Ahtola validates only that the identifier is non-zero; nothing is persisted with it. It names
+/// the format (algorithm, key derivation and page layout), not the key: connections that set a
+/// <see cref="IPageCodec"/> are never pooled, so two codecs with different keys may share an
+/// identifier.
+/// </remarks>
 public readonly struct PageCodecId : IEquatable<PageCodecId>
 {
     private readonly ulong _lo;
@@ -122,6 +128,24 @@ public readonly struct PageCodecId : IEquatable<PageCodecId>
 /// representations. Codecs must preserve the fixed page size; per-page metadata
 /// belongs in reserved bytes. Mirrors Turso <c>PageCodec</c>.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Threading: the engine does not promise a single calling thread. <see cref="EncodePage"/> and
+/// <see cref="DecodePage"/> can run on different threads, and concurrently when several
+/// connections (or a connection and its own checkpoint) share one codec instance, so
+/// implementations must be thread-safe.
+/// </para>
+/// <para>
+/// Ownership: the caller owns the codec. A connection never disposes a codec set through its
+/// <c>PageCodec</c> property; dispose it (if it is <see cref="IDisposable"/>) after every
+/// connection using it is closed. Connections that use a codec are not pooled.
+/// </para>
+/// <para>
+/// Errors: throw <see cref="PageCodecKeyMismatchException"/> when the input proves the key is
+/// wrong (providers report SQLite's "file is encrypted or is not a database"); any other
+/// exception is treated as a corrupt page.
+/// </para>
+/// </remarks>
 public interface IPageCodec
 {
     /// <summary>Stable, non-secret configuration fingerprint for this codec.</summary>
@@ -137,11 +161,49 @@ public interface IPageCodec
     PageCodecHeaderInfo BootstrapPageInfo(ReadOnlySpan<byte> rawPage1Prefix)
         => PageCodecHeaderInfo.FromVisibleSqliteHeader(rawPage1Prefix);
 
+    /// <summary>
+    /// Whether this codec, with its key, wrote the file whose leading bytes (at least the first
+    /// 32) are <paramref name="rawPage1Prefix"/>: <see langword="true"/> when they decode to a
+    /// SQLite header, <see langword="false"/> when they cannot have been written with this key,
+    /// and <see langword="null"/> (the default) when the prefix does not tell. Providers use it to
+    /// pick a codec among several candidates and to report a wrong key before reading pages.
+    /// </summary>
+    bool? MatchesHeader(ReadOnlySpan<byte> rawPage1Prefix) => null;
+
     /// <summary>Encodes a plaintext SQLite page into on-disk bytes.</summary>
     void EncodePage(PageCodecContext context, ReadOnlySpan<byte> input, Span<byte> output);
 
     /// <summary>Decodes on-disk bytes into a plaintext SQLite page.</summary>
     void DecodePage(PageCodecContext context, ReadOnlySpan<byte> input, Span<byte> output);
+}
+
+/// <summary>
+/// Thrown by a page codec when the stored bytes prove its key is wrong, as opposed to a corrupt
+/// page. Providers map it to SQLite's <c>SQLITE_NOTADB</c> ("file is encrypted or is not a
+/// database").
+/// </summary>
+public class PageCodecKeyMismatchException : Exception
+{
+    /// <summary>The message providers report for a wrong key.</summary>
+    public const string DefaultMessage = "file is encrypted or is not a database";
+
+    /// <summary>Creates the wrong-key failure.</summary>
+    public PageCodecKeyMismatchException()
+        : base(DefaultMessage)
+    {
+    }
+
+    /// <summary>Creates the wrong-key failure with a codec-specific message.</summary>
+    public PageCodecKeyMismatchException(string message)
+        : base(message)
+    {
+    }
+
+    /// <summary>Creates the wrong-key failure wrapping the codec's own error.</summary>
+    public PageCodecKeyMismatchException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
 }
 
 /// <summary>Helpers for resolving and applying page codecs in the storage layer.</summary>

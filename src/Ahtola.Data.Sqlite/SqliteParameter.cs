@@ -16,6 +16,9 @@ public class SqliteParameter : DbParameter
     private bool _hasValue;
     private DbType _dbType = DbType.String;
     private SqliteType? _sqliteType;
+    // True when _sqliteType was derived from DbType rather than set explicitly: Microsoft.Data.Sqlite
+    // lets the value pick the storage class in that case, so an incompatible value falls back to it.
+    private bool _sqliteTypeFromDbType;
 
     public SqliteParameter()
     {
@@ -51,6 +54,7 @@ public class SqliteParameter : DbParameter
         set
         {
             _dbType = value;
+            _sqliteTypeFromDbType = true;
             _sqliteType = value switch
             {
                 DbType.Binary or DbType.Guid => SqliteType.Blob,
@@ -68,6 +72,7 @@ public class SqliteParameter : DbParameter
         set
         {
             _sqliteType = value;
+            _sqliteTypeFromDbType = false;
             _dbType = value switch
             {
                 SqliteType.Integer => DbType.Int64,
@@ -147,7 +152,38 @@ public class SqliteParameter : DbParameter
     public virtual void ResetSqliteType()
     {
         _sqliteType = null;
+        _sqliteTypeFromDbType = false;
         _dbType = DbType.String;
+    }
+
+    /// <summary>
+    /// The storage class and value this parameter binds. GUIDs follow the connection's
+    /// <c>BinaryGUID</c> setting when nothing pins their storage class: the .NET byte layout as
+    /// BLOB (true, the System.Data.SQLite default) or uppercase TEXT (false, as
+    /// Microsoft.Data.Sqlite binds them). A <see cref="DbType"/> only picks the storage class
+    /// when the value can be stored that way, so <see cref="DbType.Guid"/> accepts GUID strings.
+    /// </summary>
+    private (SqliteType Type, object Value) ResolveBinding(bool binaryGuid)
+    {
+        var value = Value!;
+        if (_sqliteType is { } pinned && !_sqliteTypeFromDbType)
+            return (pinned, value);
+
+        if (_sqliteTypeFromDbType && _dbType == DbType.Guid)
+        {
+            if (value is string text && Guid.TryParse(text, out var parsed))
+                value = parsed;
+            if (value is Guid)
+                return (binaryGuid ? SqliteType.Blob : SqliteType.Text, value);
+            return (InferSqliteType(value), value);
+        }
+
+        if (_sqliteType is { } fromDbType)
+            return (fromDbType, value);
+
+        return value is Guid
+            ? (binaryGuid ? SqliteType.Blob : SqliteType.Text, value)
+            : (InferSqliteType(value), value);
     }
 
     internal bool HasValue => _hasValue;
@@ -169,17 +205,18 @@ public class SqliteParameter : DbParameter
         };
     }
 
-    internal SqlValue ToSqlValue()
+    internal SqlValue ToSqlValue(bool binaryGuid = true)
     {
         if (Value is null or DBNull)
             return SqlValue.Null;
 
-        return SqliteType switch
+        var (type, value) = ResolveBinding(binaryGuid);
+        return type switch
         {
-            SqliteType.Integer => SqlValue.Integer(ToInt64(Value)),
-            SqliteType.Real => SqlValue.Real(ToDouble(Value)),
-            SqliteType.Blob => SqlValue.Blob(ToBytes(Value)),
-            SqliteType.Text => SqlValue.Text(ApplySize(ToInvariantString(Value))),
+            SqliteType.Integer => SqlValue.Integer(ToInt64(value)),
+            SqliteType.Real => SqlValue.Real(ToDouble(value)),
+            SqliteType.Blob => SqlValue.Blob(ToBytes(value)),
+            SqliteType.Text => SqlValue.Text(ApplySize(ToInvariantString(value))),
             _ => throw new ArgumentOutOfRangeException()
         };
     }

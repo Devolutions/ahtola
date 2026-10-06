@@ -16,6 +16,15 @@ public class SqliteException : DbException
         SqliteExtendedErrorCode = extendedErrorCode;
     }
 
+    /// <summary>Creates an error that keeps the engine failure it reports as its inner exception.</summary>
+    internal SqliteException(string message, int errorCode, int extendedErrorCode, Exception? innerException)
+        : base(message, innerException)
+    {
+        HResult = errorCode;
+        SqliteErrorCode = errorCode;
+        SqliteExtendedErrorCode = extendedErrorCode;
+    }
+
     public int SqliteErrorCode { get; }
 
     public int SqliteExtendedErrorCode { get; }

@@ -258,9 +258,10 @@ one and not the other — gate both before claiming a fix.
 
 - `$(AhtolaTargetFrameworks)` = `net8.0;net9.0;net10.0` — use this MSBuild
   property in csproj `<TargetFrameworks>`, do not hard-code frameworks.
-- `$(AhtolaEntityFrameworkCoreVersion)` defaults to `10.0.10` (net10) / `9.0.9`
+- `$(AhtolaEntityFrameworkCoreVersion)` defaults to `10.0.12` (net10) / `9.0.20`
   (older TFMs) and `$(AhtolaEntityFrameworkCoreVersionRange)` is
-  `[10.0.0,11.0.0)` on net10.0 / `[9.0.9,10.0.0)` elsewhere.
+  `[10.0.12,11.0.0)` on net10.0 / `[9.0.20,10.0.0)` elsewhere (the lower bound is the
+  tested patch, because NuGet resolves the lowest version a range allows).
 - `Version`, `Company`, `Product`, `Authors`, `Copyright` are centralized here.
 
 The closure validator enforces that `Devolutions.Ahtola.EntityFrameworkCore.Sqlite`

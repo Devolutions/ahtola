@@ -64,6 +64,22 @@ public sealed class SqliteTableLeafPageBuilder
     }
 
     /// <summary>
+    /// Whether <paramref name="cell"/> still fits after the appended cells, so packers can fill
+    /// a page without catching <see cref="Append"/>'s overflow exception for every attempt.
+    /// </summary>
+    public bool CanAppend(SqliteTableLeafCell cell)
+    {
+        ArgumentNullException.ThrowIfNull(cell);
+        if (_cells.Count == ushort.MaxValue || cell.EncodedLength <= 0)
+            return false;
+
+        var pointerArrayEnd = _headerOffset
+            + SqliteBtreePageHeader.LeafHeaderSize
+            + ((_cells.Count + 1) * sizeof(ushort));
+        return (long)UsableSpace - _cellBytes - cell.EncodedLength >= pointerArrayEnd;
+    }
+
+    /// <summary>
     /// Returns a zero-initialized page image packed with the appended cells.
     /// </summary>
     /// <remarks>

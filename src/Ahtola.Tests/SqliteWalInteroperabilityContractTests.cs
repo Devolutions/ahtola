@@ -459,7 +459,7 @@ public class SqliteWalInteroperabilityContractTests
 
             File.Delete(sharedMemoryPath);
 
-            var failure = Assert.Throws<InvalidOperationException>(() => SqlitePager.Open(
+            var failure = Assert.Throws<SqliteWalLockFileMissingException>(() => SqlitePager.Open(
                 PhysicalFileSystem.Instance,
                 databasePath,
                 walPath,

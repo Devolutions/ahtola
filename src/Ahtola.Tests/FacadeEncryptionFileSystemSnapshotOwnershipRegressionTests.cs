@@ -64,7 +64,7 @@ public sealed class FacadeEncryptionFileSystemSnapshotOwnershipRegressionTests
             }
 
             using var connection = CreateConnection(facade, CreateConnectionString(path, WrongAes256Key));
-            Assert.Throws<InvalidDataException>(() => connection.Open())!
+            Assert.Catch(() => connection.Open())!
                 .Message.Should().Contain("failed authentication");
 
             connection.State.Should().Be(ConnectionState.Closed);

@@ -68,5 +68,10 @@
              that workstream landing. -->
         <Content Include="Fixtures\testing_legacy_unquoted_view_columns.db"
                  CopyToOutputDirectory="PreserveNewest" />
+        <!-- Databases written by the native engines products are migrating off: System.Data.SQLite
+             (plain and RC4 Password) and wxSQLite3/sqlite3secure (AES-128-CBC). Each holds an Items
+             table with 60 rows; LegacyPageCodecTests reads them as known-answer fixtures. -->
+        <Content Include="Fixtures\LegacyCodecs\*.db"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>

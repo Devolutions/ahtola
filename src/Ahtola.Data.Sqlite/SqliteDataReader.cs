@@ -10,6 +10,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Ahtola;
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 
 namespace Ahtola.Data.Sqlite;
 
@@ -490,13 +491,20 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         ValidateOrdinal(ordinal);
         var valueType = CurrentValueKind(ordinal);
         var declaredType = GetDeclaredTypeName(ordinal);
+        if (_connection.TypeMapping == SqliteTypeMapping.SystemDataSQLite
+            && SystemDataSqliteTypeMap.Get(declaredType) is { } systemDataSqliteType)
+        {
+            return systemDataSqliteType;
+        }
+
         if (!string.IsNullOrEmpty(declaredType))
         {
             if (IsBlobType(declaredType))
             {
                 // BLOB affinity does not constrain SQLite storage classes. DataAdapter fixes a
                 // DataColumn's type before it reads rows, so byte[] metadata would reject a later
-                // TEXT value from the same column. Use object to preserve mixed BLOB/TEXT values.
+                // TEXT value from the same column. Use object to preserve mixed BLOB/TEXT values
+                // (Type Mapping=SystemDataSQLite reports byte[], as System.Data.SQLite does).
                 return typeof(object);
             }
 
@@ -514,10 +522,12 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
 
         var dataTypeName = GetDataTypeName(ordinal);
-        // Identifier-shaped expressions can materialize a binary GUID as text in GetValue.
-        // Keep ordinary BLOB expressions binary, but make those adapter-facing GUID projections
+        // With the opt-in GUID column-name heuristic, identifier-shaped expressions can
+        // materialize a binary GUID as text in GetValue; make those adapter-facing projections
         // object-typed so DataAdapter does not commit to byte[] before reading the value.
-        return IsBlobType(dataTypeName) && IsIdentifierColumnName(GetName(ordinal))
+        return _connection.GuidColumnNameHeuristic
+               && IsBlobType(dataTypeName)
+               && IsIdentifierColumnName(GetName(ordinal))
             ? typeof(object)
             : GetClrTypeFromSqliteType(dataTypeName, valueType);
     }
@@ -782,11 +792,19 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                     : IsBlobType(info.TypeName)
                         ? typeof(object)
                     : GetClrTypeFromSqliteType(info.TypeName, valueType)
-                // Identifier-shaped expressions can materialize a binary GUID as text in
-                // GetValue, so DataAdapter must not commit their schema to byte[].
-                : valueType == ReaderValueKind.Blob && IsIdentifierColumnName(columnName)
+                // With the opt-in GUID column-name heuristic, identifier-shaped expressions can
+                // materialize a binary GUID as text in GetValue, so DataAdapter must not commit
+                // their schema to byte[].
+                : _connection.GuidColumnNameHeuristic
+                  && valueType == ReaderValueKind.Blob
+                  && IsIdentifierColumnName(columnName)
                     ? typeof(object)
                     : GetClrTypeFromValueType(valueType);
+            if (_connection.TypeMapping == SqliteTypeMapping.SystemDataSQLite
+                && SystemDataSqliteTypeMap.Get(info?.TypeName ?? GetDeclaredTypeName(i)) is { } systemDataSqliteType)
+            {
+                dataType = systemDataSqliteType;
+            }
             var isExpression = info is null;
             var isAliased = info is null
                 || !string.Equals(info.Name, columnName, StringComparison.Ordinal);
@@ -852,13 +870,23 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         EnsureOpen();
         EnsureHasCurrentRow();
         var value = ReadValue(ordinal);
+        if (_connection.TypeMapping == SqliteTypeMapping.SystemDataSQLite
+            && value.Kind is not (ReaderValueKind.Null or ReaderValueKind.Empty)
+            && SystemDataSqliteTypeMap.Get(GetDeclaredTypeName(ordinal)) is { } systemDataSqliteType
+            && TryConvertSystemDataSqliteValue(ordinal, value, systemDataSqliteType, out var converted))
+        {
+            return converted;
+        }
+
         // Only TEXT and BLOB values can map to a Guid; resolving the declared type runs schema
         // PRAGMAs once per result set, which numeric and NULL values never need.
         if (value.Kind is ReaderValueKind.Blob or ReaderValueKind.Text)
         {
             var declaredType = GetDeclaredTypeName(ordinal);
-            if (IsGuidType(declaredType))
-                return ToGuid(ordinal, value);
+            // SQLite's dynamic typing lets a GUID column hold anything (legacy rows, text another
+            // client wrote): what does not parse as a GUID comes back as stored.
+            if (IsGuidType(declaredType) && TryToGuid(value, out var guid))
+                return guid;
             if (ShouldMaterializeTextGuid(ordinal, declaredType, value))
                 return ToGuid(ordinal, value).ToString("D", CultureInfo.InvariantCulture).ToUpperInvariant();
         }
@@ -928,7 +956,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             // forward through any further 0-column (non-RETURNING DML) results.
             return _delegatedReader.NextResult() && SkipDelegatedReaderToColumns(_delegatedReader);
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
         {
             throw _command.MapAhtolaException(ex);
         }
@@ -990,7 +1018,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 statement.Dispose();
             }
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException)
         {
             _statement?.Dispose();
             _statement = null;
@@ -1061,7 +1089,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 }
             }
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException)
         {
             if (_statement is not null)
                 await _statement.DisposeAsync().ConfigureAwait(false);
@@ -1084,7 +1112,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         {
             return _delegatedReader.Read();
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
         {
             throw _command.MapAhtolaException(ex);
         }
@@ -1109,7 +1137,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 CountCurrentStatementRowsAffected();
             return _hasCurrentRow;
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException)
         {
             throw SqliteCommand.ToSqliteException(ex);
         }
@@ -1134,7 +1162,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 CountCurrentStatementRowsAffected();
             return _hasCurrentRow;
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException)
         {
             throw SqliteCommand.ToSqliteException(ex);
         }
@@ -1153,7 +1181,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         {
             return await _delegatedReader.ReadAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
         {
             throw _command.MapAhtolaException(ex);
         }
@@ -1185,7 +1213,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
             return await SkipDelegatedReaderToColumnsAsync(_delegatedReader, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
         {
             throw _command.MapAhtolaException(ex);
         }
@@ -1422,7 +1450,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
         catch (Exception ex)
         {
-            primaryError = ex is AhtolaException or EmbeddedSqlException
+            primaryError = ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException
                 ? SqliteCommand.ToSqliteException(ex)
                 : ex;
         }
@@ -1582,7 +1610,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
         catch (Exception ex)
         {
-            primaryError = ex is AhtolaException or EmbeddedSqlException
+            primaryError = ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException
                 ? SqliteCommand.ToSqliteException(ex)
                 : ex;
         }
@@ -2390,7 +2418,8 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         // preserve such identifier values through DataAdapter instead of letting DataColumn
         // stringify the byte array as "System.Byte[]". Restrict this compatibility conversion to
         // conventional identifier names so binary payloads remain blobs.
-        return _connection.BinaryGuid
+        return _connection.GuidColumnNameHeuristic
+            && _connection.BinaryGuid
             && value.Kind == ReaderValueKind.Blob
             && value.Blob.Length == 16
             && (string.IsNullOrWhiteSpace(declaredType)
@@ -2495,6 +2524,85 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         return value.Kind == ReaderValueKind.Text
             ? value.Text
             : throw new InvalidCastException("The requested value is not TEXT.");
+    }
+
+    private bool TryToGuid(ReaderValue value, out Guid guid)
+    {
+        if (value.Kind == ReaderValueKind.Blob)
+        {
+            if (value.Blob.Length == 16)
+            {
+                guid = ToGuid(ordinal: -1, value);
+                return true;
+            }
+
+            return Guid.TryParse(Encoding.UTF8.GetString(value.Blob), out guid);
+        }
+
+        if (value.Kind == ReaderValueKind.Text)
+            return Guid.TryParse(value.Text, out guid);
+
+        guid = default;
+        return false;
+    }
+
+    /// <summary>
+    /// System.Data.SQLite type mapping: converts a stored value to the CLR type its declared
+    /// column type names. A value that does not convert (stored with another storage class
+    /// than the column declares) is returned as stored, as System.Data.SQLite readers expect.
+    /// </summary>
+    private bool TryConvertSystemDataSqliteValue(int ordinal, ReaderValue value, Type type, out object converted)
+    {
+        converted = null!;
+        try
+        {
+            if (type == typeof(Guid))
+            {
+                if (!TryToGuid(value, out var guid))
+                    return false;
+                converted = guid;
+                return true;
+            }
+
+            if (type == typeof(string) || type == typeof(byte[]))
+                return false;
+
+            if (type == typeof(DateTime))
+            {
+                converted = GetDateTime(ordinal);
+                return true;
+            }
+
+            object raw = value.Kind switch
+            {
+                ReaderValueKind.Integer => value.Integer,
+                ReaderValueKind.Real => value.Real,
+                ReaderValueKind.Text => value.Text,
+                _ => value.Blob,
+            };
+            if (type == typeof(bool))
+            {
+                converted = raw switch
+                {
+                    long number => number != 0,
+                    double number => number != 0,
+                    string text when bool.TryParse(text, out var parsed) => parsed,
+                    string text => long.Parse(text, NumberStyles.Integer, CultureInfo.InvariantCulture) != 0,
+                    _ => throw new InvalidCastException(),
+                };
+                return true;
+            }
+
+            if (raw is byte[])
+                return false;
+
+            converted = Convert.ChangeType(raw, type, CultureInfo.InvariantCulture);
+            return true;
+        }
+        catch (Exception exception) when (exception is FormatException or InvalidCastException or OverflowException)
+        {
+            return false;
+        }
     }
 
     private Guid ToGuid(int ordinal, ReaderValue value)

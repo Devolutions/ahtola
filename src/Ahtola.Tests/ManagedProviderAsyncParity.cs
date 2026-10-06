@@ -225,25 +225,38 @@ public sealed class ManagedProviderAsyncParityTests
     [Test]
     public async Task ManagedSqliteAsyncLockWaitIsCancellable()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
-        connection.Open();
-        using var setup = connection.CreateCommand();
-        setup.CommandText = "CREATE TABLE values_table(value INTEGER);";
-        setup.ExecuteNonQuery();
+        // A write waits for another connection's write transaction (like SQLite, an open reader on
+        // the same connection does not block it), and that wait must honour cancellation.
+        var path = Path.Combine(Path.GetTempPath(), $"ahtola-async-lock-{Guid.NewGuid():N}.db");
+        try
+        {
+            using var holder = new SqliteConnection($"Data Source={path};Pooling=False;Local Provider=Managed");
+            holder.Open();
+            using (var setup = holder.CreateCommand())
+            {
+                setup.CommandText = "CREATE TABLE values_table(value INTEGER);";
+                setup.ExecuteNonQuery();
+            }
 
-        using var readerCommand = connection.CreateCommand();
-        readerCommand.CommandText = "SELECT * FROM values_table;";
-        using var reader = readerCommand.ExecuteReader();
+            using var transaction = holder.BeginTransaction(deferred: false);
+            using var connection = new SqliteConnection($"Data Source={path};Pooling=False;Local Provider=Managed");
+            connection.Open();
+            using var writer = connection.CreateCommand();
+            writer.CommandTimeout = 30;
+            writer.CommandText = "INSERT INTO values_table VALUES (1);";
+            using var cancellation = new CancellationTokenSource();
 
-        using var writer = connection.CreateCommand();
-        writer.CommandTimeout = 30;
-        writer.CommandText = "INSERT INTO values_table VALUES (1);";
-        using var cancellation = new CancellationTokenSource();
-
-        Task<int>? execution = null;
-        cancellation.CancelAfter(TimeSpan.FromMilliseconds(50));
-        Assert.DoesNotThrow(() => execution = writer.ExecuteNonQueryAsync(cancellation.Token));
-        await AssertCanceledAsync(execution!);
+            Task<int>? execution = null;
+            cancellation.CancelAfter(TimeSpan.FromMilliseconds(50));
+            Assert.DoesNotThrow(() => execution = writer.ExecuteNonQueryAsync(cancellation.Token));
+            await AssertCanceledAsync(execution!);
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var file in new[] { path, path + "-wal", path + "-shm", path + "-journal" })
+                File.Delete(file);
+        }
     }
 
     [Test]

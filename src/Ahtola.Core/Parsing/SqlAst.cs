@@ -461,6 +461,12 @@ internal sealed record PragmaEncryptionStatement(
 /// </summary>
 internal sealed record PragmaNoOpStatement(string Name, string? Schema = null) : ParsedStatement;
 
+/// <summary><c>PRAGMA wal_autocheckpoint</c>: the WAL frame count after which a commit checkpoints.</summary>
+internal sealed record PragmaWalAutocheckpointStatement(long? Value, string? Schema = null) : ParsedStatement;
+
+/// <summary><c>PRAGMA journal_size_limit</c>: the size a reset WAL or journal is truncated to.</summary>
+internal sealed record PragmaJournalSizeLimitStatement(long? Value, string? Schema = null) : ParsedStatement;
+
 internal sealed record PragmaPageCountStatement(string? Schema = null) : ParsedStatement;
 
 internal sealed record PragmaFreelistCountStatement(string? Schema = null) : ParsedStatement;

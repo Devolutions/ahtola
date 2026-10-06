@@ -260,7 +260,7 @@ public sealed class ManagedEncryptionFormatInteropTests
 
             using var wrongCipher = new SqliteConnection(
                 CreateConnectionString(destinationPath, "AES256GCM", Aes256Key));
-            Assert.Throws<InvalidDataException>(() => wrongCipher.Open())!
+            Assert.Throws<SqliteException>(() => wrongCipher.Open())!
                 .Message.Should().Contain("cipher fallback is not permitted");
         }
         finally

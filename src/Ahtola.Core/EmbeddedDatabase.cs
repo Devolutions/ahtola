@@ -456,6 +456,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ? default
             : fileStore.CaptureCommittedViewToken();
         _fileCatalogVersionViewToken = foreignReadOnly ? null : _ownedViewToken;
+        _contentViewToken = _ownedViewToken;
         _tables = catalog.Tables;
         _views = catalog.Views;
         _triggers = catalog.Triggers;
@@ -473,7 +474,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IFileSystem? fileSystem = null,
         bool readOnly = false,
             bool foreignReadOnly = false,
-            int? initialPageSize = null)
+            int? initialPageSize = null,
+            bool createRollbackJournalMode = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         if (foreignReadOnly && !readOnly)
@@ -485,13 +487,35 @@ public sealed partial class EmbeddedDatabase : IDisposable
             using var catalogWriteLease = readOnly
                 ? null
                 : EnterPhysicalFileCatalogWriteLock(effectiveFileSystem, path);
-            var store = EmbeddedFileStore.Open(
-                path,
-                effectiveFileSystem,
-                out var catalog,
-                readOnly: readOnly,
-                initialPageSize: initialPageSize,
-                foreignReadOnly: foreignReadOnly);
+            EmbeddedFileStore store;
+            EmbeddedFileCatalog catalog;
+            try
+            {
+                store = EmbeddedFileStore.Open(
+                    path,
+                    effectiveFileSystem,
+                    out catalog,
+                    readOnly: readOnly,
+                    initialPageSize: initialPageSize,
+                    foreignReadOnly: foreignReadOnly,
+                    createRollbackJournalMode: createRollbackJournalMode);
+            }
+            catch (SqliteWalLockFileMissingException) when (readOnly
+                                                             && !foreignReadOnly
+                                                             && effectiveFileSystem is PhysicalFileSystem)
+            {
+                // A WAL without its -shm (left by a crash, or a copied WAL database): like
+                // SQLite's read-only heap-memory WAL-index, read it through a process-local
+                // index instead of creating the -shm a read-only open must not create.
+                foreignReadOnly = true;
+                store = EmbeddedFileStore.Open(
+                    path,
+                    effectiveFileSystem,
+                    out catalog,
+                    readOnly: true,
+                    foreignReadOnly: true);
+            }
+
             EmbeddedDatabase? database = null;
             try
             {
@@ -549,6 +573,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
         lock (_gate)
             _deferredCheckpointFrameThreshold = frames;
     }
+
+    /// <summary>
+    /// The deferred-checkpoint threshold (<see cref="EnableDeferredCheckpoints"/>);
+    /// <see cref="int.MaxValue"/> disables the post-commit checkpoint.
+    /// </summary>
+    internal int DeferredCheckpointFrameThreshold
+    {
+        get
+        {
+            lock (_gate)
+                return _deferredCheckpointFrameThreshold;
+        }
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            lock (_gate)
+                _deferredCheckpointFrameThreshold = value;
+        }
+    }
+
+    /// <summary>SQLite's <c>journal_size_limit</c> for this database (-1: no limit).</summary>
+    internal long JournalSizeLimit { get; set; } = -1;
 
     private void TryCheckpointDeferredFramesBeforeClose()
     {
@@ -670,6 +716,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 _ownedCommittedGeneration = _fileStore.CommittedViewGeneration;
                 _ownedViewToken = _fileStore.CaptureCommittedViewToken();
+                _contentViewToken = _ownedViewToken;
                 return true;
             }
         }
@@ -718,7 +765,123 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// The owning connection sets this from its command timeout; zero fails
     /// fast, matching SQLite's default <c>busy_timeout</c>.
     /// </summary>
-    internal TimeSpan BusyTimeout { get; set; }
+    internal TimeSpan BusyTimeout
+    {
+        get => _busyTimeout;
+        set
+        {
+            _busyTimeout = value;
+            if (_fileStore is { } fileStore)
+                fileStore.PagerBusyTimeout = value;
+        }
+    }
+
+    private TimeSpan _busyTimeout;
+
+    /// <summary>The in-memory catalog version; it moves whenever the catalog is published or reloaded.</summary>
+    internal long CatalogVersion
+    {
+        get
+        {
+            lock (_gate)
+                return _version;
+        }
+    }
+
+    // The file write lock an explicit write transaction on this database holds until it ends
+    // (see SqlitePagerWriterReservation). Only the connection that owns this database's
+    // transaction lock takes it.
+    private SqlitePagerWriterReservation? _writerReservation;
+
+    /// <summary>
+    /// Takes the file write lock (WAL write lock or rollback-journal RESERVED) for an explicit
+    /// write transaction, waiting up to <paramref name="busyTimeout"/> for another connection or
+    /// process to release it. Without it, another process could write while the transaction is
+    /// open and its COMMIT would then fail busy.
+    /// </summary>
+    internal void AcquireFileWriterReservation(TimeSpan busyTimeout)
+    {
+        EmbeddedFileStore? fileStore;
+        lock (_gate)
+        {
+            if (_writerReservation is { IsHeld: true } || _readOnly || _mvStore is not null)
+                return;
+            fileStore = _fileStore;
+        }
+
+        if (fileStore is null || fileStore.IsExclusiveLockingMode)
+            return;
+
+        SqlitePagerWriterReservation reservation;
+        try
+        {
+            reservation = fileStore.ReserveWriter(busyTimeout);
+        }
+        catch (SqlitePagerBusyException exception)
+        {
+            throw new EmbeddedBusyException(exception);
+        }
+        catch (SqlitePagerClientOwnershipException exception)
+        {
+            throw new EmbeddedBusyException(exception);
+        }
+
+        lock (_gate)
+        {
+            var previous = _writerReservation;
+            _writerReservation = reservation;
+            previous?.Dispose();
+        }
+    }
+
+    /// <summary>Releases the explicit transaction's file write lock, if it still holds one.</summary>
+    internal void ReleaseFileWriterReservation()
+    {
+        SqlitePagerWriterReservation? reservation;
+        lock (_gate)
+        {
+            reservation = _writerReservation;
+            _writerReservation = null;
+        }
+
+        reservation?.Dispose();
+    }
+
+    /// <summary>
+    /// Whether another connection or process committed since this database's catalog was
+    /// loaded or last published. The catalog version alone cannot tell: SQLite in WAL mode does
+    /// not bump the header change counter, so a peer engine's data-only commit leaves the version
+    /// unchanged and is visible only as new WAL frames.
+    /// </summary>
+    private bool PeerCommittedSinceOwnedView()
+    {
+        // MVCC tracks concurrent writers through its own log and version checks.
+        if (_foreignReadOnly
+            || _mvStore is not null
+            || _fileStore is not { } fileStore
+            || fileStore.IsExclusiveLockingMode)
+        {
+            return false;
+        }
+
+        var current = fileStore.CaptureCommittedViewToken();
+        return current.ChangeCounter != _contentViewToken.ChangeCounter
+            || current.CommittedFrameCount != _contentViewToken.CommittedFrameCount
+            || current.WalSalt1 != _contentViewToken.WalSalt1
+            || current.WalSalt2 != _contentViewToken.WalSalt2
+            || current.CommittedPageCount != _contentViewToken.CommittedPageCount;
+    }
+
+    // The committed view this database's catalog matches, refreshed after every write this
+    // connection makes itself (including header, journal-mode, page-size and VACUUM writes that
+    // leave _ownedViewToken alone), so PeerCommittedSinceOwnedView only sees other writers.
+    private SqlitePagerViewToken _contentViewToken;
+
+    private void RecordOwnCommittedContent()
+    {
+        if (_fileStore is not null && !_foreignReadOnly)
+            _contentViewToken = _fileStore.CaptureCommittedViewToken();
+    }
 
     /// <summary>Re-reads the committed catalog after a stale-snapshot signal. Throws busy when the version cannot settle.</summary>
     /// <param name="forceReload">
@@ -4177,6 +4340,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    /// <summary>True when the schema holds any table, view, trigger or virtual table.</summary>
+    internal bool HasSchemaObjects()
+    {
+        lock (_gate)
+            return _tables.Count > 0 || _views.Count > 0 || _triggers.Count > 0 || _virtualTables.Count > 0;
+    }
+
     /// <summary>SQLite's auto-vacuum mode from page 1: 0 NONE, 1 FULL, 2 INCREMENTAL.</summary>
     internal int GetAutoVacuumMode()
     {
@@ -4739,6 +4909,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (_fileStore.JournalMode != SqliteJournalMode.Mvcc)
                     _ = _fileStore.SwitchJournalMode(SqliteJournalMode.Mvcc);
                 _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
+                RecordOwnCommittedContent();
             }
         }
 
@@ -4806,6 +4977,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 using var writeRegistration = RegisterCatalogWrite(_databasePath);
                 var result = _fileStore.SwitchJournalMode(journalMode);
                 _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
+                RecordOwnCommittedContent();
                 _version++;
                 return result;
             }
@@ -4854,6 +5026,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _fileStore.MigratePageSize(pageSize, _tables, _views, _triggers, _virtualTables);
                 _fileStore.AdoptCommittedTables(_tables);
                 _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
+                RecordOwnCommittedContent();
                 _version++;
             }
         }
@@ -4999,11 +5172,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 try
                 {
                     _fileCatalogVersion = _fileStore.UpdatePragmaHeader(updated);
+                    RecordOwnCommittedContent();
                     _version++;
                 }
                 catch (EmbeddedPostCommitMaintenanceException)
                 {
                     _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
+                    RecordOwnCommittedContent();
                     _version++;
                     throw;
                 }
@@ -5031,6 +5206,66 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool checkpointAfterCommit = true,
         IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null,
         uint maxPageCount = SqlitePageLimits.DefaultMaximumPageCount)
+    {
+        if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
+            throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+        // Writers take the file write lock before the in-process catalog gate and the
+        // cross-process catalog mutex, in that order, so a writer waiting for the lock never
+        // holds a gate the transaction that owns the lock needs for its own commit.
+        var fileStore = _fileStore;
+        using var temporaryReservation = _writerReservation is { IsHeld: true }
+            || _mvStore is not null
+            || !checkpointAfterCommit
+            || fileStore.IsExclusiveLockingMode
+                ? null
+                : ReserveWriterForPersist(fileStore, busyTimeout);
+        fileStore.AttachedWriterReservation = _writerReservation is { IsHeld: true }
+            ? _writerReservation
+            : temporaryReservation;
+        try
+        {
+            PersistFileCatalogUnderWriterLock(
+                catalog,
+                pragmaHeader,
+                forceFullRewrite,
+                busyTimeout,
+                checkpointAfterCommit,
+                targetedIndexRebuild,
+                maxPageCount);
+        }
+        finally
+        {
+            fileStore.AttachedWriterReservation = null;
+        }
+    }
+
+    private static SqlitePagerWriterReservation ReserveWriterForPersist(
+        EmbeddedFileStore fileStore,
+        TimeSpan busyTimeout)
+    {
+        try
+        {
+            return fileStore.ReserveWriter(busyTimeout);
+        }
+        catch (SqlitePagerBusyException exception)
+        {
+            throw new EmbeddedBusyException(exception);
+        }
+        catch (SqlitePagerClientOwnershipException exception)
+        {
+            throw new EmbeddedBusyException(exception);
+        }
+    }
+
+    private void PersistFileCatalogUnderWriterLock(
+        SchemaCatalog catalog,
+        PragmaHeaderMetadata? pragmaHeader,
+        bool forceFullRewrite,
+        TimeSpan busyTimeout,
+        bool checkpointAfterCommit,
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild,
+        uint maxPageCount)
     {
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -5091,7 +5326,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             if (TryReadFileCatalogVersion(out var durableVersion))
             {
-                if (durableVersion == _fileCatalogVersion)
+                if (durableVersion == _fileCatalogVersion && !PeerCommittedSinceOwnedView())
                     return;
                 break;
             }
@@ -5152,7 +5387,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return true;
 
         var durableVersion = ReadFileCatalogVersion(_fileSystem!, _databasePath);
-        if (!forceReload && durableVersion == _fileCatalogVersion)
+        if (!forceReload && durableVersion == _fileCatalogVersion && !PeerCommittedSinceOwnedView())
             return true;
 
         // Same adoption a pooled connection performs when it is handed out:
@@ -5179,6 +5414,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
 
             var previous = _fileStore!;
+            replacement.PagerBusyTimeout = _busyTimeout;
             _fileStore = replacement;
             replacement = null;
             RefreshCollationResolverBinding();
@@ -5320,6 +5556,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         try
         {
             var previous = _fileStore;
+            replacement.PagerBusyTimeout = _busyTimeout;
             _fileStore = replacement;
             replacement = null;
             RefreshCollationResolverBinding();
@@ -5416,6 +5653,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 try
                 {
                     var previous = _fileStore;
+                    replacement.PagerBusyTimeout = _busyTimeout;
                     _fileStore = replacement;
                     replacement = null;
                     RefreshCollationResolverBinding();
@@ -5525,6 +5763,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     }
 
                     var previous = _fileStore;
+                    replacement.PagerBusyTimeout = _busyTimeout;
                     _fileStore = replacement;
                     replacement = null;
                     RefreshCollationResolverBinding();
@@ -5590,6 +5829,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (!_foreignReadOnly)
             {
                 _ownedViewToken = _fileStore.CaptureCommittedViewToken();
+                _contentViewToken = _ownedViewToken;
                 _fileCatalogVersionViewToken = fileCatalogVersion is null
                     ? null
                     : _ownedViewToken;
@@ -14071,6 +14311,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             case LiteralExpression:
             case ParameterExpression:
+            case CurrentTimeExpression:
                 return;
             case RowValueExpression rowValue:
                 foreach (var value in rowValue.Values)
@@ -46180,7 +46421,7 @@ out bool hasReturning)
             var leftElement = GetExpressionElement(expression.Left, index);
             var rightElement = GetExpressionElement(expression.Right, index);
             ApplyComparisonAffinities(leftElement, rightElement, row, ref left, ref right, context);
-            var collation = GetComparisonCollation(leftElement, rightElement, row);
+            var collation = GetComparisonCollation(leftElement, rightElement, row, context);
 
             if (expression.Operator is BinaryOperator.Is or BinaryOperator.IsNot)
             {
@@ -52737,14 +52978,24 @@ out bool hasReturning)
     private static string? GetEffectiveCollation(Expression expression, QueryContext context) =>
         GetExplicitCollation(expression) ?? GetInheritedDeclaredCollation(expression, context);
 
+    // SQLite's sqlite3BinaryCompareCollSeq: an explicit COLLATE wins (left first); otherwise a
+    // column operand supplies its collation, again left first. A column with no declared
+    // collation is BINARY and still takes precedence over a NOCASE column on the right, and a
+    // CTE/subquery column counts as a column (the flattener tags its expression with its own
+    // collation, BINARY when it has none).
     private static string? GetComparisonCollation(
         Expression left,
         Expression right,
         QueryContext context) =>
         GetExplicitCollation(left)
             ?? GetExplicitCollation(right)
-            ?? GetInheritedDeclaredCollation(left, context)
-            ?? GetInheritedDeclaredCollation(right, context);
+            ?? GetColumnOperandCollation(left, context)
+            ?? GetColumnOperandCollation(right, context);
+
+    private static string? GetColumnOperandCollation(Expression expression, QueryContext context)
+        => TryGetInheritedDeclaredCollation(expression, context, out var collation)
+            ? collation ?? "BINARY"
+            : null;
 
     private static string? GetExplicitCollation(Expression? expression)
     {
@@ -52788,7 +53039,19 @@ out bool hasReturning)
     private static string? GetInheritedDeclaredCollation(
         Expression expression,
         QueryContext context)
+        => TryGetInheritedDeclaredCollation(expression, context, out var collation) ? collation : null;
+
+    /// <summary>
+    /// Resolves a column operand (through CASTs) against the collation scopes. Returns
+    /// <see langword="true"/> when the operand is a known column, with
+    /// <paramref name="collation"/> <see langword="null"/> when it declares none.
+    /// </summary>
+    private static bool TryGetInheritedDeclaredCollation(
+        Expression expression,
+        QueryContext context,
+        out string? collation)
     {
+        collation = null;
         var column = expression switch
         {
             ColumnExpression direct => direct,
@@ -52797,13 +53060,12 @@ out bool hasReturning)
         };
         if (column is null)
             return expression is CastExpression cast
-                ? GetInheritedDeclaredCollation(cast.Expression, context)
-                : null;
+                && TryGetInheritedDeclaredCollation(cast.Expression, context, out collation);
 
         if (context.CollationScope is not null
-            && context.CollationScope.TryGetValue(column.Name, out var collation))
+            && context.CollationScope.TryGetValue(column.Name, out collation))
         {
-            return collation;
+            return true;
         }
 
         if (context.OuterCollationScopes is not null)
@@ -52811,11 +53073,12 @@ out bool hasReturning)
             foreach (var scope in context.OuterCollationScopes)
             {
                 if (scope.TryGetValue(column.Name, out collation))
-                    return collation;
+                    return true;
             }
         }
 
-        return null;
+        collation = null;
+        return false;
     }
 
     private static QueryContext EnterCollationSource(QueryContext context, TableSource? source)
@@ -53061,24 +53324,31 @@ out bool hasReturning)
     private static string? GetComparisonCollation(
         Expression leftExpression,
         Expression? rightExpression,
-        SourceRow? row)
+        SourceRow? row,
+        QueryContext? context = null)
     {
         return GetCollation(leftExpression)
             ?? (rightExpression is null ? null : GetCollation(rightExpression))
-            ?? GetDeclaredCollation(leftExpression, row)
-            ?? (rightExpression is null ? null : GetDeclaredCollation(rightExpression, row));
+            ?? GetDeclaredCollation(leftExpression, row, context)
+            ?? (rightExpression is null ? null : GetDeclaredCollation(rightExpression, row, context));
     }
 
-    private static string? GetDeclaredCollation(Expression expression, SourceRow? row)
+    private static string? GetDeclaredCollation(Expression expression, SourceRow? row, QueryContext? context = null)
     {
         while (expression is CollationExpression collation)
             expression = collation.Expression;
         if (expression is CastExpression cast)
-            return GetDeclaredCollation(cast.Expression, row);
-        return expression is ColumnExpression column
-            && row?.GetColumnDefinition(column) is { } definition
-                ? NormalizeDeclaredCollation(definition.Collation)
-                : null;
+            return GetDeclaredCollation(cast.Expression, row, context);
+        if (expression is not ColumnExpression column)
+            return null;
+
+        // A column without a declared collation is BINARY and, like SQLite, still takes
+        // precedence over the other operand's collation (see GetComparisonCollation). CTE and
+        // subquery rows carry no column definitions, so their columns resolve through the
+        // query's collation scope instead.
+        if (row?.GetColumnDefinition(column) is { } definition)
+            return NormalizeDeclaredCollation(definition.Collation) ?? "BINARY";
+        return context is not null ? GetColumnOperandCollation(column, context) : null;
     }
 
     private void ValidateOrderByCollations(IReadOnlyList<OrderByTerm> orderBy)
@@ -61385,6 +61655,10 @@ public sealed partial class EmbeddedConnection : IDisposable
     private bool _ignoreCheckConstraints;
     private readonly Dictionary<EmbeddedDatabase, SqliteSynchronousMode> _synchronousModes = [];
     private readonly Dictionary<EmbeddedDatabase, string> _lockingModes = [];
+
+    // Databases switched to locking_mode=EXCLUSIVE whose exclusive lock was busy when the pragma
+    // ran: like SQLite, the lock is taken on the next access, which reports SQLITE_BUSY instead.
+    private readonly HashSet<EmbeddedDatabase> _pendingExclusiveLockingModes = [];
     private bool _dataSyncRetry;
     private bool _fullColumnNames;
     private bool _shortColumnNames = true;
@@ -62641,7 +62915,7 @@ public sealed partial class EmbeddedConnection : IDisposable
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         ThrowIfInsideHookCallback();
-        var (parameterMap, statement) = ParseCached(sql);
+        var (parameterMap, statement) = ParseAgainstCurrentSchema(sql);
         if (statement is CreateTypeStatement or CreateDomainStatement && !ExperimentalCustomTypesEnabled)
             throw new EmbeddedSqlException("Custom types are experimental and are not enabled for this connection.");
         if (_hooks.Authorizer is not null)
@@ -62664,8 +62938,44 @@ public sealed partial class EmbeddedConnection : IDisposable
         ParsedStatement Statement,
         (string Name, bool Known)[] NameProbes);
 
-    private (SqlParameterMap ParameterMap, ParsedStatement Statement) ParseCached(string sql)
+    /// <summary>
+    /// Parses <paramref name="sql"/> against the committed schema. The parse asks whether names
+    /// are tables or views; when it met an unknown name (or failed), another connection may have
+    /// created it since this connection last read the schema, which the statement-level refresh
+    /// only adopts at execution. Outside a transaction, adopt it now and parse again, as SQLite
+    /// re-reads a changed schema before preparing.
+    /// </summary>
+    private (SqlParameterMap ParameterMap, ParsedStatement Statement) ParseAgainstCurrentSchema(string sql)
     {
+        var canRefresh = _transactionDatabases is null && _transactionMutationDatabase is null;
+        try
+        {
+            var parsed = ParseCached(sql, out var consultedUnknownName);
+            if (!consultedUnknownName || !canRefresh || !RefreshCatalogsBeforePrepare())
+                return parsed;
+        }
+        catch (EmbeddedSqlException) when (canRefresh && RefreshCatalogsBeforePrepare())
+        {
+        }
+
+        return ParseCached(sql, out _);
+    }
+
+    /// <summary>Adopts peers' committed schema changes; true when the catalog was reloaded.</summary>
+    private bool RefreshCatalogsBeforePrepare()
+    {
+        var before = _database.CatalogVersion;
+        _database.RefreshForeignCatalogForStatementIfNeeded();
+        _database.RefreshOwnedCatalogForStatementIfNeeded();
+        return _database.CatalogVersion != before;
+    }
+
+    private (SqlParameterMap ParameterMap, ParsedStatement Statement) ParseCached(string sql)
+        => ParseCached(sql, out _);
+
+    private (SqlParameterMap ParameterMap, ParsedStatement Statement) ParseCached(string sql, out bool consultedUnknownName)
+    {
+        consultedUnknownName = false;
         CachedParse? cached;
         lock (_parseCache)
             _parseCache.TryGetValue(sql, out cached);
@@ -62682,7 +62992,10 @@ public sealed partial class EmbeddedConnection : IDisposable
             }
 
             if (current)
+            {
+                consultedUnknownName = cached.NameProbes.Any(static probe => !probe.Known);
                 return (cached.ParameterMap, cached.Statement);
+            }
         }
 
         var probes = new List<(string Name, bool Known)>();
@@ -62700,6 +63013,7 @@ public sealed partial class EmbeddedConnection : IDisposable
             _parseCache[sql] = new CachedParse(parameterMap, statement, [.. probes]);
         }
 
+        consultedUnknownName = probes.Any(static probe => !probe.Known);
         return (parameterMap, statement);
     }
 
@@ -63411,6 +63725,9 @@ public sealed partial class EmbeddedConnection : IDisposable
             BeginConcurrentSchemaChange();
         }
 
+        if (_pendingExclusiveLockingModes.Count != 0 && statement is not PragmaLockingModeStatement)
+            AcquirePendingExclusiveLockingModes();
+
         if (_transactionDatabases is null && !ReadsOnlyConnectionState(statement))
         {
             _database.RefreshForeignCatalogForStatementIfNeeded();
@@ -63541,6 +63858,10 @@ public sealed partial class EmbeddedConnection : IDisposable
                 // SQLite silently ignores unrecognized pragmas (Turso falls through its
                 // translate switch without emitting anything).
                 return ExecutionResult.Empty;
+            case PragmaWalAutocheckpointStatement walAutocheckpoint:
+                return ExecutePragmaWalAutocheckpoint(walAutocheckpoint);
+            case PragmaJournalSizeLimitStatement journalSizeLimit:
+                return ExecutePragmaJournalSizeLimit(journalSizeLimit);
             case VacuumStatement vacuum:
                 return ExecuteVacuum(vacuum, parameters);
             case CreateTableAsSelectStatement createTableAs:
@@ -67850,7 +68171,9 @@ Func<string, ParsedStatement> rewrite)
         {
             throw new EmbeddedSqlException($"Managed ATTACH URI has unsupported access mode '{mode}'.");
         }
-        if (requireExisting && (!_database.FileSystem.FileExists(path) || !_database.FileSystem.FileExists(path + "-wal")))
+        // SQLite only needs the database file itself: a WAL-mode database closed cleanly has no
+        // -wal (the last connection checkpoints and removes it).
+        if (requireExisting && !_database.FileSystem.FileExists(path))
             throw new EmbeddedSqlException($"unable to open database file: {path}");
 
         // Turso connection.rs from_uri_attached: cipher and hexkey must be given together.
@@ -68184,6 +68507,9 @@ Func<string, ParsedStatement> rewrite)
                                      && database.ExclusiveTransactionsExcludeReaders;
                 database.TransactionLock.Enter(this, excludeReaders, BusyTimeout);
                 _writeReservations.Add(database);
+                // SQLite's BEGIN IMMEDIATE takes RESERVED (the WAL write lock in WAL mode) up
+                // front, which also excludes writers in other processes.
+                database.AcquireFileWriterReservation(BusyTimeout);
             }
         }
         catch
@@ -68204,12 +68530,36 @@ Func<string, ParsedStatement> rewrite)
 
         database.TransactionLock.Enter(this, excludeReaders: false, BusyTimeout);
         _writeReservations.Add(database);
+        try
+        {
+            // SQLite escalates a deferred transaction to RESERVED (the WAL write lock) at its
+            // first write and keeps it until the transaction ends, which also excludes writers in
+            // other processes. A snapshot another connection made stale before this point still
+            // fails at COMMIT, as the managed engine pins snapshots at BEGIN.
+            database.AcquireFileWriterReservation(BusyTimeout);
+        }
+        catch
+        {
+            database.ReleaseFileWriterReservation();
+            _writeReservations.Remove(database);
+            database.TransactionLock.Exit(this);
+            throw;
+        }
     }
 
     private void ReleaseTransactionWriteReservations()
     {
         for (var index = _writeReservations.Count - 1; index >= 0; index--)
-            _writeReservations[index].TransactionLock.Exit(this);
+        {
+            try
+            {
+                _writeReservations[index].ReleaseFileWriterReservation();
+            }
+            finally
+            {
+                _writeReservations[index].TransactionLock.Exit(this);
+            }
+        }
         _writeReservations.Clear();
         foreach (var admission in _classicMvccWriteAdmissions.Values)
             admission.Dispose();
@@ -69479,6 +69829,46 @@ Func<string, ParsedStatement> rewrite)
         return new ExecutionResult(columns, [[SqlValue.Integer(0), SqlValue.Integer(0), SqlValue.Integer(0)]], 0);
     }
 
+    /// <summary>
+    /// SQLite's <c>wal_autocheckpoint</c>: a commit checkpoints once more than N frames wait in
+    /// the WAL; zero or a negative value turns the automatic checkpoint off (closing the last
+    /// connection still checkpoints). It drives the same deferred-checkpoint threshold Turso's
+    /// auto-checkpoint uses (default 1000).
+    /// </summary>
+    private ExecutionResult ExecutePragmaWalAutocheckpoint(PragmaWalAutocheckpointStatement statement)
+    {
+        var database = ResolvePragmaDatabase(statement.Schema);
+        if (statement.Value is { } value)
+        {
+            database.DeferredCheckpointFrameThreshold = value <= 0
+                ? int.MaxValue
+                : (int)Math.Min(value, int.MaxValue - 1);
+        }
+
+        var threshold = database.DeferredCheckpointFrameThreshold;
+        long reported = threshold switch
+        {
+            int.MaxValue => 0,
+            0 => 1,
+            _ => threshold,
+        };
+        return new ExecutionResult(["wal_autocheckpoint"], [[SqlValue.Integer(reported)]], 0);
+    }
+
+    /// <summary>
+    /// SQLite's <c>journal_size_limit</c> (bytes, -1 for no limit). The managed engine already
+    /// truncates the WAL to its header whenever a checkpoint resets it and deletes the rollback
+    /// journal after each commit, so the limit is recorded and reported only.
+    /// </summary>
+    private ExecutionResult ExecutePragmaJournalSizeLimit(PragmaJournalSizeLimitStatement statement)
+    {
+        var database = ResolvePragmaDatabase(statement.Schema);
+        if (statement.Value is { } value)
+            database.JournalSizeLimit = value < -1 ? -1 : value;
+
+        return new ExecutionResult(["journal_size_limit"], [[SqlValue.Integer(database.JournalSizeLimit)]], 0);
+    }
+
     private ExecutionResult ExecutePragmaBusyTimeout(PragmaBusyTimeoutStatement statement)
     {
         ValidatePragmaSchema(statement.Schema);
@@ -69544,17 +69934,66 @@ Func<string, ParsedStatement> rewrite)
             && statement.Value.Equals("exclusive", StringComparison.OrdinalIgnoreCase)
             && lockingMode == "normal")
         {
-            lockingMode = database.SetConnectionExclusiveLockingMode(exclusive: true, BusyTimeout)
-                ? "exclusive"
-                : "normal";
+            if (_pendingExclusiveLockingModes.Contains(database))
+            {
+                lockingMode = "exclusive";
+            }
+            else
+            {
+                try
+                {
+                    lockingMode = database.SetConnectionExclusiveLockingMode(exclusive: true, BusyTimeout)
+                        ? "exclusive"
+                        : "normal";
+                }
+                catch (Exception exception) when (exception is ISqliteStorageBusyException or EmbeddedBusyException)
+                {
+                    // SQLite records the mode and takes the lock lazily on the next access, so the
+                    // pragma itself succeeds and that access reports SQLITE_BUSY.
+                    _pendingExclusiveLockingModes.Add(database);
+                    return new ExecutionResult(["locking_mode"], [[SqlValue.Text("exclusive")]], 0);
+                }
+            }
         }
+        else if (statement.Value is not null
+            && statement.Value.Equals("normal", StringComparison.OrdinalIgnoreCase)
+            && _pendingExclusiveLockingModes.Remove(database))
+        {
+            lockingMode = "normal";
+        }
+
+        if (statement.Value is null && _pendingExclusiveLockingModes.Contains(database))
+            return new ExecutionResult(["locking_mode"], [[SqlValue.Text("exclusive")]], 0);
 
         _lockingModes[database] = lockingMode;
         return new ExecutionResult(["locking_mode"], [[SqlValue.Text(lockingMode)]], 0);
     }
 
+    private void AcquirePendingExclusiveLockingModes()
+    {
+        foreach (var database in _pendingExclusiveLockingModes.ToArray())
+        {
+            bool acquired;
+            try
+            {
+                acquired = database.SetConnectionExclusiveLockingMode(exclusive: true, BusyTimeout);
+            }
+            catch (Exception exception) when (exception is ISqliteStorageBusyException)
+            {
+                throw new EmbeddedBusyException(exception);
+            }
+
+            if (!acquired)
+                throw new EmbeddedBusyException();
+
+            _pendingExclusiveLockingModes.Remove(database);
+            _lockingModes[database] = "exclusive";
+        }
+    }
+
     private void ReleaseExclusiveLockingMode(EmbeddedDatabase database)
     {
+        _pendingExclusiveLockingModes.Remove(database);
         if (!_lockingModes.Remove(database, out var lockingMode)
             || !lockingMode.Equals("exclusive", StringComparison.Ordinal))
         {
@@ -69575,6 +70014,7 @@ Func<string, ParsedStatement> rewrite)
         }
 
         _lockingModes.Clear();
+        _pendingExclusiveLockingModes.Clear();
     }
 
     private ExecutionResult ExecutePragmaAutoVacuum(PragmaAutoVacuumStatement statement)
@@ -69594,7 +70034,17 @@ Func<string, ParsedStatement> rewrite)
         // 2/INCREMENTAL) and treats both the same; NONE only restates the state the database
         // is already in, so it is accepted (and, like SQLite once page 1 exists, has no effect),
         // while FULL, INCREMENTAL and any unrecognized value fail with the flag diagnostic.
-        if (ParseAutoVacuumMode(statement.Value) != 0)
+        var requestedMode = ParseAutoVacuumMode(statement.Value);
+        if (requestedMode is 1 or 2 && ResolvePragmaDatabase(statement.Schema).HasSchemaObjects())
+        {
+            // SQLite (pragma.c) cannot switch a database that already holds tables between NONE
+            // and FULL/INCREMENTAL: it only records the request for the next VACUUM and returns
+            // without an error. Schema upgrade scripts rely on that, so the request is accepted as
+            // the same no-op here; the managed VACUUM keeps auto-vacuum off.
+            return ExecutionResult.Empty;
+        }
+
+        if (requestedMode != 0)
         {
             throw new EmbeddedSqlException(
                 "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.");
@@ -69929,8 +70379,10 @@ Func<string, ParsedStatement> rewrite)
         }
 
         // VACUUM rewrites the whole database, so it has to lose to a connection
-        // holding a write transaction just like any other write.
-        ReserveWriteAccess(database);
+        // holding a write transaction just like any other write. VACUUM INTO only reads the
+        // source (a committed snapshot, as in SQLite), so a concurrent writer does not block it.
+        if (statement.Into is null)
+            ReserveWriteAccess(database);
 
         int? pendingPageSize = _pendingPageSizes.TryGetValue(database, out var pendingPageSizeValue)
             ? pendingPageSizeValue
@@ -70016,6 +70468,16 @@ Func<string, ParsedStatement> rewrite)
     internal string[] DescribeColumns(ParsedStatement statement)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
+        // Describing a query resolves its tables before execution adopts other connections'
+        // commits, so a table another connection just created would read as missing.
+        if (statement is QueryStatement
+            && _transactionDatabases is null
+            && _transactionMutationDatabase is null)
+        {
+            _database.RefreshForeignCatalogForStatementIfNeeded();
+            _database.RefreshOwnedCatalogForStatementIfNeeded();
+        }
+
         if (statement is ExplainStatement)
             return EmbeddedDatabase.ExplainColumns();
         if (statement is ExplainQueryPlanStatement)
@@ -70087,6 +70549,10 @@ Func<string, ParsedStatement> rewrite)
             return ["busy", "log", "checkpointed"];
         if (statement is PragmaBusyTimeoutStatement { Value: null })
             return ["busy_timeout"];
+        if (statement is PragmaWalAutocheckpointStatement)
+            return ["wal_autocheckpoint"];
+        if (statement is PragmaJournalSizeLimitStatement)
+            return ["journal_size_limit"];
         if (statement is PragmaSynchronousStatement { Value: null })
             return ["synchronous"];
         if (statement is PragmaLockingModeStatement)
@@ -70565,6 +71031,8 @@ public sealed class EmbeddedStatement : IDisposable
             || _statement is PragmaTempStoreStatement { Value: null }
             || _statement is PragmaWalCheckpointStatement
             || _statement is PragmaBusyTimeoutStatement { Value: null }
+            || _statement is PragmaWalAutocheckpointStatement
+            || _statement is PragmaJournalSizeLimitStatement
             || _statement is PragmaEncryptionStatement { Value: null }
             || _statement is PragmaMvccGroupCommitStatement { Enabled: null }
             || _statement is PragmaFtsMergeThresholdStatement { Value: null }

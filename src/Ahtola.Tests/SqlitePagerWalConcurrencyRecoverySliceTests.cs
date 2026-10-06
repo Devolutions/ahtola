@@ -106,23 +106,21 @@ public class SqlitePagerWalConcurrencyRecoverySliceTests
 
         try
         {
-            // Writable open takes WAL_WRITE_LOCK briefly for recovery. With the
-            // parent holding the writer, zero-timeout open is immediately busy —
-            // signal that, then retry open until the parent releases.
-            var openBusy = Assert.Throws<SqlitePagerBusyException>(() => SqlitePager.Open(
-                PhysicalFileSystem.Instance,
-                databasePath,
-                databasePath + "-wal",
-                busyTimeout: TimeSpan.Zero));
-            openBusy!.Operation.Should().Be(SqlitePagerLockOperation.Writer);
-            File.WriteAllText(waitingPath, "waiting");
-
+            // Like SQLite, a writable open does not need WAL_WRITE_LOCK while another process
+            // holds it: it opens as a reader and leaves the live writer's WAL tail alone. Writing
+            // is what has to wait, so a zero-timeout write is immediately busy — signal that,
+            // then retry the write until the parent releases.
             using var pager = SqlitePager.Open(
                 PhysicalFileSystem.Instance,
                 databasePath,
                 databasePath + "-wal",
-                busyTimeout: TimeSpan.FromSeconds(5));
-            using var transaction = pager.BeginTransaction(targetDatabaseSizeInPages: 1, TimeSpan.Zero);
+                busyTimeout: TimeSpan.Zero);
+            var writeBusy = Assert.Throws<SqlitePagerBusyException>(
+                () => pager.BeginTransaction(targetDatabaseSizeInPages: 1, TimeSpan.Zero));
+            writeBusy!.Operation.Should().Be(SqlitePagerLockOperation.Writer);
+            File.WriteAllText(waitingPath, "waiting");
+
+            using var transaction = pager.BeginTransaction(targetDatabaseSizeInPages: 1, TimeSpan.FromSeconds(5));
             transaction.Rollback();
             File.WriteAllText(resultPath, "acquired");
         }

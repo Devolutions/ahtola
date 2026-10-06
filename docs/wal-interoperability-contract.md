@@ -253,18 +253,31 @@ managed in-memory database share.
 - EXCLUSIVE takes it at `BEGIN` and additionally excludes other connections'
   reads, but only when the database's journal mode is a rollback journal. In WAL
   mode SQLite's EXCLUSIVE does not block readers, and neither does this.
-- Autocommit statements do not take the reservation - they are already serialized
-  by the owning database - but a write does fail busy when another connection is
-  holding one, which is what SQLite reports.
+- Autocommit writes take the reservation for the duration of the statement
+  (`EnterAutocommit`), so they serialize with explicit-transaction writers.
 - Contention throws `EmbeddedBusyException` ("database is locked"), surfaced as
-  `SqliteException` with `SqliteErrorCode` 5. There is no busy timeout, matching
-  SQLite's default `busy_timeout=0`.
+  `SqliteException` with `SqliteErrorCode` 5. Waits honour the connection's busy
+  timeout (`Default Timeout`, or `PRAGMA busy_timeout`).
 
-This SQL-layer reservation remains independent of the cross-process pager
-protocol. The pager holds its process-local writer lease and, in DELETE mode,
-main-file SHARED + RESERVED from pager transaction begin through commit,
-rollback, or disposal. PENDING + EXCLUSIVE are added only at commit. WAL mode
-continues to use its existing `-shm` writer protocol.
+Whenever a connection takes the SQL-layer reservation for an explicit transaction
+(IMMEDIATE/EXCLUSIVE at `BEGIN`, DEFERRED at its first write) it also takes the
+cross-process write lock and keeps it until the transaction ends
+(`SqlitePagerWriterReservation`): the WAL write lock (`-shm` byte 120) in WAL mode,
+or main-file SHARED + RESERVED in DELETE mode, plus the process-local writer
+role. Other connections and processes therefore cannot write while the
+transaction is open, exactly as with SQLite's RESERVED lock. The commit's pager
+transaction borrows that lock instead of acquiring it; a successful commit
+releases it, while a commit that fails busy (for example on the DELETE-mode
+EXCLUSIVE upgrade, which drops PENDING again) hands it back so the transaction can
+retry `COMMIT`. Autocommit persists take the same lock just before the commit, and
+every writer takes it *before* the in-process catalog gate and the cross-process
+catalog mutex, so a writer waiting for the lock never holds a gate the lock owner
+needs. Waiting for RESERVED in DELETE mode never holds SHARED (SQLite's deadlock
+rule). While a reservation is held, other writers and checkpoints in the process
+fail busy at once instead of queueing behind it. All pager lock waits honour the
+connection's busy timeout. A read-write open that finds the WAL write lock taken
+opens under a reader lock and leaves the live writer's WAL tail and index alone,
+so opening never waits for another process's write transaction.
 
 The resulting classic-model contract is:
 

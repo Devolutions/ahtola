@@ -10,11 +10,11 @@ namespace Ahtola.Core.Parsing;
 internal static class AlterTableSqlRewriter
 {
     /// <summary>
-    /// Inserts the added column definition immediately after the last existing column
-    /// definition, the way SQLite's token edit does: a table constraint may only follow column
-    /// definitions, so the new column lands before the first table constraint (or before the
-    /// closing parenthesis when there is none). Returns <see langword="null"/> when the stored
-    /// text cannot be reparsed.
+    /// Inserts <c>", " + column</c> exactly where SQLite's token edit does (its
+    /// <c>addColOffset</c>): right before the comma that opens the table constraints, or right
+    /// before the closing parenthesis when there are none. The surrounding text, including line
+    /// breaks, stays byte-identical to what SQLite stores. Returns <see langword="null"/> when the
+    /// stored text cannot be reparsed.
     /// </summary>
     public static string? InsertAddedColumn(string sql, string columnSql)
     {
@@ -35,16 +35,21 @@ internal static class AlterTableSqlRewriter
             return null;
 
         // When table constraints follow the columns, the last column's recorded extent ends
-        // right after its separating comma; insert "column, " there to keep constraints last.
+        // after its separating comma: that comma opens the constraint list, and SQLite inserts
+        // the new column right before it.
         if (statement.Columns.Count > 0
             && spans.GetDefinitionExtent(statement.Columns[^1]) is { } lastColumnExtent
             && lastColumnExtent.End < closeParen.Start)
         {
+            var comma = sql.LastIndexOf(',', lastColumnExtent.End - 1, lastColumnExtent.End - lastColumnExtent.Start);
+            if (comma < 0)
+                return null;
+
             return string.Concat(
-                sql.AsSpan(0, lastColumnExtent.End),
-                columnSql,
+                sql.AsSpan(0, comma),
                 ", ",
-                sql.AsSpan(lastColumnExtent.End));
+                columnSql,
+                sql.AsSpan(comma));
         }
 
         return string.Concat(

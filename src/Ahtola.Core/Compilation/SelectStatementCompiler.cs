@@ -1845,10 +1845,14 @@ internal sealed class SelectStatementCompiler
             if (column is null || _target?.ColumnDefinitions is null)
                 return null;
 
+            // A column without a declared collation is BINARY and still takes precedence over
+            // the other operand's collation, as in SQLite's sqlite3BinaryCompareCollSeq.
             var index = _target.ResolveColumnIndex(column.Name);
-            return index is { } value && value < _target.ColumnDefinitions.Count
-                ? _target.ColumnDefinitions[value]?.Collation
-                : null;
+            return index is { } value
+                && value < _target.ColumnDefinitions.Count
+                && _target.ColumnDefinitions[value] is { } definition
+                    ? definition.Collation ?? "BINARY"
+                    : null;
         }
 
         private static Expression UnwrapCollation(Expression expression)

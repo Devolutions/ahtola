@@ -547,6 +547,15 @@ public class ManagedFileStorageTests
                 ((IDisposable)database).Dispose();
             }
 
+            // Closing the last connection removes an empty WAL, as SQLite does; recreate the
+            // orphan a process that died before closing would have left behind.
+            if (!File.Exists(path + "-wal"))
+            {
+                File.WriteAllBytes(
+                    path + "-wal",
+                    SqliteWalHeader.Create(SqlitePageSize.Default, 0x1122_3344, 0x5566_7788).ToArray());
+            }
+
             File.Delete(path);
             File.Exists(path).Should().BeFalse();
             File.Exists(path + "-wal").Should().BeTrue("the orphaned WAL outlives the main file");

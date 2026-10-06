@@ -6,7 +6,7 @@ namespace Ahtola.Core.Storage;
 /// Raised when every SQLite WAL read-mark slot remains unavailable while a
 /// detached read snapshot is being established.
 /// </summary>
-public sealed class SqliteWalReadSnapshotBusyException : InvalidOperationException
+public sealed class SqliteWalReadSnapshotBusyException : InvalidOperationException, ISqliteStorageBusyException
 {
     internal SqliteWalReadSnapshotBusyException(TimeSpan timeout)
         : base($"SQLite WAL read-mark locks could not establish a read snapshot within {timeout}.")
