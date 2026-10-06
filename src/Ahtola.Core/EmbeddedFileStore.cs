@@ -1213,6 +1213,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 Array.Fill(row, SqlValue.Null);
                 for (var position = 0; position < index.Columns.Count; position++)
                     row[index.Columns[position].ColumnIndex] = indexValues[position];
+                ApplyStoredRealAffinity(table, row);
             }
             else
             {
@@ -1385,6 +1386,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 Array.Fill(row, SqlValue.Null);
                 for (var position = 0; position < index.Columns.Count; position++)
                     row[index.Columns[position].ColumnIndex] = indexValues[position];
+                ApplyStoredRealAffinity(table, row);
             }
             else
             {
@@ -3023,7 +3025,119 @@ internal sealed class EmbeddedFileStore : IDisposable
             source++;
         }
 
+        ApplyStoredRealAffinity(table, row);
         return row;
+    }
+
+    /// <summary>
+    /// Reads a stored INTEGER in a REAL-affinity column back as REAL. SQLite writes an integral
+    /// REAL value (2.0) in its integer form and converts it on every read (OP_RealAffinity after
+    /// OP_Column; turso-src/core/vdbe/execute.rs op_real_affinity), so typeof() is 'real' and a
+    /// data reader yields a double. Without this, rows decoded from a SQLite-written page kept
+    /// the integer storage class.
+    /// </summary>
+    internal static void ApplyStoredRealAffinity(EmbeddedTable table, SqlValue[] row)
+    {
+        foreach (var columnIndex in table.GetRealAffinityColumns())
+        {
+            if (columnIndex < row.Length && row[columnIndex].Kind == SqlValueKind.Integer)
+                row[columnIndex] = SqlValue.Real(row[columnIndex].AsInteger());
+        }
+    }
+
+    /// <summary>
+    /// The on-disk form of a REAL-affinity value: SQLite's OP_MakeRecord stores a REAL that is
+    /// exactly an integer of magnitude below 2^51 (sqlite3RealSameAsInt, zero of either sign
+    /// included) in integer form, which <see cref="ApplyStoredRealAffinity"/> turns back into
+    /// REAL on read. Writing the same form keeps records byte-identical to SQLite's and keeps a
+    /// rewritten row from growing (an 8-byte float where SQLite stored a small integer would
+    /// overflow full leaves on ordinary UPDATEs).
+    /// </summary>
+    internal static SqlValue ToStoredRealForm(SqlValue value)
+    {
+        if (value.Kind != SqlValueKind.Real)
+            return value;
+
+        var real = value.AsReal();
+        if (real == 0)
+            return SqlValue.Integer(0);
+        const double Limit = 2251799813685248d; // 2^51
+        if (real >= -Limit && real < Limit)
+        {
+            var integer = (long)real;
+            if ((double)integer == real)
+                return SqlValue.Integer(integer);
+        }
+
+        return value;
+    }
+
+    private static bool IsRealAffinityColumn(EmbeddedTable table, int columnIndex)
+        => Array.IndexOf(table.GetRealAffinityColumns(), columnIndex) >= 0;
+
+    private static IReadOnlyList<SqlValue> ToStoredRealForm(EmbeddedTable table, IReadOnlyList<SqlValue> row)
+    {
+        SqlValue[]? converted = null;
+        foreach (var columnIndex in table.GetRealAffinityColumns())
+        {
+            if (columnIndex >= row.Count)
+                continue;
+            var stored = ToStoredRealForm(row[columnIndex]);
+            if (stored.Kind == row[columnIndex].Kind)
+                continue;
+            converted ??= [.. row];
+            converted[columnIndex] = stored;
+        }
+
+        return converted ?? row;
+    }
+
+    // Index keys take the stored form for plain REAL-affinity columns only: an expression term's
+    // value is whatever the expression produced, which SQLite records without column affinity.
+    private static void ConvertIndexKeyToStoredRealForm(EmbeddedTable table, EmbeddedIndex index, SqlValue[] values)
+    {
+        for (var position = 0; position < index.Columns.Count && position < values.Length; position++)
+        {
+            var term = index.Columns[position];
+            if (!term.IsExpression && term.ColumnIndex >= 0 && IsRealAffinityColumn(table, term.ColumnIndex))
+                values[position] = ToStoredRealForm(values[position]);
+        }
+    }
+
+    // Records written before stored values took SQLite's form encode an integral REAL as an
+    // 8-byte float, so a stored record may differ from the rebuilt one in exactly that
+    // representation (in either direction) and still hold the same values.
+    private bool RecordsHoldSameValues(byte[] stored, byte[] rebuilt)
+    {
+        if (stored.AsSpan().SequenceEqual(rebuilt))
+            return true;
+
+        var storedValues = SqliteRecordCodec.Decode(stored, _textEncoding);
+        var rebuiltValues = SqliteRecordCodec.Decode(rebuilt, _textEncoding);
+        if (storedValues.Length != rebuiltValues.Length)
+            return false;
+
+        for (var index = 0; index < storedValues.Length; index++)
+        {
+            var left = storedValues[index];
+            var right = rebuiltValues[index];
+            if ((left.Kind, right.Kind) is (SqlValueKind.Integer, SqlValueKind.Real) or (SqlValueKind.Real, SqlValueKind.Integer))
+            {
+                var integer = left.Kind == SqlValueKind.Integer ? left : right;
+                var real = left.Kind == SqlValueKind.Real ? left : right;
+                if ((double)integer.AsInteger() != real.AsReal())
+                    return false;
+                continue;
+            }
+
+            if (!SqliteRecordCodec.Encode([left], _textEncoding).AsSpan()
+                    .SequenceEqual(SqliteRecordCodec.Encode([right], _textEncoding)))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -3040,7 +3154,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool forceFullRewrite = false,
         IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
         IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null,
-        uint maximumPageCount = SqlitePageLimits.DefaultMaximumPageCount)
+        uint maximumPageCount = SqlitePageLimits.DefaultMaximumPageCount,
+        bool unchangedRowsAreDurable = false)
         => WithGrowthCeiling(
             maximumPageCount,
             () => PersistCore(
@@ -3053,7 +3168,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 pragmaHeader,
                 forceFullRewrite,
                 previousTables,
-                targetedIndexRebuild: targetedIndexRebuild));
+                targetedIndexRebuild: targetedIndexRebuild,
+                unchangedRowsAreDurable: unchangedRowsAreDurable));
 
     /// <summary>
     /// Materializes an MVCC checkpoint into pager WAL pages without reclaiming
@@ -3526,7 +3642,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null,
         bool checkpointAfterCommit = true,
         SqliteDatabaseHeader? vacuumSourceHeader = null,
-        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null)
+        IReadOnlyList<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>? targetedIndexRebuild = null,
+        bool unchangedRowsAreDurable = false)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -3564,7 +3681,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                     triggers,
                     virtualTables,
                     previousTables,
-                    checkpointAfterCommit))
+                    checkpointAfterCommit,
+                    unchangedRowsAreDurable))
             {
                 _committedTables = tables;
                 return CommittedCatalogVersion;
@@ -4059,12 +4177,32 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    /// <summary>The number of changed rows above which a complete rewrite is preferred.</summary>
+    /// <summary>
+    /// The minimum number of changed rows the incremental path accepts before a complete rewrite
+    /// is preferred; larger databases scale it (see <see cref="GetIncrementalChangedRowBudget"/>).
+    /// </summary>
     /// <remarks>
-    /// A bulk change touches most of the database anyway, and one rewrite packs
-    /// its pages far more densely than a long sequence of incremental splits.
+    /// A change touching a large share of the database is cheaper as one rewrite, which also packs
+    /// its pages far more densely than a long sequence of incremental splits. But the rewrite
+    /// costs the whole file, so a fixed budget made a modest batch (a 1,000-row import into one
+    /// table of a large database) rewrite every table and index on commit.
     /// </remarks>
     private const int MaximumIncrementalChangedRows = 256;
+
+    /// <summary>A quarter of the catalog's rows, but never less than the fixed minimum.</summary>
+    private static int GetIncrementalChangedRowBudget(IReadOnlyDictionary<string, EmbeddedTable> previousTables)
+    {
+        long rows = 0;
+        foreach (var table in previousTables.Values)
+        {
+            // A table whose rows were never loaded still counts toward the database's size,
+            // but reading it here would force the load; it is simply left out of the estimate.
+            if (!table.HasPendingRowLoad)
+                rows += table.Rows.Count;
+        }
+
+        return (int)Math.Clamp(rows / 4, MaximumIncrementalChangedRows, int.MaxValue);
+    }
 
     /// <summary>
     /// Declares that <paramref name="tables"/> is content-identical to what this
@@ -4128,7 +4266,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         IReadOnlyDictionary<string, EmbeddedDatabase.VirtualTableDefinition> virtualTables,
         IReadOnlyDictionary<string, EmbeddedTable> previousTables,
-        bool checkpointAfterCommit)
+        bool checkpointAfterCommit,
+        bool unchangedRowsAreDurable = false)
     {
         if (!HasCurrentSchemaShape(tables, views, triggers, virtualTables, previousTables))
             return false;
@@ -4147,8 +4286,16 @@ internal sealed class EmbeddedFileStore : IDisposable
         // Incremental allocation prefers freelist leaves/trunks before appending.
         // A non-empty freelist is therefore safe here and no longer forces a full
         // rewrite solely to avoid stranding free pages.
-        if (!TryCollectRowDeltas(tables, previousTables, out var deltas) || deltas.Count == 0)
+        if (!TryCollectRowDeltas(tables, previousTables, out var deltas))
             return false;
+
+        // Every row equals the committed catalog's (an UPDATE that rewrote values with themselves,
+        // which ORMs issue routinely). When the caller vouches that the committed catalog is the
+        // file's content, there is nothing to write; otherwise (an MVCC checkpoint materializing
+        // logical-log commits) the full write path below must run. Declining sent every such
+        // statement through a complete catalog rewrite.
+        if (deltas.Count == 0)
+            return unchangedRowsAreDurable;
 
         var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
         var indexesByTable = GetIndexDefinitions(tableNames, tables, views, triggers, virtualTables, previousTables)
@@ -4460,11 +4607,21 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (change.Before is not null && change.After is not null)
                 tableTree.Update(rootPage, change.RowId, BuildTableRecord(table, change.After));
         }
+        // Inserts go in as one ascending batch, so rows sharing a leaf (appends especially) are
+        // merged into a single write of that leaf instead of one rewrite per row.
+        var inserts = new List<(long RowId, byte[] Record)>();
         foreach (var change in delta.Changes)
         {
             if (change.Before is null && change.After is not null)
-                tableTree.Insert(rootPage, change.RowId, BuildTableRecord(table, change.After));
+                inserts.Add((change.RowId, BuildTableRecord(table, change.After)));
         }
+        inserts.Sort(static (left, right) => left.RowId.CompareTo(right.RowId));
+        for (var index = 1; index < inserts.Count; index++)
+        {
+            if (inserts[index].RowId == inserts[index - 1].RowId)
+                throw new SqliteBtreeMaintenanceRequiredException("A row delta inserts the same rowid twice.");
+        }
+        tableTree.InsertMany(rootPage, inserts);
 
         foreach (var (plan, record) in indexInserts)
             plan.Tree.Insert(plan.RootPage, record);
@@ -4485,7 +4642,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (tables.Count != previousTables.Count)
             return false;
 
-        var changedRowBudget = MaximumIncrementalChangedRows;
+        var changedRowBudget = GetIncrementalChangedRowBudget(previousTables);
         foreach (var (name, table) in tables)
         {
             if (!previousTables.TryGetValue(name, out var previous))
@@ -4500,6 +4657,14 @@ internal sealed class EmbeddedFileStore : IDisposable
                 || previous.Rows.Count != previous.RowIds.Count)
             {
                 return false;
+            }
+
+            if (TryCollectAlignedRowChanges(table, previous, changedRowBudget, out var alignedChanges)
+                && alignedChanges.Count > 0)
+            {
+                changedRowBudget -= alignedChanges.Count;
+                deltas.Add(new TableRowDelta(name, table, previous, alignedChanges));
+                continue;
             }
 
             var before = new Dictionary<long, SqlValue[]>(previous.Rows.Count);
@@ -4576,6 +4741,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         var values = new SqlValue[index.Columns.Count + 1];
         Array.Copy(key, values, key.Length);
         values[^1] = SqlValue.Integer(rowId);
+        ConvertIndexKeyToStoredRealForm(table, index, values);
         var record = SqliteRecordCodec.Encode(values, _textEncoding);
         comparer.Validate(record);
         return record;
@@ -9865,13 +10031,70 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (left.Rows.Count != right.Rows.Count || left.RowIds.Count != right.RowIds.Count)
             return false;
 
-        for (var rowIndex = 0; rowIndex < left.Rows.Count; rowIndex++)
+        return TryCollectAlignedRowChanges(left, right, changedRowBudget: 0, out _);
+    }
+
+    /// <summary>
+    /// Diffs two versions of a table whose previous rows all still sit at the same positions with
+    /// the same rowids, which is how in-place UPDATEs and appending INSERTs leave them; rows past
+    /// the previous count are inserts (the aligned prefix holds every previous rowid, so theirs
+    /// are new). Copy-on-write chunks both versions still share are skipped outright, and rows
+    /// are compared by reference before by value, so a commit that touched a few rows reads only
+    /// their chunks instead of the whole table. Returns false when the versions are not aligned (a
+    /// rowid differs at some position, or rows were removed) or more than
+    /// <paramref name="changedRowBudget"/> rows changed.
+    /// </summary>
+    private static bool TryCollectAlignedRowChanges(
+        EmbeddedTable table,
+        EmbeddedTable previous,
+        int changedRowBudget,
+        out List<RowChange> changes)
+    {
+        changes = [];
+        var rows = table.Rows;
+        var previousRows = previous.Rows;
+        var rowIds = table.RowIds;
+        var previousRowIds = previous.RowIds;
+        var count = rows.Count;
+        var previousCount = previousRows.Count;
+        if (count != rowIds.Count || previousCount != previousRowIds.Count || count < previousCount)
+            return false;
+
+        // A chunk is skipped only when both versions share it and it lies wholly inside the
+        // previous count, where shared storage proves equal elements.
+        const int chunkSize = CowChunkedList<long>.ChunkSize;
+        for (var chunk = 0; chunk * chunkSize < previousCount; chunk++)
         {
-            if (left.RowIds[rowIndex] != right.RowIds[rowIndex]
-                || !left.Rows[rowIndex].AsSpan().SequenceEqual(right.Rows[rowIndex]))
+            var end = Math.Min(previousCount, (chunk + 1) * chunkSize);
+            if (end == (chunk + 1) * chunkSize
+                && rows.SharesChunkWith(previousRows, chunk)
+                && rowIds.SharesChunkWith(previousRowIds, chunk))
             {
-                return false;
+                continue;
             }
+
+            for (var index = chunk * chunkSize; index < end; index++)
+            {
+                var rowId = rowIds[index];
+                if (rowId != previousRowIds[index])
+                    return false;
+
+                var row = rows[index];
+                var previousRow = previousRows[index];
+                if (ReferenceEquals(row, previousRow) || previousRow.AsSpan().SequenceEqual(row))
+                    continue;
+
+                changes.Add(new RowChange(rowId, previousRow, row));
+                if (changes.Count > changedRowBudget)
+                    return false;
+            }
+        }
+
+        for (var index = previousCount; index < count; index++)
+        {
+            changes.Add(new RowChange(rowIds[index], null, rows[index]));
+            if (changes.Count > changedRowBudget)
+                return false;
         }
 
         return true;
@@ -10678,7 +10901,11 @@ internal sealed class EmbeddedFileStore : IDisposable
         // storage, even though nothing about it changed.
         if (primaryKeyCount == 1
             && table.RowidAliasColumnIndex >= 0
-            && !IsTableRowStorageUnchangedFromPrevious(name, table, previousTables, out _))
+            && !IsTableRowStorageUnchangedFromPrevious(name, table, previousTables, out _)
+            && !RowidAliasValuesAreTheIncreasingRowIds(
+                table,
+                primaryKeyIndex,
+                previousTables is not null && previousTables.TryGetValue(name, out var previousTable) ? previousTable : null))
         {
             var seen = new HashSet<long>();
             foreach (var row in table.Rows)
@@ -10704,6 +10931,66 @@ internal sealed class EmbeddedFileStore : IDisposable
                 || IsIndexUnchangedFromPrevious(name, table, index, previousTables);
             ValidateIndexRepresentable(name, table, index, structuralOnly: structuralOnly);
         }
+    }
+
+    // The common shape proves the rowid-alias check without hashing every row: rows kept in
+    // strictly increasing rowid order whose alias column holds exactly the row's rowid are distinct
+    // integers. Anything else falls back to the full check above. A proof is remembered per exact
+    // row and rowid contents, so the next commit re-checks only the copy-on-write chunks it no
+    // longer shares with the proven previous version (plus each chunk's first ordering step).
+    private static bool RowidAliasValuesAreTheIncreasingRowIds(
+        EmbeddedTable table,
+        int aliasIndex,
+        EmbeddedTable? previous)
+    {
+        var proofKey = new IncreasingRowidAliasProofKey(aliasIndex);
+        if (table.TryGetDerived<IncreasingRowidAliasProof>(proofKey, out _))
+            return true;
+
+        var rows = table.Rows;
+        var rowIds = table.RowIds;
+        if (rowIds.Count != rows.Count)
+            return false;
+
+        var previousCount = previous is not null
+            && !ReferenceEquals(previous, table)
+            && ReferenceEquals(previous.ColumnDefinitions, table.ColumnDefinitions)
+            && previous.Rows.Count == previous.RowIds.Count
+            && previous.Rows.Count <= rows.Count
+            && previous.TryGetDerived<IncreasingRowidAliasProof>(proofKey, out _)
+                ? previous.Rows.Count
+                : 0;
+        const int chunkSize = CowChunkedList<long>.ChunkSize;
+        for (var chunkStart = 0; chunkStart < rows.Count; chunkStart += chunkSize)
+        {
+            var chunk = chunkStart / chunkSize;
+            var end = Math.Min(rows.Count, chunkStart + chunkSize);
+            var shared = chunkStart + chunkSize <= previousCount
+                && rows.SharesChunkWith(previous!.Rows, chunk)
+                && rowIds.SharesChunkWith(previous.RowIds, chunk);
+            for (var index = chunkStart; index < end; index++)
+            {
+                var rowId = rowIds[index];
+                if (index > 0 && rowId <= rowIds[index - 1])
+                    return false;
+                if (shared)
+                    break;
+
+                var value = rows[index][aliasIndex];
+                if (value.Kind != SqlValueKind.Integer || value.AsInteger() != rowId)
+                    return false;
+            }
+        }
+
+        table.GetOrCreateDerived(proofKey, static () => IncreasingRowidAliasProof.Instance);
+        return true;
+    }
+
+    private readonly record struct IncreasingRowidAliasProofKey(int AliasIndex);
+
+    private sealed class IncreasingRowidAliasProof
+    {
+        public static readonly IncreasingRowidAliasProof Instance = new();
     }
 
     private static void ValidatePrimaryKeyIndexPrerequisites(
@@ -12568,7 +12855,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// </summary>
     private byte[] BuildTableRecord(EmbeddedTable table, IReadOnlyList<SqlValue> row)
     {
-        var record = ProjectStoredRow(table, row);
+        var record = ProjectStoredRow(table, ToStoredRealForm(table, row));
         var aliasIndex = table.RowidAliasColumnIndex;
         if (aliasIndex >= 0)
         {
@@ -12638,7 +12925,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
 
             var record = SqliteRecordCodec.Encode(
-                OrderWithoutRowidRecord(tableName, table, primaryKeySchema, row),
+                OrderWithoutRowidRecord(tableName, table, primaryKeySchema, ToStoredRealForm(table, row)),
                 _textEncoding);
             comparer.Validate(record);
             records.Add(new WithoutRowidRecord(record, key));
@@ -12761,6 +13048,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (source < storedValues.Count)
             throw new InvalidDataException($"Stored WITHOUT ROWID table '{tableName}' record has trailing values.");
 
+        ApplyStoredRealAffinity(table, row);
         return row;
     }
 
@@ -12812,7 +13100,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                 values = new SqlValue[storageColumns!.Count];
                 Array.Copy(key, values, key.Length);
                 for (var column = index.Columns.Count; column < storageColumns.Count; column++)
-                    values[column] = row[storageColumns[column].ColumnIndex];
+                {
+                    var storageColumn = storageColumns[column].ColumnIndex;
+                    values[column] = IsRealAffinityColumn(table, storageColumn)
+                        ? ToStoredRealForm(row[storageColumn])
+                        : row[storageColumn];
+                }
             }
             else
             {
@@ -12820,6 +13113,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 Array.Copy(key, values, key.Length);
                 values[^1] = SqlValue.Integer(rowId!.Value);
             }
+            ConvertIndexKeyToStoredRealForm(table, index, values);
             var record = SqliteRecordCodec.Encode(values, _textEncoding);
             // `values` is already the decoded form of `record`: every SqlValue
             // factory normalises on construction (SqlValue.Real folds NaN to
@@ -13498,7 +13792,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         for (var recordIndex = 0; recordIndex < expectedRecords.Count; recordIndex++)
         {
-            if (!actualRecords[recordIndex].AsSpan().SequenceEqual(expectedRecords[recordIndex]))
+            if (!RecordsHoldSameValues(actualRecords[recordIndex], expectedRecords[recordIndex]))
             {
                 throw new EmbeddedSqlException(
                     $"Stored index '{entry.Name}' does not match table '{entry.TableName}' at record {recordIndex}.");

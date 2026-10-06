@@ -29,9 +29,36 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
     private object _owner = new();
     private int _version;
 
+    // Process-unique identity of this list's current contents; 0 while unassigned (see
+    // ContentStamp). Every mutation clears it and ShareFrom copies it, so two lists report the
+    // same stamp only while they hold exactly the same elements in the same order.
+    private long _contentStamp;
+    private static long s_contentStampSequence;
+
     public int Count => _count;
 
     public bool IsReadOnly => false;
+
+    /// <summary>
+    /// A process-unique token for this list's exact current contents. It changes on every
+    /// mutation and is carried by <see cref="ShareFrom"/>, so equal stamps on any two lists prove
+    /// identical contents; a working copy that diverges and is discarded can never alias another
+    /// copy's state, which a per-list counter such as a revision cannot guarantee. Assigned
+    /// lazily so mutations only clear a field.
+    /// </summary>
+    public long ContentStamp
+    {
+        get
+        {
+            var stamp = Volatile.Read(ref _contentStamp);
+            if (stamp != 0)
+                return stamp;
+
+            var fresh = Interlocked.Increment(ref s_contentStampSequence);
+            var existing = Interlocked.CompareExchange(ref _contentStamp, fresh, 0);
+            return existing == 0 ? fresh : existing;
+        }
+    }
 
     public T this[int index]
     {
@@ -46,9 +73,20 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
             if ((uint)index >= (uint)_count)
                 ThrowIndexOutOfRange();
             WritableChunk(index >> Shift)[index & Mask] = value;
-            _version++;
+            Mutated();
         }
     }
+
+    /// <summary>
+    /// Whether chunk <paramref name="chunkIndex"/> (elements <c>chunkIndex * ChunkSize</c> onward)
+    /// is the same physical chunk in both lists. A chunk is copied before any write, so a shared
+    /// chunk holds identical elements in both; when the lists also have equal counts, every
+    /// element of that chunk below the count is equal without comparing them.
+    /// </summary>
+    internal bool SharesChunkWith(CowChunkedList<T> other, int chunkIndex)
+        => chunkIndex < _chunkCount
+            && chunkIndex < other._chunkCount
+            && ReferenceEquals(_chunks[chunkIndex], other._chunks[chunkIndex]);
 
     /// <summary>Makes this list an O(chunks) copy-on-write clone of <paramref name="source"/>.</summary>
     public void ShareFrom(CowChunkedList<T> source)
@@ -62,6 +100,7 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
         _owner = new object();
         source._owner = new object();
         _version++;
+        _contentStamp = source.ContentStamp;
     }
 
     public void Add(T item)
@@ -72,7 +111,7 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
             : WritableChunk(_count >> Shift);
         items[offset] = item;
         _count++;
-        _version++;
+        Mutated();
     }
 
     public void AddRange(IEnumerable<T> items)
@@ -88,7 +127,7 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
         _chunks = [];
         _chunkCount = 0;
         _count = 0;
-        _version++;
+        Mutated();
     }
 
     public bool Contains(T item) => IndexOf(item) >= 0;
@@ -163,7 +202,7 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
         }
 
         WritableChunk(firstChunk)[index & Mask] = item;
-        _version++;
+        Mutated();
     }
 
     public bool Remove(T item)
@@ -199,7 +238,7 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
         _count--;
         if ((_count & Mask) == 0 && _chunkCount > (_count >> Shift))
             _chunks[--_chunkCount] = null!;
-        _version++;
+        Mutated();
     }
 
     public void Sort()
@@ -208,7 +247,7 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
         Array.Sort(items);
         for (var index = 0; index < items.Length; index++)
             WritableChunk(index >> Shift)[index & Mask] = items[index];
-        _version++;
+        Mutated();
     }
 
     public List<T> GetRange(int index, int count)
@@ -237,6 +276,12 @@ internal sealed class CowChunkedList<T> : IList<T>, IReadOnlyList<T>
     }
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+    private void Mutated()
+    {
+        _version++;
+        _contentStamp = 0;
+    }
 
     private T[] WritableChunk(int chunk)
     {

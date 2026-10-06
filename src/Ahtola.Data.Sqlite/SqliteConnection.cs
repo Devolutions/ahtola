@@ -1279,6 +1279,14 @@ public partial class SqliteConnection :
 
     internal bool IsManagedConnection => _managedDatabase is not null;
 
+    /// <summary>
+    /// Declared-type metadata the data reader read for source tables, keyed by table name and
+    /// tagged with the engine's schema identity for the table it was read from. Entries are only
+    /// reused while that identity still compares equal, so they need no invalidation.
+    /// </summary>
+    internal Dictionary<string, (object Identity, object Columns)> TableColumnCache { get; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
     internal bool RequiresAsyncExecution => _managedDatabaseFactory is not null;
 
     /// <summary>

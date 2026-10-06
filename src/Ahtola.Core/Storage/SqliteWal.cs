@@ -454,6 +454,29 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
     /// </remarks>
     private ScanPrefix? _scanPrefix;
 
+    // The wal-index header last proven to describe this WAL's committed prefix, with the validated
+    // prefix it was proven against (see IsIndexHeaderValidated).
+    private (SqliteWalIndexHeader Header, ScanPrefix Prefix)? _validatedIndexHeader;
+
+    /// <summary>
+    /// Whether <paramref name="header"/> was already validated against this WAL and nothing has
+    /// invalidated that since: the recorded validated prefix is still the current one (every rescan
+    /// that finds a new commit, and every reset or truncation, replaces or clears it). Frames up to
+    /// the header's boundary are immutable while it stands; a WAL restart changes the salts and so
+    /// the header itself.
+    /// </summary>
+    internal bool IsIndexHeaderValidated(SqliteWalIndexHeader header)
+        => _validatedIndexHeader is { } validated
+            && _scanPrefix is { } prefix
+            && ReferenceEquals(validated.Prefix, prefix)
+            && validated.Header.Equals(header);
+
+    internal void RecordIndexHeaderValidated(SqliteWalIndexHeader header)
+    {
+        if (_scanPrefix is { } prefix && prefix.CommittedFrameNumber == header.MaximumFrame)
+            _validatedIndexHeader = (header, prefix);
+    }
+
     private sealed record ScanPrefix(
         SqliteWalHeader Seed,
         byte[] WalHeaderBytes,
@@ -1213,6 +1236,9 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
                 $"Frame number is out of range for {fullFrameCount} complete SQLite WAL frame(s).");
         }
 
+        if (TryReadFrameInValidatedPrefix(frameNumber, fullFrameCount) is { } trusted)
+            return trusted;
+
         var previousChecksum = (Header.Checksum1, Header.Checksum2);
         for (var currentFrameNumber = 1L; currentFrameNumber <= frameNumber; currentFrameNumber++)
         {
@@ -1244,6 +1270,42 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         }
 
         throw new InvalidOperationException("SQLite WAL frame traversal ended unexpectedly.");
+    }
+
+    /// <summary>
+    /// Reads a frame inside the recorded validated prefix (re-proven against the on-disk WAL
+    /// header and boundary frame header, as ScanCore does) without re-walking the chain: within
+    /// that prefix each frame's stored checksum is its chain value, so the frame is validated
+    /// against its predecessor's. Opening a read snapshot reads its boundary frame, and walking
+    /// from frame one made that cost every committed frame since the last checkpoint.
+    /// </summary>
+    private SqliteWalFrame? TryReadFrameInValidatedPrefix(long frameNumber, long fullFrameCount)
+    {
+        var file = GetSyncFile();
+        var walHeaderBytes = new byte[SqliteWalHeader.Size];
+        if (file.Read(0, walHeaderBytes) != walHeaderBytes.Length
+            || TryResumeScanPrefix(file, fullFrameCount, walHeaderBytes) is not { } prefix
+            || prefix.CommittedFrameNumber < frameNumber)
+        {
+            return null;
+        }
+
+        var previousChecksum = (Header.Checksum1, Header.Checksum2);
+        if (frameNumber > 1)
+        {
+            Span<byte> previousHeaderBytes = stackalloc byte[SqliteWalFrameHeader.Size];
+            if (file.Read(FrameOffset(frameNumber - 1), previousHeaderBytes) != previousHeaderBytes.Length)
+                return null;
+
+            var previousHeader = SqliteWalFrameHeader.Parse(previousHeaderBytes);
+            if (previousHeader.Salt1 != Header.Salt1 || previousHeader.Salt2 != Header.Salt2)
+                return null;
+            previousChecksum = (previousHeader.Checksum1, previousHeader.Checksum2);
+        }
+
+        var frame = ReadFrameBytes(FrameOffset(frameNumber));
+        var frameHeader = ValidateFrame(frame, previousChecksum, out _);
+        return DecodeFrame(frame, frameHeader);
     }
 
     /// <summary>
@@ -1338,11 +1400,34 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
         var frameSize = checked((int)FrameSize);
         var results = new List<SqliteWalFrame>(checked((int)(lastFrameNumber - firstFrameNumber + 1)));
         var previousChecksum = (Header.Checksum1, Header.Checksum2);
+
+        // A commit publishes the frames it just appended, right after the recovery scan that
+        // validated them, so the chain walk can start at the first requested frame whenever the
+        // recorded validated prefix (re-proven against the on-disk WAL header and boundary frame
+        // header, as ScanCore does) reaches the frame before it. Walking from frame one made every
+        // commit re-read and re-checksum the whole WAL, which now holds up to the checkpoint
+        // threshold of committed frames.
+        var startFrameNumber = 1L;
+        var trustedThrough = 0L;
+        if (firstFrameNumber > 1)
+        {
+            var walHeaderBytes = new byte[SqliteWalHeader.Size];
+            if (GetSyncFile().Read(0, walHeaderBytes) == walHeaderBytes.Length
+                && TryResumeScanPrefix(GetSyncFile(), fullFrameCount, walHeaderBytes) is { } prefix
+                && prefix.CommittedFrameNumber >= firstFrameNumber - 1)
+            {
+                startFrameNumber = firstFrameNumber;
+                trustedThrough = prefix.CommittedFrameNumber;
+                if (trustedThrough == firstFrameNumber - 1)
+                    previousChecksum = prefix.ChecksumAfterCommit;
+            }
+        }
+
         var rented = ArrayPool<byte>.Shared.Rent(frameSize);
         try
         {
             var frame = rented.AsSpan(0, frameSize);
-            for (var frameNumber = 1L; frameNumber <= lastFrameNumber; frameNumber++)
+            for (var frameNumber = startFrameNumber; frameNumber <= lastFrameNumber; frameNumber++)
             {
                 var read = GetSyncFile().Read(FrameOffset(frameNumber), frame);
                 if (read != frame.Length)
@@ -1351,8 +1436,21 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
                         $"Short read on SQLite WAL frame: expected {frame.Length} bytes, got {read} bytes.");
                 }
 
-                var frameHeader = ValidateFrame(frame, previousChecksum, out var checksum);
-                previousChecksum = checksum;
+                SqliteWalFrameHeader frameHeader;
+                if (frameNumber <= trustedThrough)
+                {
+                    // Inside the validated prefix the stored checksum is the chain value.
+                    frameHeader = SqliteWalFrameHeader.Parse(frame[..SqliteWalFrameHeader.Size]);
+                    if (frameHeader.Salt1 != Header.Salt1 || frameHeader.Salt2 != Header.Salt2)
+                        throw new InvalidDataException("SQLite WAL frame salts do not match the WAL header.");
+                    previousChecksum = (frameHeader.Checksum1, frameHeader.Checksum2);
+                }
+                else
+                {
+                    frameHeader = ValidateFrame(frame, previousChecksum, out var checksum);
+                    previousChecksum = checksum;
+                }
+
                 if (frameNumber < firstFrameNumber)
                     continue;
 
@@ -2313,6 +2411,10 @@ public sealed class SqliteWalFile : IDisposable, IAsyncDisposable
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    /// <summary>The open WAL file's write stamp, when its handle can report one.</summary>
+    internal FileWriteStamp? TryGetHandleWriteStamp()
+        => _file is IFileWriteStampSource source ? source.GetWriteStamp() : null;
 
     private IFile GetSyncFile()
         => _file

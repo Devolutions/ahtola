@@ -407,6 +407,10 @@ public sealed class SqlitePageStore : IDisposable
 
     internal bool SupportsPageMaterialization => _file is IPageMaterializingFile;
 
+    /// <summary>The open file's write stamp, when its handle can report one.</summary>
+    internal FileWriteStamp? TryGetHandleWriteStamp()
+        => _file is IFileWriteStampSource source ? source.GetWriteStamp() : null;
+
     internal void RefreshHeader()
     {
         ThrowIfDisposed();

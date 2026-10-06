@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using AwesomeAssertions;
 using Ahtola.Core;
 using Ahtola.Core.Storage;
@@ -992,7 +993,7 @@ public sealed class TransactionDirectIndexOverlayTests
             {
                 ["ghost"] = new TransactionTableOverlayCheckpoint(
                     true,
-                    new Dictionary<long, SqlValue[]?> { [1] = [SqlValue.Integer(1)] },
+                    new Dictionary<long, SqlValue[]?> { [1] = [SqlValue.Integer(1)] }.ToImmutableDictionary(),
                     null),
             });
         overlay.RestoreCheckpoint(seedCheckpoint);
@@ -1040,7 +1041,7 @@ public sealed class TransactionDirectIndexOverlayTests
             {
                 ["shifted"] = new TransactionTableOverlayCheckpoint(
                     true,
-                    new Dictionary<long, SqlValue[]?> { [5] = [SqlValue.Text("recreated")] },
+                    new Dictionary<long, SqlValue[]?> { [5] = [SqlValue.Text("recreated")] }.ToImmutableDictionary(),
                     null),
             });
         overlay.RestoreCheckpoint(rowidCheckpoint);

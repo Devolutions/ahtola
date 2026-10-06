@@ -182,6 +182,14 @@ public interface IManagedConnectionAdapter : IDisposable, IAsyncDisposable
     bool HasAttachedDatabases => true;
 
     /// <summary>
+    /// An opaque value that compares equal (<see cref="object.Equals(object?)"/>) for as long as the
+    /// columns, declared types and indexes of the base table an unqualified name resolves to stay
+    /// the same, letting callers reuse metadata read through <c>PRAGMA table_info</c> and
+    /// <c>index_list</c>. Null when the adapter cannot vouch for it, which disables such reuse.
+    /// </summary>
+    object? GetTableSchemaIdentity(string tableName) => null;
+
+    /// <summary>
     /// How long contended transaction-lock acquisitions wait before reporting busy,
     /// mirroring <c>sqlite3_busy_timeout</c>. Adapters without a managed transaction
     /// lock ignore the value.
@@ -209,6 +217,12 @@ public interface IManagedConnectionAdapter : IDisposable, IAsyncDisposable
 
     void ResetForPooling()
         => throw new NotSupportedException("This managed connection adapter does not support pooling.");
+
+    /// <summary>
+    /// Resets the connection as it returns to a pool. Renting it calls <see cref="ResetForPooling"/>
+    /// again, so adapters may skip work whose result only matters to the next user.
+    /// </summary>
+    void ResetForPoolReturn() => ResetForPooling();
 
     IManagedIncrementalBlobAdapter OpenBlob(
         string databaseName,
@@ -582,6 +596,9 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
 
     public ManagedConnectionHooks Hooks => GetConnection().Hooks;
 
+    public object? GetTableSchemaIdentity(string tableName)
+        => GetConnection().TryGetTableSchemaIdentity(tableName);
+
     public TimeSpan BusyTimeout
     {
         get => GetConnection().BusyTimeout;
@@ -617,6 +634,11 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     public void ResetForPooling()
     {
         GetConnection().ResetForPooling();
+    }
+
+    public void ResetForPoolReturn()
+    {
+        GetConnection().ResetForPooling(adoptCommittedChanges: false);
     }
 
     public IManagedIncrementalBlobAdapter OpenBlob(

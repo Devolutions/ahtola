@@ -31,6 +31,28 @@ Results are written below `artifacts/benchmarks/<run-id>/`, including raw BDN
 reports, normalized JSON, environment metadata, and a historical comparison
 when `-BenchmarkBaseline` names a prior normalized result.
 
+## .NET hotspots
+
+`DotNetHotspotBenchmarks` measures the access patterns typical ADO.NET, Dapper and
+EF Core applications issue, through the `Microsoft.Data.Sqlite`-compatible facade
+against `Microsoft.Data.Sqlite` on the same SQLite-written WAL file
+(`synchronous=NORMAL`). Each case is parameterized by `Engine` (`Sqlite`/`Ahtola`):
+
+```powershell
+./build.ps1 benchmark -BenchmarkProfile coverage -BenchmarkFilter '*DotNetHotspot*'
+```
+
+For the optimize-measure loop, an in-process stopwatch runner prints the
+Ahtola/SQLite ratio of every case in about a minute (optionally filtered by case
+name, with a per-case time budget in milliseconds and a single engine):
+
+```powershell
+dotnet run -c Release -f net10.0 --project src/Benchmarks/Ahtola.Benchmarks.csproj -- --hotspots-quick
+dotnet run -c Release -f net10.0 --project src/Benchmarks/Ahtola.Benchmarks.csproj -- --hotspots-quick Lookup 2000 Ahtola
+```
+
+It is a development aid: BenchmarkDotNet results remain the source of record.
+
 ## Interpretation
 
 - Native SQLite ratios provide context; they are not a regression gate.

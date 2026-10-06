@@ -1405,7 +1405,9 @@ public sealed class SqliteWalIndexSharedMemory
             throw new ArgumentOutOfRangeException(nameof(blockCount), "SQLite WAL-index block count must be positive.");
 
         var requiredLength = checked((long)blockCount * SqliteWalIndexLayout.BlockSize);
-        if (_mapping.Length < requiredLength)
+        if (_mapping is PhysicalSqliteWalSharedMemoryMapping physical
+                ? !physical.Covers(requiredLength)
+                : _mapping.Length < requiredLength)
         {
             throw new InvalidDataException(
                 $"SQLite WAL-index mapping is {_mapping.Length} bytes but requires at least {requiredLength} bytes.");
@@ -1540,6 +1542,11 @@ public sealed class SqliteWalIndexSharedMemory
         if (header.Salt1 != walHeader.Salt1 || header.Salt2 != walHeader.Salt2)
             throw new InvalidDataException("SQLite WAL-index salts do not match the WAL header.");
 
+        // A commit validates the same header several times (synchronization, read-mark and index
+        // publication); each pass rescanned the WAL tail and re-read the commit frame.
+        if (wal.IsIndexHeaderValidated(header))
+            return;
+
         var recovery = wal.ScanRecovery();
         if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
         {
@@ -1580,6 +1587,8 @@ public sealed class SqliteWalIndexSharedMemory
             throw new InvalidDataException(
                 "SQLite WAL-index frame checksum does not match its maximum WAL frame.");
         }
+
+        wal.RecordIndexHeaderValidated(header);
     }
 
     private static void ValidateMatchedFrame(

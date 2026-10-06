@@ -852,11 +852,16 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         EnsureOpen();
         EnsureHasCurrentRow();
         var value = ReadValue(ordinal);
-        var declaredType = GetDeclaredTypeName(ordinal);
-        if (IsGuidType(declaredType) && value.Kind is ReaderValueKind.Blob or ReaderValueKind.Text)
-            return ToGuid(ordinal, value);
-        if (ShouldMaterializeTextGuid(ordinal, declaredType, value))
-            return ToGuid(ordinal, value).ToString("D", CultureInfo.InvariantCulture).ToUpperInvariant();
+        // Only TEXT and BLOB values can map to a Guid; resolving the declared type runs schema
+        // PRAGMAs once per result set, which numeric and NULL values never need.
+        if (value.Kind is ReaderValueKind.Blob or ReaderValueKind.Text)
+        {
+            var declaredType = GetDeclaredTypeName(ordinal);
+            if (IsGuidType(declaredType))
+                return ToGuid(ordinal, value);
+            if (ShouldMaterializeTextGuid(ordinal, declaredType, value))
+                return ToGuid(ordinal, value).ToString("D", CultureInfo.InvariantCulture).ToUpperInvariant();
+        }
 
         return value.Kind switch
         {
@@ -2114,14 +2119,38 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     private Dictionary<string, SchemaColumnInfo> GetTableColumns(string tableName)
     {
-        var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
         if (_command.Connection is null)
-            return columns;
+            return new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
         if (_command.Connection.RequiresAsyncExecution)
             return GetManagedTableColumns(_command.Connection.ManagedConnection, tableName);
 
-        using var suspension = _command.Connection.SuspendHooks();
-        using (var command = _command.Connection.CreateCommand())
+        // Declared-type metadata comes from three or more pragma statements per source table and
+        // result set, which made a Dapper-style GetValue on a TEXT column cost several statements
+        // per query. It is reused on this connection while the engine reports the same table schema.
+        var identity = _command.Connection.IsManagedConnection
+            ? _command.Connection.ManagedConnection.GetTableSchemaIdentity(tableName)
+            : null;
+        var cache = _command.Connection.TableColumnCache;
+        if (identity is not null
+            && cache.TryGetValue(tableName, out var cached)
+            && Equals(cached.Identity, identity)
+            && cached.Columns is Dictionary<string, SchemaColumnInfo> cachedColumns)
+        {
+            return new Dictionary<string, SchemaColumnInfo>(cachedColumns, StringComparer.OrdinalIgnoreCase);
+        }
+
+        var columns = ReadTableColumns(_command.Connection, tableName);
+        if (identity is not null)
+            cache[tableName] = (identity, new Dictionary<string, SchemaColumnInfo>(columns, StringComparer.OrdinalIgnoreCase));
+        return columns;
+    }
+
+    private Dictionary<string, SchemaColumnInfo> ReadTableColumns(SqliteConnection connection, string tableName)
+    {
+        var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
+
+        using var suspension = connection.SuspendHooks();
+        using (var command = connection.CreateCommand())
         {
             command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)});";
             using var reader = command.ExecuteReader();
@@ -2137,7 +2166,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             }
         }
 
-        using (var indexCommand = _command.Connection.CreateCommand())
+        using (var indexCommand = connection.CreateCommand())
         {
             indexCommand.CommandText = $"PRAGMA index_list({QuoteIdentifier(tableName)});";
             using var indexes = indexCommand.ExecuteReader();
@@ -2147,7 +2176,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                     continue;
 
                 var indexName = indexes.GetString(1);
-                using var infoCommand = _command.Connection.CreateCommand();
+                using var infoCommand = connection.CreateCommand();
                 infoCommand.CommandText = $"PRAGMA index_info({QuoteIdentifier(indexName)});";
                 using var indexInfo = infoCommand.ExecuteReader();
                 var indexedColumns = new List<string>();
