@@ -385,6 +385,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private readonly bool _readOnly;
     private readonly bool _foreignReadOnly;
     private SqlitePagerViewToken _foreignViewToken;
+
+    // When _foreignViewToken was captured; see IsForeignViewTokenRacy.
+    private DateTimeOffset _foreignViewTokenCapturedAt;
     private SqlitePagerViewToken _ownedViewToken;
     private FileCatalogVersion _fileCatalogVersion;
     private long _ownedCommittedGeneration;
@@ -441,6 +444,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _fileCatalogWriteLock = fileCatalogWriteLock;
         _readOnly = readOnly;
         _foreignReadOnly = foreignReadOnly;
+        _foreignViewTokenCapturedAt = DateTimeOffset.UtcNow;
         _foreignViewToken = foreignReadOnly
             ? fileStore.CaptureCommittedViewToken()
             : default;
@@ -5298,7 +5302,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return;
 
         var token = _fileStore.CaptureCommittedViewToken();
-        if (token == _foreignViewToken)
+        if (token == _foreignViewToken && !IsForeignViewTokenRacy(token))
             return;
 
         var replacement = EmbeddedFileStore.Open(
@@ -5321,6 +5325,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             RefreshCollationResolverBinding();
             _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath, foreignReadOnly: true);
             PublishCatalog(replacementCatalog);
+            _foreignViewTokenCapturedAt = DateTimeOffset.UtcNow;
             _foreignViewToken = _fileStore.CaptureCommittedViewToken();
             previous.Dispose();
         }
@@ -5349,6 +5354,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RefreshForeignCatalogIfChangedLocked();
         }
     }
+
+    // File timestamps only advance with the system clock tick (15.6 ms on many Windows hosts,
+    // whole seconds on some file systems), and a peer that checkpoints a WAL-mode database and
+    // deletes its WAL changes nothing else a foreign reader can observe: the main file keeps its
+    // size and its change counter. A write landing in the same tick the token was captured in
+    // therefore leaves the token equal. Like git's "racily clean" index entries, a token whose
+    // database stamp is that close to its capture time does not prove the file unchanged, so the
+    // caller re-reads; once the file has been quiet for the window, the token is trusted again.
+    private static readonly TimeSpan ForeignStampRacyWindow = TimeSpan.FromSeconds(2);
+
+    private bool IsForeignViewTokenRacy(SqlitePagerViewToken token)
+        => token.DatabaseStamp is { } stamp
+            && stamp.LastWriteTimeUtc >= _foreignViewTokenCapturedAt - ForeignStampRacyWindow;
 
     /// <summary>
     /// Statement-boundary adoption for owned file-backed connections in autocommit.
