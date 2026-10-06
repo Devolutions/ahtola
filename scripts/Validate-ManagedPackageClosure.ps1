@@ -76,6 +76,7 @@ function Test-PackageMetadata(
         'copyright'   = $null
         'tags'        = $null
         'readme'      = 'README.md'
+        'icon'        = 'ahtola-logo.png'
         'projectUrl'  = 'https://github.com/Devolutions/ahtola'
     }
     foreach ($name in $requiredText.Keys) {
@@ -204,6 +205,7 @@ function Test-PackageContent(
 
     $requiredEntries = [System.Collections.Generic.List[string]]::new()
     $requiredEntries.Add('README.md')
+    $requiredEntries.Add('ahtola-logo.png')
     foreach ($framework in $expectedFrameworks) {
         foreach ($expectedAssembly in $expectedAssemblies) {
             $requiredEntries.Add("lib/$framework/$expectedAssembly")

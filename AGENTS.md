@@ -187,7 +187,8 @@ build/pack/validate flows:
 - `scripts/Validate-ManagedPackageClosure.ps1` validates built `.nupkg`
   entries, `project.assets.json`, and publish output against the same idea
   plus a native-archive-entry pattern (`runtimes/`, `native/`,
-  `Ahtola.Raw.dll`, `libAhtola_sdk_kit.*`, etc.).
+  `Ahtola.Raw.dll`, `libAhtola_sdk_kit.*`, etc.). It also requires each
+  package's README and `ahtola-logo.png` icon (packed from `docs/assets/`).
 
 Consequence: do **not** add `PackageReference`s to `Ahtola.Raw`,
 `Ahtola.Data.Native`, `Ahtola.Data.Sync`, or any `Turso.*` companion, and do

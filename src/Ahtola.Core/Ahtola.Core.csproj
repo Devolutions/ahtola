@@ -17,6 +17,7 @@
     <RepositoryUrl>https://github.com/Devolutions/ahtola</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>ahtola-logo.png</PackageIcon>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
     <IsAotCompatible>true</IsAotCompatible>
@@ -26,6 +27,7 @@
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="README.md" />
+    <None Include="..\..\docs\assets\ahtola-logo.png" Pack="true" PackagePath="ahtola-logo.png" />
   </ItemGroup>
 
   <ItemGroup>
