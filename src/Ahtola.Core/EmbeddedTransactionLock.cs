@@ -21,6 +21,15 @@ public class EmbeddedBusyException : EmbeddedSqlException
         : base(message)
     {
     }
+
+    /// <summary>
+    /// Wraps a storage-level lock failure (pager, main-file or WAL-index lock contention) as
+    /// SQLite's busy error, keeping the original as the inner exception.
+    /// </summary>
+    public EmbeddedBusyException(Exception innerException)
+        : base("database is locked", innerException)
+    {
+    }
 }
 
 /// <summary>

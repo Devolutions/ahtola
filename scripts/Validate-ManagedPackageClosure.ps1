@@ -125,9 +125,9 @@ function Get-ExpectedDependencies(
         'Devolutions.Ahtola.EntityFrameworkCore.Sqlite' {
             $dependencies['Devolutions.Ahtola.Data.Sqlite'] = $PackageVersion
             $dependencies['Microsoft.EntityFrameworkCore.Sqlite.Core'] = if ($Framework -eq 'net10.0') {
-                '[10.0.0,11.0.0)'
+                '[10.0.12,11.0.0)'
             } else {
-                '[9.0.9,10.0.0)'
+                '[9.0.20,10.0.0)'
             }
         }
     }

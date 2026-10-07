@@ -26,7 +26,9 @@ public class ManagedTableInteriorFileStoreTests
                        path + "-wal",
                        readOnly: true))
             {
-                pager.RecoveryInfo.LastCommittedFrameNumber.Should().BeGreaterThan(0);
+                // The last close checkpointed every frame and removed the empty WAL, as SQLite
+                // does, so the pages below are read from the main file.
+                pager.RecoveryInfo.LastCommittedFrameNumber.Should().Be(0);
                 var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
                 var schema = SqliteTableLeafPageView.Parse(
                     pager.ReadCommittedPage(1),

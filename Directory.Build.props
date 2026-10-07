@@ -3,11 +3,14 @@
     <Version>0.8.0-pre.22</Version>
     <AhtolaTargetFrameworks>net8.0;net9.0;net10.0</AhtolaTargetFrameworks>
     <!-- Default pin used by tests/benchmarks (matches newest supported major). -->
-        <AhtolaEntityFrameworkCoreVersion>10.0.10</AhtolaEntityFrameworkCoreVersion>
-        <!-- Per-TFM ranges: EF Core 10 only ships net10.0; older TFMs stay on EF Core 9. -->
-        <AhtolaEntityFrameworkCoreVersionRange Condition="'$(TargetFramework)' == 'net10.0'">[10.0.0,11.0.0)</AhtolaEntityFrameworkCoreVersionRange>
-        <AhtolaEntityFrameworkCoreVersionRange Condition="'$(TargetFramework)' != 'net10.0'">[9.0.9,10.0.0)</AhtolaEntityFrameworkCoreVersionRange>
-        <AhtolaEntityFrameworkCoreVersion Condition="'$(TargetFramework)' != 'net10.0' and '$(TargetFramework)' != ''">9.0.9</AhtolaEntityFrameworkCoreVersion>
+        <AhtolaEntityFrameworkCoreVersion>10.0.12</AhtolaEntityFrameworkCoreVersion>
+        <!-- Per-TFM ranges: EF Core 10 only ships net10.0; older TFMs stay on EF Core 9. The lower
+             bound is the patch we build and test against: NuGet resolves the lowest version a
+             range allows, so a .0 bound left consumers on an older Sqlite.Core patch than the
+             rest of their EF Core packages. -->
+        <AhtolaEntityFrameworkCoreVersionRange Condition="'$(TargetFramework)' == 'net10.0'">[10.0.12,11.0.0)</AhtolaEntityFrameworkCoreVersionRange>
+        <AhtolaEntityFrameworkCoreVersionRange Condition="'$(TargetFramework)' != 'net10.0'">[9.0.20,10.0.0)</AhtolaEntityFrameworkCoreVersionRange>
+        <AhtolaEntityFrameworkCoreVersion Condition="'$(TargetFramework)' != 'net10.0' and '$(TargetFramework)' != ''">9.0.20</AhtolaEntityFrameworkCoreVersion>
     <Company>Devolutions</Company>
     <Product>Ahtola</Product>
     <Copyright>Copyright (c) 2026 Devolutions</Copyright>

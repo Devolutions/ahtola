@@ -35,7 +35,7 @@ function Get-Dependencies(
             @("        <dependency id=`"Devolutions.Ahtola.Data.Sqlite`" version=`"$version`" />")
         }
         'Devolutions.Ahtola.EntityFrameworkCore.Sqlite' {
-            $efVersion = if ($Framework -eq 'net10.0') { '[10.0.0,11.0.0)' } else { '[9.0.9,10.0.0)' }
+            $efVersion = if ($Framework -eq 'net10.0') { '[10.0.12,11.0.0)' } else { '[9.0.20,10.0.0)' }
             if ($DuplicateEfProviderDependency) {
                 @(
                     "        <dependency id=`"Devolutions.Ahtola.Data.Sqlite`" version=`"$version`" />"

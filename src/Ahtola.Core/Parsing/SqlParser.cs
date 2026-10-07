@@ -413,6 +413,10 @@ internal sealed class SqlParser
             return new PragmaWalCheckpointStatement(ParseOptionalPragmaMode(name), schema);
         if (name.Equals("busy_timeout", StringComparison.OrdinalIgnoreCase))
             return new PragmaBusyTimeoutStatement(ParseOptionalPragmaLong(name), schema);
+        if (name.Equals("wal_autocheckpoint", StringComparison.OrdinalIgnoreCase))
+            return new PragmaWalAutocheckpointStatement(ParseOptionalPragmaLong(name), schema);
+        if (name.Equals("journal_size_limit", StringComparison.OrdinalIgnoreCase))
+            return new PragmaJournalSizeLimitStatement(ParseOptionalPragmaLong(name), schema);
         if (name.Equals("synchronous", StringComparison.OrdinalIgnoreCase))
             return new PragmaSynchronousStatement(ParseOptionalPragmaSetting(name), schema);
         if (name.Equals("locking_mode", StringComparison.OrdinalIgnoreCase))

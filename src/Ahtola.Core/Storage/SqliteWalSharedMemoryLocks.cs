@@ -18,6 +18,21 @@ namespace Ahtola.Core.Storage;
 /// process can still be using it. See
 /// <c>docs/wal-interoperability-contract.md</c> for the normative lock-byte map.
 /// </remarks>
+/// <summary>
+/// A read-only open found a WAL but no <c>-shm</c> WAL-index file, which a read-only pager must
+/// not create. Providers fall back to a process-local WAL index (SQLite's heap-memory WAL-index
+/// for read-only connections), as happens after a crash or when copying a desktop WAL database.
+/// </summary>
+public sealed class SqliteWalLockFileMissingException : InvalidOperationException
+{
+    internal SqliteWalLockFileMissingException()
+        : base(
+            "Cannot safely open the managed database read-only because its WAL lock file is missing. "
+            + "Creating that file would mutate storage.")
+    {
+    }
+}
+
 internal sealed class SqliteWalSharedMemoryLocks :
     ISqlitePagerLockCoordinator,
     IAsyncSqlitePagerLockCoordinator
@@ -302,11 +317,7 @@ internal sealed class SqliteWalSharedMemoryLocks :
             return;
 
         if (!allowCreate)
-        {
-            throw new InvalidOperationException(
-                "Cannot safely open the managed database read-only because its WAL lock file is missing. "
-                + "Creating that file would mutate storage.");
-        }
+            throw new SqliteWalLockFileMissingException();
 
         using var created = new FileStream(
             _path,

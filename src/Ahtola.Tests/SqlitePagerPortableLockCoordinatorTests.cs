@@ -411,7 +411,8 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
             {
             }
 
-            using (var wal = SqliteWalFile.Open(PhysicalFileSystem.Instance, walPath))
+            // Closing the pager removed its empty WAL, as SQLite's last close does.
+            using (var wal = SqliteWalFile.Create(PhysicalFileSystem.Instance, walPath, walHeader))
             {
                 wal.AppendFrame(
                     pageNumber: 1,

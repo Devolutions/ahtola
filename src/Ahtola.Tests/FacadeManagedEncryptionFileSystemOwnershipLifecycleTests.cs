@@ -49,7 +49,7 @@ public sealed class FacadeManagedEncryptionFileSystemOwnershipLifecycleTests
             }
 
             using var connection = new SqliteConnection(CreateConnectionString(path, WrongAes256Key));
-            Assert.Throws<InvalidDataException>(() => connection.Open())!.Message.Should().Contain("failed authentication");
+            Assert.Throws<SqliteException>(() => connection.Open())!.Message.Should().Contain("failed authentication");
 
             connection.State.Should().Be(ConnectionState.Closed);
             GetOwnedEncryptionFileSystemOrNull(connection).Should().BeNull();

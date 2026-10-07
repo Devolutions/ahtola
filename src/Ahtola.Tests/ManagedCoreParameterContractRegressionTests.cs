@@ -242,7 +242,7 @@ public sealed class ManagedCoreParameterContractRegressionTests
     [Test]
     public void ManagedSqliteFacadeAdapterMaterializesGuidBlobsInIdentifierBlobColumns()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed;Guid Column Name Heuristic=True");
         connection.Open();
 
         using (var create = connection.CreateCommand())
@@ -274,7 +274,7 @@ public sealed class ManagedCoreParameterContractRegressionTests
     [Test]
     public void ManagedSqliteFacadeAdapterMaterializesGuidBlobsInProductionStyleAliasedUndeclaredIdentifierColumns()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed;Guid Column Name Heuristic=True");
         connection.Open();
 
         using (var create = connection.CreateCommand())
@@ -385,7 +385,7 @@ public sealed class ManagedCoreParameterContractRegressionTests
     [Test]
     public void ManagedSqliteFacadeAdapterMaterializesGuidBlobsInUnresolvedIdentifierExpressions()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed;Guid Column Name Heuristic=True");
         connection.Open();
 
         using (var create = connection.CreateCommand())
@@ -417,7 +417,7 @@ public sealed class ManagedCoreParameterContractRegressionTests
     [Test]
     public void ManagedSqliteFacadeAdapterPreservesGuidBlobsInTextColumns()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed;Guid Column Name Heuristic=True");
         connection.Open();
 
         using (var create = connection.CreateCommand())
@@ -490,7 +490,10 @@ public sealed class ManagedCoreParameterContractRegressionTests
         using var reader = select.ExecuteReader();
         reader.Read().Should().BeTrue();
 
-        var exception = Assert.Throws<InvalidOperationException>(() => reader.GetValue(0))!;
+        // SQLite's dynamic typing lets a GUID column hold anything: GetValue returns what does
+        // not parse as stored, while GetGuid still reports the storage without the value.
+        reader.GetValue(0).Should().Be("not-a-guid");
+        var exception = Assert.Throws<InvalidOperationException>(() => reader.GetGuid(0))!;
         exception.Message.Should().Be("Unable to parse GUID for column 'id' (ordinal 0, declared type 'GUID', storage TEXT).");
         exception.Message.Should().NotContain("not-a-guid");
     }

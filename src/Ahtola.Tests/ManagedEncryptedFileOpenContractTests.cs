@@ -29,12 +29,16 @@ public sealed class ManagedEncryptedFileOpenContractTests
                 reopen.ExecuteScalar<string>("SELECT value FROM records WHERE id = 7;").Should().Be("encrypted");
             }
 
-            var wrongKeyFailure = Assert.Throws<InvalidDataException>(() =>
+            // SQLITE_NOTADB with SQLite's classic wrong-key text; the engine's diagnosis stays
+            // available as the inner exception.
+            var wrongKeyFailure = Assert.Throws<SqliteException>(() =>
             {
                 using var wrongKey = new SqliteConnection(ConnectionString(path, WrongAes256Key));
                 wrongKey.Open();
             });
-            wrongKeyFailure!.Message.Should().Contain("failed authentication");
+            wrongKeyFailure!.SqliteErrorCode.Should().Be(26);
+            wrongKeyFailure.Message.Should().Contain("file is encrypted or is not a database");
+            wrongKeyFailure.InnerException!.Message.Should().Contain("failed authentication");
         }
         finally
         {
@@ -53,13 +57,14 @@ public sealed class ManagedEncryptedFileOpenContractTests
     }
 
     [Test]
-    public void PasswordKeywordsAreRejected()
+    public void SystemDataSqlitePasswordKeywordIsAcceptedWhilePasswordSchemeIsRejected()
     {
-        var password = () => new SqliteConnectionStringBuilder("Data Source=app.db;Password=secret");
+        // Password selects System.Data.SQLite's legacy page codec (see LegacyPageCodecTests);
+        // Ahtola's own builder still has no password-derived key scheme.
+        new SqliteConnectionStringBuilder("Data Source=app.db;Password=secret").Password.Should().Be("secret");
         var passwordScheme = () => new global::Ahtola.AhtolaConnectionStringBuilder(
             "Data Source=app.db;Password Scheme=Ahtola.Password.v1");
 
-        password.Should().Throw<ArgumentException>();
         passwordScheme.Should().Throw<ArgumentException>();
     }
 

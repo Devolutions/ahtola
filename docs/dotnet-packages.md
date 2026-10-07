@@ -182,15 +182,27 @@ and `Ahtola.AhtolaConnectionStringBuilder`:
 | `Encryption Cipher` / `Encryption Key` | Raw-key encryption (hex AES-GCM or AEGIS keys) |
 | `Local Provider` | `Managed` (default) or `Native`. `Native` requires the optional, non-shipped native companion to have called `AhtolaNativeProvider.Register(factory)` (typically from a `[ModuleInitializer]`); nothing is loaded by assembly name, so without a registration the connection fails closed with `NotSupportedException`. |
 | `Foreign Read Only` | Read another engine's open database without taking main-file locks (`Mode=ReadOnly` + `Pooling=False`) |
-| `DateTimeKind`, `BinaryGUID` | Facade-only ADO.NET conversion behavior |
+| `DateTimeKind`, `BinaryGUID` | Facade-only ADO.NET conversion behavior. `BinaryGUID=False` binds `Guid` parameters as uppercase `TEXT`, like Microsoft.Data.Sqlite |
+| `Journal Mode`, `Synchronous`, `Page Size`, `Cache Size`, `BusyTimeout` | System.Data.SQLite keywords, applied as pragmas on open; `Journal Mode` also picks the mode a new database is created in |
+| `Read Only`, `FailIfMissing` | System.Data.SQLite spellings of `Mode=ReadOnly` / `Mode=ReadWrite` |
+| `Password` | System.Data.SQLite password: legacy RC4 page codec (wxSQLite3 AES-128 files are detected too); see [Migrating](migrating-from-sqlite-providers.md#passwords-and-legacy-encrypted-files) |
+| `Ignore Unknown Keywords` | Ignore unknown keywords instead of throwing |
+| `Auto Enlist Transaction` | Commands without a `Transaction` join the connection's pending transaction |
+| `Type Mapping` | `Default`, or `SystemDataSQLite` for System.Data.SQLite's declared-type CLR types |
+| `Guid Column Name Heuristic` | Read 16-byte blobs in `ID`/`*ID` columns as GUID strings (off by default) |
+
+See [Migrating from Microsoft.Data.Sqlite or System.Data.SQLite](migrating-from-sqlite-providers.md)
+for every behaviour that differs from those providers and from native SQLite.
 
 > **WAL checkpoints.** Local file connections opened through `SqliteConnection`
 > or `AhtolaConnection` follow Turso's checkpoint policy (`core/storage/pager.rs`
 > `commit_wal`, `core/storage/wal.rs` `should_checkpoint`): an ordinary commit is
 > checkpointed into the main database file only once more than 1000 committed
-> frames are waiting in the `-wal`, and closing the database (the last pooled
-> connection, `ClearPool`/`ClearAllPools`, or `Pooling=False` close) checkpoints
-> what is left when no other connection holds the WAL. Between checkpoints the
+> frames are waiting in the `-wal` (`PRAGMA wal_autocheckpoint` changes the
+> threshold), and closing the database (the last pooled connection,
+> `ClearPool`/`ClearAllPools`, or `Pooling=False` close) checkpoints what is left
+> when no other connection holds the WAL, then deletes the empty `-wal` and the
+> `-shm` when no connection in any process still has the file open. Between checkpoints the
 > `.db` file alone does not contain the latest commits, exactly as with SQLite and
 > Turso in WAL mode, so copy or back up the `-wal` with it (or run
 > `PRAGMA wal_checkpoint(TRUNCATE)` first). Structural changes (schema rewrites,
@@ -367,10 +379,12 @@ connection.Open();
 
 Like Turso's `EncryptionKey::from_hex_string`, Ahtola accepts only exact
 16-byte or 32-byte hexadecimal keys; select a cipher that requires that key
-size. It performs no password-based key derivation, and `Password` /
-`Password Scheme` are unsupported. Legacy SEE/SQLCipher files require a
-dedicated `IPageCodec` or export/recreation under Ahtola encryption or plain
-SQLite. Wrong or missing keys fail with the phrase
+size. It performs no password-based key derivation. The System.Data.SQLite
+`Password` keyword instead selects the legacy page codecs in
+`Ahtola.Data.Sqlite.Codecs` (System.Data.SQLite RC4 and wxSQLite3 AES-128-CBC),
+kept to open existing files; `SqliteConnection.ChangePageCodec` re-keys a file.
+SEE/SQLCipher files require a dedicated `IPageCodec` or export/recreation. Wrong
+or missing keys fail with `SqliteException` code 26 whose message starts with
 `file is encrypted or is not a database`.
 
 ## Entity Framework Core
@@ -799,9 +813,10 @@ catch (Ahtola.Data.Sqlite.SqliteRemoteException ex)
 }
 ```
 
-- Local busy/lock conflicts (classic single-writer contention, or a same-row
-  MVCC conflict) surface as an exception whose message contains `database is
-  locked`; `Default Timeout` / `Command Timeout` on the connection string
+- Local busy/lock conflicts (classic single-writer contention, another
+  process's lock, or a same-row MVCC conflict) surface as `SqliteException`
+  with `SqliteErrorCode` 5 (`database is locked`), so `DbException`-based retry
+  loops work; `Default Timeout` / `Command Timeout` on the connection string
   (and `PRAGMA busy_timeout`) control how long a statement waits before
   giving up.
 - The SQLite-compatible facade maps Turso/Hrana failures to

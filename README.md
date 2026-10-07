@@ -214,11 +214,15 @@ Encryption uses Turso-compatible raw keys:
 | `Encryption Cipher=Aes256Gcm; Encryption Key=<64 hex chars>` | Exact 32-byte raw key |
 | `Encryption Cipher=Aes128Gcm; Encryption Key=<32 hex chars>` | Exact 16-byte raw key |
 
-Like Turso, Ahtola performs no password-based key derivation. `Password` and
-`Password Scheme` are unsupported. Legacy SEE/SQLCipher files require a
-dedicated `IPageCodec` or export/recreation under Ahtola encryption or plain
-SQLite. Wrong or missing keys include the phrase
-`file is encrypted or is not a database`.
+Like Turso, the built-in encryption performs no password-based key derivation.
+Files encrypted by System.Data.SQLite (`Password`, RC4) or wxSQLite3/sqlite3secure
+(AES-128-CBC) open through the System.Data.SQLite `Password` keyword or the codecs
+in `Ahtola.Data.Sqlite.Codecs`. SEE/SQLCipher files require a dedicated
+`IPageCodec` or export/recreation. Wrong or missing keys fail with
+`SqliteException` code 26 (`file is encrypted or is not a database`).
+
+Migrating from Microsoft.Data.Sqlite or System.Data.SQLite? See
+[docs/migrating-from-sqlite-providers.md](docs/migrating-from-sqlite-providers.md).
 
 ## PowerShell module
 

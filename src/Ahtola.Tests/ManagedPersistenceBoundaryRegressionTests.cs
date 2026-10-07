@@ -170,7 +170,13 @@ public sealed class ManagedPersistenceBoundaryRegressionTests
     {
         var page = File.ReadAllBytes(path);
         var header = SqliteDatabaseHeader.Parse(page.AsSpan(0, SqliteDatabaseHeader.Size));
-        using var wal = SqliteWalFile.Open(PhysicalFileSystem.Instance, path + "-wal");
+        // The writer's last close removed its empty WAL, as SQLite does; start a new one.
+        using var wal = File.Exists(path + "-wal")
+            ? SqliteWalFile.Open(PhysicalFileSystem.Instance, path + "-wal")
+            : SqliteWalFile.Create(
+                PhysicalFileSystem.Instance,
+                path + "-wal",
+                SqliteWalHeader.Create(header.PageSize, salt1: 0x1122_3344, salt2: 0x5566_7788, checkpointSequence: 0));
         wal.AppendFrame(1, page.AsSpan(0, header.PageSize));
         wal.Flush();
     }

@@ -44,6 +44,11 @@ public partial class SqliteConnection :
     private AhtolaEncryptionFileSystem? _managedEncryptionFileSystem;
     private AhtolaPageCodecFileSystem? _managedPageCodecFileSystem;
     private IPageCodec? _pageCodec;
+    private IReadOnlyList<IPageCodec>? _pageCodecCandidates;
+    // The codec the current open selected: PageCodec, one of PageCodecCandidates, or one this
+    // connection created from the Password keyword (then also listed in _ownedPageCodecs).
+    private IPageCodec? _selectedPageCodec;
+    private List<IPageCodec>? _ownedPageCodecs;
     private bool _recursiveTriggers;
     private bool _readUncommitted;
     private bool _managedSharedMemory;
@@ -148,6 +153,134 @@ public partial class SqliteConnection :
                 PageCodecId.ValidateNonZero(value.CodecId);
             _pageCodec = value;
         }
+    }
+
+    /// <summary>
+    /// Codecs to choose from when <see cref="PageCodec"/> is not set: on <see cref="Open"/> the
+    /// connection reads the start of the file and uses the first candidate whose
+    /// <see cref="IPageCodec.MatchesHeader"/> accepts it (a plain SQLite file uses none, and a
+    /// new or empty file uses the first candidate). The open fails with
+    /// <c>SQLITE_NOTADB</c> when no candidate matches. <see cref="SelectedPageCodec"/> reports the
+    /// choice. The codecs are not owned by the connection.
+    /// </summary>
+    public IReadOnlyList<IPageCodec>? PageCodecCandidates
+    {
+        get => _pageCodecCandidates;
+        set
+        {
+            if (State == ConnectionState.Open)
+                throw new InvalidOperationException("PageCodecCandidates cannot be set while the connection is open.");
+            if (value is { Count: > 0 } && IsRemoteDataSource)
+                throw new NotSupportedException("Page codecs are supported only for local database connections.");
+            if (value is not null)
+            {
+                foreach (var candidate in value)
+                {
+                    ArgumentNullException.ThrowIfNull(candidate, nameof(value));
+                    PageCodecId.ValidateNonZero(candidate.CodecId);
+                }
+            }
+
+            _pageCodecCandidates = value is null ? null : [.. value];
+        }
+    }
+
+    /// <summary>
+    /// The page codec the open connection uses: <see cref="PageCodec"/>, the matching entry of
+    /// <see cref="PageCodecCandidates"/>, or the legacy codec selected for the System.Data.SQLite
+    /// <c>Password</c> keyword. <see langword="null"/> for a plain database or a closed connection.
+    /// </summary>
+    public IPageCodec? SelectedPageCodec => State == ConnectionState.Open ? _selectedPageCodec : null;
+
+    private IPageCodec? EffectivePageCodec => _selectedPageCodec ?? _pageCodec;
+
+    private bool HasPageCodecConfiguration
+        => _pageCodec is not null
+           || _pageCodecCandidates is { Count: > 0 }
+           || !string.IsNullOrEmpty(_connectionOptions.Password);
+
+    /// <summary>
+    /// Picks the codec this open uses. An explicit <see cref="PageCodec"/> wins; otherwise the
+    /// candidates (or the legacy codecs the Password keyword implies) are matched against the
+    /// file's first bytes. A codec that proves the key wrong fails the open with SQLite's
+    /// "file is encrypted or is not a database".
+    /// </summary>
+    private void SelectPageCodec(string filename)
+    {
+        _selectedPageCodec = null;
+        if (!HasPageCodecConfiguration || filename.Equals(":memory:", StringComparison.Ordinal))
+            return;
+
+        var prefix = Codecs.LegacyPageCodecs.ReadPrefix(filename);
+        if (_pageCodec is not null)
+        {
+            if (prefix.Length != 0
+                && !Codecs.LegacyPageCodecs.HasSqliteMagic(prefix)
+                && _pageCodec.MatchesHeader(prefix) == false)
+            {
+                throw CreateWrongKeyException();
+            }
+
+            _selectedPageCodec = _pageCodec;
+            return;
+        }
+
+        IReadOnlyList<IPageCodec> candidates;
+        if (_pageCodecCandidates is { Count: > 0 } explicitCandidates)
+        {
+            candidates = explicitCandidates;
+        }
+        else
+        {
+            // System.Data.SQLite's Password keyword: new files use its RC4 format; existing files
+            // may also be wxSQLite3/sqlite3secure AES-128 files written by the same products.
+            var password = _connectionOptions.Password;
+            _ownedPageCodecs ??= [];
+            _ownedPageCodecs.Add(new Codecs.SystemDataSQLiteRc4PageCodec(password));
+            _ownedPageCodecs.Add(new Codecs.WxSQLite3Aes128PageCodec(password));
+            candidates = _ownedPageCodecs;
+        }
+
+        if (prefix.Length == 0)
+        {
+            _selectedPageCodec = candidates[0];
+            return;
+        }
+
+        if (Codecs.LegacyPageCodecs.HasSqliteMagic(prefix))
+            return;
+
+        IPageCodec? undetermined = null;
+        foreach (var candidate in candidates)
+        {
+            switch (candidate.MatchesHeader(prefix))
+            {
+                case true:
+                    _selectedPageCodec = candidate;
+                    return;
+                case null:
+                    undetermined ??= candidate;
+                    break;
+            }
+        }
+
+        _selectedPageCodec = undetermined ?? throw CreateWrongKeyException();
+    }
+
+    private static SqliteException CreateWrongKeyException()
+        => SqliteCommand.CreateSqliteException(
+            SqliteResultCode.NotADatabase,
+            PageCodecKeyMismatchException.DefaultMessage);
+
+    private void ReleaseSelectedPageCodec()
+    {
+        _selectedPageCodec = null;
+        if (_ownedPageCodecs is not { } owned)
+            return;
+
+        _ownedPageCodecs = null;
+        foreach (var codec in owned)
+            (codec as IDisposable)?.Dispose();
     }
 
     internal bool IsSharedCache => _connectionOptions.Cache == SqliteCacheMode.Shared;
@@ -266,6 +399,7 @@ public partial class SqliteConnection :
         }
         ValidateManagedSharedCacheOptions();
         ValidateForeignReadOnlyOptions();
+        BusyTimeoutOverride = null;
         var useManaged = _connectionOptions.EffectiveLocalProvider == AhtolaLocalProvider.Managed;
         var localOriginalState = State;
         var filename = NormalizeDataSource(_connectionOptions);
@@ -277,6 +411,7 @@ public partial class SqliteConnection :
         {
             if (useManaged)
             {
+                SelectPageCodec(filename);
                 managedEncryption = _connectionOptions.CreateManagedEncryptionOptions();
                 if (managedEncryption is not null
                     && (_connectionOptions.Mode == SqliteOpenMode.Memory
@@ -362,7 +497,13 @@ public partial class SqliteConnection :
             CleanupFailedOpen(sharedMemoryPath);
             throw MapManagedEncryptionOpenFailure(ex, managedEncryption is not null || useManaged);
         }
-        catch (InvalidDataException ex) when (managedEncryption is null && PageCodec is null && IsPlainNotADatabase(ex))
+        catch (Exception ex) when (EffectivePageCodec is not null && IsCodecKeyMismatch(ex))
+        {
+            // The configured codec proved its key wrong: SQLite's classic wrong-key error.
+            CleanupFailedOpen(sharedMemoryPath);
+            throw CreateWrongKeyException();
+        }
+        catch (InvalidDataException ex) when (managedEncryption is null && !HasPageCodecConfiguration && IsPlainNotADatabase(ex))
         {
             // An unkeyed, codec-less open of a garbage plain header is SQLite's SQLITE_NOTADB.
             // A configured key or codec keeps the encrypted-or-not-a-database phrase below.
@@ -380,6 +521,12 @@ public partial class SqliteConnection :
         {
             CleanupFailedOpen(sharedMemoryPath);
             throw MapManagedEncryptionOpenFailure(ex, managedEncryption is not null || useManaged);
+        }
+        catch (Exception ex) when (ex is ISqliteStorageBusyException)
+        {
+            // Another connection or process holds a conflicting lock on the file: SQLITE_BUSY.
+            CleanupFailedOpen(sharedMemoryPath);
+            throw SqliteCommand.ToSqliteException(ex);
         }
         catch (Exception ex) when (LooksLikeEncryptedOrCorruptDatabase(ex))
         {
@@ -867,6 +1014,158 @@ public partial class SqliteConnection :
     public static void ClearAllPools()
     {
         ManagedConnectionPool.ClearAll();
+    }
+
+    /// <summary>
+    /// Re-encodes every page of the open database with <paramref name="newCodec"/>
+    /// (<see langword="null"/> writes a plain SQLite file), the page-codec counterpart of
+    /// System.Data.SQLite's <c>ChangePassword</c> and SQLite's <c>PRAGMA rekey</c>. The
+    /// connection stays open and uses the new codec afterwards.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// No other connection, in this process or another, may have the database open: the method
+    /// takes SQLite's exclusive lock to prove it and fails with <c>SQLITE_BUSY</c> otherwise.
+    /// Pooled idle connections to the file are cleared first.
+    /// </para>
+    /// <para>
+    /// The database is copied page by page into a sibling file written with the new codec,
+    /// flushed, and then moved over the original, so a crash leaves either the old or the new
+    /// database intact (plus a leftover <c>*.ahtola-rekey</c> file). The journal mode is kept, and
+    /// the old <c>-wal</c>/<c>-shm</c>/<c>-journal</c> files are removed.
+    /// </para>
+    /// </remarks>
+    public void ChangePageCodec(IPageCodec? newCodec)
+    {
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection(nameof(ChangePageCodec)));
+        if (!IsManagedProvider || IsRemoteDataSource || _managedDatabaseFactory is not null)
+            throw new NotSupportedException("ChangePageCodec is supported only for managed local database files.");
+        if (_connectionOptions.HasEncryptionOptions)
+            throw new NotSupportedException("ChangePageCodec cannot be combined with Encryption Cipher/Encryption Key.");
+        if (_readOnly)
+            throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
+        if (Transaction is not null || HasOpenReader)
+            throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
+        if (newCodec is not null)
+            PageCodecId.ValidateNonZero(newCodec.CodecId);
+
+        var path = _dataSource;
+        if (string.IsNullOrEmpty(path) || path.Equals(":memory:", StringComparison.Ordinal) || _managedSharedMemory)
+            throw new NotSupportedException("ChangePageCodec requires a database file.");
+
+        var journalMode = Convert.ToString(ExecuteScalarText("PRAGMA journal_mode;"), CultureInfo.InvariantCulture) ?? "delete";
+        // Prove this is the only connection: the exclusive lock is only granted when no other
+        // connection holds the database (a busy pragma leaves the mode pending, so read it back).
+        ExecuteNonQuery("PRAGMA locking_mode = EXCLUSIVE;");
+        try
+        {
+            ExecuteScalarText("SELECT count(*) FROM sqlite_master;");
+        }
+        finally
+        {
+            ExecuteNonQuery("PRAGMA locking_mode = NORMAL;");
+        }
+
+        if (journalMode.Equals("wal", StringComparison.OrdinalIgnoreCase))
+            ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
+
+        var temporaryPath = path + ".ahtola-rekey";
+        TryDeleteDatabaseFiles(temporaryPath);
+        try
+        {
+            using (var destination = new SqliteConnection(
+                       new SqliteConnectionStringBuilder
+                       {
+                           DataSource = temporaryPath,
+                           Pooling = false,
+                           JournalMode = "Delete",
+                       }.ToString()))
+            {
+                destination.PageCodec = newCodec;
+                destination.Open();
+                // Hold the write lock while copying so no other connection can commit pages the
+                // copy would miss.
+                using (var transaction = BeginTransaction(deferred: false))
+                {
+                    BackupDatabase(destination);
+                    transaction.Commit();
+                }
+
+                if (!journalMode.Equals("delete", StringComparison.OrdinalIgnoreCase))
+                    destination.ExecuteNonQuery("PRAGMA journal_mode = " + journalMode.ToUpperInvariant() + ";");
+            }
+
+            var previousCodec = _pageCodec;
+            var connectionString = ConnectionString;
+            Close();
+            ClearPool(this);
+            try
+            {
+                try
+                {
+                    File.Move(temporaryPath, path, overwrite: true);
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    // Another connection still has the file open (an idle rollback-journal
+                    // connection holds no lock, so only the replace can tell): leave it intact.
+                    throw new SqliteException(
+                        Properties.Resources.SqliteNativeError(5, "database is locked"),
+                        5,
+                        5,
+                        exception);
+                }
+
+                foreach (var sidecar in new[] { path + "-wal", path + "-shm", path + "-journal" })
+                    TryDeleteFile(sidecar);
+            }
+            finally
+            {
+                // Reopen whichever file is in place: the re-keyed one, or the original if the move
+                // failed.
+                _pageCodec = File.Exists(temporaryPath) ? previousCodec : newCodec;
+                _pageCodecCandidates = null;
+                if (!File.Exists(temporaryPath) && _connectionOptions.Password.Length != 0)
+                {
+                    var builder = new SqliteConnectionStringBuilder(connectionString) { Password = null! };
+                    ConnectionString = builder.ToString();
+                }
+                Open();
+            }
+        }
+        finally
+        {
+            TryDeleteDatabaseFiles(temporaryPath);
+        }
+    }
+
+    private object? ExecuteScalarText(string sql)
+    {
+        using var command = CreateCommand();
+        command.CommandText = sql;
+        return command.ExecuteScalar();
+    }
+
+    private static void TryDeleteDatabaseFiles(string path)
+    {
+        TryDeleteFile(path);
+        foreach (var sidecar in new[] { path + "-wal", path + "-shm", path + "-journal" })
+            TryDeleteFile(sidecar);
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     public static void ClearPool(SqliteConnection connection)
@@ -1370,6 +1669,15 @@ public partial class SqliteConnection :
 
     internal bool BinaryGuid => _connectionOptions.BinaryGUID;
 
+    internal bool AutoEnlistTransaction => _connectionOptions.AutoEnlistTransaction;
+
+    /// <summary>The lock wait <c>PRAGMA busy_timeout</c> set on this open connection, if any.</summary>
+    internal TimeSpan? BusyTimeoutOverride { get; set; }
+
+    internal SqliteTypeMapping TypeMapping => _connectionOptions.TypeMapping;
+
+    internal bool GuidColumnNameHeuristic => _connectionOptions.GuidColumnNameHeuristic;
+
     internal bool IsManagedSharedMemory => _managedSharedMemory;
 
     internal bool HasOpenReader
@@ -1511,6 +1819,40 @@ public partial class SqliteConnection :
             ExecuteNonQuery("PRAGMA foreign_keys = 1;");
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
+        foreach (var pragma in GetSystemDataSqlitePragmas())
+            ExecuteNonQuery(pragma);
+    }
+
+    /// <summary>
+    /// The pragmas System.Data.SQLite applies on open for its Journal Mode, Synchronous, Page
+    /// Size, Cache Size and BusyTimeout keywords.
+    /// </summary>
+    private IEnumerable<string> GetSystemDataSqlitePragmas()
+    {
+        if (!IsManagedConnection || _readOnly)
+        {
+            if (_connectionOptions.CacheSize is { } readOnlyCacheSize)
+                yield return "PRAGMA cache_size = " + readOnlyCacheSize.ToString(CultureInfo.InvariantCulture) + ";";
+            if (_connectionOptions.BusyTimeout is { } readOnlyBusyTimeout)
+                yield return "PRAGMA busy_timeout = " + readOnlyBusyTimeout.ToString(CultureInfo.InvariantCulture) + ";";
+            yield break;
+        }
+
+        if (_connectionOptions.PageSize is { } pageSize)
+            yield return "PRAGMA page_size = " + pageSize.ToString(CultureInfo.InvariantCulture) + ";";
+        if (_connectionOptions.JournalMode is { Length: > 0 } journalMode
+            && !journalMode.Equals("Default", StringComparison.OrdinalIgnoreCase)
+            && _dataSource is not null
+            && !_dataSource.Equals(":memory:", StringComparison.Ordinal))
+        {
+            yield return "PRAGMA journal_mode = " + journalMode.ToUpperInvariant() + ";";
+        }
+        if (_connectionOptions.Synchronous is { Length: > 0 } synchronous)
+            yield return "PRAGMA synchronous = " + synchronous.ToUpperInvariant() + ";";
+        if (_connectionOptions.CacheSize is { } cacheSize)
+            yield return "PRAGMA cache_size = " + cacheSize.ToString(CultureInfo.InvariantCulture) + ";";
+        if (_connectionOptions.BusyTimeout is { } busyTimeout)
+            yield return "PRAGMA busy_timeout = " + busyTimeout.ToString(CultureInfo.InvariantCulture) + ";";
     }
 
     private async Task ApplyConnectionOptionsAsync(CancellationToken cancellationToken)
@@ -1533,7 +1875,19 @@ public partial class SqliteConnection :
         }
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
+        foreach (var pragma in GetSystemDataSqlitePragmas())
+            await ExecuteNonQueryAsync(pragma, cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Whether a database this open creates starts in rollback-journal mode: the Journal Mode
+    /// keyword names a rollback-journal mode, so the file never goes through WAL (and never
+    /// leaves <c>-wal</c>/<c>-shm</c> sidecars behind).
+    /// </summary>
+    private bool CreatesRollbackJournalDatabase
+        => _connectionOptions.JournalMode is { Length: > 0 } mode
+           && !mode.Equals("Wal", StringComparison.OrdinalIgnoreCase)
+           && !mode.Equals("Default", StringComparison.OrdinalIgnoreCase);
 
     private void ApplyReplicaConnectionOptions()
     {
@@ -1663,15 +2017,16 @@ public partial class SqliteConnection :
 
         try
         {
-            if (encryption is not null && PageCodec is not null)
+            var pageCodec = EffectivePageCodec;
+            if (encryption is not null && pageCodec is not null)
             {
                 throw new InvalidOperationException(
                     "Built-in encryption cannot be combined with an external page codec.");
             }
 
-            if (encryption is null && PageCodec is null && !readOnly)
+            if (encryption is null && pageCodec is null && !readOnly)
             {
-                var adapter = ManagedDatabaseAdapter.Open(filename);
+                var adapter = ManagedDatabaseAdapter.Open(filename, CreatesRollbackJournalDatabase);
                 database = adapter;
                 // Turso's checkpoint policy: checkpoint once the WAL passes its threshold.
                 adapter.EnableDeferredCheckpoints();
@@ -1687,19 +2042,39 @@ public partial class SqliteConnection :
                     encryption);
                 fileSystem = managedEncryptionFileSystem;
             }
-            else if (PageCodec is not null)
+            else if (pageCodec is not null)
             {
                 managedPageCodecFileSystem = new AhtolaPageCodecFileSystem(
                     PhysicalFileSystem.Instance,
-                    PageCodec);
+                    pageCodec);
                 fileSystem = managedPageCodecFileSystem;
             }
 
-            var fileAdapter = ManagedDatabaseAdapter.OpenFile(
-                filename,
-                fileSystem,
-                readOnly: readOnly,
-                foreignReadOnly: foreignReadOnly);
+            ManagedDatabaseAdapter fileAdapter;
+            try
+            {
+                fileAdapter = ManagedDatabaseAdapter.OpenFile(
+                    filename,
+                    fileSystem,
+                    readOnly: readOnly,
+                    foreignReadOnly: foreignReadOnly,
+                    createRollbackJournalMode: CreatesRollbackJournalDatabase);
+            }
+            catch (Exception ex) when (readOnly
+                                       && !foreignReadOnly
+                                       && encryption is null
+                                       && pageCodec is null
+                                       && IsWalLockFileMissing(ex))
+            {
+                // A WAL without its -shm (left by a crash, or a copied WAL database): like
+                // SQLite's read-only heap-memory WAL-index, read it through a process-local
+                // index instead of creating the -shm.
+                fileAdapter = ManagedDatabaseAdapter.OpenFile(
+                    filename,
+                    fileSystem,
+                    readOnly: true,
+                    foreignReadOnly: true);
+            }
             database = fileAdapter;
             fileAdapter.EnableDeferredCheckpoints();
             _ = database.Connect();
@@ -1745,6 +2120,7 @@ public partial class SqliteConnection :
             {
                 managedEncryptionFileSystem?.Dispose();
                 managedPageCodecFileSystem?.Dispose();
+                ReleaseSelectedPageCodec();
             }
         }
     }
@@ -2002,7 +2378,7 @@ public partial class SqliteConnection :
 
     private bool CanUseManagedPooling(string filename)
         => _connectionOptions.Pooling
-               && PageCodec is null
+               && !HasPageCodecConfiguration
                && !HasManagedCallbacks
                && !_connectionOptions.ForeignReadOnly
                && _connectionOptions.Mode != SqliteOpenMode.Memory
@@ -2013,7 +2389,7 @@ public partial class SqliteConnection :
         key = default;
         if (_connectionOptions.EffectiveLocalProvider != AhtolaLocalProvider.Managed
             || !_connectionOptions.Pooling
-            || PageCodec is not null
+            || HasPageCodecConfiguration
             || _connectionOptions.Mode == SqliteOpenMode.Memory
             || _connectionOptions.Cache == SqliteCacheMode.Shared)
         {
@@ -2183,18 +2559,51 @@ public partial class SqliteConnection :
         if (!encryptionAttempted && !LooksLikeEncryptedOrCorruptDatabase(exception))
             return exception;
 
-        if (AhtolaEncryptionOptions.ContainsEncryptedOrNotDatabasePhrase(exception.Message))
-            return exception;
-
-        var mapped = AhtolaEncryptionOptions.EnsureEncryptedOrNotDatabasePhrase(exception.Message);
-        return exception switch
+        if (exception is SqliteException sqlite)
         {
-            SqliteException sqlite => new SqliteException(
+            if (AhtolaEncryptionOptions.ContainsEncryptedOrNotDatabasePhrase(exception.Message))
+                return exception;
+
+            var mapped = AhtolaEncryptionOptions.EnsureEncryptedOrNotDatabasePhrase(exception.Message);
+            return new SqliteException(
                 Properties.Resources.SqliteNativeError(sqlite.SqliteErrorCode, mapped),
                 sqlite.SqliteErrorCode,
-                sqlite.SqliteExtendedErrorCode),
-            _ => new InvalidDataException(mapped, exception),
-        };
+                sqlite.SqliteExtendedErrorCode);
+        }
+
+        // SQLITE_NOTADB, led by the classic text System.Data.SQLite and SQLite before 3.8 used for
+        // a wrong key, which existing code matches on; the engine's own diagnosis (failed
+        // authentication, unsupported cipher, tampering) follows it and stays available as the
+        // inner exception.
+        return new SqliteException(
+            Properties.Resources.SqliteNativeError(
+                SqliteResultCode.NotADatabase,
+                AhtolaEncryptionOptions.EnsureEncryptedOrNotDatabasePhrase(exception.Message)),
+            SqliteResultCode.NotADatabase,
+            SqliteResultCode.NotADatabase,
+            exception);
+    }
+
+    private static bool IsWalLockFileMissing(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is SqliteWalLockFileMissingException)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsCodecKeyMismatch(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is PageCodecKeyMismatchException)
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsManagedEncryptionConfigurationException(Exception exception)

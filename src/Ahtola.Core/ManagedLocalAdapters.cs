@@ -470,23 +470,35 @@ public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
             _databaseOwner?.EnableDeferredCheckpoints();
     }
 
-    public static ManagedDatabaseAdapter Open(string path)
+    public static ManagedDatabaseAdapter Open(string path) => Open(path, createRollbackJournalMode: false);
+
+    /// <summary>
+    /// Opens <paramref name="path"/>; a database this call creates starts in rollback-journal
+    /// mode when <paramref name="createRollbackJournalMode"/> is set (WAL otherwise).
+    /// </summary>
+    public static ManagedDatabaseAdapter Open(string path, bool createRollbackJournalMode)
     {
         ArgumentNullException.ThrowIfNull(path);
         return string.Equals(path, ":memory:", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(path)
             ? new ManagedDatabaseAdapter(new EmbeddedDatabase())
-            : new ManagedDatabaseAdapter(EmbeddedDatabase.OpenFile(path));
+            : new ManagedDatabaseAdapter(EmbeddedDatabase.OpenFile(path, createRollbackJournalMode: createRollbackJournalMode));
     }
 
     public static ManagedDatabaseAdapter OpenFile(
         string path,
         IFileSystem fileSystem,
         bool readOnly = false,
-        bool foreignReadOnly = false)
+        bool foreignReadOnly = false,
+        bool createRollbackJournalMode = false)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(fileSystem);
-        return new ManagedDatabaseAdapter(EmbeddedDatabase.OpenFile(path, fileSystem, readOnly, foreignReadOnly));
+        return new ManagedDatabaseAdapter(EmbeddedDatabase.OpenFile(
+            path,
+            fileSystem,
+            readOnly,
+            foreignReadOnly,
+            createRollbackJournalMode: createRollbackJournalMode));
     }
 
     public static ManagedDatabaseAdapter FromConnection(EmbeddedConnection connection)

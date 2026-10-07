@@ -391,6 +391,23 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// Opens (or creates) the managed file database and reconstructs its catalog
     /// from the committed SQLite pages.
     /// </summary>
+    private static bool IsEmptyFile(IFileSystem fileSystem, string path)
+    {
+        try
+        {
+            using var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting, readOnly: true);
+            return file.Length == 0;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
     public static EmbeddedFileStore Open(
         string path,
         IFileSystem fileSystem,
@@ -411,6 +428,21 @@ internal sealed class EmbeddedFileStore : IDisposable
         var walPath = path + "-wal";
         var databaseExists = fileSystem.FileExists(path);
         var walExists = fileSystem.FileExists(walPath);
+        if (databaseExists
+            && !readOnly
+            && !foreignReadOnly
+            && !walExists
+            && !fileSystem.FileExists(path + "-journal")
+            && IsEmptyFile(fileSystem, path))
+        {
+            // SQLite treats an existing zero-length file as a new, empty database and writes
+            // its header on first use. System.Data.SQLite's CreateFile() makes exactly such a
+            // file before the first open, so replace it with a freshly created database. A
+            // rollback journal or WAL next to it may hold the real content (an interrupted
+            // rewrite), so the file is only replaced when neither exists.
+            fileSystem.DeleteFile(path);
+            databaseExists = false;
+        }
         if (initialPageSize is { } requestedPageSize)
             _ = SqlitePageSize.Encode(requestedPageSize);
 
@@ -508,6 +540,27 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// connections to detect owner commits between statements.
     /// </summary>
     internal SqlitePagerViewToken CaptureCommittedViewToken() => _pager.CaptureCommittedViewToken();
+
+    /// <summary>
+    /// How long the pager waits on file locks (main-file lock bytes, WAL-index locks) held by
+    /// other connections or processes before reporting busy. The owning database forwards its
+    /// connection busy timeout here so cross-process contention honours it too.
+    /// </summary>
+    internal TimeSpan PagerBusyTimeout
+    {
+        get => _pager.BusyTimeout;
+        set => _pager.BusyTimeout = value;
+    }
+
+    /// <summary>Takes the pager write lock an explicit write transaction holds until it ends.</summary>
+    internal SqlitePagerWriterReservation ReserveWriter(TimeSpan busyTimeout) => _pager.ReserveWriter(busyTimeout);
+
+    /// <summary>The write reservation the pager transactions of the next persist borrow.</summary>
+    internal SqlitePagerWriterReservation? AttachedWriterReservation
+    {
+        get => _pager.AttachedWriterReservation;
+        set => _pager.AttachedWriterReservation = value;
+    }
 
     internal void SetSynchronousMode(SqliteSynchronousMode synchronousMode)
     {
@@ -3456,8 +3509,10 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
 
             _pager.ReplaceDatabaseFile(temporaryPath);
+            var busyTimeout = _pager.BusyTimeout;
             _pager.Dispose();
             _pager = SqlitePager.Open(_fileSystem, _databasePath, _walPath);
+            _pager.BusyTimeout = busyTimeout;
             _header = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
             _pageSize = _header.PageSize;
             _usableSpace = _header.UsableSpace;
@@ -13492,27 +13547,32 @@ internal sealed class EmbeddedFileStore : IDisposable
     private List<List<SqliteTableLeafCell>> PartitionSchemaLeafCells(
         IReadOnlyList<SqliteTableLeafCell> cells)
     {
+        // One pass with a running builder per page: rebuilding the page for every added cell made
+        // each schema rewrite quadratic in the number of schema rows (every DDL commit rewrites
+        // the schema), and probing overflow by catching exceptions made it slower still.
         var groups = new List<List<SqliteTableLeafCell>> { new() };
+        var builder = new SqliteTableLeafPageBuilder(_pageSize, _usableSpace, isFirstPage: false);
         foreach (var cell in cells)
         {
-            var group = groups[^1];
-            group.Add(cell);
-            if (TryBuildSchemaLeafPage(group, isFirstPage: false, out _))
-                continue;
-
-            group.RemoveAt(group.Count - 1);
-            if (group.Count == 0)
+            if (!builder.CanAppend(cell))
             {
-                throw new EmbeddedSqlException(
-                    "The managed file engine cannot persist a sqlite_schema row because it does not fit in a SQLite schema page.");
+                if (groups[^1].Count == 0)
+                {
+                    throw new EmbeddedSqlException(
+                        "The managed file engine cannot persist a sqlite_schema row because it does not fit in a SQLite schema page.");
+                }
+
+                groups.Add([]);
+                builder = new SqliteTableLeafPageBuilder(_pageSize, _usableSpace, isFirstPage: false);
+                if (!builder.CanAppend(cell))
+                {
+                    throw new EmbeddedSqlException(
+                        "The managed file engine cannot persist a sqlite_schema row because it does not fit in a SQLite schema page.");
+                }
             }
 
-            groups.Add([cell]);
-            if (!TryBuildSchemaLeafPage(groups[^1], isFirstPage: false, out _))
-            {
-                throw new EmbeddedSqlException(
-                    "The managed file engine cannot persist a sqlite_schema row because it does not fit in a SQLite schema page.");
-            }
+            builder.Append(cell);
+            groups[^1].Add(cell);
         }
 
         return groups;
@@ -13536,19 +13596,20 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool isFirstPage,
         out byte[] page)
     {
-        try
+        var builder = new SqliteTableLeafPageBuilder(_pageSize, _usableSpace, isFirstPage);
+        foreach (var cell in cells)
         {
-            var builder = new SqliteTableLeafPageBuilder(_pageSize, _usableSpace, isFirstPage);
-            foreach (var cell in cells)
-                builder.Append(cell);
-            page = builder.Build();
-            return true;
+            if (!builder.CanAppend(cell))
+            {
+                page = null!;
+                return false;
+            }
+
+            builder.Append(cell);
         }
-        catch (InvalidOperationException)
-        {
-            page = null!;
-            return false;
-        }
+
+        page = builder.Build();
+        return true;
     }
 
     private static List<ManagedSchemaRow> BuildSchemaEntries(

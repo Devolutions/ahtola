@@ -51,6 +51,19 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Ws Half Open Timeout",
         "Ws Max Message Bytes",
         "Ws Connect Attempts",
+        "Journal Mode",
+        "Synchronous",
+        "Read Only",
+        "FailIfMissing",
+        "Page Size",
+        "Cache Size",
+        "Busy Timeout",
+        "Legacy Format",
+        "Password",
+        "Ignore Unknown Keywords",
+        "Auto Enlist Transaction",
+        "Type Mapping",
+        "Guid Column Name Heuristic",
     ];
 
     private static readonly Dictionary<string, string> KeywordMap = new(StringComparer.OrdinalIgnoreCase)
@@ -148,7 +161,40 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["WsConnectAttempts"] = "Ws Connect Attempts",
         ["WebSocket Connect Attempts"] = "Ws Connect Attempts",
         ["WebSocketConnectAttempts"] = "Ws Connect Attempts",
+        // System.Data.SQLite keywords. RDM and other System.Data.SQLite consumers persist
+        // connection strings that use them, so they are accepted and translated into pragmas
+        // or open modes rather than rejected.
+        ["Journal Mode"] = "Journal Mode",
+        ["JournalMode"] = "Journal Mode",
+        ["Synchronous"] = "Synchronous",
+        ["Read Only"] = "Read Only",
+        ["ReadOnly"] = "Read Only",
+        ["FailIfMissing"] = "FailIfMissing",
+        ["Fail If Missing"] = "FailIfMissing",
+        ["Page Size"] = "Page Size",
+        ["PageSize"] = "Page Size",
+        ["Cache Size"] = "Cache Size",
+        ["CacheSize"] = "Cache Size",
+        ["Busy Timeout"] = "Busy Timeout",
+        ["BusyTimeout"] = "Busy Timeout",
+        ["Legacy Format"] = "Legacy Format",
+        ["LegacyFormat"] = "Legacy Format",
+        ["Password"] = "Password",
+        ["Pwd"] = "Password",
+        ["Ignore Unknown Keywords"] = "Ignore Unknown Keywords",
+        ["IgnoreUnknownKeywords"] = "Ignore Unknown Keywords",
+        ["Auto Enlist Transaction"] = "Auto Enlist Transaction",
+        ["AutoEnlistTransaction"] = "Auto Enlist Transaction",
+        ["Type Mapping"] = "Type Mapping",
+        ["TypeMapping"] = "Type Mapping",
+        ["Guid Column Name Heuristic"] = "Guid Column Name Heuristic",
+        ["GuidColumnNameHeuristic"] = "Guid Column Name Heuristic",
     };
+
+    // Keywords a connection string carried that this provider does not know, kept only when
+    // Ignore Unknown Keywords is on (System.Data.SQLite ignores unknown keywords).
+    private readonly Dictionary<string, object?> _ignoredKeywords = new(StringComparer.OrdinalIgnoreCase);
+    private bool _ignoreUnknownKeywords;
 
     public SqliteConnectionStringBuilder()
     {
@@ -156,7 +202,157 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 
     public SqliteConnectionStringBuilder(string? connectionString)
     {
+        // Honour Ignore Unknown Keywords wherever it appears in the string, not only when it
+        // precedes the unknown keywords.
+        _ignoreUnknownKeywords = RequestsIgnoreUnknownKeywords(connectionString);
         ConnectionString = connectionString ?? string.Empty;
+    }
+
+    private static bool RequestsIgnoreUnknownKeywords(string? connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+            return false;
+
+        var generic = new DbConnectionStringBuilder { ConnectionString = connectionString };
+        foreach (var keyword in new[] { "Ignore Unknown Keywords", "IgnoreUnknownKeywords" })
+        {
+            if (generic.TryGetValue(keyword, out var value)
+                && bool.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out var enabled))
+            {
+                return enabled;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// System.Data.SQLite compatibility: when true, keywords this provider does not know are
+    /// ignored instead of throwing <see cref="ArgumentException"/>. The setting applies wherever
+    /// it appears in a connection string passed to the constructor or a connection.
+    /// </summary>
+    public bool IgnoreUnknownKeywords
+    {
+        get => GetBool("Ignore Unknown Keywords");
+        set => this["Ignore Unknown Keywords"] = value;
+    }
+
+    /// <summary>Keywords that were ignored because <see cref="IgnoreUnknownKeywords"/> is on.</summary>
+    public IReadOnlyDictionary<string, object?> IgnoredKeywords => _ignoredKeywords;
+
+    /// <summary>
+    /// System.Data.SQLite <c>Journal Mode</c>: the journal mode applied on every open
+    /// (<c>Delete</c>, <c>Wal</c>, <c>Truncate</c>, <c>Persist</c>, <c>Memory</c> or
+    /// <c>Off</c>). A database created by the open is created directly in that mode, so
+    /// <c>Delete</c> never leaves WAL sidecar files behind. Empty keeps the database's mode
+    /// (new databases are created in WAL mode).
+    /// </summary>
+    public string JournalMode
+    {
+        get => GetString("Journal Mode");
+        set => SetString("Journal Mode", value);
+    }
+
+    /// <summary>System.Data.SQLite <c>Synchronous</c>: applied as <c>PRAGMA synchronous</c> on open.</summary>
+    public string Synchronous
+    {
+        get => GetString("Synchronous");
+        set => SetString("Synchronous", value);
+    }
+
+    /// <summary>System.Data.SQLite <c>Read Only</c>: opens read-only when <see cref="Mode"/> is not set.</summary>
+    public bool ReadOnly
+    {
+        get => GetBool("Read Only");
+        set => this["Read Only"] = value;
+    }
+
+    /// <summary>
+    /// System.Data.SQLite <c>FailIfMissing</c>: opens read-write without creating the file when
+    /// <see cref="Mode"/> is not set.
+    /// </summary>
+    public bool FailIfMissing
+    {
+        get => GetBool("FailIfMissing");
+        set => this["FailIfMissing"] = value;
+    }
+
+    /// <summary>System.Data.SQLite <c>Page Size</c>: applied as <c>PRAGMA page_size</c> on open.</summary>
+    public int? PageSize
+    {
+        get => GetNullableInt("Page Size");
+        set => SetNullable("Page Size", value);
+    }
+
+    /// <summary>System.Data.SQLite <c>Cache Size</c>: applied as <c>PRAGMA cache_size</c> on open.</summary>
+    public int? CacheSize
+    {
+        get => GetNullableInt("Cache Size");
+        set => SetNullable("Cache Size", value);
+    }
+
+    /// <summary>
+    /// System.Data.SQLite <c>BusyTimeout</c> in milliseconds: applied as
+    /// <c>PRAGMA busy_timeout</c> on open, so it overrides <see cref="DefaultTimeout"/> for lock
+    /// waits.
+    /// </summary>
+    public int? BusyTimeout
+    {
+        get => GetNullableInt("Busy Timeout");
+        set => SetNullable("Busy Timeout", value);
+    }
+
+    /// <summary>System.Data.SQLite <c>Legacy Format</c>: accepted and ignored.</summary>
+    public bool LegacyFormat
+    {
+        get => GetBool("Legacy Format");
+        set => this["Legacy Format"] = value;
+    }
+
+    /// <summary>
+    /// System.Data.SQLite <c>Password</c>: opens (or creates) the database with
+    /// System.Data.SQLite's legacy RC4 page encryption
+    /// (<c>Ahtola.Data.Sqlite.Codecs.SystemDataSQLiteRc4PageCodec</c>) unless a
+    /// <see cref="SqliteConnection.PageCodec"/> is set explicitly.
+    /// </summary>
+    public string Password
+    {
+        get => GetString("Password");
+        set => SetString("Password", value);
+    }
+
+    /// <summary>
+    /// System.Data.SQLite compatibility: when true, commands that do not set
+    /// <see cref="SqliteCommand.Transaction"/> run inside the connection's pending transaction, as
+    /// in System.Data.SQLite, instead of failing as in Microsoft.Data.Sqlite (the default).
+    /// </summary>
+    public bool AutoEnlistTransaction
+    {
+        get => GetBool("Auto Enlist Transaction");
+        set => this["Auto Enlist Transaction"] = value;
+    }
+
+    /// <summary>
+    /// How declared column types map to CLR types in readers. <see cref="SqliteTypeMapping.SystemDataSQLite"/>
+    /// reproduces System.Data.SQLite (<c>INT</c> as <see cref="int"/>, <c>BOOLEAN</c> as
+    /// <see cref="bool"/>, <c>DATETIME</c> as <see cref="System.DateTime"/>, …).
+    /// </summary>
+    public SqliteTypeMapping TypeMapping
+    {
+        get => GetEnum("Type Mapping", SqliteTypeMapping.Default);
+        set => this["Type Mapping"] = value;
+    }
+
+    /// <summary>
+    /// Whether a 16-byte BLOB in a column named <c>ID</c> or <c>*ID</c> (declared TEXT, BLOB or
+    /// with no type) reads back as a GUID string when <see cref="BinaryGUID"/> is on. Off by
+    /// default; the heuristic turned hex ids into dashed GUID text for consumers that never
+    /// declared their columns as GUIDs.
+    /// </summary>
+    public bool GuidColumnNameHeuristic
+    {
+        get => GetBool("Guid Column Name Heuristic");
+        set => this["Guid Column Name Heuristic"] = value;
     }
 
     public string DataSource
@@ -167,7 +363,17 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 
     public SqliteOpenMode Mode
     {
-        get => GetEnum("Mode", SqliteOpenMode.ReadWriteCreate);
+        get
+        {
+            if (base.ContainsKey("Mode"))
+                return GetEnum("Mode", SqliteOpenMode.ReadWriteCreate);
+            // System.Data.SQLite spells the open mode with Read Only and FailIfMissing.
+            if (GetBool("Read Only"))
+                return SqliteOpenMode.ReadOnly;
+            if (GetBool("FailIfMissing"))
+                return SqliteOpenMode.ReadWrite;
+            return SqliteOpenMode.ReadWriteCreate;
+        }
         set => this["Mode"] = value;
     }
 
@@ -251,9 +457,13 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         }
     }
 
+    /// <summary>
+    /// The local provider. When the keyword is absent this reports the provider a connection
+    /// actually uses, <see cref="AhtolaLocalProvider.Managed"/>.
+    /// </summary>
     public AhtolaLocalProvider LocalProvider
     {
-        get => GetEnum("Local Provider", AhtolaLocalProvider.Native);
+        get => GetEnum("Local Provider", AhtolaLocalProvider.Managed);
         set => this["Local Provider"] = value;
     }
 
@@ -528,14 +738,26 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         }
         set
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(keyword);
+            if (!KeywordMap.ContainsKey(keyword) && _ignoreUnknownKeywords)
+            {
+                _ignoredKeywords[keyword] = value;
+                return;
+            }
+
             var normalizedKeyword = NormalizeKeyword(keyword);
             if (value is null)
             {
                 Remove(normalizedKeyword);
+                if (normalizedKeyword == "Ignore Unknown Keywords")
+                    _ignoreUnknownKeywords = false;
                 return;
             }
 
-            base[normalizedKeyword] = ConvertToStoredValue(normalizedKeyword, value);
+            var stored = ConvertToStoredValue(normalizedKeyword, value);
+            base[normalizedKeyword] = stored;
+            if (normalizedKeyword == "Ignore Unknown Keywords")
+                _ignoreUnknownKeywords = stored is true;
         }
     }
 
@@ -737,6 +959,13 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             : defaultValue;
     }
 
+    private int? GetNullableInt(string keyword)
+    {
+        return base.TryGetValue(keyword, out var value)
+            ? Convert.ToInt32(value, CultureInfo.InvariantCulture)
+            : null;
+    }
+
     private long GetLong(string keyword, long defaultValue)
     {
         return base.TryGetValue(keyword, out var value)
@@ -782,7 +1011,14 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Foreign Keys" => ConvertToNullableBoolean(value),
             "Recursive Triggers" or "Pooling" or "BinaryGUID" or "Foreign Read Only" or "Read Your Writes"
                 or "Bootstrap If Empty" or "Partial Sync Prefetch" or "Force Logical MVCC Pull"
+                or "Read Only" or "FailIfMissing" or "Legacy Format" or "Ignore Unknown Keywords"
+                or "Auto Enlist Transaction" or "Guid Column Name Heuristic"
                 => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
+            "Page Size" or "Cache Size" or "Busy Timeout"
+                => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+            "Type Mapping" => ConvertEnum<SqliteTypeMapping>(value),
+            "Journal Mode" => ConvertJournalMode(value),
+            "Synchronous" => ConvertSynchronous(value),
             "Tls" => ConvertToNullableBoolean(value),
             "Default Timeout" or "Version" or "Sync Interval" or "Ws Keepalive Interval" or "Ws Keepalive Timeout"
                 or "Ws Half Open Timeout" or "Ws Max Message Bytes" or "Ws Connect Attempts"
@@ -809,8 +1045,29 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "DateTimeKind" => ConvertDateTimeKind(value),
             "Local Provider" => ConvertLocalProvider(value),
             "Automatic Sync Mode" => ConvertAutomaticSyncMode(value),
+            "Type Mapping" => ConvertEnum<SqliteTypeMapping>(value),
             _ => value,
         };
+    }
+
+    private static readonly string[] JournalModes = ["Delete", "Truncate", "Persist", "Memory", "Wal", "Off", "Default"];
+
+    private static readonly string[] SynchronousModes = ["Off", "Normal", "Full", "Extra", "0", "1", "2", "3"];
+
+    private static string ConvertJournalMode(object value)
+    {
+        var text = Convert.ToString(value, CultureInfo.InvariantCulture)?.Trim() ?? string.Empty;
+        if (text.Length != 0 && !JournalModes.Contains(text, StringComparer.OrdinalIgnoreCase))
+            throw new ArgumentException($"Invalid Journal Mode '{text}'. Expected one of: {string.Join(", ", JournalModes)}.");
+        return text;
+    }
+
+    private static string ConvertSynchronous(object value)
+    {
+        var text = Convert.ToString(value, CultureInfo.InvariantCulture)?.Trim() ?? string.Empty;
+        if (text.Length != 0 && !SynchronousModes.Contains(text, StringComparer.OrdinalIgnoreCase))
+            throw new ArgumentException($"Invalid Synchronous mode '{text}'. Expected Off, Normal, Full or Extra.");
+        return text;
     }
 
     private object? GetValueOrDefault(string keyword)
@@ -833,7 +1090,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "DateTimeFormat" => string.Empty,
             "BinaryGUID" => true,
             "Version" => 3,
-            "Local Provider" => AhtolaLocalProvider.Native,
+            "Local Provider" => AhtolaLocalProvider.Managed,
             "Foreign Read Only" => false,
             "Auth Token" => string.Empty,
             "Replica Path" => string.Empty,
@@ -859,6 +1116,18 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Ws Half Open Timeout" => 0,
             "Ws Max Message Bytes" => 16 * 1024 * 1024,
             "Ws Connect Attempts" => 3,
+            "Journal Mode" => string.Empty,
+            "Synchronous" => string.Empty,
+            "Read Only" => false,
+            "FailIfMissing" => false,
+            "Page Size" => null!,
+            "Cache Size" => null!,
+            "Busy Timeout" => null!,
+            "Legacy Format" => false,
+            "Ignore Unknown Keywords" => false,
+            "Auto Enlist Transaction" => false,
+            "Type Mapping" => SqliteTypeMapping.Default,
+            "Guid Column Name Heuristic" => false,
             _ => throw new ArgumentException(Properties.Resources.KeywordNotSupported(keyword)),
         };
     }

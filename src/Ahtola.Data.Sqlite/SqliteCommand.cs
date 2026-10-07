@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Ahtola;
 using Ahtola.Core;
+using Ahtola.Core.Storage;
 using Ahtola.Core.Execution;
 using Ahtola.Core.Parsing;
 
@@ -191,7 +192,7 @@ public class SqliteCommand : DbCommand
                 command.Prepare();
                 return;
             }
-            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
             {
                 throw MapAhtolaException(ex, CommandText);
             }
@@ -213,7 +214,7 @@ public class SqliteCommand : DbCommand
             _statement = preparedStatement;
             preparedStatement = null;
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
         {
             throw MapAhtolaException(ex);
         }
@@ -339,7 +340,7 @@ public class SqliteCommand : DbCommand
             var reader = await command.ExecuteReaderAsync(behavior, cancellationToken).ConfigureAwait(false);
             return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
         {
             if (ReferenceEquals(_ahtolaCommand, command))
                 _ahtolaCommand = null;
@@ -454,7 +455,7 @@ public class SqliteCommand : DbCommand
                 statement.Dispose();
             }
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException)
         {
             throw ToSqliteException(ex);
         }
@@ -574,7 +575,7 @@ public class SqliteCommand : DbCommand
                 }
             }
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException)
         {
             throw ToSqliteException(ex);
         }
@@ -610,7 +611,7 @@ public class SqliteCommand : DbCommand
             var reader = command.ExecuteReader(behavior);
             return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
         }
-        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+        catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
         {
             if (ReferenceEquals(_ahtolaCommand, command))
                 _ahtolaCommand = null;
@@ -641,7 +642,7 @@ public class SqliteCommand : DbCommand
                 var reader = batch.ExecuteReader(behavior);
                 return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
             }
-            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
             {
                 if (ReferenceEquals(_ahtolaBatch, batch))
                     _ahtolaBatch = null;
@@ -673,7 +674,7 @@ public class SqliteCommand : DbCommand
                 var reader = await batch.ExecuteReaderAsync(behavior, cancellationToken).ConfigureAwait(false);
                 return new SqliteDataReader(this, reader, behavior, CloseAhtolaReader, skipToFirstColumnResult: true);
             }
-            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or HttpRequestException)
+            catch (Exception ex) when (ex is AhtolaException or EmbeddedSqlException or ISqliteStorageBusyException or HttpRequestException)
             {
                 if (ReferenceEquals(_ahtolaBatch, batch))
                     _ahtolaBatch = null;
@@ -865,9 +866,35 @@ public class SqliteCommand : DbCommand
                 return;
             if (connectionTransaction.IsCompleted)
                 throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
+            // System.Data.SQLite runs a command without a transaction inside the connection's
+            // pending transaction; Auto Enlist Transaction=True opts into that.
+            if (Transaction is null && Connection.AutoEnlistTransaction)
+                return;
             if (!IsTransactionControlCommand(CommandText))
                 throw new InvalidOperationException(Properties.Resources.TransactionRequired);
         }
+
+    /// <summary>
+    /// The lock wait for the statement about to run: <c>PRAGMA busy_timeout = N</c> (also set by
+    /// the BusyTimeout keyword) overrides the command timeout for the rest of the connection's
+    /// life, as <c>sqlite3_busy_timeout</c> does; otherwise the command timeout applies.
+    /// </summary>
+    private TimeSpan ResolveBusyTimeout(SqliteConnection connection, string sql)
+    {
+        var match = BusyTimeoutAssignment.Match(sql);
+        if (match.Success
+            && long.TryParse(match.Groups["ms"].Value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var milliseconds))
+        {
+            connection.BusyTimeoutOverride = TimeSpan.FromMilliseconds(Math.Clamp(milliseconds, 0, int.MaxValue));
+        }
+
+        return connection.BusyTimeoutOverride
+               ?? (CommandTimeout == 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(CommandTimeout));
+    }
+
+    private static readonly Regex BusyTimeoutAssignment = new(
+        @"^\s*PRAGMA\s+(?:(?:main|""main""|\[main\]|`main`)\s*\.\s*)?busy_timeout\s*(?:=\s*|\(\s*)(?<ms>[-+]?\d+)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private void CloseReader()
     {
@@ -906,8 +933,7 @@ public class SqliteCommand : DbCommand
         {
             // Mirror the native path below: Microsoft.Data.Sqlite maps CommandTimeout onto
             // sqlite3_busy_timeout per command, so managed lock contention waits the same way.
-            connection.ManagedConnection.BusyTimeout =
-                CommandTimeout == 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(CommandTimeout);
+            connection.ManagedConnection.BusyTimeout = ResolveBusyTimeout(connection, sql);
             IManagedStatementAdapter? managedStatement = null;
             try
             {
@@ -946,7 +972,7 @@ public class SqliteCommand : DbCommand
                 managedStatement = null;
                 return statement;
             }
-            catch (EmbeddedSqlException ex)
+            catch (Exception ex) when (ex is EmbeddedSqlException or ISqliteStorageBusyException)
             {
                 throw ToSqliteException(ex, sql);
             }
@@ -990,8 +1016,7 @@ public class SqliteCommand : DbCommand
         if (!connection.IsManagedConnection)
             return PrepareSingleStatement(sql);
 
-        connection.ManagedConnection.BusyTimeout =
-            CommandTimeout == 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(CommandTimeout);
+        connection.ManagedConnection.BusyTimeout = ResolveBusyTimeout(connection, sql);
         IManagedStatementAdapter? managedStatement = null;
         try
         {
@@ -1004,7 +1029,7 @@ public class SqliteCommand : DbCommand
             managedStatement = null;
             return statement;
         }
-        catch (EmbeddedSqlException ex)
+        catch (Exception ex) when (ex is EmbeddedSqlException or ISqliteStorageBusyException)
         {
             throw ToSqliteException(ex, sql);
         }
@@ -1121,7 +1146,7 @@ public class SqliteCommand : DbCommand
                 continue;
             }
 
-            statement.Bind(parameterIndex, parameter.ToSqlValue());
+            statement.Bind(parameterIndex, parameter.ToSqlValue(Connection?.BinaryGuid ?? true));
             boundParameters[parameterIndex] = true;
         }
 
@@ -1134,7 +1159,7 @@ public class SqliteCommand : DbCommand
                 continue;
 
             var parameter = positionalParameters[positionalParameterIndex++];
-            statement.Bind(statementParameterIndex, parameter.ToSqlValue());
+            statement.Bind(statementParameterIndex, parameter.ToSqlValue(Connection?.BinaryGuid ?? true));
             boundParameters[statementParameterIndex] = true;
         }
 
@@ -1189,14 +1214,28 @@ public class SqliteCommand : DbCommand
     private static bool IsWriteCommand(string commandText)
         => SplitStatements(commandText).Any(IsWriteStatement);
 
+    // Native SQLite runs INSERT/UPDATE/DELETE (and INSERT ... RETURNING) on a connection that
+    // still has a statement stepping: rows already returned stay valid and the reader keeps
+    // going. Only schema changes, VACUUM and ATTACH/DETACH wait for the connection's readers.
     private static bool IsReaderBlockingCommand(string commandText)
         => SplitStatements(commandText).Any(statement =>
         {
             var firstKeyword = SqlTransactionControl.GetFirstKeyword(statement);
-            return IsWriteStatement(statement)
+            return (IsWriteStatement(statement) && !IsDataManipulationStatement(statement))
                    || firstKeyword?.Equals("ATTACH", StringComparison.OrdinalIgnoreCase) == true
                    || firstKeyword?.Equals("DETACH", StringComparison.OrdinalIgnoreCase) == true;
         });
+
+    private static bool IsDataManipulationStatement(string statement)
+    {
+        var firstKeyword = SqlTransactionControl.GetFirstKeyword(statement);
+        return firstKeyword is not null
+               && (firstKeyword.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("UPDATE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("DELETE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("REPLACE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("WITH", StringComparison.OrdinalIgnoreCase));
+    }
 
     private static bool IsWriteStatement(string statement)
     {
@@ -1758,8 +1797,12 @@ public class SqliteCommand : DbCommand
 
     internal static SqliteException ToSqliteException(Exception ex, string? sql = null)
     {
+        // Busy errors keep the engine or storage failure as the inner exception: it names the
+        // lock that was contended, which is what a caller diagnosing a timeout needs.
         if (ex is EmbeddedBusyException)
-            return new SqliteException(Properties.Resources.SqliteNativeError(5, ex.Message), 5);
+            return new SqliteException(Properties.Resources.SqliteNativeError(5, ex.Message), 5, 5, ex.InnerException ?? ex);
+        if (ex is ISqliteStorageBusyException)
+            return new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5, 5, ex);
 
         if (TryGetSqliteErrorCode(ex) is { } sqliteErrorCode)
             return CreateSqliteException(sqliteErrorCode, UnwrapMessage(ex));
